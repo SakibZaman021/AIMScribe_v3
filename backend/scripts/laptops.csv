@@ -1,0 +1,6 @@
+hospital_id,hospital_name,room,doctor_id,doctor_name
+HOSP001,Square Hospital,Room 3,,
+HOSP001,Square Hospital,Room 4,,
+HOSP002,United Hospital,OPD 2,,
+HOSP002,United Hospital,OPD 3,,
+HOSP003,Hospital Three,Room 1,,

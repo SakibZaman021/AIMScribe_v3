@@ -1,0 +1,55 @@
+# Environment variables (contains secrets/API keys)
+.env
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Logs
+logs/
+*.log
+
+# Audio files (large binary files)
+audio/
+
+# ChromaDB local storage
+chromadb/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# My recorder project (if not part of main app)
+my_recorder_project/
+
+# Enrolment output. Each folder holds live single-use tokens, one per doctor PC.
+# The register inside carries no tokens and is safe to keep, but the folder as a
+# whole must never be committed.
+scripts/enrolment_*/
+scripts/doctors.csv

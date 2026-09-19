@@ -1,0 +1,12 @@
+# AIMScribe Archive Worker - AIMS LAB server
+#
+# Deliberately tiny. This process runs on the machine holding every consultation
+# recording, so every dependency is attack surface. It needs an HTTP client and
+# nothing else - WAV joining, hashing and path handling are all standard library.
+
+requests>=2.32.0
+
+# Windows ships no system timezone database, and slim Linux images often omit it.
+# Without this, zoneinfo cannot resolve Asia/Dhaka and file naming silently falls
+# back to UTC - which files every evening consultation under the previous day.
+tzdata>=2024.1

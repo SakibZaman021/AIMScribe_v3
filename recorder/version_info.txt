@@ -1,0 +1,31 @@
+# Windows version resource for the signed executable.
+# Referenced by BUILD.bat via --version-file. Keep the version numbers in step
+# with APP_VERSION in config.py.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 3, 1, 0),
+    prodvers=(2, 3, 1, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [StringStruct('CompanyName', 'AIMS LAB'),
+         StringStruct('FileDescription', 'AIMScribe Clinical Audio Agent'),
+         StringStruct('FileVersion', '2.3.1.0'),
+         StringStruct('InternalName', 'AIMScribe_Agent'),
+         StringStruct('LegalCopyright', 'Copyright (c) AIMS LAB'),
+         StringStruct('OriginalFilename', 'AIMScribe_Agent.exe'),
+         StringStruct('ProductName', 'AIMScribe'),
+         StringStruct('ProductVersion', '2.3.1.0')]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

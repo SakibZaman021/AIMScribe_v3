@@ -1,0 +1,37 @@
+# AIMScribe Agent — runtime dependencies (doctor PC)
+#
+# Kept deliberately small: every package here ships inside the signed executable
+# and widens the supply-chain surface on ~20 clinical machines.
+#
+# Before a production build, pin exactly:
+#     pip install pip-tools
+#     pip-compile --generate-hashes -o requirements.lock requirements.txt
+# and build from requirements.lock.
+
+# Audio capture
+pyaudio>=0.2.14
+
+# Local control plane (loopback only)
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0
+pydantic>=2.6,<3.0
+
+# WebSocket transport for uvicorn
+websockets>=12.0
+wsproto>=1.2.0
+
+# Backend client, mTLS and presigned uploads
+aiohttp>=3.9.5
+
+# Hash chain, Ed25519 device key, AES-GCM spool encryption, DPAPI wrapping
+cryptography>=42.0
+
+# CMED recording grants (EdDSA JWT verification)
+pyjwt[crypto]>=2.8,<3.0
+
+# System tray
+pystray>=0.19.5
+Pillow>=10.3.0
+
+# Configuration is read by config.py directly from .env — no python-dotenv needed.
+# Build tooling is intentionally NOT here; see requirements-build.txt.

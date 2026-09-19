@@ -1,0 +1,92 @@
+# Render Blueprint - AIMScribe Backend
+# Deploy: Connect GitHub repo → Render auto-detects this file
+
+services:
+  # Backend API + Worker
+  - type: web
+    name: aimscribe-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Azure OpenAI - Transcription
+      - key: AZURE_TRANSCRIBE_ENDPOINT
+        sync: false
+      - key: AZURE_TRANSCRIBE_API_KEY
+        sync: false
+      - key: AZURE_TRANSCRIBE_DEPLOYMENT
+        value: gpt-4o-transcribe-diarize
+      - key: AZURE_TRANSCRIBE_API_VERSION
+        value: 2025-03-01-preview
+
+      # Azure OpenAI - NER
+      - key: AZURE_NER_ENDPOINT
+        sync: false
+      - key: AZURE_NER_API_KEY
+        sync: false
+      - key: AZURE_NER_DEPLOYMENT
+        value: gpt-5.2-chat
+      - key: AZURE_API_VERSION
+        value: 2025-01-01-preview
+
+      # PostgreSQL (Neon)
+      - key: POSTGRES_HOST
+        sync: false
+      - key: POSTGRES_PORT
+        value: "5432"
+      - key: POSTGRES_DB
+        sync: false
+      - key: POSTGRES_USER
+        sync: false
+      - key: POSTGRES_PASSWORD
+        sync: false
+      - key: POSTGRES_SSLMODE
+        value: require
+
+      # Redis (from Render Redis service)
+      - key: REDIS_HOST
+        fromService:
+          name: aimscribe-redis
+          type: redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          name: aimscribe-redis
+          type: redis
+          property: port
+      - key: REDIS_PASSWORD
+        fromService:
+          name: aimscribe-redis
+          type: redis
+          property: password
+
+      # Cloudflare R2 (S3-compatible, replaces MinIO)
+      - key: MINIO_ENDPOINT
+        sync: false
+      - key: MINIO_EXTERNAL_ENDPOINT
+        sync: false
+      - key: MINIO_ACCESS_KEY
+        sync: false
+      - key: MINIO_SECRET_KEY
+        sync: false
+      - key: MINIO_BUCKET
+        value: aimscribe-audio
+      - key: MINIO_SECURE
+        value: "true"
+
+      # Server
+      - key: PORT
+        value: "6000"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PROMPTS_DIR
+        value: /app/src/prompts
+      - key: NER_TRIGGER_CLIPS
+        value: "2"
+
+  # Redis for job queue
+  - type: redis
+    name: aimscribe-redis
+    plan: free
+    ipAllowList: []

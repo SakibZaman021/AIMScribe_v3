@@ -1,0 +1,5 @@
+# The wire-format vectors are hashed byte for byte by the test suites in this
+# repository and in the backend, and the two copies must be identical. Line
+# ending conversion would change that hash on checkout and break both, so this
+# file is exempt from all normalisation.
+recorder/tests/wire_vectors.json -text

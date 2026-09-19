@@ -1,0 +1,4 @@
+hospital_id,hospital_name,doctor_id,doctor_name,room
+HOSP001,Square Hospital,DR001,Dr Sakib Zaman,Room 3
+HOSP001,Square Hospital,DR002,Dr Ayesha Rahman,Room 4
+HOSP002,United Hospital,DR003,Dr Kamrul Hasan,OPD 2

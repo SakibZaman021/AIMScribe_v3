@@ -1,0 +1,52 @@
+# AIMScribe Archive Worker - AIMS LAB server deployment
+#
+#   docker compose up -d
+#   docker compose logs -f
+#
+# The archive volume is a bind mount to real storage, not a Docker volume, so the
+# recordings live somewhere you can back up, snapshot and replicate independently
+# of Docker's lifecycle.
+
+services:
+  archive-worker:
+    build: .
+    image: aimscribe/archive-worker:2.0
+    container_name: aimscribe-archive-worker
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      # Left side: the real archive path on the AIMS LAB server.
+      # Windows host example:  D:/AIMSLAB_AUDIO_STORAGE:/archive
+      - ${AIMS_ARCHIVE_HOST_PATH:-./archive-data}:/archive
+
+    environment:
+      - AIMS_ARCHIVE_ROOT=/archive
+      - TZ=${TZ:-Asia/Dhaka}
+
+    # No ports. The worker only makes outbound connections, which is what keeps
+    # the AIMS LAB server free of any inbound attack surface.
+
+    # Hardening: the worker needs to write to /archive and nothing else.
+    read_only: true
+    tmpfs:
+      # Segments are downloaded here before joining. Sized for one session:
+      # about 320 MB per hour of 44.1 kHz audio, doubled for the join.
+      - /tmp:size=4g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g

@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.yml
+Dockerfile.local
+
+# Client app (not needed in backend container)
+aimscribe.exe.v1/
+aimscribe-client/
+
+# Test files
+test_*.py
+tests/
+*.test.py
+
+# Docs
+*.md
+!requirements.txt
+
+# Misc
+*.log
+*.tmp
+nul
+server.bat
+worker.bat
+start_all.bat
+demo-ngrok.bat
+
+# ChromaDB (not used in cloud)
+chromadb/

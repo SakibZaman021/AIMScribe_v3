@@ -1,0 +1,72 @@
+# Node.js
+node_modules/
+.next/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+logs/
+*.log
+
+# Recordings (large files)
+recordings/
+temp_clips/*.wav
+
+# Claude
+.claude/
+
+# Agent secrets and local state — never commit these
+recorder/scripts/dev-keys/
+recorder/dist/
+recorder/build/
+*.dpapi
+*.pem
+# Exception: the two public halves the installer ships. They are identical on
+# every doctor PC and carry no secret. The blanket rule above stays, because it
+# is what keeps a private key out of a public repository - and it has already
+# earned its place once.
+!recorder/keys/*_pub.pem
+*.key
+*.crt
+spool/
+*.aimspl
+journal.jsonl
+
+# Editor and tooling state, per-machine
+.claude/
+.vscode/
+.idea/
+
+# Build markers and caches
+*.tsbuildinfo
+.deps_installed
+
+# upgrade workspace
+backend/.env
+**/node_modules/
+**/.venv/
+**/__pycache__/

@@ -1,0 +1,220 @@
+# ================================================================
+# AIMScribe Backend - Docker Compose (Full Stack)
+# ================================================================
+# Runs: Redis, MinIO, API Server, Worker
+# PostgreSQL: Using Neon Cloud (https://neon.tech)
+# ================================================================
+# Usage:
+#   docker-compose up -d              (Start all services)
+#   docker-compose up -d --build      (Rebuild and start)
+#   docker-compose down               (Stop all services)
+#   docker-compose logs -f api worker (View API & Worker logs)
+#   docker-compose logs -f            (View all logs)
+# ================================================================
+
+services:
+  # ================================================================
+  # Redis (Job Queue & Caching)
+  # ================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aimscribe-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ================================================================
+  # MinIO (Object Storage for Audio Files)
+  # ================================================================
+  minio:
+    image: minio/minio
+    container_name: aimscribe-minio
+    environment:
+      MINIO_ROOT_USER: aimscribe
+      MINIO_ROOT_PASSWORD: aimscribe123
+    ports:
+      - "9000:9000" # API
+      - "9001:9001" # Console
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # ================================================================
+  # MinIO Setup (Creates bucket on first run)
+  # ================================================================
+  minio-setup:
+    image: minio/mc
+    container_name: aimscribe-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set aimscribe http://minio:9000 aimscribe aimscribe123;
+      mc mb --ignore-existing aimscribe/aimscribe-audio;
+      mc anonymous set download aimscribe/aimscribe-audio;
+      echo 'Bucket created successfully';
+      exit 0;
+      "
+
+  # ================================================================
+  # API Server (FastAPI)
+  # ================================================================
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: aimscribe-api
+    ports:
+      - "6000:6000"
+    environment:
+      # Azure OpenAI - Transcription
+      AZURE_TRANSCRIBE_ENDPOINT: ${AZURE_TRANSCRIBE_ENDPOINT}
+      AZURE_TRANSCRIBE_API_KEY: ${AZURE_TRANSCRIBE_API_KEY}
+      AZURE_TRANSCRIBE_DEPLOYMENT: ${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe-diarize}
+      AZURE_TRANSCRIBE_API_VERSION: ${AZURE_TRANSCRIBE_API_VERSION:-2025-03-01-preview}
+      # Azure OpenAI - NER
+      AZURE_NER_ENDPOINT: ${AZURE_NER_ENDPOINT}
+      AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
+      AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
+      # PostgreSQL (Neon Cloud)
+      # Credentials come from .env, which is gitignored. They were previously
+      # hardcoded here and published to a public repository.
+      POSTGRES_HOST: ${POSTGRES_HOST:?set POSTGRES_HOST in .env}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
+      POSTGRES_POOL_MIN: 2
+      POSTGRES_POOL_MAX: 10
+      # Redis (container hostname)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # Object storage. Both are set from .env so this file works unchanged
+      # against the local MinIO container or Cloudflare R2.
+      #
+      # MINIO_EXTERNAL_ENDPOINT is baked into every presigned URL and must
+      # resolve for whoever opens it: the agent on a doctor PC and the archive
+      # worker on the AIMS LAB server. With MinIO that means a LAN address,
+      # which goes stale when the machine changes network. With R2 leave it
+      # empty - one public hostname serves everyone.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      # Cloudflare R2 requires "auto". Part of the SigV4 signature, so a
+      # mismatch fails every presigned request with SignatureDoesNotMatch.
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      # Server
+      SERVER_PORT: 6000
+      SERVER_HOST: 0.0.0.0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PROMPTS_DIR: /app/src/prompts
+      # Protocol 2
+      AIMS_ADMIN_KEY: ${AIMS_ADMIN_KEY:?set AIMS_ADMIN_KEY in .env}
+      AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
+      AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:-}
+      AIMS_ALLOWED_ORIGINS: ${AIMS_ALLOWED_ORIGINS:-http://localhost:3000}
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:6000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ================================================================
+  # Worker (Async Transcription & NER Processing)
+  # ================================================================
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: aimscribe-worker
+    environment:
+      # Azure OpenAI - Transcription
+      AZURE_TRANSCRIBE_ENDPOINT: ${AZURE_TRANSCRIBE_ENDPOINT}
+      AZURE_TRANSCRIBE_API_KEY: ${AZURE_TRANSCRIBE_API_KEY}
+      AZURE_TRANSCRIBE_DEPLOYMENT: ${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe-diarize}
+      AZURE_TRANSCRIBE_API_VERSION: ${AZURE_TRANSCRIBE_API_VERSION:-2025-03-01-preview}
+      # Azure OpenAI - NER
+      AZURE_NER_ENDPOINT: ${AZURE_NER_ENDPOINT}
+      AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
+      AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
+      # PostgreSQL (Neon Cloud)
+      # Credentials come from .env, which is gitignored. They were previously
+      # hardcoded here and published to a public repository.
+      POSTGRES_HOST: ${POSTGRES_HOST:?set POSTGRES_HOST in .env}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
+      POSTGRES_POOL_MIN: 2
+      POSTGRES_POOL_MAX: 10
+      # Redis (container hostname)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # MinIO (container hostname)
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      # Worker Config
+      LOG_LEVEL: INFO
+      PROMPTS_DIR: /app/src/prompts
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      # The worker is what posts NER results to CMED, so it is the process that
+      # needs the signing secret. Only the api service had it, so every webhook
+      # went out signed with an empty key and CMED rejected all of them.
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ================================================================
+  # Database UI: Use Neon Console at https://console.neon.tech
+  # ================================================================
+
+volumes:
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  default:
+    name: aimscribe-network

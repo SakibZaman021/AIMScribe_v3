@@ -1,0 +1,12 @@
+# Build-time only. Never installed on a doctor PC.
+-r requirements.txt
+
+pyinstaller>=6.6.0
+
+# Test suite
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Dependency pinning and audit, run before every release
+pip-tools>=7.4
+pip-audit>=2.7
