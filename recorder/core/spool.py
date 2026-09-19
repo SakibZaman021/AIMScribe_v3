@@ -170,6 +170,22 @@ class SessionSpool:
         # and were previously sent once and forgotten.
         self.reported_entries: set = set()
 
+        # SRS 3.2 §5: a consultation records before it is authorised, and
+        # nothing is sent until the server has granted it. A hard refusal
+        # deletes it (SRS-GRT-08). Sessions from before v3 carry no trigger and
+        # load as granted, so they upload exactly as they always did.
+        self.authorisation = "granted"        # pending | granted | refused
+        self.refusal_code = ""
+        self.grant_jti: Optional[str] = None
+        self.confirmation = ""                # as the grant or the server last said
+        # The patient did not consent (SRS §7.8a): nothing is uploaded, local
+        # pieces are deleted, and the server is told until it acknowledges.
+        self.refused = False
+        self.refusal_reported = False
+        # Set by the controller while this is the consultation being recorded.
+        # In memory only: after a restart nothing is live.
+        self.live = False
+
         self._journal_path = directory / JOURNAL_NAME
 
     # ---- construction ----
@@ -189,6 +205,7 @@ class SessionSpool:
         audio: Dict[str, int],
         session_id: Optional[str] = None,
         opened_at: Optional[datetime] = None,
+        trigger: Optional[Dict[str, str]] = None,
     ) -> "SessionSpool":
         session_id = session_id or new_ulid()
         directory = root / session_id
@@ -204,6 +221,11 @@ class SessionSpool:
             "patient_ref": patient_ref,
             "consent_method": consent_method,
         }
+        if trigger:
+            # CMED's five fields, kept so the grant can still be asked for after
+            # a restart or an outage (SRS-UPL-06).
+            spool.meta["trigger"] = dict(trigger)
+            spool.authorisation = "pending"
 
         spool._append_journal({
             "rec": "session",
@@ -264,6 +286,9 @@ class SessionSpool:
                         for key in ("device_id", "doctor_id", "hospital_id",
                                     "patient_ref", "consent_method")
                     }
+                    if record.get("trigger"):
+                        spool.meta["trigger"] = record["trigger"]
+                        spool.authorisation = "pending"
                 elif spool is None:
                     continue
                 elif kind == "chain":
@@ -307,6 +332,19 @@ class SessionSpool:
                     spool.close_reported = True
                 elif kind == "entry_reported":
                     spool.reported_entries.add(record["entry_no"])
+                elif kind == "authorised":
+                    spool.authorisation = "granted"
+                    spool.grant_jti = record.get("grant_jti")
+                    spool.confirmation = record.get("confirmation", "")
+                elif kind == "authorisation_refused":
+                    spool.authorisation = "refused"
+                    spool.refusal_code = record.get("code", "")
+                elif kind == "confirmation":
+                    spool.confirmation = record.get("state", "")
+                elif kind == "refused":
+                    spool.refused = True
+                elif kind == "refusal_reported":
+                    spool.refusal_reported = True
 
         return spool
 
@@ -487,6 +525,74 @@ class SessionSpool:
             logger.info("Purged local segment %s of session %s", seq_no, self.session_id)
             return True
 
+    # ---- authorisation, confirmation and refusal (SRS 3.2) ----
+
+    @property
+    def needs_authorisation(self) -> bool:
+        return self.authorisation == "pending" and not self.refused
+
+    def record_authorised(self, grant_jti: Optional[str], confirmation: str) -> None:
+        with self._lock:
+            self.authorisation = "granted"
+            self.grant_jti = grant_jti
+            self.confirmation = confirmation
+            self._append_journal({"rec": "authorised", "grant_jti": grant_jti,
+                                  "confirmation": confirmation, "at": time.time()})
+
+    def record_authorisation_refused(self, code: str) -> None:
+        with self._lock:
+            self.authorisation = "refused"
+            self.refusal_code = code
+            self._append_journal({"rec": "authorisation_refused", "code": code,
+                                  "at": time.time()})
+
+    def record_confirmation(self, state: str) -> None:
+        with self._lock:
+            if state and state != self.confirmation:
+                self.confirmation = state
+                self._append_journal({"rec": "confirmation", "state": state,
+                                      "at": time.time()})
+
+    def refuse(self) -> int:
+        """
+        The patient did not consent (SRS 3.2 §7.8a).
+
+        The refusal is journalled first, so it survives a crash or power cut
+        (SRS-CNS-05); then every piece is deleted, sent or not (SRS-CNS-03).
+        Returns the number of pieces deleted.
+        """
+        with self._lock:
+            if not self.refused:
+                self.refused = True
+                self._append_journal({"rec": "refused", "at": time.time()})
+            return self.delete_all_pieces()
+
+    def delete_all_pieces(self) -> int:
+        with self._lock:
+            removed = 0
+            for segment in self.segments.values():
+                path = self.directory / segment.filename
+                try:
+                    if path.exists():
+                        path.unlink()
+                        removed += 1
+                except OSError as exc:
+                    logger.warning("Could not delete %s: %s", path, exc)
+                segment.state = PURGED
+            return removed
+
+    def mark_refusal_reported(self) -> None:
+        with self._lock:
+            if not self.refusal_reported:
+                self.refusal_reported = True
+                self._append_journal({"rec": "refusal_reported", "at": time.time()})
+
+    def oldest_pending_at(self) -> Optional[datetime]:
+        """When the oldest piece still waiting to be delivered was captured."""
+        waiting = [s.captured_end_at for s in self.segments.values()
+                   if s.state == PENDING and s.captured_end_at is not None]
+        return min(waiting) if waiting else None
+
     # ---- lifecycle ----
 
     def mark_acknowledged(self) -> None:
@@ -560,6 +666,8 @@ class SessionSpool:
         receipt. Dropping any one of these can delete the journal for a session the
         server has not finished accounting for.
         """
+        if self.refused:
+            return self.refusal_reported
         return (
             self.server_acknowledged
             and self.closed_at is not None
@@ -714,6 +822,15 @@ class Spool:
         """Remove a fully archived and purged session directory."""
         if session.is_complete:
             _remove_tree(session.directory)
+
+    def remove(self, session: SessionSpool, *, reason: str) -> None:
+        """
+        Remove a session that must not be kept: refused by the server before
+        anything was sent (SRS-GRT-08), or refused by the patient and reported
+        (SRS-CNS-03).
+        """
+        logger.warning("Removing session %s from the spool: %s", session.session_id, reason)
+        _remove_tree(session.directory)
 
 
 # ============================================================

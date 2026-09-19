@@ -565,6 +565,27 @@ class GrantError(Exception):
     """Raised when a grant is missing, malformed, expired, or not properly signed."""
 
 
+class GrantGuard:
+    """
+    Single-use enforcement for recording grants (SRS-GRT-05).
+
+    A grant is a bearer token: without replay protection, a copy of one could
+    open sessions until it expired. Entries are pruned lazily.
+    """
+
+    def __init__(self) -> None:
+        self._seen: Dict[str, float] = {}
+
+    def consume(self, grant: "Grant") -> None:
+        import time as _time
+        now = _time.time()
+        if len(self._seen) > 512:
+            self._seen = {jti: exp for jti, exp in self._seen.items() if exp > now}
+        if self._seen.get(grant.jti, 0) > now:
+            raise GrantError("grant has already been used")
+        self._seen[grant.jti] = float(grant.expires_at)
+
+
 def verify_grant(
     token: str,
     public_key: Ed25519PublicKey,

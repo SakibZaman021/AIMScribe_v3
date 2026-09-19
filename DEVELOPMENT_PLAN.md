@@ -53,7 +53,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 |---|---|---|
 | **1. Recorder, Channel A** — *done* | Reply envelope; five-field trigger; `prescription_built` and the gate; clinic from the PC, mismatch refused (D1); consent removed from the grant; buffer 4 GB, alert at 25%; no deletion wait | Unit tests; `AT-02`, `AT-09`–`AT-12`, `AT-31`, `AT-32` on a bench |
 | **2. Server, authorisation and Channel B** — *done* | `POST /grant/mint` with register checks and D1; `clinical/patient-information` and `clinical/prescription` with `X-CMED-Key`; confirmation notices and matching; receipts on custody; refusal endpoint; webhook off (D2) | `AT-04`, `AT-57`–`AT-63`, `AT-68`–`AT-70`, `AT-78` |
-| **3. Recorder talks to the new server** | Grant requested from the server alongside capture; "confirming" state; unconfirmed handling; refusal deletes local pieces; alert when a piece waits over 15 minutes; final delivery and clean-up at start-up and shutdown | `AT-01`, `AT-03`, `AT-07`, `AT-08`, `AT-20`, `AT-58`, `AT-59`, `AT-77` |
+| **3. Recorder talks to the new server** — *done* | Grant requested from the server alongside capture; "confirming" state; unconfirmed handling; refusal deletes local pieces; alert when a piece waits over 15 minutes; final delivery and clean-up at start-up and shutdown | `AT-01`, `AT-03`, `AT-07`, `AT-08`, `AT-20`, `AT-58`, `AT-59`, `AT-77` |
 | **4. On-screen control** | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
 | **5. Two databases** | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
 | **6. Archive and cloud copy** | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
@@ -74,10 +74,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 |---|---|---|---|
 | 19 Sep 2026 | 1 | `recorder/api/protocol.py` holds the Channel A contract: the five-field trigger, `prescription_built`, and every Appendix A code. The WebSocket server answers every command with `request_id`, `status` and `code`, and gets the grant from an authoriser (connected to the server in Phase 3). The session controller has the gate, files every recording under the PC's clinic and refuses a mismatch (D1), and carries reply codes on its refusals. Grants no longer need a consent claim. Buffer 4 GB, alert at 25%, deletion straight after a receipt. The development client sends the new messages. | 167 recorder tests pass (115 before) |
 
-**Until Phase 3 is done**, a recorder built from this folder answers every
-`start` with `503 AGENT_NOT_READY` in production mode: the server can now issue
-grants (Phase 2), but the recorder does not ask for them yet. Run it with `AIMS_REQUIRE_GRANT=false` to try it on a
-bench. The first chain entry still carries a consent-method field, now always
+*(Resolved in Phase 3: the recorder now asks the server for each grant.)* The first chain entry still carries a consent-method field, now always
 `reception`, so the chain format - and the shared wire vectors - are unchanged.
 | 19 Sep 2026 | 2 | On the existing `/api/v2` server: `POST /grant/mint` issues 60-second Ed25519 grants for the PC's own clinic and refuses a mismatch (D1); `clinical/patient-information` and `clinical/prescription` take CMED's key, store a repeated request once, version changed prescriptions, and quarantine malformed ones with `422`; every recording is confirmed against API 2 (`pending`, `confirmed`, `unconfirmed` after two minutes, erased after 24 hours by `POST /maintenance/sweep`, which the archive worker calls each pass); receipts are issued the moment a piece is verified; `POST /session/refuse` erases a refused consultation and drops its clinical data; the AI webhook to CMED is off (D2). Sessions from old recorders are `legacy` and archive as before. | 144 server tests pass (105 before); 167 recorder tests unchanged |
 
@@ -91,3 +88,13 @@ bench. The first chain entry still carries a consent-method field, now always
 
 Until the archive gains the cloud copy (Phase 6), `archive/complete` still deletes
 pieces from R2 after archiving, as the old code did.
+
+| 19 Sep 2026 | 3 | The recorder records first and asks the server alongside (SRS-GRT-07): the page gets `200 RECORDING_STARTED` when the grant arrives within 1.5 s, `202 RECORDING_PROVISIONAL` otherwise, and the recorder keeps asking. Every grant is verified against the pinned key and must be for this patient, doctor and PC's clinic, and unused. Nothing is uploaded before a grant; a hard refusal stops the recording and deletes it unsent (SRS-GRT-08). Where each consultation stands - waiting, granted, refused by the server, refused by the patient - is journalled, so a restart or an offline morning resumes correctly and the upload loop asks for grants once a consultation has closed. The session carries its grant to `/session/open`; while recording, the recorder asks every five seconds whether CMED's API 2 has confirmed it and shows unconfirmed after two minutes, never cutting. "Patient did not consent" stops at once, deletes every local piece and reports the refusal until the server acknowledges. An alert fires when a piece waits over 15 minutes; shutdown makes one last bounded delivery. The grant key is now `aimslab_grant_pub.pem`, issuer `aimslab`, in config and both installers. | 202 recorder tests pass (167 before); 144 server tests unchanged |
+
+### Before building a recorder installer from this folder
+
+`recorder/keys/aimslab_grant_pub.pem` is the old development key, renamed. Replace it
+with the public half of the server's `AIMS_GRANT_PRIVATE_KEY` (Phase 2, step 2), or
+every grant will be refused and every recording deleted. The on-screen Stop and
+Pause control that offers "Patient did not consent" comes in Phase 4; until then the
+refusal can be sent as a `stop` command with that reason.

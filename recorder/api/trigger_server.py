@@ -106,12 +106,14 @@ class Runtime:
             logger.critical("Purge-receipt key unavailable (%s); local audio will never "
                             "be deleted automatically", exc)
 
+        # The AIMS LAB server's grant key, pinned at install (SRS-GRT-04).
+        grant_key = None
         if self.cfg.security.require_grant:
             try:
-                self.ws.set_grant_key(
-                    crypto.load_public_key(self.cfg.security.grant_public_key_path))
+                grant_key = crypto.load_public_key(self.cfg.security.grant_public_key_path)
             except Exception as exc:
-                logger.critical("Grant key unavailable (%s); recordings cannot start", exc)
+                logger.critical("Grant key unavailable (%s); no recording can be authorised, "
+                                "so every recording will be refused and deleted", exc)
 
         # Enrollment runs before anything else that needs an identity. If it
         # cannot complete, the agent still starts and shows its tray icon - it
@@ -141,6 +143,7 @@ class Runtime:
             on_event=self._on_event,
         )
         self.uploader.set_device_token(load_device_token(self.cfg))
+        self.uploader.set_grant_key(grant_key)
         await self.uploader.start()
 
         self.controller = SessionController(

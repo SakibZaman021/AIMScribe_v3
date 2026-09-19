@@ -12,9 +12,13 @@ Per segment the sequence is:
     PUT  <presigned url>      -> the WAV bytes, straight to object storage
     POST /segment/commit      -> server re-reads the object and verifies sha256
 
-Then, separately and later:
+Before any of that, a v3 session is authorised (SRS 3.2 §5):
 
-    GET  /session/{id}/receipts -> signed proof the archive copy exists
+    POST /grant/mint          -> five fields in, a signed single-use grant out
+
+and afterwards:
+
+    GET  /session/{id}/receipts -> signed proof the server holds a verified copy
     verify signature + sha256   -> only now may the local file be deleted
 
 Uploads and deletion are deliberately decoupled: a segment reaching storage is not
@@ -37,6 +41,16 @@ from core.crypto import ReceiptError
 from core.spool import COMMITTED, PENDING, RECEIPTED, SessionSpool, Spool
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AuthOutcome:
+    """The server's answer to a grant request."""
+    status: str                         # granted | pending | refused
+    code: str
+    message: str = ""
+    grant: Optional[crypto.Grant] = None
+    confirmation: str = ""
 
 
 @dataclass
@@ -113,6 +127,12 @@ class UploadManager:
         self.last_error: str = ""
         self.consecutive_failures = 0
 
+        # SRS 3.2: grants from the server, checked here.
+        self._grant_key = None
+        self._grant_guard = crypto.GrantGuard()
+        self._auth_locks: Dict[str, asyncio.Lock] = {}
+        self._stall_alerted = False
+
     # ---- lifecycle ----
 
     def set_device_token(self, token: Optional[str]) -> None:
@@ -144,9 +164,12 @@ class UploadManager:
         self._task = asyncio.create_task(self._loop(), name="UploadManager")
         logger.info("Upload manager started; backend %s", self.cfg.backend.base_url)
 
-    async def stop(self) -> None:
-        self._running = False
-        self._wake.set()
+    async def stop(self, *, final_delivery_seconds: float = 10.0) -> None:
+        """
+        Stop, after one last bounded attempt to deliver and clean up
+        (SRS-REC-18): a laptop closed straight after the last patient should
+        leave as little behind as possible.
+        """
         if self._task:
             self._task.cancel()
             try:
@@ -154,6 +177,15 @@ class UploadManager:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._running and self._http is not None and final_delivery_seconds > 0:
+            try:
+                await asyncio.wait_for(self._drain_once(), timeout=final_delivery_seconds)
+            except asyncio.TimeoutError:
+                logger.info("Final delivery cut short after %.0f s", final_delivery_seconds)
+            except Exception as exc:
+                logger.warning("Final delivery failed: %s", exc)
+        self._running = False
+        self._wake.set()
         if self._http:
             await self._http.close()
             self._http = None
@@ -198,6 +230,9 @@ class UploadManager:
         for session in sessions:
             if not self._running:
                 return
+
+            if not await self._settle_before_upload(session):
+                continue
 
             if not session.server_acknowledged:
                 if await self._open_remote(session):
@@ -290,6 +325,8 @@ class UploadManager:
                 self.spool.discard(session)
                 logger.info("Session %s fully archived and purged locally", session.session_id)
 
+        self._check_stall()
+
     # ---- protocol steps ----
 
     async def _open_remote(self, session: SessionSpool) -> bool:
@@ -306,6 +343,8 @@ class UploadManager:
             "patient_ref": session.meta.get("patient_ref"),
             "consent_obtained": True,
             "consent_method": session.meta.get("consent_method", ""),
+            # Links the session to its grant, and so to CMED's API 2 (§5.6).
+            "grant_jti": session.grant_jti,
             "audio": session.audio,
             "device_pubkey": self._device_key.public_bytes_raw().hex(),
             "genesis": genesis.to_wire(),
@@ -318,6 +357,8 @@ class UploadManager:
         result = await self._post("/session/open", payload, attempts=1)
         if result is None:
             return False
+        if result.get("confirmation"):
+            session.record_confirmation(str(result["confirmation"]))
         logger.info("Session %s registered with the backend", session.session_id)
         self._emit("session_registered", {"session_id": session.session_id})
         return True
@@ -547,7 +588,7 @@ class UploadManager:
             logger.info("Verified purge receipt for %s segment %s", session.session_id, seq_no)
 
     def _purge_expired(self, session: SessionSpool) -> None:
-        """Delete receipted segments once the grace window has passed."""
+        """Delete receipted segments. The window is zero by default (SRS-REC-16)."""
         grace = self.cfg.spool.purge_grace_hours * 3600
         now = time.time()
         for segment in list(session.segments.values()):
@@ -559,6 +600,201 @@ class UploadManager:
                 self._emit("segment_purged", {
                     "session_id": session.session_id, "seq_no": segment.seq_no,
                 })
+
+
+    # ---- authorisation, confirmation and refusal (SRS 3.2) ----
+
+    def set_grant_key(self, key) -> None:
+        """The public key the server's grants are verified against (pinned at install)."""
+        self._grant_key = key
+
+    async def authorise(self, session: SessionSpool) -> "AuthOutcome":
+        """
+        Ask the server for this consultation's grant (SRS 3.2 §5.3).
+
+            granted   verified grant stored; the session may upload
+            pending   the server could not be reached; recording carries on
+            refused   a hard refusal; the session must be deleted (SRS-GRT-08)
+
+        Serialised per session, so the live consultation and the upload loop
+        can never mint two grants for the same recording.
+        """
+        if session.refused:
+            return AuthOutcome("refused", "PATIENT_REFUSED", "The patient did not consent.")
+        lock = self._auth_locks.setdefault(session.session_id, asyncio.Lock())
+        async with lock:
+            if session.authorisation == "granted":
+                return AuthOutcome("granted", "GRANTED", "", None, session.confirmation)
+            if session.authorisation == "refused":
+                return AuthOutcome("refused", session.refusal_code or "AUTHORISATION_FAILED", "")
+
+            trigger = dict(session.meta.get("trigger") or {})
+            status, body = await self._request_raw("POST", "/grant/mint", trigger)
+
+            # Not reachable, or reachable but unable to decide: ask again later.
+            if status is None or status >= 500 or status in (408, 429):
+                return AuthOutcome("pending", "AGENT_NOT_READY",
+                                   "The AIMS LAB server could not be reached.")
+
+            if status >= 400:
+                body = body or {}
+                code = body.get("code") or (
+                    "DEVICE_NOT_ENROLLED" if status in (401, 403) else "AUTHORISATION_FAILED")
+                return self._refuse_authorisation(session, code, body.get("message", ""))
+
+            try:
+                grant = self._verified_grant(session, trigger, body or {})
+            except crypto.GrantError as exc:
+                logger.critical("Grant for %s rejected: %s", session.session_id, exc)
+                return self._refuse_authorisation(session, "AUTHORISATION_FAILED", str(exc))
+
+            confirmation = str((body or {}).get("confirmation") or "pending")
+            session.record_authorised(grant.jti, confirmation)
+            logger.info("Session %s authorised (%s)", session.session_id, confirmation)
+            self._emit("session_authorised", {"session_id": session.session_id,
+                                              "confirmation": confirmation})
+            self.nudge()
+            return AuthOutcome("granted", "GRANTED", "", grant, confirmation)
+
+    def _refuse_authorisation(self, session: SessionSpool, code: str,
+                              message: str) -> "AuthOutcome":
+        session.record_authorisation_refused(code)
+        self._emit("integrity_alert", {
+            "session_id": session.session_id,
+            "alert_type": "authorisation_refused",
+            "detail": code,
+        })
+        return AuthOutcome("refused", code, message)
+
+    def _verified_grant(self, session: SessionSpool, trigger: Dict[str, Any],
+                        body: Dict[str, Any]) -> crypto.Grant:
+        """
+        The grant must verify against the pinned key and be for exactly this
+        consultation, on this PC's clinic, and unused (SRS-GRT-04, -05).
+        """
+        if self._grant_key is None:
+            raise crypto.GrantError("no grant verification key is installed")
+        grant = crypto.verify_grant(
+            body.get("grant"), self._grant_key,
+            issuer=self.cfg.security.grant_issuer,
+            audience=self.cfg.security.grant_audience,
+        )
+        if grant.patient_ref != trigger.get("patient_id"):
+            raise crypto.GrantError("grant is for another patient")
+        if grant.doctor_id and grant.doctor_id != trigger.get("doctor_id"):
+            raise crypto.GrantError("grant is for another doctor")
+        own = session.meta.get("hospital_id")
+        if grant.hospital_id and own and grant.hospital_id != own:
+            raise crypto.GrantError("grant is for another clinic")
+        self._grant_guard.consume(grant)
+        return grant
+
+    async def check_confirmation(self, session: SessionSpool) -> Optional[str]:
+        """Has CMED's API 2 confirmed this recording yet? (SRS-CNF-07)"""
+        if not session.server_acknowledged:
+            return None
+        status, body = await self._request_raw(
+            "GET", f"/session/{session.session_id}/confirmation", None)
+        if status == 200 and body and body.get("confirmation"):
+            session.record_confirmation(str(body["confirmation"]))
+            return str(body["confirmation"])
+        return None
+
+    async def refuse_remote(self, session: SessionSpool) -> bool:
+        """Tell the server the patient refused, so it erases what it holds (SRS-CNS-04)."""
+        status, _ = await self._request_raw(
+            "POST", "/session/refuse", {"session_id": session.session_id})
+        return status is not None and status < 300
+
+    async def forget(self, session: SessionSpool) -> None:
+        async with self._lock:
+            self._sessions = [s for s in self._sessions if s.session_id != session.session_id]
+        self._auth_locks.pop(session.session_id, None)
+
+    async def _drop(self, session: SessionSpool, reason: str) -> None:
+        await self.forget(session)
+        self.spool.remove(session, reason=reason)
+
+    async def _settle_before_upload(self, session: SessionSpool) -> bool:
+        """
+        What must happen before a session may upload. True when it may.
+
+        A refused consultation is erased here and reported until acknowledged.
+        A session not yet authorised asks for its grant - unless it is the one
+        being recorded, which the controller authorises itself.
+        """
+        if session.refused:
+            session.delete_all_pieces()
+            if await self.refuse_remote(session):
+                session.mark_refusal_reported()
+                await self._drop(session, "refusal delivered to the server")
+            return False
+
+        if session.authorisation == "refused":
+            if not session.live:
+                await self._drop(session, f"authorisation refused ({session.refusal_code})")
+            return False
+
+        if session.needs_authorisation:
+            if session.live:
+                return False
+            outcome = await self.authorise(session)
+            if outcome.status == "refused":
+                await self._drop(session, f"authorisation refused ({outcome.code})")
+            return outcome.status == "granted"
+        return True
+
+    # ---- delivery health ----
+
+    STALL_SECONDS = 15 * 60                    # SRS-SPL-07
+
+    def oldest_pending_seconds(self) -> float:
+        now = datetime.now(timezone.utc)
+        ages = [(now - at).total_seconds() for s in self._sessions
+                for at in [s.oldest_pending_at()] if at is not None]
+        return max(ages, default=0.0)
+
+    def _check_stall(self) -> None:
+        age = self.oldest_pending_seconds()
+        if age > self.STALL_SECONDS and not self._stall_alerted:
+            self._stall_alerted = True
+            self._emit("integrity_alert", {
+                "session_id": None,
+                "alert_type": "delivery_stalled",
+                "detail": f"a piece has waited {int(age // 60)} minutes to be delivered",
+            })
+        elif age <= self.STALL_SECONDS:
+            self._stall_alerted = False
+
+    async def _request_raw(self, method: str, endpoint: str,
+                           json_body: Optional[Dict[str, Any]]):
+        """
+        One attempt, returning (status, body) so the caller can tell a refusal
+        from an outage. (None, None) when the server could not be reached.
+        """
+        if self._http is None:
+            return None, None
+        url = self.cfg.backend.url(endpoint)
+        timeout = aiohttp.ClientTimeout(total=self.cfg.backend.request_timeout)
+        headers = {"X-Device-Token": self._device_token} if self._device_token else None
+        try:
+            async with self._http.request(method, url, json=json_body, headers=headers,
+                                          timeout=timeout) as response:
+                try:
+                    body = await response.json(content_type=None)
+                except Exception:
+                    body = {}
+                if response.status < 300:
+                    self.last_success_at = time.time()
+                    self.consecutive_failures = 0
+                return response.status, body if isinstance(body, dict) else {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.consecutive_failures += 1
+            logger.warning("%s %s error: %s", method, endpoint, self.last_error)
+            return None, None
 
     # ---- doctor register ----
 
@@ -704,7 +940,8 @@ class UploadManager:
             "consecutive_failures": self.consecutive_failures,
             "last_error": self.last_error,
             "online": self.consecutive_failures == 0 and self.last_success_at is not None,
+            "oldest_pending_seconds": round(self.oldest_pending_seconds()),
         }
 
 
-__all__ = ["UploadManager", "UploadOutcome", "build_ssl_context"]
+__all__ = ["UploadManager", "UploadOutcome", "AuthOutcome", "build_ssl_context"]

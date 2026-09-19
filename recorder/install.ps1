@@ -110,11 +110,11 @@ Copy-Item (Join-Path $SourceDir '*') $InstallDir -Recurse -Force
 
 # ---- pinned public keys ----
 #
-# cmed_grant_pub.pem verifies the recording grant; without it the agent refuses
-# to record. aimslab_receipt_pub.pem verifies purge receipts; without it local
+# aimslab_grant_pub.pem verifies the recording grant; without it no recording
+# can be authorised. aimslab_receipt_pub.pem verifies purge receipts; without it local
 # audio is never deleted, which is the safe direction but fills the disk.
 $keyTargets = @{
-    'cmed_grant_pub.pem'      = 'grant verification'
+    'aimslab_grant_pub.pem'   = 'grant verification'
     'aimslab_receipt_pub.pem' = 'purge receipt verification'
 }
 $missingKeys = @()
@@ -208,8 +208,8 @@ AIMS_LOCAL_API_KEY=$apiKey
 AIMS_REQUIRE_GRANT=true
 AIMS_ENABLE_DOCS=false
 
-AIMS_GRANT_PUBLIC_KEY_PATH=$DataDir\keys\cmed_grant_pub.pem
-AIMS_GRANT_ISSUER=cmed
+AIMS_GRANT_PUBLIC_KEY_PATH=$DataDir\keys\aimslab_grant_pub.pem
+AIMS_GRANT_ISSUER=aimslab
 AIMS_GRANT_AUDIENCE=aimscribe-recorder
 AIMS_RECEIPT_PUBLIC_KEY_PATH=$DataDir\keys\aimslab_receipt_pub.pem
 
@@ -277,7 +277,7 @@ if (-not $EnrollmentToken) {
     Write-Host "   * Re-run with -EnrollmentToken, or write the token to $DataDir\state\enrollment.token"
 }
 Write-Host "   1. Place the mTLS client certificate at $DataDir\keys\device.crt and .key"
-Write-Host "   2. Copy the CMED grant public key to $DataDir\keys\cmed_grant_pub.pem"
+Write-Host "   2. Copy the AIMS LAB grant public key to $DataDir\keys\aimslab_grant_pub.pem"
 Write-Host "   3. Copy the AIMS LAB receipt public key to $DataDir\keys\aimslab_receipt_pub.pem"
 Write-Host ''
 Write-Host ' Give this key to the CMED deployment for this PC:'

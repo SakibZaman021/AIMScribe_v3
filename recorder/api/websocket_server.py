@@ -32,7 +32,8 @@ from fastapi import WebSocket
 from api import protocol
 from api.protocol import ProtocolError, Trigger
 from core import crypto
-from core.crypto import GrantError
+# GrantGuard lives with the other grant code now; re-exported for older imports.
+from core.crypto import GrantError, GrantGuard  # noqa: F401
 from core.session_controller import SessionError
 
 logger = logging.getLogger(__name__)
@@ -43,47 +44,15 @@ CLOSE_INTERNAL = 4500
 
 MAX_MESSAGE_BYTES = 64 * 1024
 
-# Asks the AIMS LAB server to authorise one consultation and returns the
-# verified grant. Supplied at startup (Runtime); a test supplies its own.
-Authoriser = Callable[[Trigger], Awaitable[crypto.Grant]]
-
-
-class AuthorisationUnavailable(Exception):
-    """The server could not be asked. Not the page's fault, and worth a retry."""
-
-
-class GrantGuard:
-    """
-    Single-use enforcement for recording grants.
-
-    A grant is a bearer token: without replay protection, a copy of one could
-    reopen sessions until it expired. Entries are pruned lazily.
-    """
-
-    def __init__(self) -> None:
-        self._seen: Dict[str, float] = {}
-
-    def consume(self, grant: crypto.Grant) -> None:
-        now = time.time()
-        if len(self._seen) > 512:
-            self._seen = {jti: exp for jti, exp in self._seen.items() if exp > now}
-        if self._seen.get(grant.jti, 0) > now:
-            raise GrantError("grant has already been used")
-        self._seen[grant.jti] = float(grant.expires_at)
-
-
 class WebSocketManager:
     """Tracks connected CMED pages and answers their commands."""
 
-    def __init__(self, cfg, *, controller=None, grant_guard: Optional[GrantGuard] = None,
-                 authoriser: Optional[Authoriser] = None):
+    def __init__(self, cfg, *, controller=None, grant_guard: Optional[GrantGuard] = None):
         self.cfg = cfg
         self._controller = controller
         self._guard = grant_guard or GrantGuard()
-        self._authoriser = authoriser
         self._connections: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
-        self._grant_key = None
         self._uploader = None
         self._hospital_id = ""
 
@@ -92,22 +61,11 @@ class WebSocketManager:
     def set_controller(self, controller) -> None:
         self._controller = controller
 
-    def set_authoriser(self, authoriser: Optional[Authoriser]) -> None:
-        self._authoriser = authoriser
-
     def set_register_source(self, uploader, hospital_id: str) -> None:
         """Where the doctor list comes from: the backend, via the uploader's
         device-authenticated client, for this machine's hospital."""
         self._uploader = uploader
         self._hospital_id = hospital_id or ""
-
-    def set_grant_key(self, key) -> None:
-        """The pinned public key the server's grants are verified against."""
-        self._grant_key = key
-
-    @property
-    def grant_key(self):
-        return self._grant_key
 
     @property
     def client_count(self) -> int:
@@ -188,12 +146,6 @@ class WebSocketManager:
             code = self._contract_code(command, exc.code)
             return self._stamp(protocol.reply(command, code, request_id=request_id,
                                               message=str(exc)))
-        except AuthorisationUnavailable as exc:
-            logger.warning("Command %s could not be authorised: %s", command, exc)
-            return self._stamp(protocol.reply(
-                command, "AGENT_NOT_READY", request_id=request_id,
-                message="The recorder could not reach the AIMS LAB server to authorise "
-                        "this recording."))
         except GrantError as exc:
             logger.warning("Command %s rejected: %s", command, exc)
             return self._stamp(protocol.reply(command, "AUTHORISATION_FAILED",
@@ -226,46 +178,40 @@ class WebSocketManager:
     # ---- CMED's commands ----
 
     async def _start(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """API 1. Five fields in; the grant comes from the AIMS LAB server."""
+        """
+        API 1. Five fields in. The recorder starts at once and asks the AIMS LAB
+        server for the grant alongside (SRS-GRT-07): 200 when the server has
+        already said yes, 202 RECORDING_PROVISIONAL while it is still being asked.
+        """
         trigger = protocol.parse_trigger(message)
-        grant = await self._authorise(trigger)
-        result = await self._controller.open_session(
-            grant, trigger_start_time=trigger.start_time)
-        return "RECORDING_STARTED", {
+        grant = None if self.cfg.security.require_grant else self._development_grant(trigger)
+        result = await self._controller.open_session(trigger, grant=grant)
+        code = ("RECORDING_STARTED" if result.get("authorisation") == "granted"
+                else "RECORDING_PROVISIONAL")
+        return code, {
             "session_id": result["session_id"],
             "started_at": result["started_at"],
             "armed": False,
             "supersedes": result.get("previous_session_id"),
+            "authorisation": result.get("authorisation"),
+            "confirmation": result.get("confirmation"),
         }
 
-    async def _authorise(self, trigger: Trigger) -> crypto.Grant:
-        if not self.cfg.security.require_grant:
-            # Development only; config.production_warnings() surfaces this loudly.
-            logger.warning("Starting a session WITHOUT server authorisation (development mode)")
-            return crypto.Grant(
-                jti=f"dev-{time.time_ns()}",
-                doctor_id=trigger.doctor_id,
-                doctor_name="",
-                hospital_id="",          # the controller files under this PC's clinic
-                patient_ref=trigger.patient_id,
-                consent_obtained=True,
-                consent_method="reception",
-                expires_at=int(time.time()) + 60,
-                raw="",
-            )
-
-        if self._authoriser is None:
-            raise AuthorisationUnavailable("no authoriser is configured")
-        grant = await self._authoriser(trigger)
-
-        # The grant must be for this trigger. A grant for another patient - a
-        # server fault, or one replayed from another consultation - must never
-        # start this recording.
-        if grant.patient_ref != trigger.patient_id or (
-                grant.doctor_id and grant.doctor_id != trigger.doctor_id):
-            raise GrantError("grant does not match the trigger")
-        self._guard.consume(grant)
-        return grant
+    @staticmethod
+    def _development_grant(trigger: Trigger) -> crypto.Grant:
+        """Development only; config.production_warnings() surfaces this loudly."""
+        logger.warning("Starting a session WITHOUT server authorisation (development mode)")
+        return crypto.Grant(
+            jti=f"dev-{time.time_ns()}",
+            doctor_id=trigger.doctor_id,
+            doctor_name="",
+            hospital_id="",          # the controller files under this PC's clinic
+            patient_ref=trigger.patient_id,
+            consent_obtained=True,
+            consent_method="reception",
+            expires_at=int(time.time()) + 60,
+            raw="",
+        )
 
     async def _prescription_built(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """API 3, part one. Arms the gate; the recording keeps running."""
@@ -278,7 +224,10 @@ class WebSocketManager:
     # ---- commands CMED does not use ----
 
     async def _stop(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        return "OK", await self._controller.stop_session(reason="doctor_stopped")
+        # The on-screen control sends the reason; "patient_did_not_consent"
+        # erases the consultation (SRS 3.2 §7.8a).
+        reason = str(message.get("reason") or "doctor_stopped")[:64]
+        return "OK", await self._controller.stop_session(reason=reason)
 
     async def _pause(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Supervised pause. Reason is mandatory; long pauses need a supervisor."""
@@ -355,5 +304,4 @@ class WebSocketManager:
         return payload
 
 
-__all__ = ["WebSocketManager", "GrantGuard", "AuthorisationUnavailable", "Authoriser",
-           "CLOSE_POLICY"]
+__all__ = ["WebSocketManager", "GrantGuard", "CLOSE_POLICY"]

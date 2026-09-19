@@ -4,7 +4,7 @@ Generate the development key pairs the agent needs to start.
 In production these keys belong to two different systems and the agent only ever
 holds the public halves:
 
-    cmed_grant_*      CMED's server signs recording grants; the agent verifies.
+    aimslab_grant_*   the AIMS LAB server signs recording grants; the agent verifies.
     aimslab_receipt_* The AIMS LAB server signs purge receipts; the agent verifies.
 
 For local development one machine plays all three roles, so this script makes both
@@ -99,13 +99,14 @@ def write_dev_identity() -> None:
 def main() -> int:
     print("Generating development key pairs\n")
 
-    make_pair("cmed_grant", config.security.grant_public_key_path)
+    make_pair("aimslab_grant", config.security.grant_public_key_path)
     make_pair("aimslab_receipt", config.security.receipt_public_key_path)
     write_dev_identity()
 
     print(f"\nAgent state directory: {data_dir()}")
     print("\nThe agent will now pass its configuration check.")
-    print("Mint a grant with:  python scripts/dev_make_grant.py --patient P12345")
+    print("For a bench without the server, run the agent with AIMS_REQUIRE_GRANT=false\n"
+          "and drive it with scripts/dev_client.py.")
     return 0
 
 

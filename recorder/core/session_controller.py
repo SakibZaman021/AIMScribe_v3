@@ -19,8 +19,9 @@ Rules enforced here rather than trusted from the caller:
   prescription is built (the gate, SRS §7.7).
 * Pause requires a reason from a fixed list, and a supervisor's name once the
   expected duration passes the configured threshold.
-* Stopping never deletes audio. Local files go only when a signed purge receipt
-  proves the archive copy exists, which the upload manager handles.
+* Stopping never deletes audio, with one exception: "Patient did not consent"
+  deletes the consultation everywhere (SRS 3.2 §7.8a). Otherwise local files go
+  only when a signed receipt proves the server holds a verified copy.
 """
 from __future__ import annotations
 
@@ -44,6 +45,22 @@ IDLE = "idle"
 RECORDING = "recording"
 PAUSED = "paused"
 CLOSING = "closing"
+
+# The Stop reason that erases a consultation (SRS 3.2 §7.8a).
+REFUSAL_REASON = "patient_did_not_consent"
+
+# Hard refusals from the server, and what the doctor is told (SRS-GRT-08).
+REFUSAL_MESSAGES = {
+    "CLINIC_MISMATCH": "This PC is registered to a different clinic, so the recording "
+                       "was stopped and deleted. AIMS LAB has been alerted.",
+    "DEVICE_NOT_ENROLLED": "This PC is not registered with AIMS LAB, so the recording "
+                           "was stopped and deleted.",
+    "AUTHORISATION_FAILED": "This recording could not be authorised, so it was stopped "
+                            "and deleted.",
+    "DOCTOR_NOT_AT_CLINIC": "This doctor is not registered at this clinic.",
+    "MISSING_FIELD": "CMED's message was incomplete, so the recording was stopped.",
+    "INVALID_IDENTIFIER": "CMED's message was not valid, so the recording was stopped.",
+}
 
 
 class SessionError(RuntimeError):
@@ -71,14 +88,12 @@ class PauseRecord:
 @dataclass
 class ActiveSession:
     spool: SessionSpool
-    grant: Grant
+    patient_ref: str
     patient_name: str
     recorder: AudioRecorder
     segmenter: Segmenter
     opened_at: datetime
-    # Who is consulting. Usually the machine's own doctor, but a shared
-    # consulting room rotates, so CMED may name someone else for this
-    # consultation - the backend has already checked they are credentialed here.
+    # Who is consulting, from CMED's trigger. A shared room rotates doctors.
     doctor_id: str = ""
     # API 1's start_time, exactly as CMED's server wrote it. Together with the
     # patient it identifies the consultation, so a repeated trigger for the same
@@ -87,6 +102,9 @@ class ActiveSession:
     # Set by prescription_built (API 3). Until then a new trigger is refused and
     # this recording carries on (SRS-GAT-01..04).
     armed: bool = False
+    # SRS 3.2 §5: recording starts before the server has answered.
+    authorisation: str = "pending"        # pending | granted
+    confirmation: str = ""                # confirming | confirmed | unconfirmed
     audio_seconds: float = 0.0
     paused_seconds: float = 0.0
     pause: Optional[PauseRecord] = None
@@ -184,21 +202,35 @@ class SessionController:
 
     async def open_session(
         self,
-        grant: Grant,
+        trigger,
         *,
+        grant: Optional[Grant] = None,
         patient_name: str = "",
         session_id: Optional[str] = None,
-        trigger_start_time: str = "",
     ) -> Dict[str, Any]:
+        """
+        API 1: CMED's trigger. The microphone opens now (SRS-GRT-07).
+
+        Permission is asked from the AIMS LAB server alongside capture, and this
+        returns once capture is running and either the server has answered or a
+        short wait has passed:
+
+            authorisation "granted"   the page is told 200 RECORDING_STARTED
+            authorisation "pending"   202 RECORDING_PROVISIONAL; still asking
+
+        A hard refusal inside the wait raises; one after it stops the recording
+        and deletes what was captured (SRS-GRT-08). A server that cannot be
+        reached never stops a recording - nothing is uploaded until it answers.
+
+        `grant` is passed only in development mode, where no server is asked.
+        """
+        auth_task = None
         async with self._lock:
             previous_id: Optional[str] = None
 
             # One instant for the whole handover. CMED treats consultations as
             # contiguous - the second patient's start time is the first
             # patient's end time - so both must be stamped from the same value.
-            # Reading the clock twice put the microphone teardown and the final
-            # segment seal in between, leaving a gap that made the two records
-            # disagree.
             boundary = datetime.now(timezone.utc)
 
             if not self.device_id:
@@ -207,37 +239,21 @@ class SessionController:
                     "recordings cannot be attributed or archived until it is.",
                     code="DEVICE_NOT_ENROLLED")
 
-            # Who is consulting comes from CMED, every time, with no fallback.
-            #
-            # A consulting room runs two shifts. The morning doctors and the
-            # afternoon doctors use the same laptops, and nobody knows in advance
-            # which desk anyone will sit at. Taking the doctor from the enrolment
-            # meant an afternoon consultation was filed under whoever happened to
-            # be enrolled on that machine in the morning - silently, and in the
-            # filename.
-            #
-            # CMED knows who is on shift: doctors log in there, and it sends the
-            # doctor with the trigger. Falling back to the machine's own doctor
-            # is precisely the bug, so there is no fallback. A trigger that names
-            # nobody is refused rather than guessed at.
-            doctor_id = grant.doctor_id
+            # Who is consulting comes from CMED, every time, with no fallback: a
+            # room runs two shifts, and falling back to a machine's doctor filed
+            # afternoon consultations under the morning shift.
+            doctor_id = trigger.doctor_id
+            patient_ref = trigger.patient_id
             if not doctor_id:
                 raise SessionError(
                     "CMED did not say which doctor is seeing this patient, so the "
-                    "recording cannot be attributed. Start the consultation from "
-                    "CMED rather than starting the recorder directly.",
-                    code="MISSING_FIELD")
+                    "recording cannot be attributed.", code="MISSING_FIELD")
 
-            # The clinic is the machine's, always (SRS-INV-01; decision D1).
-            #
-            # The grant names the clinic the AIMS LAB server mapped CMED's
-            # hospital to. A doctor moved to another site sits at that site's PC,
-            # so a disagreement never means "the doctor moved": it means the
-            # mapping is wrong or this laptop is in the wrong building. Filing
-            # the recording under either clinic would label evidence wrongly, so
-            # it is refused rather than warned about (SRS-GRT-10).
+            # The clinic is the machine's, always (SRS-INV-01; decision D1). The
+            # server refuses a grant for another clinic; this is the same rule
+            # for a grant supplied directly.
             hospital_id = self.hospital_id
-            if grant.hospital_id and grant.hospital_id != hospital_id:
+            if grant is not None and grant.hospital_id and grant.hospital_id != hospital_id:
                 self._emit("integrity_alert", {
                     "session_id": None,
                     "alert_type": "clinic_mismatch",
@@ -246,29 +262,26 @@ class SessionController:
                 })
                 raise SessionError(
                     "This PC is registered to a different clinic, so the recording "
-                    "cannot start. AIMS LAB has been alerted.",
-                    code="CLINIC_MISMATCH")
+                    "cannot start. AIMS LAB has been alerted.", code="CLINIC_MISMATCH")
 
             if self._active is not None:
                 active = self._active
-                # The same consultation triggered twice - usually a double click
-                # or a page reload - is not a new patient.
-                if (trigger_start_time
-                        and active.trigger_start_time == trigger_start_time
-                        and active.grant.patient_ref == grant.patient_ref):
+                # The same consultation triggered twice - a double click or a
+                # page reload - is not a new patient.
+                if (active.trigger_start_time == trigger.start_time
+                        and active.patient_ref == patient_ref):
                     raise SessionError("This consultation is already being recorded.",
                                        code="SESSION_ALREADY_ACTIVE")
 
                 # The gate (SRS-GAT-03). Until the open consultation's
                 # prescription is built, a new trigger is a doctor glancing at
-                # another patient, not the next consultation: refuse it and keep
-                # recording. Cutting here is what split consultations in the pilot.
+                # another patient, not the next consultation.
                 if not active.armed:
                     logger.info("Trigger for patient %s refused: session %s is not armed",
-                                self._pseudonym(grant.patient_ref), active.session_id)
+                                self._pseudonym(patient_ref), active.session_id)
                     self._emit("trigger_refused", {
                         "session_id": active.session_id,
-                        "patient_ref": grant.patient_ref,
+                        "patient_ref": patient_ref,
                         "doctor_id": doctor_id,
                         "at": crypto.iso_utc(boundary),
                         "reason": "gate_not_armed",
@@ -277,8 +290,6 @@ class SessionController:
                         "The current consultation has not been completed yet.",
                         code="GATE_NOT_ARMED")
 
-                # Armed: the previous consultation is over. Close it properly,
-                # at the same instant the next one opens.
                 previous_id = active.session_id
                 logger.info("Closing session %s before opening a new one", previous_id)
                 await self._close_active(reason="superseded_by_new_patient", at=boundary)
@@ -286,22 +297,25 @@ class SessionController:
             if not self._spool.has_capacity(self.cfg.audio.bytes_per_second * 240):
                 raise SessionError(
                     "Local audio buffer is full. Recording cannot start until the "
-                    "backlog uploads. Contact support.",
-                    code="AGENT_NOT_READY")
+                    "backlog uploads. Contact support.", code="AGENT_NOT_READY")
 
             spool_session = self._spool.open_session(
                 device_key=self._device_key,
                 device_id=self.device_id,
                 doctor_id=doctor_id,
                 hospital_id=hospital_id,
-                patient_ref=grant.patient_ref,
-                consent_method=grant.consent_method,
+                patient_ref=patient_ref,
+                # Consent is taken at reception (SRS 3.2 §7.8a). The field stays
+                # in the first chain entry so the chain format is unchanged.
+                consent_method="reception",
                 audio={
                     "sample_rate": self.cfg.audio.sample_rate,
                     "channels": self.cfg.audio.channels,
                     "sample_width": self.cfg.audio.sample_width,
                 },
                 session_id=session_id,
+                # With a grant in hand there is nothing to ask for later.
+                trigger=None if grant is not None else trigger.fields(),
             )
 
             segmenter = Segmenter(
@@ -338,45 +352,149 @@ class SessionController:
                 })
                 raise SessionError(
                     "The microphone is unavailable. Check that it is connected and "
-                    "not in use by another application.",
-                    code="AGENT_NOT_READY") from exc
+                    "not in use by another application.", code="AGENT_NOT_READY") from exc
 
-            self._active = ActiveSession(
+            spool_session.live = True
+            active = ActiveSession(
                 spool=spool_session,
-                grant=grant,
+                patient_ref=patient_ref,
                 patient_name=patient_name,
                 recorder=recorder,
                 segmenter=segmenter,
                 opened_at=opened_at,
                 doctor_id=doctor_id,
-                trigger_start_time=trigger_start_time,
+                trigger_start_time=trigger.start_time,
+                authorisation="granted" if grant is not None else "pending",
+                confirmation="" if grant is not None else "confirming",
             )
+            self._active = active
             self.state = RECORDING
 
             await self._uploader.track(spool_session)
             self._uploader.nudge()
 
             logger.info("Session %s opened for patient %s by doctor %s at %s",
-                        spool_session.session_id,
-                        self._pseudonym(grant.patient_ref),
-                        self._pseudonym(doctor_id),
-                        self.hospital_id)
-
-            result = {
-                "session_id": spool_session.session_id,
-                "status": "recording",
-                "started_at": crypto.iso_utc(opened_at),
-                "previous_session_stopped": previous_id is not None,
-                "previous_session_id": previous_id,
-                "armed": False,
-            }
+                        spool_session.session_id, self._pseudonym(patient_ref),
+                        self._pseudonym(doctor_id), hospital_id)
             self._emit("recording_started", {
                 "session_id": spool_session.session_id,
-                "patient_ref": grant.patient_ref,
+                "patient_ref": patient_ref,
                 "doctor_id": doctor_id,
-                "hospital_id": self.hospital_id,
+                "hospital_id": hospital_id,
             })
-            return result
+
+            if grant is None:
+                auth_task = asyncio.create_task(self._authorise_live(active))
+                self._background.add(auth_task)
+                auth_task.add_done_callback(self._on_background_done)
+
+        # Outside the lock: a refusal has to take it to stop the recording.
+        if auth_task is not None:
+            try:
+                outcome = await asyncio.wait_for(asyncio.shield(auth_task),
+                                                 timeout=self._knob("authorise_wait_seconds", 1.5))
+            except asyncio.TimeoutError:
+                outcome = None
+            if outcome is not None and outcome.status == "refused":
+                raise SessionError(
+                    outcome.message or REFUSAL_MESSAGES.get(
+                        outcome.code, "This recording could not be authorised."),
+                    code=outcome.code if outcome.code in REFUSAL_MESSAGES
+                    else "AUTHORISATION_FAILED")
+
+        return {
+            "session_id": active.session_id,
+            "status": "recording",
+            "started_at": crypto.iso_utc(active.opened_at),
+            "previous_session_stopped": previous_id is not None,
+            "previous_session_id": previous_id,
+            "armed": False,
+            "authorisation": active.authorisation,
+            "confirmation": active.confirmation,
+        }
+
+    # ---- authorisation and confirmation (SRS 3.2 §5) ----
+
+    async def _authorise_live(self, active: ActiveSession):
+        """
+        Ask for the live consultation's grant, and keep asking while it records.
+
+        Once the consultation closes, the upload loop takes over the asking - so
+        an outage, a restart or a whole offline morning still ends with every
+        recording either authorised and uploaded, or refused and deleted.
+        """
+        while True:
+            outcome = await self._uploader.authorise(active.spool)
+            if outcome.status == "granted":
+                active.authorisation = "granted"
+                confirmed = outcome.confirmation == "confirmed"
+                active.confirmation = "confirmed" if confirmed else "confirming"
+                self._emit("session_authorised", {"session_id": active.session_id})
+                self._emit("session_confirmed" if confirmed else "session_confirming",
+                           {"session_id": active.session_id})
+                if not confirmed:
+                    self._spawn(self._watch_confirmation(active))
+                return outcome
+            if outcome.status == "refused":
+                if outcome.code != "PATIENT_REFUSED":
+                    await self._abandon(active, code=outcome.code)
+                return outcome
+            if self._active is not active:
+                return outcome
+            await asyncio.sleep(self._knob("authorise_retry_seconds", 10.0))
+
+    async def _abandon(self, active: ActiveSession, *, code: str) -> None:
+        """
+        The server refused this consultation (SRS-GRT-08): stop capture and
+        delete what was captured. Nothing of it was ever uploaded - the upload
+        loop sends nothing before a grant.
+        """
+        async with self._lock:
+            if self._active is active:
+                if active.recorder.is_running:
+                    active.recorder.stop()
+                active.segmenter.stop(seal_remaining=False)
+                self._active = None
+                self.state = IDLE
+            active.spool.live = False
+        await self._uploader.forget(active.spool)
+        self._spool.remove(active.spool, reason=f"authorisation refused ({code})")
+        logger.warning("Session %s refused by the server (%s); audio deleted",
+                       active.session_id, code)
+        self._emit("integrity_alert", {
+            "session_id": active.session_id,
+            "alert_type": "authorisation_refused",
+            "detail": code,
+        })
+        self._emit("recording_stopped", {
+            "session_id": active.session_id,
+            "status": "stopped",
+            "reason": "authorisation_refused",
+            "code": code,
+        })
+
+    async def _watch_confirmation(self, active: ActiveSession) -> None:
+        """
+        SRS-CNF-07 and -08: ask every five seconds whether CMED's API 2 has
+        confirmed this recording. After two minutes it is shown as unconfirmed.
+        The recording is never cut for this.
+        """
+        deadline = time.monotonic() + self._knob("confirm_deadline_seconds", 120.0)
+        while active.confirmation == "confirming" and self._active is active:
+            await asyncio.sleep(self._knob("confirm_poll_seconds", 5.0))
+            state = await self._uploader.check_confirmation(active.spool)
+            if state == "confirmed":
+                active.confirmation = "confirmed"
+                self._emit("session_confirmed", {"session_id": active.session_id})
+                return
+            if state == "unconfirmed" or time.monotonic() >= deadline:
+                active.confirmation = "unconfirmed"
+                self._emit("session_unconfirmed", {"session_id": active.session_id})
+                return
+
+    def _knob(self, name: str, default: float) -> float:
+        security = getattr(self.cfg, "security", None)
+        return float(getattr(security, name, default)) if security is not None else default
 
     # ---- the gate ----
 
@@ -392,7 +510,7 @@ class SessionController:
             active = self._active
             if active is None:
                 raise SessionError("Nothing is being recorded.", code="NO_ACTIVE_SESSION")
-            if active.grant.patient_ref != patient_id or active.session_id != session_id:
+            if active.patient_ref != patient_id or active.session_id != session_id:
                 self._emit("integrity_alert", {
                     "session_id": active.session_id,
                     "alert_type": "arm_mismatch",
@@ -541,6 +659,10 @@ class SessionController:
     # ---- stopping ----
 
     async def stop_session(self, *, reason: str = "doctor_stopped") -> Dict[str, Any]:
+        if reason == REFUSAL_REASON:
+            if self._active is None:
+                return {"status": "not_recording", "session_id": None}
+            return await self.refuse_session()
         async with self._lock:
             if self._active is None:
                 return {"status": "not_recording", "session_id": None}
@@ -614,8 +736,37 @@ class SessionController:
                     active.session_id, active.audio_seconds,
                     len(active.spool.segments), len(active.pauses), reason)
 
+        active.spool.live = False
         self._active = None
         self.state = IDLE
+        self._emit("recording_stopped", result)
+        return result
+
+    async def refuse_session(self) -> Dict[str, Any]:
+        """
+        The patient did not consent (SRS 3.2 §7.8a).
+
+        The microphone stops at once, every piece of this consultation is
+        deleted from the PC, and the upload loop tells the server - which erases
+        what it holds - until the server acknowledges (SRS-CNS-03..05).
+        """
+        async with self._lock:
+            active = self._require_active()
+            if active.recorder.is_running:
+                active.recorder.stop()
+            # Stop the cutter before deleting, so no piece lands afterwards.
+            active.segmenter.stop(seal_remaining=False)
+            deleted = active.spool.refuse()
+            active.spool.live = False
+            self._active = None
+            self.state = IDLE
+
+        self._uploader.nudge()
+        logger.warning("Session %s refused by the patient; %s piece(s) deleted locally",
+                       active.session_id, deleted)
+        result = {"status": "refused", "session_id": active.session_id,
+                  "reason": REFUSAL_REASON, "pieces_deleted": deleted}
+        self._emit("session_refused", {"session_id": active.session_id})
         self._emit("recording_stopped", result)
         return result
 
@@ -768,6 +919,7 @@ class SessionController:
             "spool_bytes": upload["spool_bytes"],
             "spool_pressure": upload["spool_pressure"],
             "pending_segments": upload["pending_segments"],
+            "oldest_pending_seconds": upload.get("oldest_pending_seconds", 0),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 
@@ -782,9 +934,11 @@ class SessionController:
             "is_recording": self.state == RECORDING,
             "is_paused": self.state == PAUSED,
             "session_id": active.session_id if active else None,
-            "patient_ref": active.grant.patient_ref if active else None,
+            "patient_ref": active.patient_ref if active else None,
             "patient_name": active.patient_name if active else None,
             "armed": active.armed if active else False,
+            "authorisation": active.authorisation if active else None,
+            "confirmation": active.confirmation if active else None,
             # Reported even with no session running, so the dashboard can
             # show who this machine is enrolled to before recording starts.
             "doctor_id": (active.doctor_id if active else None) or None,
@@ -863,4 +1017,5 @@ class SessionController:
                 logger.debug("Event handler for %s raised: %s", event, exc)
 
 
-__all__ = ["SessionController", "SessionError", "IDLE", "RECORDING", "PAUSED", "CLOSING"]
+__all__ = ["SessionController", "SessionError", "IDLE", "RECORDING", "PAUSED", "CLOSING",
+           "REFUSAL_REASON", "REFUSAL_MESSAGES"]

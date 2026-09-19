@@ -210,9 +210,9 @@ class SecurityConfig:
     """
     Who is allowed to drive this recorder.
 
-    The browser is never trusted for identity. Doctor, hospital and patient come
-    from a CMED-signed grant; the local API key only proves the caller is the
-    installed CMED front end rather than an arbitrary page.
+    The browser is never trusted for identity. It sends CMED's five fields; the
+    AIMS LAB server checks them and signs a grant, verified here against a key
+    pinned at install. The clinic always comes from this PC's enrolment.
     """
     bind_host: str = "127.0.0.1"
     bind_port: int = 5050
@@ -221,9 +221,12 @@ class SecurityConfig:
     local_api_key: str = ""
     require_grant: bool = True
     enable_docs: bool = False
-    grant_issuer: str = "cmed"
+    grant_issuer: str = "aimslab"
     grant_audience: str = "aimscribe-recorder"
-    grant_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "cmed_grant_pub.pem")
+    grant_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "aimslab_grant_pub.pem")
+    # How long `start` waits for the server's answer before replying 202
+    # RECORDING_PROVISIONAL. Capture never waits (SRS-GRT-07).
+    authorise_wait_seconds: float = 1.5
     receipt_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "aimslab_receipt_pub.pem")
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
@@ -330,9 +333,9 @@ class Config:
             local_api_key=_str("AIMS_LOCAL_API_KEY"),
             require_grant=_bool("AIMS_REQUIRE_GRANT", True),
             enable_docs=_bool("AIMS_ENABLE_DOCS", False),
-            grant_issuer=_str("AIMS_GRANT_ISSUER", "cmed"),
+            grant_issuer=_str("AIMS_GRANT_ISSUER", "aimslab"),
             grant_audience=_str("AIMS_GRANT_AUDIENCE", "aimscribe-recorder"),
-            grant_public_key_path=_path("AIMS_GRANT_PUBLIC_KEY_PATH", keys / "cmed_grant_pub.pem"),
+            grant_public_key_path=_path("AIMS_GRANT_PUBLIC_KEY_PATH", keys / "aimslab_grant_pub.pem"),
             receipt_public_key_path=_path("AIMS_RECEIPT_PUBLIC_KEY_PATH", keys / "aimslab_receipt_pub.pem"),
             device_key_path=keys / "device_ed25519.dpapi",
             allow_plaintext_keystore=_bool("AIMS_ALLOW_PLAINTEXT_KEYSTORE", False),

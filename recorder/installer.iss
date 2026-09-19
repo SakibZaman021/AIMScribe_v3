@@ -65,7 +65,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\AIMScribe_Agent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Public halves only. Identical on every PC and carrying no secret, which is
 ; why they can ship in the installer instead of being copied by hand.
-Source: "keys\cmed_grant_pub.pem";      DestDir: "{commonappdata}\AIMScribe\keys"; Flags: ignoreversion
+Source: "keys\aimslab_grant_pub.pem";   DestDir: "{commonappdata}\AIMScribe\keys"; Flags: ignoreversion
 Source: "keys\aimslab_receipt_pub.pem"; DestDir: "{commonappdata}\AIMScribe\keys"; Flags: ignoreversion
 
 [Dirs]
@@ -243,7 +243,7 @@ begin
     Env.Add('AIMS_REQUIRE_GRANT=true');
     Env.Add('AIMS_ENABLE_DOCS=false');
     Env.Add('');
-    Env.Add('AIMS_GRANT_ISSUER=cmed');
+    Env.Add('AIMS_GRANT_ISSUER=aimslab');
     Env.Add('AIMS_GRANT_AUDIENCE=aimscribe-recorder');
     Env.Add('');
     Env.Add('AIMS_HEARTBEAT_SECONDS=30');

@@ -109,31 +109,30 @@ def test_cmed_commands_cannot_reply_outside_appendix_a():
         protocol.reply("prescription_built", "OK")
 
 
+
 # ============================================================
 # The manager: one reply per command
 # ============================================================
 
-def _grant(trigger, *, jti=None, hospital_id="HOSP003", patient_ref=None) -> crypto.Grant:
-    return crypto.Grant(
-        jti=jti or f"jti-{time.time_ns()}", doctor_id=trigger.doctor_id, doctor_name="",
-        hospital_id=hospital_id, patient_ref=patient_ref or trigger.patient_id,
-        consent_obtained=True, consent_method="reception",
-        expires_at=int(time.time()) + 60, raw="token")
+from tests.fakes import ScriptedUploader, make_controller, trigger as _trigger  # noqa: E402
 
 
 class FakeController:
-    def __init__(self):
+    def __init__(self, authorisation="granted"):
         self.opened = []
         self.armed = []
+        self.stopped = []
         self.open_error = None
+        self.authorisation = authorisation
         self.arm_result = {"session_id": "S1", "armed": True, "already": False}
 
-    async def open_session(self, grant, *, trigger_start_time=""):
+    async def open_session(self, trigger, *, grant=None):
         if self.open_error:
             raise self.open_error
-        self.opened.append((grant, trigger_start_time))
+        self.opened.append((trigger, grant))
         return {"session_id": "S1", "started_at": "2026-09-13T04:14:32Z",
-                "previous_session_id": None}
+                "previous_session_id": None, "authorisation": self.authorisation,
+                "confirmation": "confirming"}
 
     async def arm(self, *, patient_id, session_id):
         self.armed.append((patient_id, session_id))
@@ -141,14 +140,18 @@ class FakeController:
             raise self.arm_result
         return self.arm_result
 
+    async def stop_session(self, *, reason="doctor_stopped"):
+        self.stopped.append(reason)
+        return {"status": "stopped", "reason": reason}
+
     def status(self):
         return {"state": "recording", "armed": False}
 
 
-def _manager(make_security, *, authoriser=None, **security):
+def _manager(make_security, *, authorisation="granted", **security):
     cfg = SimpleNamespace(security=make_security(**security))
-    manager = WebSocketManager(cfg, authoriser=authoriser)
-    controller = FakeController()
+    manager = WebSocketManager(cfg)
+    controller = FakeController(authorisation)
     manager.set_controller(controller)
     return manager, controller
 
@@ -157,30 +160,29 @@ async def _send(manager, message) -> dict:
     return await manager.handle_message(None, json.dumps(message))
 
 
-async def test_start_records_and_echoes_request_id(make_security):
-    calls = []
-
-    async def authorise(trigger):
-        calls.append(trigger)
-        return _grant(trigger)
-
-    manager, controller = _manager(make_security, authoriser=authorise)
+async def test_start_granted_is_200_and_echoes_request_id(make_security):
+    """AT-01 shape: the server said yes within the wait."""
+    manager, controller = _manager(make_security)
     reply = await _send(manager, _start())
-
     assert (reply["status"], reply["code"]) == (200, "RECORDING_STARTED")
     assert reply["request_id"] == "cmed-1"
     assert reply["data"]["session_id"] == "S1" and reply["data"]["armed"] is False
-    # The five fields went to the server, and start_time reached the controller.
-    assert calls[0].fields() == TRIGGER
-    assert controller.opened[0][1] == TRIGGER["start_time"]
+    trigger, grant = controller.opened[0]
+    assert trigger.fields() == TRIGGER
+    assert grant is None                 # production: the server is asked, not the page
+
+
+async def test_start_still_being_authorised_is_202(make_security):
+    """SRS-GRT-07: recording, while the server is still being asked."""
+    manager, _ = _manager(make_security, authorisation="pending")
+    reply = await _send(manager, _start())
+    assert (reply["status"], reply["code"]) == (202, "RECORDING_PROVISIONAL")
+    assert reply["event"] == "ack"
 
 
 async def test_missing_doctor_is_refused_before_anything_else(make_security):
-    """AT-02: nothing is authorised or recorded for a trigger with no doctor."""
-    async def authorise(trigger):
-        raise AssertionError("must not be called")
-
-    manager, controller = _manager(make_security, authoriser=authorise)
+    """AT-02: nothing is recorded for a trigger with no doctor."""
+    manager, controller = _manager(make_security)
     message = _start()
     del message["trigger"]["doctor_id"]
     reply = await _send(manager, message)
@@ -188,61 +190,19 @@ async def test_missing_doctor_is_refused_before_anything_else(make_security):
     assert controller.opened == []
 
 
-async def test_no_authoriser_means_not_ready_not_unauthorised(make_security):
-    manager, controller = _manager(make_security)          # require_grant=True
+@pytest.mark.parametrize("code,status", [("GATE_NOT_ARMED", 409), ("CLINIC_MISMATCH", 401),
+                                         ("DEVICE_NOT_ENROLLED", 423)])
+async def test_controller_refusal_keeps_its_code(make_security, code, status):
+    manager, controller = _manager(make_security)
+    controller.open_error = SessionError("refused", code=code)
     reply = await _send(manager, _start())
-    assert (reply["status"], reply["code"]) == (503, "AGENT_NOT_READY")
-    assert controller.opened == []
-
-
-async def test_refused_authorisation_is_401(make_security):
-    async def authorise(trigger):
-        raise GrantError("server refused")
-
-    manager, controller = _manager(make_security, authoriser=authorise)
-    reply = await _send(manager, _start())
-    assert (reply["status"], reply["code"]) == (401, "AUTHORISATION_FAILED")
-    assert controller.opened == []
-
-
-async def test_grant_for_another_patient_is_refused(make_security):
-    async def authorise(trigger):
-        return _grant(trigger, patient_ref="SOMEONE_ELSE")
-
-    manager, controller = _manager(make_security, authoriser=authorise)
-    reply = await _send(manager, _start())
-    assert reply["code"] == "AUTHORISATION_FAILED"
-    assert controller.opened == []
-
-
-async def test_a_grant_works_once(make_security):
-    """AT-07: the same grant presented twice is refused the second time."""
-    async def authorise(trigger):
-        return _grant(trigger, jti="same")
-
-    manager, _ = _manager(make_security, authoriser=authorise)
-    assert (await _send(manager, _start()))["code"] == "RECORDING_STARTED"
-    assert (await _send(manager, _start()))["code"] == "AUTHORISATION_FAILED"
-
-
-async def test_controller_refusal_keeps_its_code(make_security):
-    async def authorise(trigger):
-        return _grant(trigger)
-
-    manager, controller = _manager(make_security, authoriser=authorise)
-    controller.open_error = SessionError("not finished", code="GATE_NOT_ARMED")
-    reply = await _send(manager, _start())
-    assert (reply["status"], reply["code"]) == (409, "GATE_NOT_ARMED")
+    assert (reply["status"], reply["code"]) == (status, code)
 
 
 async def test_generic_refusal_on_start_stays_inside_appendix_a(make_security):
-    async def authorise(trigger):
-        return _grant(trigger)
-
-    manager, controller = _manager(make_security, authoriser=authorise)
+    manager, controller = _manager(make_security)
     controller.open_error = SessionError("something")          # default code REFUSED
-    reply = await _send(manager, _start())
-    assert reply["code"] in {"AGENT_NOT_READY"}
+    assert (await _send(manager, _start()))["code"] == "AGENT_NOT_READY"
 
 
 async def test_prescription_built_arms(make_security):
@@ -267,6 +227,14 @@ async def test_prescription_built_for_another_patient(make_security):
     assert (reply["status"], reply["code"]) == (409, "PATIENT_MISMATCH")
 
 
+async def test_stop_carries_its_reason(make_security):
+    """The refusal reason reaches the controller (SRS 3.2 §7.8a)."""
+    manager, controller = _manager(make_security)
+    await _send(manager, {"command": "stop", "reason": "patient_did_not_consent"})
+    await _send(manager, {"command": "stop"})
+    assert controller.stopped == ["patient_did_not_consent", "doctor_stopped"]
+
+
 async def test_oversized_and_malformed_frames(make_security):
     """AT-31: refused, with a reply, and the connection kept."""
     manager, _ = _manager(make_security)
@@ -276,22 +244,18 @@ async def test_oversized_and_malformed_frames(make_security):
 
 
 async def test_unknown_extra_fields_are_ignored(make_security):
-    """AT-32: a field the recorder does not know does not break the command."""
-    async def authorise(trigger):
-        return _grant(trigger)
-
-    manager, _ = _manager(make_security, authoriser=authorise)
+    """AT-32."""
+    manager, _ = _manager(make_security)
     message = _start()
     message["trigger"]["ward"] = "OPD-2"
     message["something_new"] = {"a": 1}
     assert (await _send(manager, message))["code"] == "RECORDING_STARTED"
 
 
-async def test_development_mode_needs_no_server(make_security):
+async def test_development_mode_supplies_its_own_grant(make_security):
     manager, controller = _manager(make_security, require_grant=False)
-    reply = await _send(manager, _start())
-    assert reply["code"] == "RECORDING_STARTED"
-    grant = controller.opened[0][0]
+    assert (await _send(manager, _start()))["code"] == "RECORDING_STARTED"
+    grant = controller.opened[0][1]
     # The page's hospital is never used as the clinic: that is the PC's.
     assert grant.hospital_id == "" and grant.patient_ref == "P0012345"
 
@@ -300,100 +264,32 @@ async def test_development_mode_needs_no_server(make_security):
 # The controller: the gate, and the clinic
 # ============================================================
 
-class FakeRecorder:
-    def __init__(self, **kwargs):
-        self.is_running = False
-        self.bytes_per_second = 88200
-        self.duration_seconds = 0.0
-
-    def start(self):
-        self.is_running = True
-
-    def stop(self):
-        self.is_running = False
-        return SimpleNamespace(bytes_captured=0, overruns=0, read_errors=0)
-
-
-class FakeSegmenter:
-    def __init__(self, **kwargs):
-        pass
-
-    def start(self, at):
-        pass
-
-    def stop(self, seal_remaining=True):
-        pass
-
-    def flush(self, is_final=False):
-        pass
-
-    def set_segment_start(self, at):
-        pass
-
-    def submit(self, chunk):
-        pass
-
-
-class FakeUploader:
-    def __init__(self):
-        self.closed = []
-
-    async def track(self, session):
-        pass
-
-    def nudge(self):
-        pass
-
-    async def close_remote(self, session, **kwargs):
-        self.closed.append(session.session_id)
-
-    def status(self):
-        return {"spool_bytes": 0, "spool_pressure": "ok", "pending_segments": 0}
-
-
 @pytest.fixture
 def controller(monkeypatch, spool, device_key):
-    import core.session_controller as sc
-    monkeypatch.setattr(sc, "AudioRecorder", FakeRecorder)
-    monkeypatch.setattr(sc, "Segmenter", FakeSegmenter)
-
-    cfg = SimpleNamespace(
-        audio=SimpleNamespace(sample_rate=44100, channels=1, sample_width=2,
-                              bytes_per_second=88200, frames_per_buffer=4096,
-                              input_device_index=None),
-        segment=SimpleNamespace(min_seconds=30, max_seconds=60, grace_seconds=15,
-                                silence_rms=320, silence_hold_seconds=3.0),
-        ops=SimpleNamespace(redact_logs=True, heartbeat_seconds=30),
-        pause=SimpleNamespace(reasons=("other",), self_authorise_seconds=300),
-        spool_seconds=lambda: 4 * 1024 ** 3 / 88200,
-    )
-    events = []
-    ctl = SessionController(cfg, device_key=device_key, spool=spool,
-                            uploader=FakeUploader(),
-                            on_event=lambda name, data: events.append((name, data)))
-    ctl.device_id = "DEV1"
-    ctl.hospital_id = "HOSP003"
-    ctl.events = events
-    return ctl
+    return make_controller(monkeypatch, spool, device_key, ScriptedUploader())
 
 
-def _g(patient="P1", *, hospital="HOSP003", jti=None) -> crypto.Grant:
-    return crypto.Grant(jti=jti or f"j-{time.time_ns()}", doctor_id="DR0042", doctor_name="",
+def _g(patient="P1", *, hospital="HOSP003") -> crypto.Grant:
+    return crypto.Grant(jti=f"j-{time.time_ns()}", doctor_id="DR0042", doctor_name="",
                         hospital_id=hospital, patient_ref=patient, consent_obtained=True,
                         consent_method="reception", expires_at=int(time.time()) + 60, raw="")
 
 
+async def _open(controller, patient="P1", start="2026-09-13T10:00:00+06:00", **grant):
+    return await controller.open_session(_trigger(patient, start), grant=_g(patient, **grant))
+
+
 async def test_a_session_starts_unarmed(controller):
-    result = await controller.open_session(_g(), trigger_start_time="T1")
-    assert result["armed"] is False
+    result = await _open(controller)
+    assert (result["armed"], result["authorisation"]) == (False, "granted")
     assert controller.status()["armed"] is False
 
 
 async def test_unarmed_session_refuses_the_next_patient(controller):
     """AT-09: a stray trigger is refused and the recording continues."""
-    first = await controller.open_session(_g("P1"), trigger_start_time="T1")
+    first = await _open(controller, "P1")
     with pytest.raises(SessionError) as err:
-        await controller.open_session(_g("P2"), trigger_start_time="T2")
+        await _open(controller, "P2", "2026-09-13T10:05:00+06:00")
     assert err.value.code == "GATE_NOT_ARMED"
     assert controller.status()["session_id"] == first["session_id"]
     assert controller.state == "recording"
@@ -402,12 +298,11 @@ async def test_unarmed_session_refuses_the_next_patient(controller):
 
 async def test_armed_session_hands_over(controller):
     """AT-10: after prescription_built, the next trigger closes one and opens the next."""
-    first = await controller.open_session(_g("P1"), trigger_start_time="T1")
+    first = await _open(controller, "P1")
     armed = await controller.arm(patient_id="P1", session_id=first["session_id"])
-    assert armed["already"] is False
-    assert controller.status()["armed"] is True
+    assert armed["already"] is False and controller.status()["armed"] is True
 
-    second = await controller.open_session(_g("P2"), trigger_start_time="T2")
+    second = await _open(controller, "P2", "2026-09-13T10:12:00+06:00")
     assert second["previous_session_id"] == first["session_id"]
     assert controller.status()["session_id"] == second["session_id"]
     assert controller.status()["armed"] is False
@@ -415,22 +310,19 @@ async def test_armed_session_hands_over(controller):
 
 async def test_arming_for_another_patient_is_refused(controller):
     """AT-11: the gate stays unarmed."""
-    first = await controller.open_session(_g("P1"), trigger_start_time="T1")
-    with pytest.raises(SessionError) as err:
-        await controller.arm(patient_id="P9", session_id=first["session_id"])
-    assert err.value.code == "PATIENT_MISMATCH"
-    with pytest.raises(SessionError) as err:
-        await controller.arm(patient_id="P1", session_id="NOT-THIS-ONE")
-    assert err.value.code == "PATIENT_MISMATCH"
+    first = await _open(controller, "P1")
+    for patient, session in (("P9", first["session_id"]), ("P1", "NOT-THIS-ONE")):
+        with pytest.raises(SessionError) as err:
+            await controller.arm(patient_id=patient, session_id=session)
+        assert err.value.code == "PATIENT_MISMATCH"
     assert controller.status()["armed"] is False
 
 
 async def test_arming_twice_is_harmless(controller):
     """AT-12."""
-    first = await controller.open_session(_g("P1"), trigger_start_time="T1")
+    first = await _open(controller, "P1")
     await controller.arm(patient_id="P1", session_id=first["session_id"])
-    again = await controller.arm(patient_id="P1", session_id=first["session_id"])
-    assert again["already"] is True
+    assert (await controller.arm(patient_id="P1", session_id=first["session_id"]))["already"]
 
 
 async def test_arming_with_nothing_recording(controller):
@@ -440,38 +332,34 @@ async def test_arming_with_nothing_recording(controller):
 
 
 async def test_the_same_trigger_twice_is_not_a_new_patient(controller):
-    await controller.open_session(_g("P1"), trigger_start_time="T1")
+    await _open(controller, "P1")
     with pytest.raises(SessionError) as err:
-        await controller.open_session(_g("P1"), trigger_start_time="T1")
+        await _open(controller, "P1")
     assert err.value.code == "SESSION_ALREADY_ACTIVE"
 
 
 async def test_clinic_mismatch_is_refused(controller):
     """Decision D1 / SRS-GRT-10: never filed, never warned-and-recorded."""
     with pytest.raises(SessionError) as err:
-        await controller.open_session(_g(hospital="HOSP001"), trigger_start_time="T1")
+        await _open(controller, hospital="HOSP001")
     assert err.value.code == "CLINIC_MISMATCH"
     assert controller.state == "idle"
-    assert any(data.get("alert_type") == "clinic_mismatch"
-               for name, data in controller.events if name == "integrity_alert")
 
 
 async def test_recording_is_filed_under_the_pcs_clinic(controller):
-    result = await controller.open_session(_g(hospital=""), trigger_start_time="T1")
+    await _open(controller, hospital="")
     assert controller.status()["hospital_id"] == "HOSP003"
-    assert result["session_id"]
 
 
 async def test_unenrolled_pc_cannot_record(controller):
     controller.device_id = ""
     with pytest.raises(SessionError) as err:
-        await controller.open_session(_g(), trigger_start_time="T1")
+        await _open(controller)
     assert err.value.code == "DEVICE_NOT_ENROLLED"
 
 
 async def test_stop_works_whether_or_not_armed(controller):
     """SRS-GAT-05: the doctor's Stop is never blocked by the gate."""
-    await controller.open_session(_g("P1"), trigger_start_time="T1")
+    await _open(controller, "P1")
     result = await controller.stop_session(reason="doctor_stopped")
-    assert result["status"] == "stopped"
-    assert controller.state == "idle"
+    assert result["status"] == "stopped" and controller.state == "idle"
