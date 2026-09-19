@@ -165,6 +165,9 @@ class SessionSpool:
         self.duration_seconds = 0.0
         self.paused_seconds = 0.0
         self.close_reason = ""
+        # The doctor's own words from the Stop form (SRS-UIX-04). Travels in the
+        # manifest; the signed close entry carries the reason itself.
+        self.close_detail = ""
         # Chain entries the backend has acknowledged. Segments track their own
         # state; this covers pause and resume, which are links in the same chain
         # and were previously sent once and forgotten.
@@ -328,6 +331,7 @@ class SessionSpool:
                     # Survives a crash, so a session closed from the tray and
                     # reported after a restart still reports why.
                     spool.close_reason = record.get("reason", "")
+                    spool.close_detail = record.get("detail", "")
                 elif kind == "close_reported":
                     spool.close_reported = True
                 elif kind == "entry_reported":
@@ -602,7 +606,8 @@ class SessionSpool:
                 self._append_journal({"rec": "acknowledged", "at": time.time()})
 
     def close(self, *, duration_seconds: float, paused_seconds: float,
-              reason: str = "", at: Optional[datetime] = None) -> ChainEntry:
+              reason: str = "", detail: str = "",
+              at: Optional[datetime] = None) -> ChainEntry:
         with self._lock:
             # `at` lets the caller supply the exact instant. When one patient
             # supersedes another, CMED's record needs this consultation to end
@@ -613,6 +618,7 @@ class SessionSpool:
             self.duration_seconds = duration_seconds
             self.paused_seconds = paused_seconds
             self.close_reason = reason
+            self.close_detail = detail
             entry = self.append_chain_entry("close", crypto.close_payload(
                 closed_at=self.closed_at,
                 segment_count=len(self.segments),
@@ -624,6 +630,7 @@ class SessionSpool:
                 "rec": "closed",
                 "at": crypto.iso_utc(self.closed_at),
                 "reason": reason,
+                "detail": detail,
                 "duration_seconds": round(duration_seconds, 3),
                 "paused_seconds": round(paused_seconds, 3),
             })
@@ -693,6 +700,8 @@ class SessionSpool:
             "closed_at": crypto.iso_utc(self.closed_at) if self.closed_at else None,
             "audio": {"codec": "pcm_s16le", "container": "wav", **self.audio},
             **self.meta,
+            "close_reason": self.close_reason,
+            "close_detail": self.close_detail,
             "chain_head": self.head_hash.hex() if self.head_hash else None,
             "device_pubkey": self._device_key.public_bytes_raw().hex(),
             "segments": [

@@ -81,6 +81,8 @@ class Runtime:
         self.problems = cfg.validate()
         self.warnings = cfg.production_warnings()
         self._loop = None
+        # The on-screen Stop and Pause control, when a screen is present.
+        self.overlay = None
 
     @property
     def loop(self):
@@ -194,6 +196,8 @@ class Runtime:
         Called from both the event loop and worker threads, so the broadcast is
         always scheduled onto the loop rather than awaited directly.
         """
+        if self.overlay is not None:
+            self.overlay.post(event, data)
         if self._loop is None:
             return
         try:

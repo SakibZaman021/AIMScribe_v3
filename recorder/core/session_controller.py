@@ -49,6 +49,11 @@ CLOSING = "closing"
 # The Stop reason that erases a consultation (SRS 3.2 §7.8a).
 REFUSAL_REASON = "patient_did_not_consent"
 
+# Recorded as a pause the moment Stop is pressed, so the microphone cuts at once
+# and the gap is explained in the chain while the doctor picks a reason
+# (SRS-UIX-08). Not a reason anyone chooses; the on-screen control sets it.
+STOP_HOLD_REASON = "stop_requested"
+
 # Hard refusals from the server, and what the doctor is told (SRS-GRT-08).
 REFUSAL_MESSAGES = {
     "CLINIC_MISMATCH": "This PC is registered to a different clinic, so the recording "
@@ -105,6 +110,8 @@ class ActiveSession:
     # SRS 3.2 §5: recording starts before the server has answered.
     authorisation: str = "pending"        # pending | granted
     confirmation: str = ""                # confirming | confirmed | unconfirmed
+    # Stop was pressed and the reason form is open (SRS-UIX-08).
+    stop_hold: bool = False
     audio_seconds: float = 0.0
     paused_seconds: float = 0.0
     pause: Optional[PauseRecord] = None
@@ -535,6 +542,7 @@ class SessionController:
         reason_detail: str = "",
         authorised_by: str = "",
         expected_seconds: int = 0,
+        internal: bool = False,
     ) -> Dict[str, Any]:
         """
         Supervised pause. The gap becomes an explained chain entry.
@@ -547,7 +555,8 @@ class SessionController:
             if self.state == PAUSED:
                 raise SessionError("Recording is already paused.")
 
-            if reason not in self.cfg.pause.reasons:
+            if reason not in self.cfg.pause.reasons and not (
+                    internal and reason == STOP_HOLD_REASON):
                 raise SessionError(
                     f"Unknown pause reason. Choose one of: {', '.join(self.cfg.pause.reasons)}")
             if reason == "other" and not reason_detail.strip():
@@ -606,6 +615,38 @@ class SessionController:
                 "paused_at": crypto.iso_utc(now),
             }
 
+    async def hold_for_stop(self) -> Dict[str, Any]:
+        """
+        Stop was pressed on the on-screen control: cut the microphone now.
+
+        The press cuts capture before any form is filled (SRS-UIX-08) - if the
+        patient has just objected, they must not be recorded while the doctor
+        chooses a reason. The gap is a pause in the chain, so it is explained.
+        The form then closes the session, or Cancel releases the hold.
+        """
+        active = self._active
+        if active is None:
+            return {"status": "not_recording", "session_id": None}
+        if self.state == PAUSED:
+            # Already silent; there is nothing to hold and nothing to release.
+            active.stop_hold = False
+            return {"status": "paused", "session_id": active.session_id, "held": False}
+        result = await self.pause_session(
+            reason=STOP_HOLD_REASON,
+            reason_detail="Stop pressed; waiting for the reason",
+            internal=True)
+        active.stop_hold = True
+        return {**result, "held": True}
+
+    async def release_stop_hold(self) -> Dict[str, Any]:
+        """The doctor cancelled Stop: recording carries on (SRS-UIX-07)."""
+        active = self._active
+        if active is None or not active.stop_hold:
+            return {"status": "unchanged",
+                    "session_id": active.session_id if active else None}
+        active.stop_hold = False
+        return await self.resume_session()
+
     async def resume_session(self) -> Dict[str, Any]:
         async with self._lock:
             active = self._require_active()
@@ -658,7 +699,8 @@ class SessionController:
 
     # ---- stopping ----
 
-    async def stop_session(self, *, reason: str = "doctor_stopped") -> Dict[str, Any]:
+    async def stop_session(self, *, reason: str = "doctor_stopped",
+                           detail: str = "") -> Dict[str, Any]:
         if reason == REFUSAL_REASON:
             if self._active is None:
                 return {"status": "not_recording", "session_id": None}
@@ -666,10 +708,10 @@ class SessionController:
         async with self._lock:
             if self._active is None:
                 return {"status": "not_recording", "session_id": None}
-            return await self._close_active(reason=reason)
+            return await self._close_active(reason=reason, detail=detail)
 
-    async def _close_active(self, *, reason: str,
-                            at: Optional[datetime] = None) -> Dict[str, Any]:
+    async def _close_active(self, *, reason: str, at: Optional[datetime] = None,
+                            detail: str = "") -> Dict[str, Any]:
         active = self._active
         assert active is not None
         self.state = CLOSING
@@ -699,6 +741,7 @@ class SessionController:
             duration_seconds=active.audio_seconds,
             paused_seconds=active.paused_seconds,
             reason=reason,
+            detail=detail,
             at=at,
         )
         verdict = active.spool.verify_chain()
@@ -1018,4 +1061,4 @@ class SessionController:
 
 
 __all__ = ["SessionController", "SessionError", "IDLE", "RECORDING", "PAUSED", "CLOSING",
-           "REFUSAL_REASON", "REFUSAL_MESSAGES"]
+           "REFUSAL_REASON", "REFUSAL_MESSAGES", "STOP_HOLD_REASON"]

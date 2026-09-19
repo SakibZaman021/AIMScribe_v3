@@ -68,6 +68,12 @@ class ScriptedUploader:
             session.record_authorisation_refused(outcome.code)
         return outcome
 
+    async def notify_pause(self, session, entry):
+        return True
+
+    async def notify_resume(self, session, entry):
+        return True
+
     async def check_confirmation(self, session):
         return self.confirmations.pop(0) if self.confirmations else None
 

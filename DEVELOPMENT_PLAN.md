@@ -54,7 +54,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 | **1. Recorder, Channel A** — *done* | Reply envelope; five-field trigger; `prescription_built` and the gate; clinic from the PC, mismatch refused (D1); consent removed from the grant; buffer 4 GB, alert at 25%; no deletion wait | Unit tests; `AT-02`, `AT-09`–`AT-12`, `AT-31`, `AT-32` on a bench |
 | **2. Server, authorisation and Channel B** — *done* | `POST /grant/mint` with register checks and D1; `clinical/patient-information` and `clinical/prescription` with `X-CMED-Key`; confirmation notices and matching; receipts on custody; refusal endpoint; webhook off (D2) | `AT-04`, `AT-57`–`AT-63`, `AT-68`–`AT-70`, `AT-78` |
 | **3. Recorder talks to the new server** — *done* | Grant requested from the server alongside capture; "confirming" state; unconfirmed handling; refusal deletes local pieces; alert when a piece waits over 15 minutes; final delivery and clean-up at start-up and shutdown | `AT-01`, `AT-03`, `AT-07`, `AT-08`, `AT-20`, `AT-58`, `AT-59`, `AT-77` |
-| **4. On-screen control** | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
+| **4. On-screen control** — *done* | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
 | **5. Two databases** | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
 | **6. Archive and cloud copy** | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
 | **7. UIU hosting** | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
@@ -96,5 +96,12 @@ pieces from R2 after archiving, as the old code did.
 `recorder/keys/aimslab_grant_pub.pem` is the old development key, renamed. Replace it
 with the public half of the server's `AIMS_GRANT_PRIVATE_KEY` (Phase 2, step 2), or
 every grant will be refused and every recording deleted. The on-screen Stop and
-Pause control that offers "Patient did not consent" comes in Phase 4; until then the
-refusal can be sent as a `stop` command with that reason.
+Pause control (Phase 4) offers "Patient did not consent".
+
+| 19 Sep 2026 | 4 | The on-screen control (`recorder/ui/`): a small always-on-top window at the top right, shown only while recording or paused, with a red circular Stop and a blue rectangular Pause, usable by keyboard. Stop cuts the microphone the instant it is pressed, recorded as a pause so the gap is explained; the reason form then closes the session with the reason and the doctor's comment, or Cancel resumes. "Patient did not consent" is first and asks once - "Delete this recording? It cannot be recovered." - with No returning to the list. Pause takes effect only after a reason; the same button then resumes. Plain-words notes: checking with CMED, confirmed, not yet confirmed, microphone muted, and why a recording was not kept - each once per consultation, never blocking. The rules live in `overlay_model.py` (no tkinter) and are tested there; the window was checked on screen at 125% scaling. `BUILD.bat` no longer excludes tkinter, which would have shipped a recorder without the window. `AIMS_OVERLAY=false` turns it off on a bench. | 226 recorder tests pass (202 before) |
+
+**Still open for the control.** The Stop and Pause reason lists are placeholders
+until the clinical team agrees them (**OD-07**); they are one table in
+`ui/overlay_model.py`. Level prompts for a quiet patient or clipping (`SRS-LVL-03`,
+`-05`) need the per-piece level figures (`SRS-LVL-01`), which the recorder does not
+compute yet.

@@ -560,6 +560,13 @@ def main() -> int:
     runtime = Runtime(config, log_salt=load_log_salt())
     app = create_app(runtime)
 
+    # The on-screen Stop and Pause control (SRS 3.2 §7.8). AIMS_OVERLAY=false
+    # turns it off, for a bench machine without a screen.
+    if os.getenv("AIMS_OVERLAY", "true").strip().lower() not in ("0", "false", "no"):
+        from ui.overlay import Overlay
+        runtime.overlay = Overlay(runtime)
+        runtime.overlay.start()
+
     server = uvicorn.Server(uvicorn.Config(
         app,
         host=config.security.bind_host,

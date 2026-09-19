@@ -83,7 +83,7 @@ pyinstaller ^
     --hidden-import=cryptography.hazmat.primitives.ciphers.aead ^
     --hidden-import=jwt.algorithms ^
     --collect-all=pystray ^
-    --exclude-module=tkinter ^
+    --hidden-import=ui.overlay ^
     --exclude-module=matplotlib ^
     --exclude-module=numpy ^
     --exclude-module=PyQt5 ^
