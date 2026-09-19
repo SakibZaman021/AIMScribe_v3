@@ -21,6 +21,8 @@ from message_queue.redis_async import AsyncRedisClient, push_transcription_job_a
 # Protocol 2: device identity, integrity chain, purge receipts, archive handshake.
 import api_v2
 from api_v2 import router as v2_router
+from clinical import router as clinical_router
+from grants import GrantIssuer
 from db_v2 import V2Repository
 from integrity import ReceiptSigner
 
@@ -152,6 +154,9 @@ class AsyncAppContext:
         api_v2.ctx.redis = self.redis
         api_v2.ctx.legacy_db = self.db
         api_v2.ctx.signer = ReceiptSigner.from_env()
+        # SRS 3.2 §5: this server issues recording grants. Without the key
+        # recorders refuse to record, which is the safe direction.
+        api_v2.ctx.grants = GrantIssuer.from_env()
 
         if api_v2.ctx.signer is None:
             logger.critical(
@@ -223,6 +228,8 @@ app.add_middleware(
 )
 
 app.include_router(v2_router)
+# Channel B: CMED's server sends API 2 and prescriptions here (SRS 3.2 §6.2).
+app.include_router(clinical_router)
 
 
 # ============================================================================

@@ -27,6 +27,16 @@ if not WEBHOOK_SECRET:
         "an empty key and CMED will reject them, so prescription fields will "
         "never populate.")
 
+def cmed_webhook_enabled() -> bool:
+    """
+    Decision D2 (SRS 3.2 SRS-DAT-03): nothing clinical goes back to CMED, so
+    this webhook is off unless AIMS_CMED_WEBHOOK_ENABLED is explicitly true.
+    Kept in the code for a future draft-prescription feature.
+    """
+    return os.getenv("AIMS_CMED_WEBHOOK_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes")
+
+
 # Retry configuration
 MAX_RETRIES = 6
 RETRY_DELAYS = [0, 5, 30, 120, 600, 3600]  # seconds: immediate, 5s, 30s, 2m, 10m, 1h

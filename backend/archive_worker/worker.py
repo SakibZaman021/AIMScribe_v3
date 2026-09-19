@@ -137,6 +137,7 @@ class ArchiveWorker:
     # ---- main pass ----
 
     def drain_once(self) -> int:
+        self.sweep()
         sessions = self.fetch_pending()
         if not sessions:
             return 0
@@ -160,6 +161,23 @@ class ArchiveWorker:
                 logger.error("Session %s failed unexpectedly: %s",
                              session.get("session_id"), exc, exc_info=True)
         return processed
+
+    def sweep(self) -> None:
+        """
+        Ask the server to settle confirmation deadlines (SRS 3.2 §5.6):
+        two minutes without CMED's API 2 makes a recording unconfirmed, and 24
+        hours erases it. Best effort - archiving goes on if this fails.
+        """
+        try:
+            response = self.session.post(
+                f"{self.settings.backend_url}/api/v2/maintenance/sweep",
+                timeout=self.settings.request_timeout,
+                verify=self.settings.verify_tls,
+            )
+            if response.status_code >= 300:
+                logger.warning("Sweep answered %s", response.status_code)
+        except Exception as exc:
+            logger.warning("Sweep failed: %s", exc)
 
     def fetch_pending(self) -> List[Dict[str, Any]]:
         response = self.session.get(

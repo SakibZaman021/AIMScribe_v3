@@ -16,8 +16,8 @@ from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND / "src"))
-sys.path.insert(0, str(BACKEND.parent.parent / "AIMScribe.exe-main" /
-                      "AIMScribe.exe-main" / "recorder"))
+# The v3 recorder, beside this backend in the upgrade folder.
+sys.path.insert(0, str(BACKEND.parent / "recorder"))
 
 import integrity                      # the backend's verifier
 from core import crypto               # the agent's chain builder

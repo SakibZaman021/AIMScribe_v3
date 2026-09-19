@@ -7,8 +7,11 @@ everything here requires authentication.
 
 The three flows:
 
-  AGENT     enroll -> session/open -> segment/authorize -> segment/commit
-                   -> session/close -> poll receipts -> delete local audio
+  AGENT     enroll -> grant/mint -> session/open -> segment/authorize
+                   -> segment/commit (receipt issued) -> delete local audio
+                   -> session/close          (SRS 3.2: receipts on custody)
+
+  CMED      clinical/patient-information, clinical/prescription (clinical.py)
 
   WORKER    archive/pending -> download from R2 -> write the sorted tree
                             -> archive/complete -> receipts are issued
@@ -26,7 +29,7 @@ import hmac
 import logging
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -34,6 +37,11 @@ from pydantic import BaseModel, Field
 
 import integrity
 from db_v2 import V2Repository
+from fastapi.responses import JSONResponse
+
+import confirmation as conf
+from confirmation import FieldError
+from grants import GrantIssuer, new_jti
 from integrity import ChainError, ReceiptSigner, parse_entry, safe_identifier, safe_session_id
 
 logger = logging.getLogger(__name__)
@@ -58,6 +66,7 @@ class V2Context:
         self.redis = None
         self.legacy_db = None
         self.signer: Optional[ReceiptSigner] = None
+        self.grants: Optional[GrantIssuer] = None
 
     @property
     def ready(self) -> bool:
@@ -137,11 +146,16 @@ class OpenSessionRequest(BaseModel):
     doctor_id: str = Field(..., max_length=64)
     hospital_id: str = Field(..., max_length=64)
     patient_ref: str = Field(..., max_length=64)
-    consent_obtained: bool
+    # Kept so protocol-2 recorders still validate. Consent is taken at
+    # reception and is not checked here (SRS 3.2 §7.8a).
+    consent_obtained: bool = True
     consent_method: str = Field("", max_length=64)
     audio: AudioSpec
     device_pubkey: str = Field("", max_length=64)
     genesis: Dict[str, Any]
+    # The grant this recording was authorised under (v3 recorders). Links the
+    # session to CMED's API 2; absent from protocol-2 recorders.
+    grant_jti: Optional[str] = Field(None, max_length=128)
 
 
 class AuthorizeRequest(BaseModel):
@@ -334,9 +348,6 @@ async def enroll_device(body: EnrollRequest):
 
 @router.post("/session/open")
 async def open_session(body: OpenSessionRequest, device=Depends(require_device)):
-    if not body.consent_obtained:
-        raise HTTPException(status_code=400, detail="patient consent is required")
-
     try:
         session_id = safe_session_id(body.session_id)
         doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
@@ -345,16 +356,21 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # CMED names the hospital as well as the doctor, and both are recorded as
-    # sent. Overriding the hospital with the device's meant a consultation
-    # triggered for one site was filed under another, silently and in the
-    # filename. A disagreement is worth knowing about - a laptop does not
-    # usually move - so it is raised, but it does not change the record.
-    if hospital_id != device["hospital_id"]:
+    if await _repo().refusal(session_id):
+        raise HTTPException(status_code=409,
+                            detail="this consultation was refused by the patient")
+
+    # The clinic is the device's, always (SRS-INV-01; decision D1). A v3
+    # recorder cannot get here with another clinic - its grant is refused - so a
+    # disagreement comes from an old recorder. The audio already exists, so it
+    # is filed under the device's clinic rather than refused, and someone is told.
+    claimed_hospital = hospital_id
+    hospital_id = device["hospital_id"]
+    if claimed_hospital != hospital_id:
         await _repo().raise_alert(
-            alert_type="hospital_mismatch", severity="warning",
+            alert_type="clinic_mismatch", severity="critical",
             session_id=session_id, device_id=device["device_id"],
-            detail={"device_hospital": device["hospital_id"], "claimed": hospital_id},
+            detail={"device_hospital": hospital_id, "claimed": claimed_hospital},
         )
 
     # CMED decides who the doctor is, and this does not second-guess it.
@@ -417,12 +433,15 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         except Exception as exc:
             logger.debug("Legacy patient upsert skipped: %s", exc)
 
+    state = await _link_grant(session_id, body.grant_jti, patient_ref, device)
+
     await _repo().audit(
         event_type="session.opened", actor_type="device",
         actor_id=doctor_id, device_id=device["device_id"], session_id=session_id,
-        detail={"hospital_id": hospital_id, "consent_method": body.consent_method},
+        detail={"hospital_id": hospital_id, "confirmation": state},
     )
-    return {"session_id": session_id, "status": "open", "hospital_id": hospital_id}
+    return {"session_id": session_id, "status": "open", "hospital_id": hospital_id,
+            "confirmation": state}
 
 
 @router.post("/segment/authorize")
@@ -470,6 +489,8 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     repo = _repo()
     session_id = safe_session_id(body.session_id)
     session = await _session_for_device(session_id, device)
+    if session.get("confirmation") in ("refused", "expired"):
+        raise HTTPException(status_code=409, detail="this consultation has been erased")
 
     # The client does not get to choose where its audio lands. Both forms are
     # accepted: sessions opened before readable keys still use the ULID.
@@ -521,6 +542,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     if await _verified_duplicate(session_id, entry, device):
         logger.info("Segment %s of %s was already committed; treating the retry "
                     "as the success it is", body.seq_no, session_id)
+        await _issue_custody_receipt(session_id, body.seq_no, claimed)
         return {"status": "committed", "seq_no": body.seq_no,
                 "object_key": body.object_key, "duplicate": True}
 
@@ -563,6 +585,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     if outcome == "stored":
         await _queue_transcription(session_id, body, session)
 
+    await _issue_custody_receipt(session_id, body.seq_no, claimed)
     return {"status": "committed", "seq_no": body.seq_no, "duplicate": outcome == "duplicate"}
 
 
@@ -854,7 +877,8 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
 
 @router.get("/session/{session_id}/receipts")
 async def session_receipts(session_id: str, device=Depends(require_device)):
-    """Purge receipts the agent may act on. Empty until the worker has archived."""
+    """Purge receipts the agent may act on - one per piece, issued the moment the
+    piece is verified on arrival (SRS-REC-15)."""
     sid = safe_session_id(session_id)
     await _session_for_device(sid, device)
     return {"session_id": sid, "receipts": await _repo().receipts_for(sid)}
@@ -1024,6 +1048,288 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
 
 
 # ============================================================
+# v3 (SRS 3.2): grants from this server, confirmation against CMED's
+# API 2, receipts on custody, and refusals
+# ============================================================
+
+def _coded(status: int, code: str, message: str, **extra) -> JSONResponse:
+    """A refusal the recorder can act on: status, code and a message."""
+    return JSONResponse(status_code=status,
+                        content={"status": status, "code": code, "message": message,
+                                 **extra})
+
+
+async def _clinic_for(cmed_hospital_id: str, device: Dict[str, Any]) -> Optional[str]:
+    """
+    The clinic a grant is issued for: always the device's own (decision D1).
+
+    CMED's identifier must map to it (SRS-ENR-19). A clinic whose CMED
+    identifier already is our code needs no mapping - that is how the dummy
+    CMED app, and any site set up that way, work. Anything else is a mismatch:
+    the mapping is wrong or the laptop is in the wrong building, and a recording
+    filed under either clinic would be labelled wrongly (SRS-GRT-10).
+    """
+    own = device["hospital_id"]
+    mapped = await _repo().hospital_for_cmed_id(cmed_hospital_id)
+    if mapped is not None:
+        return own if mapped == own else None
+    return own if cmed_hospital_id == own else None
+
+
+@router.post("/grant/mint")
+async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
+    """
+    Authorise one consultation (SRS 3.2 §5.3).
+
+    The recorder forwards CMED's five fields. The reply is a 60-second,
+    single-use grant, signed with a key only this server holds, and whether
+    CMED's API 2 for the same consultation has already arrived:
+
+        confirmed   API 2 matched - the recording enters the dataset
+        pending     not yet; the recorder keeps recording and asks again
+
+    Recording never waits for this (SRS-GRT-07); the recorder calls it
+    alongside capture.
+    """
+    repo = _repo()
+    if ctx.grants is None:
+        return _coded(503, "AGENT_NOT_READY", "The grant signing key is not configured.")
+    try:
+        visit = conf.parse_visit(body)
+    except FieldError as exc:
+        return _coded(400, exc.code, str(exc), field=exc.field)
+
+    clinic = await _clinic_for(visit.cmed_hospital_id, device)
+    if clinic is None:
+        await repo.raise_alert(
+            alert_type="clinic_mismatch", severity="critical",
+            device_id=device["device_id"],
+            detail={"device_hospital": device["hospital_id"],
+                    "cmed_hospital_id": visit.cmed_hospital_id,
+                    "mapped_to": await repo.hospital_for_cmed_id(visit.cmed_hospital_id)})
+        return _coded(401, "CLINIC_MISMATCH",
+                      "This PC is registered to a different clinic.")
+
+    # Decision D4: the doctor register is a directory, not a gate. CMED
+    # authenticates its own doctors, and its API 2 now proves the consultation;
+    # refusing a doctor new to this server stopped real consultations before.
+    try:
+        await repo.upsert_doctor(doctor_id=visit.doctor_id, hospital_id=clinic,
+                                 full_name=visit.doctor_id, only_if_new=True)
+    except Exception as exc:
+        logger.warning("Could not record doctor %s in the directory: %s",
+                       visit.doctor_id, exc)
+
+    now = datetime.now(timezone.utc)
+    jti = new_jti()
+    await repo.create_authorisation(
+        jti=jti, device_id=device["device_id"], hospital_id=clinic, visit=visit,
+        expires_at=now + timedelta(seconds=ctx.grants.lifetime))
+    notice_id = await repo.find_unclaimed_notice(
+        visit, hospital_id=clinic, since=now - conf.NOTICE_MATCH_WINDOW)
+    confirmed = notice_id is not None and await repo.claim_notice(notice_id, jti)
+    state = "confirmed" if confirmed else "pending"
+
+    token, _ = ctx.grants.issue(
+        jti=jti, patient_ref=visit.patient_id, doctor_id=visit.doctor_id,
+        hospital_id=clinic, cmed_hospital_id=visit.cmed_hospital_id,
+        start_time=visit.start_time, visit_date=visit.visit_date, confirmation=state)
+    await repo.audit(event_type="grant.issued", actor_type="device",
+                     actor_id=visit.doctor_id, device_id=device["device_id"],
+                     detail={"hospital_id": clinic, "confirmation": state})
+    return {"status": 200, "code": "GRANTED", "grant": token, "jti": jti,
+            "confirmation": state, "hospital_id": clinic,
+            "expires_in": ctx.grants.lifetime}
+
+
+async def _link_grant(session_id: str, grant_jti: Optional[str], patient_ref: str,
+                      device: Dict[str, Any]) -> str:
+    """
+    Tie a session to the grant it was opened under, and so to CMED's API 2.
+    No grant means a protocol-2 recorder: 'legacy', archived as before.
+    """
+    repo = _repo()
+    row = await repo.session_confirmation(session_id)
+
+    if not grant_jti:
+        state, jti = "legacy", None
+    else:
+        grant = await repo.get_authorisation(grant_jti)
+        valid = (grant is not None
+                 and str(grant["device_id"]) == str(device["device_id"])
+                 and grant["patient_id"] == patient_ref
+                 and grant.get("session_id") in (None, session_id))
+        if not valid:
+            await repo.raise_alert(alert_type="grant_link_failed", severity="critical",
+                                   session_id=session_id, device_id=device["device_id"],
+                                   detail={"grant_jti": grant_jti})
+            state, jti = "unconfirmed", None
+        else:
+            await repo.link_authorisation(grant_jti, session_id)
+            state = "confirmed" if grant.get("notice_id") else "pending"
+            jti = grant_jti
+
+    # A retried open must not step a session backwards.
+    if row is not None and row.get("grant_jti"):
+        if state == "confirmed" and row["confirmation"] in conf.WAITING:
+            await repo.set_session_confirmation(session_id, "confirmed")
+            return "confirmed"
+        return row["confirmation"]
+
+    await repo.set_session_confirmation(session_id, state, grant_jti=jti)
+    return state
+
+
+async def _issue_custody_receipt(session_id: str, seq_no: int, sha256: bytes) -> bool:
+    """
+    SRS-REC-15: the PC may delete a piece as soon as this server holds a
+    verified copy. The bytes were just read back and re-hashed, so the receipt
+    is issued here - not after archiving, which left audio on clinic PCs for
+    days waiting on a process they could not see.
+    """
+    if ctx.signer is None:
+        return False
+    receipt = ctx.signer.sign_segment(
+        session_id=session_id, seq_no=seq_no, sha256_hex=sha256.hex(),
+        archived_at=datetime.now(timezone.utc))
+    await _repo().store_receipt(
+        session_id=session_id, scope="segment", seq_no=seq_no, sha256=sha256,
+        payload=receipt["payload"], signature=bytes.fromhex(receipt["signature"]))
+    return True
+
+
+async def _mark_unconfirmed(session_id: str, row: Dict[str, Any]) -> None:
+    repo = _repo()
+    await repo.set_session_confirmation(session_id, "unconfirmed")
+    await repo.raise_alert(
+        alert_type="unconfirmed_recording", severity="warning",
+        session_id=session_id, device_id=row.get("device_id"),
+        detail={"reason": "no matching API 2 from CMED within two minutes"})
+
+
+async def _current_confirmation(session_id: str) -> str:
+    row = await _repo().session_confirmation(session_id)
+    if row is None:
+        return "unknown"
+    state = conf.current_state(row["confirmation"], row["opened_at"],
+                               datetime.now(timezone.utc))
+    if state == "unconfirmed" and row["confirmation"] == "pending":
+        await _mark_unconfirmed(session_id, row)
+    return state
+
+
+@router.get("/session/{session_id}/confirmation")
+async def session_confirmation(session_id: str, device=Depends(require_device)):
+    """
+    Asked every five seconds by a recorder showing "confirming" (SRS-CNF-07).
+    After two minutes without CMED's API 2 the answer becomes "unconfirmed"
+    and an alert is raised (SRS-CNF-08); the recording is never cut.
+    """
+    sid = safe_session_id(session_id)
+    await _session_for_device(sid, device)
+    return {"session_id": sid, "confirmation": await _current_confirmation(sid)}
+
+
+async def _erase_session(session_id: str, *, state: str):
+    """
+    Remove every trace of a consultation's content: its pieces in storage, its
+    chain and receipts, CMED's clinical records for the visit, and the old
+    transcription rows. Returns (objects deleted, the visit, if known).
+    """
+    repo = _repo()
+    row = await repo.session_confirmation(session_id)
+    visit = None
+    if row and row.get("grant_jti"):
+        grant = await repo.get_authorisation(row["grant_jti"])
+        if grant and grant["patient_id"] != "REDACTED":
+            visit_date = grant["visit_date"]
+            visit = conf.Visit(
+                patient_id=grant["patient_id"], doctor_id=grant["doctor_id"],
+                cmed_hospital_id=grant["cmed_hospital_id"], start_time=grant["start_time"],
+                visit_date=visit_date.isoformat() if hasattr(visit_date, "isoformat")
+                else str(visit_date))
+
+    removed = await _delete_bucket_objects(session_id)
+    if visit is not None:
+        await repo.delete_clinical_for(visit)
+    await repo.erase_session(session_id, state=state)
+    return removed, visit
+
+
+class RefuseRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/session/refuse")
+async def refuse_session(body: RefuseRequest, device=Depends(require_device)):
+    """
+    The patient did not consent (SRS 3.2 §7.8a). The doctor pressed Stop and
+    chose "Patient did not consent"; the recorder has already deleted what it
+    held. Here everything else goes, within the request (SRS-CNS-04, -05), and
+    only an audit entry without audio or patient remains (SRS-CNS-06).
+
+    Accepted for a session this server has never seen, so a refusal made while
+    the PC was offline still stops that session being opened later.
+    """
+    repo = _repo()
+    session_id = safe_session_id(body.session_id)
+    session = await repo.get_session(session_id)
+    if session is not None and str(session["device_id"]) != str(device["device_id"]):
+        raise HTTPException(status_code=403, detail="session belongs to another device")
+
+    removed, visit = 0, None
+    if session is not None and session.get("confirmation") != "refused":
+        removed, visit = await _erase_session(session_id, state="refused")
+
+    first = await repo.record_refusal(
+        session_id=session_id, device_id=device["device_id"],
+        hospital_id=device["hospital_id"],
+        doctor_id=session["doctor_id"] if session else None,
+        visit_sha256=visit.digest() if visit else None)
+    await repo.complete_refusal(session_id)
+
+    if first:
+        session_date = session.get("session_date") if session else None
+        await repo.audit(
+            event_type="session.refused", actor_type="device",
+            actor_id=session["doctor_id"] if session else None,
+            device_id=device["device_id"], session_id=session_id,
+            detail={"hospital_id": device["hospital_id"],
+                    "date": session_date.isoformat() if session_date else None,
+                    "objects_deleted": removed})
+    return {"status": "refused", "session_id": session_id, "objects_deleted": removed}
+
+
+@router.post("/maintenance/sweep")
+async def maintenance_sweep(_: None = Depends(require_worker)):
+    """
+    Settle confirmation deadlines. The archive worker calls this every pass.
+
+        waiting 24 hours with no API 2  ->  erased and audited   (SRS-CNF-09)
+        pending for two minutes         ->  unconfirmed, alert   (SRS-CNF-08)
+    """
+    repo = _repo()
+    now = datetime.now(timezone.utc)
+
+    erased = 0
+    for row in await repo.sessions_in_confirmation(
+            ["pending", "unconfirmed"], opened_before=now - conf.UNCONFIRMED_LIFETIME):
+        removed, _ = await _erase_session(row["session_id"], state="expired")
+        await repo.audit(event_type="session.expired_unconfirmed", actor_type="service",
+                         actor_id="sweep", session_id=row["session_id"],
+                         detail={"objects_deleted": removed})
+        erased += 1
+
+    marked = 0
+    for row in await repo.sessions_in_confirmation(
+            ["pending"], opened_before=now - conf.CONFIRM_DEADLINE):
+        await _mark_unconfirmed(row["session_id"], row)
+        marked += 1
+
+    return {"status": "ok", "marked_unconfirmed": marked, "erased": erased}
+
+
+# ============================================================
 # Administration
 # ============================================================
 
@@ -1031,6 +1337,9 @@ class HospitalRequest(BaseModel):
     hospital_id: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     timezone: str = Field("Asia/Dhaka", max_length=64)
+    # CMED's identifier for this clinic (SRS-ENR-19). Without it, only a CMED
+    # that already sends our own code can be granted (decision D1).
+    cmed_hospital_id: str = Field("", max_length=64)
 
 
 class TokenRequest(BaseModel):
@@ -1051,7 +1360,13 @@ class TokenRequest(BaseModel):
 async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)):
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
     await _repo().upsert_hospital(hospital_id, body.name, body.timezone)
-    return {"status": "ok", "hospital_id": hospital_id}
+    cmed_id = (safe_identifier(body.cmed_hospital_id, field="cmed_hospital_id")
+               if body.cmed_hospital_id else None)
+    if cmed_id:
+        await _repo().set_cmed_hospital_id(hospital_id, cmed_id)
+        await _repo().audit(event_type="hospital.mapped", actor_type="admin",
+                            actor_id=hospital_id, detail={"cmed_hospital_id": cmed_id})
+    return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id}
 
 
 class DoctorRequest(BaseModel):
@@ -1133,6 +1448,45 @@ async def admin_revoke_device(device_id: str, reason: str = "",
     await _repo().audit(event_type="device.revoked", actor_type="admin",
                         device_id=device_id, detail={"reason": reason})
     return {"status": "revoked", "device_id": device_id}
+
+
+class CmedKeyRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=64)
+    created_by: str = Field(..., max_length=128)
+    expires_in_days: int = Field(0, ge=0, le=3650)
+
+
+class CmedKeyRevokeRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=64)
+
+
+@router.post("/admin/cmed-key")
+async def admin_cmed_key(body: CmedKeyRequest, _: None = Depends(require_admin)):
+    """
+    Issue a key for CMED's server (SRS-CHB-03). Shown once; only its hash is
+    kept. Several may be active at once, so a key is replaced by issuing the
+    new one, letting CMED switch, then revoking the old label.
+    """
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+                  if body.expires_in_days else None)
+    key = await _repo().create_cmed_key(label=body.label, created_by=body.created_by,
+                                        expires_at=expires_at)
+    await _repo().audit(event_type="cmed_key.created", actor_type="admin",
+                        actor_id=body.created_by, detail={"label": body.label})
+    return {"cmed_key": key, "label": body.label,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "note": "Shown once. Give it to CMED for its server configuration only."}
+
+
+@router.post("/admin/cmed-key/revoke")
+async def admin_cmed_key_revoke(body: CmedKeyRevokeRequest,
+                                _: None = Depends(require_admin)):
+    revoked = await _repo().revoke_cmed_keys(body.label)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="no active key with that label")
+    await _repo().audit(event_type="cmed_key.revoked", actor_type="admin",
+                        detail={"label": body.label, "keys": revoked})
+    return {"status": "revoked", "label": body.label, "keys": revoked}
 
 
 @router.get("/admin/alerts")

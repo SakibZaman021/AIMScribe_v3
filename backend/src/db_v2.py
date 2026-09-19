@@ -12,7 +12,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 
@@ -288,7 +288,7 @@ class V2Repository:
                        protocol_version, status, session_date, opened_at, closed_at,
                        segment_count, chain_head_hash, archive_relpath, archived_at,
                        quarantine_reason, sample_rate, channels, sample_width,
-                       object_prefix
+                       object_prefix, confirmation, grant_jti
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -605,6 +605,10 @@ class V2Repository:
                   AND s.quarantine_reason IS NULL
                   AND s.status <> 'quarantined'
                   AND s.protocol_version >= 2
+                  -- SRS 3.2 §5.6: only confirmed recordings enter the dataset;
+                  -- sessions from protocol-2 recorders are 'legacy' and archive
+                  -- as before.
+                  AND s.confirmation IN ('confirmed', 'legacy')
                   AND EXISTS (SELECT 1 FROM segments g
                                WHERE g.session_id = s.session_id
                                  AND g.state = 'committed')
@@ -731,6 +735,281 @@ class V2Repository:
                 return True
             except asyncpg.UniqueViolationError:
                 return False
+
+
+    # ============================================================
+    # v3 (SRS 3.2): clinic mapping, grants, confirmation, refusals and
+    # Channel B. Tables from scripts/010_v3_confirmation_channel_b.sql.
+    # ============================================================
+
+    async def hospital_for_cmed_id(self, cmed_hospital_id: str) -> Optional[str]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT hospital_id FROM hospitals WHERE cmed_hospital_id = $1",
+                cmed_hospital_id)
+
+    async def hospital_exists(self, hospital_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT 1 FROM hospitals WHERE hospital_id = $1", hospital_id))
+
+    async def set_cmed_hospital_id(self, hospital_id: str,
+                                   cmed_hospital_id: Optional[str]) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE hospitals SET cmed_hospital_id = $2 WHERE hospital_id = $1",
+                hospital_id, cmed_hospital_id or None)
+
+    async def create_authorisation(self, *, jti: str, device_id, hospital_id: str,
+                                   visit, expires_at: datetime) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO grant_authorisations
+                    (jti, device_id, hospital_id, cmed_hospital_id, patient_id,
+                     doctor_id, start_time, visit_date, expires_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            """, jti, device_id, hospital_id, visit.cmed_hospital_id, visit.patient_id,
+                 visit.doctor_id, visit.start_time, visit.day, expires_at)
+
+    async def get_authorisation(self, jti: str) -> Optional[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM grant_authorisations WHERE jti = $1", jti)
+        return dict(row) if row else None
+
+    async def link_authorisation(self, jti: str, session_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE grant_authorisations SET session_id = $2
+                 WHERE jti = $1 AND (session_id IS NULL OR session_id = $2)
+            """, jti, session_id)
+
+    _VISIT_MATCH = """patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
+                      AND start_time = $4 AND visit_date = $5 AND hospital_id = $6"""
+
+    async def find_unclaimed_notice(self, visit, *, hospital_id: str,
+                                    since: datetime) -> Optional[int]:
+        """The most recent unused API 2 for this visit and clinic (SRS-CNF-04, -05)."""
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(f"""
+                SELECT id FROM clinical_records
+                 WHERE kind = 'patient_information' AND claimed_by_jti IS NULL
+                   AND {self._VISIT_MATCH} AND received_at >= $7
+                 ORDER BY received_at DESC, id DESC LIMIT 1
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day, hospital_id, since)
+
+    async def find_waiting_authorisation(self, visit, *, hospital_id: str,
+                                         since: datetime) -> Optional[Dict[str, Any]]:
+        """The most recent grant for this visit that no API 2 has confirmed yet."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(f"""
+                SELECT jti, session_id FROM grant_authorisations
+                 WHERE notice_id IS NULL AND {self._VISIT_MATCH} AND issued_at >= $7
+                 ORDER BY issued_at DESC LIMIT 1
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day, hospital_id, since)
+        return dict(row) if row else None
+
+    async def claim_notice(self, notice_id: int, jti: str) -> bool:
+        """One API 2 confirms one grant, once (SRS-CNF-04). All or nothing."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                grant = await conn.fetchval("""
+                    SELECT jti FROM grant_authorisations
+                     WHERE jti = $1 AND notice_id IS NULL FOR UPDATE
+                """, jti)
+                if grant is None:
+                    return False
+                claimed = await conn.fetchval("""
+                    UPDATE clinical_records SET claimed_by_jti = $2
+                     WHERE id = $1 AND claimed_by_jti IS NULL RETURNING id
+                """, notice_id, jti)
+                if claimed is None:
+                    return False
+                await conn.execute(
+                    "UPDATE grant_authorisations SET notice_id = $1 WHERE jti = $2",
+                    notice_id, jti)
+        return True
+
+    async def set_session_confirmation(self, session_id: str, state: str, *,
+                                       grant_jti: Optional[str] = None) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions
+                   SET confirmation = $2,
+                       grant_jti = COALESCE($3, grant_jti),
+                       unconfirmed_at = CASE WHEN $2 = 'unconfirmed'
+                                             THEN COALESCE(unconfirmed_at, now())
+                                             ELSE unconfirmed_at END,
+                       updated_at = now()
+                 WHERE session_id = $1
+            """, session_id, state, grant_jti)
+
+    async def session_confirmation(self, session_id: str) -> Optional[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT session_id, confirmation, opened_at, grant_jti, unconfirmed_at,
+                       refused_at, device_id, doctor_id, hospital_id, session_date
+                  FROM sessions WHERE session_id = $1
+            """, session_id)
+        return dict(row) if row else None
+
+    async def sessions_in_confirmation(self, states: List[str], *,
+                                       opened_before: datetime) -> List[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT session_id, confirmation, opened_at, device_id
+                  FROM sessions
+                 WHERE confirmation = ANY($1::text[]) AND opened_at < $2
+                 ORDER BY opened_at LIMIT 500
+            """, list(states), opened_before)
+        return [dict(r) for r in rows]
+
+    async def record_refusal(self, *, session_id: str, device_id, hospital_id: str,
+                             doctor_id: Optional[str],
+                             visit_sha256: Optional[bytes]) -> bool:
+        """True the first time a session is refused; a retry changes nothing."""
+        async with self._pool.acquire() as conn:
+            inserted = await conn.fetchval("""
+                INSERT INTO session_refusals
+                    (session_id, device_id, hospital_id, doctor_id, visit_sha256)
+                VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT (session_id) DO NOTHING RETURNING session_id
+            """, session_id, device_id, hospital_id, doctor_id, visit_sha256)
+        return inserted is not None
+
+    async def refusal(self, session_id: str) -> Optional[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM session_refusals WHERE session_id = $1", session_id)
+        return dict(row) if row else None
+
+    async def complete_refusal(self, session_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE session_refusals SET completed_at = COALESCE(completed_at, now())
+                 WHERE session_id = $1
+            """, session_id)
+
+    async def refused_visit(self, visit_sha256: bytes) -> bool:
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT 1 FROM session_refusals WHERE visit_sha256 = $1", visit_sha256))
+
+    async def erase_session(self, session_id: str, *, state: str) -> None:
+        """
+        Remove a consultation's content and keep only its bare row, without the
+        patient, so the audit log still resolves (SRS-CNS-06, SRS-CNF-09).
+        The caller has already removed the objects from storage.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM purge_receipts WHERE session_id = $1",
+                                   session_id)
+                await conn.execute("DELETE FROM segments WHERE session_id = $1", session_id)
+                await conn.execute("DELETE FROM chain_entries WHERE session_id = $1",
+                                   session_id)
+                await conn.execute("""
+                    UPDATE grant_authorisations SET patient_id = 'REDACTED'
+                     WHERE session_id = $1
+                """, session_id)
+                await conn.execute("""
+                    UPDATE sessions
+                       SET patient_id = 'REDACTED', object_prefix = NULL, manifest = NULL,
+                           status = $2, confirmation = $2,
+                           refused_at = CASE WHEN $2 = 'refused' THEN now()
+                                             ELSE refused_at END,
+                           updated_at = now()
+                     WHERE session_id = $1
+                """, session_id, state)
+            # The old transcription tables may hold text of this consultation.
+            # Not every database has all of them, so each is best effort.
+            for table in ("ner_results", "transcripts", "clips"):
+                try:
+                    await conn.execute(f"DELETE FROM {table} WHERE session_id = $1",
+                                       session_id)
+                except Exception as exc:
+                    logger.warning("Could not clear %s for %s: %s", table, session_id, exc)
+
+    async def delete_clinical_for(self, visit) -> int:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM clinical_records
+                 WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
+                   AND start_time = $4 AND visit_date = $5
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day)
+        return int(result.split()[-1]) if result else 0
+
+    # ---- Channel B ----
+
+    async def cmed_key_valid(self, key_sha256: bytes) -> Optional[str]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("""
+                UPDATE api_keys SET last_used_at = now()
+                 WHERE key_sha256 = $1 AND scope = 'cmed' AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > now())
+                RETURNING label
+            """, key_sha256)
+
+    async def create_cmed_key(self, *, label: str, created_by: str,
+                              expires_at: Optional[datetime]) -> str:
+        """Returned once. Only the hash is stored (SRS-CHB-02)."""
+        key = "cmed_" + new_token()
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO api_keys (key_sha256, label, scope, created_by, expires_at)
+                VALUES ($1, $2, 'cmed', $3, $4)
+            """, hash_token(key), label, created_by, expires_at)
+        return key
+
+    async def revoke_cmed_keys(self, label: str) -> int:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE api_keys SET revoked_at = now()
+                 WHERE scope = 'cmed' AND label = $1 AND revoked_at IS NULL
+            """, label)
+        return int(result.split()[-1]) if result else 0
+
+    async def next_prescription_version(self, visit) -> int:
+        async with self._pool.acquire() as conn:
+            return int(await conn.fetchval("""
+                SELECT COALESCE(MAX(version), 0) + 1 FROM clinical_records
+                 WHERE kind = 'prescription' AND patient_id = $1 AND doctor_id = $2
+                   AND cmed_hospital_id = $3 AND start_time = $4 AND visit_date = $5
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day))
+
+    async def store_clinical_record(self, *, kind: str, visit, hospital_id: Optional[str],
+                                    body: Dict[str, Any], body_sha256: bytes,
+                                    version: int) -> Tuple[int, bool]:
+        """(record id, already there). The same body twice is one row (SRS-CHB-07)."""
+        async with self._pool.acquire() as conn:
+            new_id = await conn.fetchval("""
+                INSERT INTO clinical_records
+                    (kind, cmed_hospital_id, hospital_id, patient_id, doctor_id,
+                     start_time, visit_date, version, body, body_sha256)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT ON CONSTRAINT clinical_once DO NOTHING
+                RETURNING id
+            """, kind, visit.cmed_hospital_id, hospital_id, visit.patient_id,
+                 visit.doctor_id, visit.start_time, visit.day, version,
+                 json.dumps(body, ensure_ascii=False), body_sha256)
+            if new_id is not None:
+                return int(new_id), False
+            existing = await conn.fetchval(
+                "SELECT id FROM clinical_records WHERE kind = $1 AND body_sha256 = $2",
+                kind, body_sha256)
+        return int(existing), True
+
+    async def quarantine_clinical(self, *, kind: str, raw: str,
+                                  problems: List[Dict[str, str]]) -> int:
+        async with self._pool.acquire() as conn:
+            return int(await conn.fetchval("""
+                INSERT INTO clinical_quarantine (kind, raw, problems)
+                VALUES ($1, $2, $3) RETURNING id
+            """, kind, raw, json.dumps(problems, ensure_ascii=False)))
 
 
 __all__ = ["V2Repository", "hash_token", "new_token"]

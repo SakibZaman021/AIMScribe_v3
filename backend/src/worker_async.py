@@ -21,7 +21,7 @@ from database.postgres_async import AsyncPostgreSQLDatabase
 from config import settings
 from processing.transcriber_v4 import TranscriberV4
 from processing.ner_extractor import NERExtractor
-from webhooks.cmed_webhook import send_ner_webhook
+from webhooks.cmed_webhook import cmed_webhook_enabled, send_ner_webhook
 
 # Configure Logging
 logging.basicConfig(
@@ -366,7 +366,9 @@ class AsyncAIMScribeWorker:
 
             # Send webhook to CMED if configured
             webhook_url = session.get('ner_webhook_url')
-            if webhook_url:
+            if webhook_url and not cmed_webhook_enabled():
+                logger.info("CMED webhook switched off (decision D2); not sending")
+            if webhook_url and cmed_webhook_enabled():
                 clip_count = await self.db.get_clip_count(session_id)
                 logger.info(f"Sending NER webhook to CMED: {webhook_url}")
 
