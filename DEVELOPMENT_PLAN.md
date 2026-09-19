@@ -55,7 +55,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 | **2. Server, authorisation and Channel B** — *done* | `POST /grant/mint` with register checks and D1; `clinical/patient-information` and `clinical/prescription` with `X-CMED-Key`; confirmation notices and matching; receipts on custody; refusal endpoint; webhook off (D2) | `AT-04`, `AT-57`–`AT-63`, `AT-68`–`AT-70`, `AT-78` |
 | **3. Recorder talks to the new server** — *done* | Grant requested from the server alongside capture; "confirming" state; unconfirmed handling; refusal deletes local pieces; alert when a piece waits over 15 minutes; final delivery and clean-up at start-up and shutdown | `AT-01`, `AT-03`, `AT-07`, `AT-08`, `AT-20`, `AT-58`, `AT-59`, `AT-77` |
 | **4. On-screen control** — *done* | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
-| **5. Two databases** | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
+| **5. Two databases** — *done* | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
 | **6. Archive and cloud copy** | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
 | **7. UIU hosting** | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
 | **8. Tools for CMED and operators** | Test page; test Channel B environment; dummy CMED app on the new protocol; dashboard | `AT-27`, `AT-71`, `AT-72`; §8.9 |
@@ -105,3 +105,23 @@ until the clinical team agrees them (**OD-07**); they are one table in
 `ui/overlay_model.py`. Level prompts for a quiet patient or clipping (`SRS-LVL-03`,
 `-05`) need the per-piece level figures (`SRS-LVL-01`), which the recorder does not
 compute yet.
+
+| 19 Sep 2026 | 5 | CMED's clinical data moves to its own database, `aims_clinical` (`backend/scripts/clinical/`), reached through `AIMS_CLINICAL_DATABASE_URL`. The recordings database keeps only a five-field `confirmation_notices` row per API 2 - never a name or a body (SRS-DBA-20); this corrects Phase 2, which kept the bodies beside the recordings (`010` edited in place, as it was never deployed). Every message is first stored as received (`intake_records`, once per body) and then loaded into rows: patients, encounters (live and previous visit), demographics, paramedic observations, female and male details, prescriptions with one row per medicine, diagnoses and investigations; views give the current and previous prescription. A load that fails keeps the message and is retried by the sweep. Clinical reads are logged in an append-only table. Closing a session names its recording `PatientID_DoctorID_HospitalID_HHMMSS_HHMMSS_YYYYMMDD` (`011`), unique, and links the visit's encounter to it. A refusal erases the visit in both databases. The SQL is now tested on a real PostgreSQL 16, which found a parameter-type bug in `set_session_confirmation` and `erase_session` that would have failed every session open; fixed. | 152 server tests, 20 PostgreSQL tests, 226 recorder tests pass |
+
+### Putting Phase 5 on the current server
+
+1. Create a second Neon database, `aims_clinical`, and apply `backend/scripts/clinical/001_aims_clinical.sql`, then `002_roles.sql` (roles only; set their passwords in Neon, never in the repo).
+2. Set `AIMS_CLINICAL_DATABASE_URL` on Render to the writer role's connection string. Without it the server falls back to the main database and logs a critical warning on every start.
+3. Apply `backend/scripts/011_v3_file_names.sql` to the recordings database (needs `pg_trgm`, which Neon has). `010` is applied as it now stands; if the Phase 2 version was ever applied somewhere, drop its `clinical_records` and `clinical_quarantine` tables after checking they are empty.
+
+**Testing the SQL.** `backend/tests/test_db_integration.py` builds both databases on a
+portable PostgreSQL and runs against them; it is skipped unless the `pgserver`
+package is installed (on this PC: `C:\Users\USER\AppData\Local\aimspg`, a short path
+because the package breaks under long ones). The v1 scripts do not replay from an
+empty database, so the test starts from the v1 tables as they stand after migration
+001. The portable build has no `pgcrypto` or `pg_trgm`; the test leaves those lines
+out, and only there.
+
+**Still open for the databases.** Female and male details are kept whole in a
+`details` column until the clinical team agrees their fields (**OD-15**); paramedic
+readings outside the agreed columns are kept in `other` (**OD-16**).

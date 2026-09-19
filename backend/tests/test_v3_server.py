@@ -56,8 +56,8 @@ ULIDS = iter(f"01JB8XQ4M7YZ2K9V3N5P6R8T{a}{b}"
 class FakeRepo:
     def __init__(self):
         self.hospitals = {"HOSP001": None, "HOSP003": CMED_ID}   # code -> CMED id
-        self.doctors, self.auths, self.records = set(), {}, []
-        self.quarantine, self.sessions, self.refusals = [], {}, {}
+        self.doctors, self.auths, self.notices = set(), {}, []
+        self.sessions, self.refusals = {}, {}
         self.receipts, self.segments = [], {}
         self.alerts, self.audits, self.keys = [], [], {}
 
@@ -97,8 +97,8 @@ class FakeRepo:
             visit.start_time, visit.day, hospital_id)
 
     async def find_unclaimed_notice(self, visit, *, hospital_id, since):
-        found = [r for r in self.records
-                 if r["kind"] == "patient_information" and r["claimed_by_jti"] is None
+        found = [r for r in self.notices
+                 if r["claimed_by_jti"] is None
                  and self._match(r, visit, hospital_id) and r["received_at"] >= since]
         return max(found, key=lambda r: (r["received_at"], r["id"]))["id"] if found else None
 
@@ -112,7 +112,7 @@ class FakeRepo:
 
     async def claim_notice(self, notice_id, jti):
         grant = self.auths.get(jti)
-        record = next(r for r in self.records if r["id"] == notice_id)
+        record = next(r for r in self.notices if r["id"] == notice_id)
         if grant is None or grant["notice_id"] is not None or record["claimed_by_jti"]:
             return False
         record["claimed_by_jti"], grant["notice_id"] = jti, notice_id
@@ -171,42 +171,30 @@ class FakeRepo:
             if grant["session_id"] == session_id:
                 grant["patient_id"] = "REDACTED"
 
-    async def delete_clinical_for(self, visit):
-        keep = [r for r in self.records
-                if (r["patient_id"], r["doctor_id"], r["cmed_hospital_id"],
-                    r["start_time"], r["visit_date"]) != (
-                    visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
-                    visit.start_time, visit.day)]
-        removed = len(self.records) - len(keep)
-        self.records = keep
-        return removed
+    async def delete_notices_for(self, visit):
+        before = len(self.notices)
+        self.notices = [n for n in self.notices
+                        if (n["patient_id"], n["start_time"]) != (visit.patient_id,
+                                                                  visit.start_time)]
+        return before - len(self.notices)
 
     # Channel B
     async def cmed_key_valid(self, digest):
         key = self.keys.get(digest)
         return key["label"] if key and not key["revoked"] else None
 
-    async def next_prescription_version(self, visit):
-        return 1 + sum(1 for r in self.records if r["kind"] == "prescription"
-                       and (r["patient_id"], r["start_time"]) == (visit.patient_id,
-                                                                  visit.start_time))
+    async def record_notice(self, visit, *, hospital_id, clinical_record_id):
+        nid = len(self.notices) + 1
+        self.notices.append(dict(
+            id=nid, cmed_hospital_id=visit.cmed_hospital_id, hospital_id=hospital_id,
+            patient_id=visit.patient_id, doctor_id=visit.doctor_id,
+            start_time=visit.start_time, visit_date=visit.day,
+            clinical_record_id=clinical_record_id, claimed_by_jti=None, received_at=NOW()))
+        return nid
 
-    async def store_clinical_record(self, *, kind, visit, hospital_id, body,
-                                    body_sha256, version):
-        for r in self.records:
-            if (r["kind"], r["body_sha256"]) == (kind, body_sha256):
-                return r["id"], True
-        rid = len(self.records) + 1000
-        self.records.append(dict(
-            id=rid, kind=kind, cmed_hospital_id=visit.cmed_hospital_id,
-            hospital_id=hospital_id, patient_id=visit.patient_id, doctor_id=visit.doctor_id,
-            start_time=visit.start_time, visit_date=visit.day, version=version, body=body,
-            body_sha256=body_sha256, claimed_by_jti=None, received_at=NOW()))
-        return rid, False
-
-    async def quarantine_clinical(self, *, kind, raw, problems):
-        self.quarantine.append({"kind": kind, "raw": raw, "problems": problems})
-        return len(self.quarantine)
+    async def set_file_names(self, session_id, *, file_stem, local_start, local_end):
+        self.sessions[session_id]["file_stem"] = file_stem
+        return file_stem
 
     # audit and alerts
     async def raise_alert(self, **kw):
@@ -214,6 +202,52 @@ class FakeRepo:
 
     async def audit(self, **kw):
         self.audits.append(kw)
+
+
+class FakeClinical:
+    """aims_clinical, as the Channel B code sees it."""
+
+    def __init__(self):
+        self.records, self.quarantined, self.loaded, self.linked = [], [], [], []
+
+    async def receive(self, *, kind, visit, hospital_id, body, body_sha256):
+        for r in self.records:
+            if (r["kind"], r["body_sha256"]) == (kind, body_sha256):
+                return r["id"], True, r["version"]
+        version = 1
+        if kind == "prescription":
+            version += sum(1 for r in self.records if r["kind"] == "prescription"
+                           and (r["patient_id"], r["start_time"]) == (visit.patient_id,
+                                                                      visit.start_time))
+        rid = len(self.records) + 5000
+        self.records.append(dict(
+            id=rid, kind=kind, cmed_hospital_id=visit.cmed_hospital_id,
+            hospital_id=hospital_id, patient_id=visit.patient_id, doctor_id=visit.doctor_id,
+            start_time=visit.start_time, visit_date=visit.day, version=version, body=body,
+            body_sha256=body_sha256))
+        return rid, False, version
+
+    async def quarantine(self, *, kind, raw, problems):
+        self.quarantined.append({"kind": kind, "raw": raw, "problems": problems})
+        return len(self.quarantined)
+
+    async def load(self, record_id):
+        self.loaded.append(record_id)
+        return True
+
+    async def load_pending(self, limit=50):
+        return 0
+
+    async def erase_visit(self, visit):
+        before = len(self.records)
+        self.records = [r for r in self.records
+                        if (r["patient_id"], r["start_time"]) != (visit.patient_id,
+                                                                  visit.start_time)]
+        return before - len(self.records)
+
+    async def link_session(self, visit, **kw):
+        self.linked.append(kw)
+        return True
 
 
 class FakeBucket:
@@ -232,10 +266,12 @@ def server():
     api_v2.ctx.minio = FakeBucket()
     api_v2.ctx.grants = GrantIssuer(grant_key)
     api_v2.ctx.signer = ReceiptSigner(receipt_key)
-    yield SimpleNamespace(repo=repo, bucket=api_v2.ctx.minio,
+    api_v2.ctx.clinical = FakeClinical()
+    yield SimpleNamespace(repo=repo, bucket=api_v2.ctx.minio, clinical=api_v2.ctx.clinical,
                           grant_public=grant_key.public_key(),
                           receipt_public=receipt_key.public_key())
     api_v2.ctx.repo = api_v2.ctx.minio = api_v2.ctx.grants = api_v2.ctx.signer = None
+    api_v2.ctx.clinical = None
 
 
 # ============================================================
@@ -328,13 +364,15 @@ async def test_api2_first_then_grant_is_confirmed(server):
     assert (status, stored["code"]) == (202, "ACCEPTED")
     status, reply = await mint()
     assert reply["confirmation"] == "confirmed"
-    assert server.repo.records[0]["claimed_by_jti"] == reply["jti"]
+    assert server.repo.notices[0]["claimed_by_jti"] == reply["jti"]
+    # The recordings side keeps the five fields only - never the body.
+    assert "body" not in server.repo.notices[0]
 
 
 async def test_api2_older_than_five_minutes_confirms_nothing(server):
     """SRS-CNF-03."""
     await send("patient_information", api2())
-    server.repo.records[0]["received_at"] -= timedelta(minutes=6)
+    server.repo.notices[0]["received_at"] -= timedelta(minutes=6)
     assert (await mint())[1]["confirmation"] == "pending"
 
 
@@ -350,8 +388,10 @@ async def test_the_most_recent_api2_is_used(server):
     await send("patient_information", api2(paramedic={"notes": "first"}))
     await send("patient_information", api2(paramedic={"notes": "second"}))
     _, reply = await mint()
-    claimed = [r for r in server.repo.records if r["claimed_by_jti"] == reply["jti"]]
-    assert claimed[0]["body"]["paramedic"]["notes"] == "second"
+    notice = next(n for n in server.repo.notices if n["claimed_by_jti"] == reply["jti"])
+    body = next(r["body"] for r in server.clinical.records
+                if r["id"] == notice["clinical_record_id"])
+    assert body["paramedic"]["notes"] == "second"
 
 
 async def test_start_time_must_match_character_for_character(server):
@@ -375,7 +415,7 @@ async def test_api2_for_another_clinic_is_never_claimed(server):
     other = {**FIELDS, "hospital_id": "CMED-MIRPUR-01"}
     await send("patient_information", api2(**other))
     assert (await mint(other))[1]["code"] == "CLINIC_MISMATCH"
-    assert server.repo.records[0]["claimed_by_jti"] is None
+    assert server.repo.notices[0]["claimed_by_jti"] is None
 
 
 async def test_unmapped_clinic_works_only_when_it_is_our_own_code(server):
@@ -494,7 +534,8 @@ async def test_refusal_erases_the_consultation(server):
     result = await api_v2.refuse_session(api_v2.RefuseRequest(session_id=sid), device=DEVICE)
     assert (result["status"], result["objects_deleted"]) == ("refused", 4)
     assert server.repo.sessions[sid]["patient_id"] == "REDACTED"
-    assert server.repo.records == []                      # API 2 and prescription gone
+    assert server.clinical.records == []                      # API 2 and prescription gone
+    assert server.repo.notices == []
     audit = [a for a in server.repo.audits if a["event_type"] == "session.refused"][0]
     assert "P0012345" not in json.dumps(audit, default=str)   # SRS-CNS-06
 
@@ -513,7 +554,7 @@ async def test_clinical_data_after_a_refusal_is_dropped(server):
     for kind, body in (("patient_information", api2()), ("prescription", prescription())):
         status, stored = await send(kind, body)
         assert (status, stored["code"], stored["record_id"]) == (202, "ACCEPTED", None)
-    assert server.repo.records == []
+    assert server.clinical.records == []
 
 
 async def test_offline_refusal_of_an_unknown_session_is_remembered(server):
@@ -539,7 +580,7 @@ async def test_missing_or_wrong_key_stores_nothing(server, key):
     """AT-68."""
     status, reply = await send("patient_information", api2(), key=key)
     assert (status, reply["code"]) == (401, "INVALID_KEY")
-    assert server.repo.records == []
+    assert server.clinical.records == []
 
 
 async def test_revoked_key_is_refused(server):
@@ -575,8 +616,8 @@ async def test_schema_problems_are_quarantined(server):
     status, reply = await send("patient_information", body)
     assert (status, reply["code"]) == (422, "SCHEMA_INVALID")
     assert {p["field"] for p in reply["fields"]} == {"demographics", "previous_visit"}
-    assert json.loads(server.repo.quarantine[0]["raw"]) == body
-    assert server.repo.records == []
+    assert json.loads(server.clinical.quarantined[0]["raw"]) == body
+    assert server.clinical.records == []
     assert server.repo.alerts[-1]["alert_type"] == "clinical_schema_invalid"
 
     status, reply = await send("prescription", prescription(items="Paracetamol 500mg"))
@@ -589,7 +630,7 @@ async def test_the_same_request_twice_is_one_record(server):
     second = await send("patient_information", api2())
     assert (second[0], second[1]["code"]) == (200, "ALREADY_RECEIVED")
     assert second[1]["record_id"] == first[1]["record_id"]
-    assert len(server.repo.records) == 1
+    assert len(server.clinical.records) == 1
 
 
 async def test_a_changed_prescription_is_a_new_version(server):
@@ -610,14 +651,14 @@ async def test_unknown_fields_are_stored_not_rejected(server):
     """SRS-CHB-11."""
     status, _ = await send("patient_information", api2(blood_group="O+", ward="OPD-2"))
     assert status == 202
-    assert server.repo.records[0]["body"]["blood_group"] == "O+"
+    assert server.clinical.records[0]["body"]["blood_group"] == "O+"
 
 
 async def test_unmapped_clinic_is_stored_but_confirms_nothing(server):
     other = {**FIELDS, "hospital_id": "CMED-NEW-SITE"}
     status, _ = await send("patient_information", api2(**other))
     assert status == 202
-    assert server.repo.records[0]["hospital_id"] is None
+    assert server.clinical.records[0]["hospital_id"] is None
     assert server.repo.alerts[-1]["alert_type"] == "unmapped_clinic"
 
 

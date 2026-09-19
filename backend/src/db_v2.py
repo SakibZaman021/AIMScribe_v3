@@ -288,7 +288,7 @@ class V2Repository:
                        protocol_version, status, session_date, opened_at, closed_at,
                        segment_count, chain_head_hash, archive_relpath, archived_at,
                        quarantine_reason, sample_rate, channels, sample_width,
-                       object_prefix, confirmation, grant_jti
+                       object_prefix, confirmation, grant_jti, file_stem
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -792,8 +792,8 @@ class V2Repository:
         """The most recent unused API 2 for this visit and clinic (SRS-CNF-04, -05)."""
         async with self._pool.acquire() as conn:
             return await conn.fetchval(f"""
-                SELECT id FROM clinical_records
-                 WHERE kind = 'patient_information' AND claimed_by_jti IS NULL
+                SELECT id FROM confirmation_notices
+                 WHERE claimed_by_jti IS NULL
                    AND {self._VISIT_MATCH} AND received_at >= $7
                  ORDER BY received_at DESC, id DESC LIMIT 1
             """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
@@ -822,7 +822,7 @@ class V2Repository:
                 if grant is None:
                     return False
                 claimed = await conn.fetchval("""
-                    UPDATE clinical_records SET claimed_by_jti = $2
+                    UPDATE confirmation_notices SET claimed_by_jti = $2
                      WHERE id = $1 AND claimed_by_jti IS NULL RETURNING id
                 """, notice_id, jti)
                 if claimed is None:
@@ -837,9 +837,9 @@ class V2Repository:
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 UPDATE sessions
-                   SET confirmation = $2,
+                   SET confirmation = $2::text,
                        grant_jti = COALESCE($3, grant_jti),
-                       unconfirmed_at = CASE WHEN $2 = 'unconfirmed'
+                       unconfirmed_at = CASE WHEN $2::text = 'unconfirmed'
                                              THEN COALESCE(unconfirmed_at, now())
                                              ELSE unconfirmed_at END,
                        updated_at = now()
@@ -917,8 +917,8 @@ class V2Repository:
                 await conn.execute("""
                     UPDATE sessions
                        SET patient_id = 'REDACTED', object_prefix = NULL, manifest = NULL,
-                           status = $2, confirmation = $2,
-                           refused_at = CASE WHEN $2 = 'refused' THEN now()
+                           status = $2::text, confirmation = $2::text,
+                           refused_at = CASE WHEN $2::text = 'refused' THEN now()
                                              ELSE refused_at END,
                            updated_at = now()
                      WHERE session_id = $1
@@ -932,10 +932,11 @@ class V2Repository:
                 except Exception as exc:
                     logger.warning("Could not clear %s for %s: %s", table, session_id, exc)
 
-    async def delete_clinical_for(self, visit) -> int:
+    async def delete_notices_for(self, visit) -> int:
+        """A refused visit's API 2 notices go too (SRS-CNS-04)."""
         async with self._pool.acquire() as conn:
             result = await conn.execute("""
-                DELETE FROM clinical_records
+                DELETE FROM confirmation_notices
                  WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
                    AND start_time = $4 AND visit_date = $5
             """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
@@ -972,44 +973,40 @@ class V2Repository:
             """, label)
         return int(result.split()[-1]) if result else 0
 
-    async def next_prescription_version(self, visit) -> int:
+    async def record_notice(self, visit, *, hospital_id: str,
+                            clinical_record_id: int) -> int:
+        """
+        API 2's five fields, kept for matching (SRS-CNF-03). The body is not
+        here: it is in aims_clinical, which this database never reads.
+        """
         async with self._pool.acquire() as conn:
             return int(await conn.fetchval("""
-                SELECT COALESCE(MAX(version), 0) + 1 FROM clinical_records
-                 WHERE kind = 'prescription' AND patient_id = $1 AND doctor_id = $2
-                   AND cmed_hospital_id = $3 AND start_time = $4 AND visit_date = $5
-            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
-                 visit.start_time, visit.day))
+                INSERT INTO confirmation_notices
+                    (cmed_hospital_id, hospital_id, patient_id, doctor_id, start_time,
+                     visit_date, clinical_record_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
+            """, visit.cmed_hospital_id, hospital_id, visit.patient_id, visit.doctor_id,
+                 visit.start_time, visit.day, clinical_record_id))
 
-    async def store_clinical_record(self, *, kind: str, visit, hospital_id: Optional[str],
-                                    body: Dict[str, Any], body_sha256: bytes,
-                                    version: int) -> Tuple[int, bool]:
-        """(record id, already there). The same body twice is one row (SRS-CHB-07)."""
-        async with self._pool.acquire() as conn:
-            new_id = await conn.fetchval("""
-                INSERT INTO clinical_records
-                    (kind, cmed_hospital_id, hospital_id, patient_id, doctor_id,
-                     start_time, visit_date, version, body, body_sha256)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                ON CONFLICT ON CONSTRAINT clinical_once DO NOTHING
-                RETURNING id
-            """, kind, visit.cmed_hospital_id, hospital_id, visit.patient_id,
-                 visit.doctor_id, visit.start_time, visit.day, version,
-                 json.dumps(body, ensure_ascii=False), body_sha256)
-            if new_id is not None:
-                return int(new_id), False
-            existing = await conn.fetchval(
-                "SELECT id FROM clinical_records WHERE kind = $1 AND body_sha256 = $2",
-                kind, body_sha256)
-        return int(existing), True
-
-    async def quarantine_clinical(self, *, kind: str, raw: str,
-                                  problems: List[Dict[str, str]]) -> int:
-        async with self._pool.acquire() as conn:
-            return int(await conn.fetchval("""
-                INSERT INTO clinical_quarantine (kind, raw, problems)
-                VALUES ($1, $2, $3) RETURNING id
-            """, kind, raw, json.dumps(problems, ensure_ascii=False)))
+    async def set_file_names(self, session_id: str, *, file_stem: str, local_start,
+                             local_end) -> Optional[str]:
+        """
+        The recording's name and its times, as columns (SRS-DBA-25). Names are
+        unique; two sessions closing in the same second would share one, so the
+        second gets the session's tail rather than overwriting the first.
+        """
+        for candidate in (file_stem, f"{file_stem}_{session_id[-5:]}"):
+            try:
+                async with self._pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE sessions SET file_stem = $2, local_start = $3, local_end = $4
+                         WHERE session_id = $1
+                    """, session_id, candidate, local_start, local_end)
+                return candidate
+            except asyncpg.UniqueViolationError:
+                continue
+        logger.error("No unique file name for %s", session_id)
+        return None
 
 
 __all__ = ["V2Repository", "hash_token", "new_token"]

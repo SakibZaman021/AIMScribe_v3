@@ -8,6 +8,10 @@ Two endpoints, both authenticated with the key AIMS LAB issues to CMED:
 
 Every reply carries `status` and `code` (§6.2.4). The body is stored before the
 reply is sent, so a `202 ACCEPTED` means the record is safe here.
+
+Bodies go to the clinical database, aims_clinical (clinical_store.py). Only the
+five fields of an API 2 are kept on the recordings side, for matching, so a
+role that can search recordings never sees a patient's name (SRS-DBA-20).
 """
 from __future__ import annotations
 
@@ -179,9 +183,11 @@ async def receive(request: Request, kind: str) -> JSONResponse:
 
     repo = api_v2._repo()
 
+    store = api_v2._clinical()
+
     problems = problems_with(kind, body)
     if problems:
-        qid = await repo.quarantine_clinical(kind=kind, raw=raw, problems=problems)
+        qid = await store.quarantine(kind=kind, raw=raw, problems=problems)
         await repo.raise_alert(alert_type="clinical_schema_invalid", severity="warning",
                                detail={"kind": kind, "quarantine_id": qid,
                                        "fields": [p["field"] for p in problems]})
@@ -204,15 +210,19 @@ async def receive(request: Request, kind: str) -> JSONResponse:
                                        "kind": kind})
 
     digest = integrity.sha256_bytes(integrity.canonical_json(body))
-    version = await repo.next_prescription_version(visit) if kind == "prescription" else 1
-    record_id, duplicate = await repo.store_clinical_record(
-        kind=kind, visit=visit, hospital_id=hospital_id, body=body,
-        body_sha256=digest, version=version)
+    record_id, duplicate, version = await store.receive(
+        kind=kind, visit=visit, hospital_id=hospital_id, body=body, body_sha256=digest)
     if duplicate:
         return _reply(200, "ALREADY_RECEIVED", record_id=str(record_id))
 
+    # Into the tables now. A load that fails keeps the body and is tried again
+    # by the sweep; it never fails the request (SRS-CRI-04).
+    await store.load(record_id)
+
     if kind == "patient_information" and hospital_id is not None:
-        await confirm_waiting(visit, hospital_id, record_id)
+        notice_id = await repo.record_notice(visit, hospital_id=hospital_id,
+                                             clinical_record_id=record_id)
+        await confirm_waiting(visit, hospital_id, notice_id)
 
     logger.info("Stored %s %s from %s", kind, record_id, label)
     extra = {"version": version} if kind == "prescription" else {}

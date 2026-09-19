@@ -23,6 +23,7 @@ import api_v2
 from api_v2 import router as v2_router
 from clinical import router as clinical_router
 from grants import GrantIssuer
+from clinical_store import ClinicalStore
 from db_v2 import V2Repository
 from integrity import ReceiptSigner
 
@@ -158,6 +159,22 @@ class AsyncAppContext:
         # recorders refuse to record, which is the safe direction.
         api_v2.ctx.grants = GrantIssuer.from_env()
 
+        # SRS 3.2 §8.7: patient information lives in its own database, with its
+        # own credentials, so a role that can search recordings cannot read it.
+        clinical_url = os.getenv("AIMS_CLINICAL_DATABASE_URL", "").strip()
+        self.clinical_pool = None
+        if clinical_url:
+            import asyncpg
+            self.clinical_pool = await asyncpg.create_pool(
+                clinical_url, min_size=1, max_size=5, command_timeout=30)
+            api_v2.ctx.clinical = ClinicalStore(self.clinical_pool, separate=True)
+        else:
+            logger.critical(
+                "AIMS_CLINICAL_DATABASE_URL is not set - CMED's clinical records are "
+                "being kept in the recordings database. Set it before real patient "
+                "data arrives (SRS-DBA-20).")
+            api_v2.ctx.clinical = ClinicalStore(self.db.pool, separate=False)
+
         if api_v2.ctx.signer is None:
             logger.critical(
                 "AIMS_RECEIPT_PRIVATE_KEY is not set. Audio will be received and "
@@ -169,6 +186,8 @@ class AsyncAppContext:
 
     async def close(self):
         """Close all connections."""
+        if getattr(self, "clinical_pool", None) is not None:
+            await self.clinical_pool.close()
         if self.db:
             await self.db.close()
         if self.redis:

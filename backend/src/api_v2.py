@@ -67,6 +67,8 @@ class V2Context:
         self.legacy_db = None
         self.signer: Optional[ReceiptSigner] = None
         self.grants: Optional[GrantIssuer] = None
+        # aims_clinical (SRS 3.2 §8.7.2): CMED's clinical records.
+        self.clinical = None
 
     @property
     def ready(self) -> bool:
@@ -80,6 +82,12 @@ def _repo() -> V2Repository:
     if not ctx.ready:
         raise HTTPException(status_code=503, detail="v2 layer is not initialised")
     return ctx.repo
+
+
+def _clinical():
+    if ctx.clinical is None:
+        raise HTTPException(status_code=503, detail="clinical database is not initialised")
+    return ctx.clinical
 
 
 # ============================================================
@@ -850,6 +858,9 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
         close_reason=body.close_reason,
     )
 
+    # The shared file name, and the clinical visit it belongs to.
+    await _record_file_name(session_id)
+
     # A consultation normally ends because the doctor pressed Stop in CMED.
     # Anything else - stopped from the tray icon, superseded by the next patient,
     # recovered after the PC died mid-consultation - is worth someone's attention
@@ -1242,18 +1253,63 @@ async def _erase_session(session_id: str, *, state: str):
     if row and row.get("grant_jti"):
         grant = await repo.get_authorisation(row["grant_jti"])
         if grant and grant["patient_id"] != "REDACTED":
-            visit_date = grant["visit_date"]
-            visit = conf.Visit(
-                patient_id=grant["patient_id"], doctor_id=grant["doctor_id"],
-                cmed_hospital_id=grant["cmed_hospital_id"], start_time=grant["start_time"],
-                visit_date=visit_date.isoformat() if hasattr(visit_date, "isoformat")
-                else str(visit_date))
+            visit = _visit_from_grant(grant)
 
     removed = await _delete_bucket_objects(session_id)
     if visit is not None:
-        await repo.delete_clinical_for(visit)
+        await repo.delete_notices_for(visit)
+        if ctx.clinical is not None:
+            await ctx.clinical.erase_visit(visit)
     await repo.erase_session(session_id, state=state)
     return removed, visit
+
+
+def _visit_from_grant(grant: Dict[str, Any]) -> conf.Visit:
+    visit_date = grant["visit_date"]
+    return conf.Visit(
+        patient_id=grant["patient_id"], doctor_id=grant["doctor_id"],
+        cmed_hospital_id=grant["cmed_hospital_id"], start_time=grant["start_time"],
+        visit_date=visit_date.isoformat() if hasattr(visit_date, "isoformat")
+        else str(visit_date))
+
+
+def file_stem_for(patient: str, doctor: str, hospital: str, local_start: datetime,
+                  local_end: datetime) -> str:
+    """`PatientID_DoctorID_HospitalID_HHMMSS_HHMMSS_YYYYMMDD` (SRS-SES-05)."""
+    return (f"{patient}_{doctor}_{hospital}_{local_start:%H%M%S}_{local_end:%H%M%S}"
+            f"_{local_start:%Y%m%d}")
+
+
+async def _record_file_name(session_id: str) -> Optional[str]:
+    """
+    Name a closed recording, in columns (SRS-DBA-25), and tie its clinical
+    visit to it by that name (SRS-DBA-21). Linking is best effort: the nightly
+    reconciliation reports anything left unlinked (SRS-CRI-10).
+    """
+    repo = _repo()
+    session = await repo.get_session(session_id)
+    if not session or not session.get("opened_at") or not session.get("closed_at"):
+        return None
+    start = await _local_time(session["hospital_id"], session["opened_at"])
+    end = await _local_time(session["hospital_id"], session["closed_at"])
+    stem = await repo.set_file_names(
+        session_id,
+        file_stem=file_stem_for(session["patient_id"], session["doctor_id"],
+                                session["hospital_id"], start, end),
+        local_start=start.time().replace(tzinfo=None),
+        local_end=end.time().replace(tzinfo=None))
+
+    if session.get("grant_jti") and ctx.clinical is not None:
+        grant = await repo.get_authorisation(session["grant_jti"])
+        if grant and grant["patient_id"] != "REDACTED":
+            try:
+                await ctx.clinical.link_session(_visit_from_grant(grant),
+                                                session_id=session_id, file_stem=stem,
+                                                hospital_id=session["hospital_id"])
+            except Exception as exc:
+                logger.warning("Could not link %s to its clinical visit: %s",
+                               session_id, exc)
+    return stem
 
 
 class RefuseRequest(BaseModel):
@@ -1326,7 +1382,11 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
         await _mark_unconfirmed(row["session_id"], row)
         marked += 1
 
-    return {"status": "ok", "marked_unconfirmed": marked, "erased": erased}
+    # Clinical records that did not load first time (SRS-CRI-04).
+    loaded = await ctx.clinical.load_pending() if ctx.clinical is not None else 0
+
+    return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
+            "clinical_loaded": loaded}
 
 
 # ============================================================

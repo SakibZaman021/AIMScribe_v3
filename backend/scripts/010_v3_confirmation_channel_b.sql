@@ -1,6 +1,7 @@
 -- ================================================================
 -- 010 - SRS 3.2 on the existing server: grants from the server,
--- confirmation against CMED's API 2, Channel B, and refusals.
+-- confirmation against CMED's API 2, and refusals. CMED's clinical
+-- records themselves live in aims_clinical (scripts/clinical/).
 --
 -- Additive only. Existing sessions become confirmation = 'legacy' and
 -- keep archiving exactly as before.
@@ -34,41 +35,25 @@ CREATE INDEX IF NOT EXISTS idx_grants_waiting
     WHERE notice_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_grants_session ON grant_authorisations(session_id);
 
--- Channel B records: API 2 (patient_information) and prescriptions.
--- Kept here until the clinical database is split out (Phase 5).
-CREATE TABLE IF NOT EXISTS clinical_records (
-    id               BIGSERIAL PRIMARY KEY,
-    kind             VARCHAR(24) NOT NULL
-        CHECK (kind IN ('patient_information', 'prescription')),
-    cmed_hospital_id VARCHAR(64) NOT NULL,
-    hospital_id      VARCHAR(64),                   -- mapped; NULL if unmapped
-    patient_id       VARCHAR(64) NOT NULL,
-    doctor_id        VARCHAR(64) NOT NULL,
-    start_time       TEXT NOT NULL,
-    visit_date       DATE NOT NULL,
-    version          INTEGER NOT NULL DEFAULT 1,
-    body             JSONB NOT NULL,
-    body_sha256      BYTEA NOT NULL,
-    claimed_by_jti   TEXT,                          -- API 2 only: the grant it confirmed
-    received_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    CONSTRAINT clinical_body_sha_len CHECK (octet_length(body_sha256) = 32),
-    CONSTRAINT clinical_once UNIQUE (kind, body_sha256)          -- SRS-CHB-07
+-- API 2 notices waiting to be matched (SRS 3.2 §5.6): the five fields and
+-- nothing else. The body - with the patient's name - is kept in the
+-- separate aims_clinical database (SRS-DBA-20); clinical_record_id points to it.
+CREATE TABLE IF NOT EXISTS confirmation_notices (
+    id                 BIGSERIAL PRIMARY KEY,
+    cmed_hospital_id   VARCHAR(64) NOT NULL,
+    hospital_id        VARCHAR(64),                 -- mapped; NULL if unmapped
+    patient_id         VARCHAR(64) NOT NULL,
+    doctor_id          VARCHAR(64) NOT NULL,
+    start_time         TEXT NOT NULL,
+    visit_date         DATE NOT NULL,
+    clinical_record_id BIGINT,
+    claimed_by_jti     TEXT,                        -- the grant it confirmed
+    received_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_clinical_visit
-    ON clinical_records(kind, patient_id, doctor_id, cmed_hospital_id, start_time, visit_date);
-CREATE INDEX IF NOT EXISTS idx_clinical_unclaimed
-    ON clinical_records(received_at) WHERE kind = 'patient_information'
-                                       AND claimed_by_jti IS NULL;
-
--- Requests that failed validation, stored unchanged (SRS-CRI-07, SRS-CHB-10).
-CREATE TABLE IF NOT EXISTS clinical_quarantine (
-    id          BIGSERIAL PRIMARY KEY,
-    kind        VARCHAR(24) NOT NULL,
-    raw         TEXT NOT NULL,
-    problems    JSONB NOT NULL,
-    received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-    reviewed_at TIMESTAMP WITH TIME ZONE
-);
+CREATE INDEX IF NOT EXISTS idx_notices_visit
+    ON confirmation_notices(patient_id, doctor_id, cmed_hospital_id, start_time, visit_date);
+CREATE INDEX IF NOT EXISTS idx_notices_unclaimed
+    ON confirmation_notices(received_at) WHERE claimed_by_jti IS NULL;
 
 -- Confirmation state per session (SRS §5.6).
 --   legacy       opened by a protocol-2 recorder; archived as before
