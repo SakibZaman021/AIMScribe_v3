@@ -1,13 +1,7 @@
 """
-WebSocket control channel for the CMED browser.
+WebSocket control channel for the CMED page (Channel A, SRS 3.2 §6.1).
 
-This is the primary way CMED drives the recorder. The security model changed
-completely from v1, which checked `websocket.client.host` and accepted anything
-from 127.0.0.1 - that check always passes for *any* page open on the PC, because
-the peer address of a browser is always loopback. WebSockets are also not subject
-to CORS, so the wildcard CORS fix does not help here either.
-
-What is enforced now, in order, before the socket is accepted:
+Admission is unchanged, and is checked before the socket is accepted, in order:
 
 1. `Origin` must be in the configured allowlist. Absent or "null" is rejected.
 2. `Host` must be an expected loopback authority. This is the DNS-rebinding
@@ -15,9 +9,14 @@ What is enforced now, in order, before the socket is accepted:
    header distinguishes it.
 3. The peer address must actually be loopback.
 
-And before any recording starts, the `start` command must carry a CMED-signed,
-single-use grant. Doctor, hospital and patient are read from that grant, never
-from the browser's own payload.
+What v3 changes is what the page sends. It no longer signs a grant or holds a
+key: it sends five plain fields (API 1), and the recorder asks the AIMS LAB
+server for the grant. The page cannot choose the clinic - that is this PC's
+enrolment - and it cannot end a consultation early: a new trigger is refused
+until `prescription_built` (API 3) has armed the gate.
+
+Every command gets exactly one reply carrying `request_id`, `status` and `code`
+(api/protocol.py). Pages act on `code`, never on `message`.
 """
 from __future__ import annotations
 
@@ -26,10 +25,12 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
 
 from fastapi import WebSocket
 
+from api import protocol
+from api.protocol import ProtocolError, Trigger
 from core import crypto
 from core.crypto import GrantError
 from core.session_controller import SessionError
@@ -42,13 +43,21 @@ CLOSE_INTERNAL = 4500
 
 MAX_MESSAGE_BYTES = 64 * 1024
 
+# Asks the AIMS LAB server to authorise one consultation and returns the
+# verified grant. Supplied at startup (Runtime); a test supplies its own.
+Authoriser = Callable[[Trigger], Awaitable[crypto.Grant]]
+
+
+class AuthorisationUnavailable(Exception):
+    """The server could not be asked. Not the page's fault, and worth a retry."""
+
 
 class GrantGuard:
     """
     Single-use enforcement for recording grants.
 
-    A grant is a bearer token: without replay protection, a page that captured one
-    could reopen sessions with it until it expired. Entries are pruned lazily.
+    A grant is a bearer token: without replay protection, a copy of one could
+    reopen sessions until it expired. Entries are pruned lazily.
     """
 
     def __init__(self) -> None:
@@ -64,12 +73,14 @@ class GrantGuard:
 
 
 class WebSocketManager:
-    """Tracks connected CMED clients and dispatches their commands."""
+    """Tracks connected CMED pages and answers their commands."""
 
-    def __init__(self, cfg, *, controller=None, grant_guard: Optional[GrantGuard] = None):
+    def __init__(self, cfg, *, controller=None, grant_guard: Optional[GrantGuard] = None,
+                 authoriser: Optional[Authoriser] = None):
         self.cfg = cfg
         self._controller = controller
         self._guard = grant_guard or GrantGuard()
+        self._authoriser = authoriser
         self._connections: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self._grant_key = None
@@ -81,6 +92,9 @@ class WebSocketManager:
     def set_controller(self, controller) -> None:
         self._controller = controller
 
+    def set_authoriser(self, authoriser: Optional[Authoriser]) -> None:
+        self._authoriser = authoriser
+
     def set_register_source(self, uploader, hospital_id: str) -> None:
         """Where the doctor list comes from: the backend, via the uploader's
         device-authenticated client, for this machine's hospital."""
@@ -88,7 +102,12 @@ class WebSocketManager:
         self._hospital_id = hospital_id or ""
 
     def set_grant_key(self, key) -> None:
+        """The pinned public key the server's grants are verified against."""
         self._grant_key = key
+
+    @property
+    def grant_key(self):
+        return self._grant_key
 
     @property
     def client_count(self) -> int:
@@ -134,124 +153,159 @@ class WebSocketManager:
 
     async def handle_message(self, websocket: WebSocket, raw: str) -> Dict[str, Any]:
         if len(raw) > MAX_MESSAGE_BYTES:
-            return self._error("message too large")
-
+            return self._stamp(protocol.reply("", "MALFORMED_MESSAGE",
+                                              message="The message is too large."))
         try:
             message = json.loads(raw)
         except json.JSONDecodeError:
-            return self._error("invalid JSON")
-
+            return self._stamp(protocol.reply("", "MALFORMED_MESSAGE"))
         if not isinstance(message, dict):
-            return self._error("expected a JSON object")
+            return self._stamp(protocol.reply("", "MALFORMED_MESSAGE",
+                                              message="Expected a JSON object."))
 
         command = str(message.get("command", "")).lower()
-        if self._controller is None:
-            return self._error("recorder is not ready")
+        request_id = protocol.request_id_of(message)
 
-        handlers = {
+        handler = self._handlers().get(command)
+        if handler is None:
+            return self._stamp(protocol.reply(
+                command, "UNKNOWN_COMMAND", request_id=request_id,
+                message=f"Unknown command: {command or '(none)'}"))
+        if self._controller is None:
+            return self._stamp(protocol.reply(command, "AGENT_NOT_READY",
+                                              request_id=request_id))
+
+        try:
+            code, data = await handler(message)
+            return self._stamp(protocol.reply(command, code, request_id=request_id, data=data))
+        except ProtocolError as exc:
+            logger.info("Command %s refused: %s", command, exc)
+            return self._stamp(protocol.reply(command, exc.code, request_id=request_id,
+                                              message=str(exc)))
+        except SessionError as exc:
+            # Expected refusals: the message is safe to show the doctor verbatim.
+            logger.info("Command %s refused: %s", command, exc)
+            code = self._contract_code(command, exc.code)
+            return self._stamp(protocol.reply(command, code, request_id=request_id,
+                                              message=str(exc)))
+        except AuthorisationUnavailable as exc:
+            logger.warning("Command %s could not be authorised: %s", command, exc)
+            return self._stamp(protocol.reply(
+                command, "AGENT_NOT_READY", request_id=request_id,
+                message="The recorder could not reach the AIMS LAB server to authorise "
+                        "this recording."))
+        except GrantError as exc:
+            logger.warning("Command %s rejected: %s", command, exc)
+            return self._stamp(protocol.reply(command, "AUTHORISATION_FAILED",
+                                              request_id=request_id))
+        except Exception as exc:
+            logger.error("Command %s failed: %s", command, exc, exc_info=True)
+            return self._stamp(protocol.reply(command, "AGENT_NOT_READY",
+                                              request_id=request_id,
+                                              message="The recorder hit an internal error."))
+
+    def _handlers(self) -> Dict[str, Callable[[Dict[str, Any]],
+                                              Awaitable[Tuple[str, Dict[str, Any]]]]]:
+        return {
             "start": self._start,
+            "prescription_built": self._prescription_built,
             "stop": self._stop,
             "pause": self._pause,
             "resume": self._resume,
             "status": self._status,
             "doctors": self._doctors,
         }
-        handler = handlers.get(command)
-        if handler is None:
-            return self._error(f"unknown command: {command or '(none)'}")
 
-        try:
-            return await handler(message)
-        except SessionError as exc:
-            # Expected refusals: safe to show the doctor verbatim.
-            logger.info("Command %s refused: %s", command, exc)
-            return self._error(str(exc), code="refused")
-        except GrantError as exc:
-            logger.warning("Command %s rejected: %s", command, exc)
-            return self._error("Authorisation failed. Reload CMED and try again.",
-                               code="unauthorised")
-        except Exception as exc:
-            logger.error("Command %s failed: %s", command, exc, exc_info=True)
-            return self._error("The recorder hit an internal error.", code="internal")
+    @staticmethod
+    def _contract_code(command: str, code: str) -> str:
+        """Keep CMED's two commands inside Appendix A (SRS-IF1-10)."""
+        if command in protocol.CMED_COMMANDS and code in ("OK", "REFUSED"):
+            return "AGENT_NOT_READY"
+        return code if code in protocol.CODES else "REFUSED"
 
-    # ---- commands ----
+    # ---- CMED's commands ----
 
-    async def _start(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        grant_token = message.get("grant")
+    async def _start(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """API 1. Five fields in; the grant comes from the AIMS LAB server."""
+        trigger = protocol.parse_trigger(message)
+        grant = await self._authorise(trigger)
+        result = await self._controller.open_session(
+            grant, trigger_start_time=trigger.start_time)
+        return "RECORDING_STARTED", {
+            "session_id": result["session_id"],
+            "started_at": result["started_at"],
+            "armed": False,
+            "supersedes": result.get("previous_session_id"),
+        }
 
-        if self.cfg.security.require_grant:
-            if self._grant_key is None:
-                raise GrantError("no grant verification key is installed")
-            grant = crypto.verify_grant(
-                grant_token,
-                self._grant_key,
-                issuer=self.cfg.security.grant_issuer,
-                audience=self.cfg.security.grant_audience,
-            )
-            self._guard.consume(grant)
-        else:
+    async def _authorise(self, trigger: Trigger) -> crypto.Grant:
+        if not self.cfg.security.require_grant:
             # Development only; config.production_warnings() surfaces this loudly.
-            session = message.get("session", {}) or {}
-            logger.warning("Starting a session WITHOUT a grant (development mode)")
-            grant = crypto.Grant(
-                jti=f"dev-{time.time()}",
-                doctor_id=str(session.get("doctor_id", "DR_DEV")),
-                doctor_name=str(session.get("doctor_name", "")),
-                hospital_id=str(session.get("hospital_id", "HOSP_DEV")),
-                patient_ref=str(session.get("patient_id") or session.get("patient_ref") or ""),
+            logger.warning("Starting a session WITHOUT server authorisation (development mode)")
+            return crypto.Grant(
+                jti=f"dev-{time.time_ns()}",
+                doctor_id=trigger.doctor_id,
+                doctor_name="",
+                hospital_id="",          # the controller files under this PC's clinic
+                patient_ref=trigger.patient_id,
                 consent_obtained=True,
-                consent_method="development",
+                consent_method="reception",
                 expires_at=int(time.time()) + 60,
                 raw="",
             )
-            if not grant.patient_ref:
-                raise SessionError("A patient reference is required.")
 
-        # Display-only fields may come from the browser; identity may not.
-        patient_name = str((message.get("session") or {}).get("patient_name", ""))[:120]
+        if self._authoriser is None:
+            raise AuthorisationUnavailable("no authoriser is configured")
+        grant = await self._authoriser(trigger)
 
-        result = await self._controller.open_session(grant, patient_name=patient_name)
-        return self._ack("start", result)
+        # The grant must be for this trigger. A grant for another patient - a
+        # server fault, or one replayed from another consultation - must never
+        # start this recording.
+        if grant.patient_ref != trigger.patient_id or (
+                grant.doctor_id and grant.doctor_id != trigger.doctor_id):
+            raise GrantError("grant does not match the trigger")
+        self._guard.consume(grant)
+        return grant
 
-    async def _stop(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        result = await self._controller.stop_session(reason="doctor_stopped")
-        return self._ack("stop", result)
+    async def _prescription_built(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """API 3, part one. Arms the gate; the recording keeps running."""
+        built = protocol.parse_prescription_built(message)
+        result = await self._controller.arm(patient_id=built.patient_id,
+                                            session_id=built.session_id)
+        code = "GATE_ALREADY_ARMED" if result.get("already") else "GATE_ARMED"
+        return code, {"session_id": result["session_id"], "armed": True}
 
-    async def _pause(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    # ---- commands CMED does not use ----
+
+    async def _stop(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return "OK", await self._controller.stop_session(reason="doctor_stopped")
+
+    async def _pause(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Supervised pause. Reason is mandatory; long pauses need a supervisor."""
-        result = await self._controller.pause_session(
+        return "OK", await self._controller.pause_session(
             reason=str(message.get("reason", "")),
             reason_detail=str(message.get("reason_detail", ""))[:500],
             authorised_by=str(message.get("authorised_by", ""))[:120],
             expected_seconds=int(message.get("expected_seconds", 0) or 0),
         )
-        return self._ack("pause", result)
 
-    async def _resume(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        result = await self._controller.resume_session()
-        return self._ack("resume", result)
+    async def _resume(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return "OK", await self._controller.resume_session()
 
-    async def _status(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        return self._status_event()
+    async def _status(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return "OK", self._controller.status()
 
-    async def _doctors(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    async def _doctors(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
         Doctors seen at this hospital before, as typing suggestions only.
 
-        Not a permission list. CMED decides who is consulting - doctors log in
-        there and it knows the rota - so a name missing from this list is no
-        reason to refuse a recording. An empty list is perfectly normal at a new
-        site and must never block the clinic.
+        Not a permission list: CMED decides who is consulting. An empty list is
+        normal at a new site and must never block the clinic.
         """
         register = None
         if self._uploader is not None and self._hospital_id:
             register = await self._uploader.fetch_doctors(self._hospital_id)
-
-        return self._ack("doctors", {
-            "hospital_id": self._hospital_id or None,
-            # Deliberately absent: the machine has no doctor.
-            "doctors": register or [],
-        })
+        return "OK", {"hospital_id": self._hospital_id or None, "doctors": register or []}
 
     # ---- outbound ----
 
@@ -267,9 +321,8 @@ class WebSocketManager:
         """
         Fan out to every client concurrently.
 
-        v1 awaited each send while holding the connection lock, so one wedged
-        client blocked every broadcast and every connect. The set is snapshotted
-        instead, and sends run in parallel outside the lock.
+        The set is snapshotted and sends run in parallel outside the lock, so one
+        wedged client cannot block every broadcast and every connect.
         """
         async with self._lock:
             targets = list(self._connections)
@@ -301,19 +354,6 @@ class WebSocketManager:
         payload.setdefault("timestamp", crypto.iso_utc(datetime.now(timezone.utc)))
         return payload
 
-    def _ack(self, command: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Reply to the sender only.
 
-        State changes reach every client as broadcast events emitted by the
-        controller. Commands previously broadcast *and* returned the same object,
-        so the caller saw each state change two or three times and could not tell
-        an acknowledgement from an event.
-        """
-        return self._stamp({"event": "ack", "command": command, "data": data})
-
-    def _error(self, message: str, *, code: str = "error") -> Dict[str, Any]:
-        return self._stamp({"event": "error", "code": code, "message": message})
-
-
-__all__ = ["WebSocketManager", "GrantGuard", "CLOSE_POLICY"]
+__all__ = ["WebSocketManager", "GrantGuard", "AuthorisationUnavailable", "Authoriser",
+           "CLOSE_POLICY"]

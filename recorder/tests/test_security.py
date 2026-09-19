@@ -120,7 +120,6 @@ def test_valid_grant_is_accepted(grant_keys):
     ({"exp": int(time.time()) - 10}, "expired"),
     ({"aud": "someone-else"}, "wrong audience"),
     ({"iss": "attacker"}, "wrong issuer"),
-    ({"consent_obtained": False}, "no consent"),
     ({"patient_ref": ""}, "missing patient"),
 ])
 def test_bad_grants_are_rejected(grant_keys, overrides, reason):
@@ -333,3 +332,17 @@ def test_production_warnings_flag_plaintext_backend(make_security, tmp_path):
     assert "cleartext" in warnings
     assert "AIMS_ENABLE_DOCS" in warnings
     assert "AIMS_REQUIRE_GRANT" in warnings
+
+
+def test_grant_without_consent_claim_is_accepted(grant_keys):
+    """
+    SRS 3.2: consent is taken at reception and a refusal is recorded on the
+    Stop button (§7.8a). The grant no longer carries consent, so a grant that
+    omits it - or says false - is not refused for that reason.
+    """
+    private_pem, public = grant_keys
+    for claim in ({"consent_obtained": None}, {"consent_obtained": False}):
+        grant = verify_grant(_token(private_pem, **claim, _n=hash(str(claim)) % 97),
+                             public, issuer="cmed", audience="aimscribe-recorder")
+        assert grant.patient_ref == "P12345"
+        assert grant.consent_method

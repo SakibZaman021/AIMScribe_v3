@@ -603,14 +603,13 @@ def verify_grant(
     except Exception as exc:  # PyJWT raises a family of subclasses
         raise GrantError(f"grant rejected: {type(exc).__name__}") from exc
 
-    if not claims.get("consent_obtained"):
-        raise GrantError("grant does not record patient consent")
+    # Consent is not a grant claim any more. Reception takes consent before the
+    # consultation, and a refusal is recorded on the recorder's own Stop button
+    # (SRS 3.2 §7.8a), so neither CMED nor the server vouches for it here.
 
-    # The patient is the one thing only CMED knows, so it is the one thing the
-    # grant must carry. Doctor and hospital are deliberately allowed to be empty:
-    # they belong to the machine's enrolment, and CMED no longer knows them. A
-    # grant that does name them is not trusted either - the controller compares
-    # them against the enrolment and raises an integrity alert on a mismatch.
+    # A grant for nobody authorises nothing. The clinic it names is checked by
+    # the controller against this PC's enrolment and refused on a mismatch
+    # (SRS-GRT-10).
     if not claims.get("patient_ref"):
         raise GrantError("grant is missing patient_ref")
 
@@ -621,7 +620,7 @@ def verify_grant(
         hospital_id=str(claims.get("hospital_id") or ""),
         patient_ref=str(claims["patient_ref"]),
         consent_obtained=True,
-        consent_method=str(claims.get("consent_method", "")),
+        consent_method=str(claims.get("consent_method") or "reception"),
         expires_at=int(claims["exp"]),
         raw=token,
     )

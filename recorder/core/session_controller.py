@@ -13,9 +13,10 @@ States:
 
 Rules enforced here rather than trusted from the caller:
 
-* The hospital comes from the device enrolment; the doctor comes from a
-  verified CMED grant and is checked against the backend's register.
-* A session cannot open without recorded patient consent.
+* The clinic comes from the device enrolment, always (SRS-INV-01). The doctor
+  and patient come from a grant the AIMS LAB server issued for CMED's trigger.
+* A new trigger does not end the current consultation until CMED has said its
+  prescription is built (the gate, SRS §7.7).
 * Pause requires a reason from a fixed list, and a supervisor's name once the
   expected duration passes the configured threshold.
 * Stopping never deletes audio. Local files go only when a signed purge receipt
@@ -46,7 +47,15 @@ CLOSING = "closing"
 
 
 class SessionError(RuntimeError):
-    """A session request that must be refused, with a reason safe to show a user."""
+    """
+    A session request that must be refused, with a reason safe to show a user.
+
+    `code` is the Channel A reply code the page receives (api/protocol.py).
+    """
+
+    def __init__(self, message: str, *, code: str = "REFUSED"):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -71,6 +80,13 @@ class ActiveSession:
     # consulting room rotates, so CMED may name someone else for this
     # consultation - the backend has already checked they are credentialed here.
     doctor_id: str = ""
+    # API 1's start_time, exactly as CMED's server wrote it. Together with the
+    # patient it identifies the consultation, so a repeated trigger for the same
+    # one is recognised rather than refused by the gate.
+    trigger_start_time: str = ""
+    # Set by prescription_built (API 3). Until then a new trigger is refused and
+    # this recording carries on (SRS-GAT-01..04).
+    armed: bool = False
     audio_seconds: float = 0.0
     paused_seconds: float = 0.0
     pause: Optional[PauseRecord] = None
@@ -172,6 +188,7 @@ class SessionController:
         *,
         patient_name: str = "",
         session_id: Optional[str] = None,
+        trigger_start_time: str = "",
     ) -> Dict[str, Any]:
         async with self._lock:
             previous_id: Optional[str] = None
@@ -187,7 +204,8 @@ class SessionController:
             if not self.device_id:
                 raise SessionError(
                     "This PC is not enrolled with the AIMS LAB server. Contact IT - "
-                    "recordings cannot be attributed or archived until it is.")
+                    "recordings cannot be attributed or archived until it is.",
+                    code="DEVICE_NOT_ENROLLED")
 
             # Who is consulting comes from CMED, every time, with no fallback.
             #
@@ -207,33 +225,69 @@ class SessionController:
                 raise SessionError(
                     "CMED did not say which doctor is seeing this patient, so the "
                     "recording cannot be attributed. Start the consultation from "
-                    "CMED rather than starting the recorder directly.")
+                    "CMED rather than starting the recorder directly.",
+                    code="MISSING_FIELD")
 
-            # The hospital also comes from CMED, because a doctor can be moved to
-            # another site at a day's notice. The enrolment is still what decides
-            # whether this machine may record at all - an unenrolled laptop gets
-            # nowhere - but it no longer decides the label. A disagreement is
-            # worth knowing about, so it is raised without blocking the clinic.
-            hospital_id = grant.hospital_id or self.hospital_id
-            if grant.hospital_id and self.hospital_id and grant.hospital_id != self.hospital_id:
+            # The clinic is the machine's, always (SRS-INV-01; decision D1).
+            #
+            # The grant names the clinic the AIMS LAB server mapped CMED's
+            # hospital to. A doctor moved to another site sits at that site's PC,
+            # so a disagreement never means "the doctor moved": it means the
+            # mapping is wrong or this laptop is in the wrong building. Filing
+            # the recording under either clinic would label evidence wrongly, so
+            # it is refused rather than warned about (SRS-GRT-10).
+            hospital_id = self.hospital_id
+            if grant.hospital_id and grant.hospital_id != hospital_id:
                 self._emit("integrity_alert", {
                     "session_id": None,
-                    "alert_type": "hospital_mismatch",
-                    "detail": (f"device enrolled at {self.hospital_id}, "
-                               f"CMED says {grant.hospital_id}"),
+                    "alert_type": "clinic_mismatch",
+                    "detail": (f"device enrolled at {hospital_id}, "
+                               f"grant is for {grant.hospital_id}"),
                 })
+                raise SessionError(
+                    "This PC is registered to a different clinic, so the recording "
+                    "cannot start. AIMS LAB has been alerted.",
+                    code="CLINIC_MISMATCH")
 
             if self._active is not None:
-                # A doctor opening a different patient means the previous
-                # consultation is over. Close it properly rather than abandoning it.
-                previous_id = self._active.session_id
+                active = self._active
+                # The same consultation triggered twice - usually a double click
+                # or a page reload - is not a new patient.
+                if (trigger_start_time
+                        and active.trigger_start_time == trigger_start_time
+                        and active.grant.patient_ref == grant.patient_ref):
+                    raise SessionError("This consultation is already being recorded.",
+                                       code="SESSION_ALREADY_ACTIVE")
+
+                # The gate (SRS-GAT-03). Until the open consultation's
+                # prescription is built, a new trigger is a doctor glancing at
+                # another patient, not the next consultation: refuse it and keep
+                # recording. Cutting here is what split consultations in the pilot.
+                if not active.armed:
+                    logger.info("Trigger for patient %s refused: session %s is not armed",
+                                self._pseudonym(grant.patient_ref), active.session_id)
+                    self._emit("trigger_refused", {
+                        "session_id": active.session_id,
+                        "patient_ref": grant.patient_ref,
+                        "doctor_id": doctor_id,
+                        "at": crypto.iso_utc(boundary),
+                        "reason": "gate_not_armed",
+                    })
+                    raise SessionError(
+                        "The current consultation has not been completed yet.",
+                        code="GATE_NOT_ARMED")
+
+                # Armed: the previous consultation is over. Close it properly,
+                # at the same instant the next one opens.
+                previous_id = active.session_id
                 logger.info("Closing session %s before opening a new one", previous_id)
                 await self._close_active(reason="superseded_by_new_patient", at=boundary)
 
             if not self._spool.has_capacity(self.cfg.audio.bytes_per_second * 240):
                 raise SessionError(
                     "Local audio buffer is full. Recording cannot start until the "
-                    "backlog uploads. Contact support.")
+                    "backlog uploads. Contact support.",
+                    code="AGENT_NOT_READY")
 
             spool_session = self._spool.open_session(
                 device_key=self._device_key,
@@ -284,7 +338,8 @@ class SessionController:
                 })
                 raise SessionError(
                     "The microphone is unavailable. Check that it is connected and "
-                    "not in use by another application.") from exc
+                    "not in use by another application.",
+                    code="AGENT_NOT_READY") from exc
 
             self._active = ActiveSession(
                 spool=spool_session,
@@ -294,6 +349,7 @@ class SessionController:
                 segmenter=segmenter,
                 opened_at=opened_at,
                 doctor_id=doctor_id,
+                trigger_start_time=trigger_start_time,
             )
             self.state = RECORDING
 
@@ -312,6 +368,7 @@ class SessionController:
                 "started_at": crypto.iso_utc(opened_at),
                 "previous_session_stopped": previous_id is not None,
                 "previous_session_id": previous_id,
+                "armed": False,
             }
             self._emit("recording_started", {
                 "session_id": spool_session.session_id,
@@ -320,6 +377,36 @@ class SessionController:
                 "hospital_id": self.hospital_id,
             })
             return result
+
+    # ---- the gate ----
+
+    async def arm(self, *, patient_id: str, session_id: str) -> Dict[str, Any]:
+        """
+        API 3, part one: the prescription is built.
+
+        Arms the gate so that the *next* trigger may end this consultation. The
+        recording itself is not touched (SRS-IF1-12): the doctor usually counsels
+        the patient for another minute or two, and that is worth keeping.
+        """
+        async with self._lock:
+            active = self._active
+            if active is None:
+                raise SessionError("Nothing is being recorded.", code="NO_ACTIVE_SESSION")
+            if active.grant.patient_ref != patient_id or active.session_id != session_id:
+                self._emit("integrity_alert", {
+                    "session_id": active.session_id,
+                    "alert_type": "arm_mismatch",
+                    "detail": "prescription_built named a different patient or session",
+                })
+                raise SessionError("That signal belongs to a different consultation.",
+                                   code="PATIENT_MISMATCH")
+            if active.armed:
+                return {"session_id": active.session_id, "armed": True, "already": True}
+
+            active.armed = True
+            logger.info("Session %s armed: the next patient will close it", active.session_id)
+            self._emit("gate_armed", {"session_id": active.session_id})
+            return {"session_id": active.session_id, "armed": True, "already": False}
 
     # ---- pause / resume ----
 
@@ -697,6 +784,7 @@ class SessionController:
             "session_id": active.session_id if active else None,
             "patient_ref": active.grant.patient_ref if active else None,
             "patient_name": active.patient_name if active else None,
+            "armed": active.armed if active else False,
             # Reported even with no session running, so the dashboard can
             # show who this machine is enrolled to before recording starts.
             "doctor_id": (active.doctor_id if active else None) or None,
@@ -757,7 +845,7 @@ class SessionController:
 
     def _require_active(self) -> ActiveSession:
         if self._active is None:
-            raise SessionError("No recording is in progress.")
+            raise SessionError("No recording is in progress.", code="NO_ACTIVE_SESSION")
         return self._active
 
     def _pseudonym(self, value: str) -> str:

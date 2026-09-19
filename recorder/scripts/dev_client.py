@@ -1,21 +1,23 @@
 """
 Development WebSocket client - drives the agent without CMED or a backend.
 
-Lets you exercise the whole local pipeline (grant check, capture, segmenting,
-spooling, supervised pause) before the server side exists. Segments will fail to
-upload and stay sealed in the spool, which is exactly the offline behaviour the
-design promises.
+Sends the v3 Channel A messages (SRS 3.2 §6.1): a five-field trigger, and
+`prescription_built` to arm the gate. Run the agent with AIMS_REQUIRE_GRANT=false
+until the server's grant endpoint exists; with it true, `start` is answered
+503 AGENT_NOT_READY. Segments fail to upload without a backend and stay sealed
+in the spool, which is the offline behaviour the design promises.
 
     python scripts/dev_client.py
 
-Commands: start <patient> | pause <reason> | resume | stop | status | quit
+Commands: start <patient> | built | pause <reason> | resume | stop | status | quit
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import sys
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,24 +26,34 @@ import websockets
 
 from config import config
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+DHAKA = timezone(timedelta(hours=6))
+
+# The open consultation, as the page would remember it.
+current = {"patient_id": None, "session_id": None}
 
 
-def mint_grant(patient: str) -> str:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT_DIR / "dev_make_grant.py"), "--patient", patient],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    return result.stdout.strip()
+def trigger(patient: str) -> dict:
+    """API 1. In CMED, start_time comes from CMED's server; here we make one."""
+    now = datetime.now(DHAKA).replace(microsecond=0)
+    return {
+        "patient_id": patient,
+        "doctor_id": "DR_DEV",
+        "hospital_id": "CMED-DEV-01",
+        "start_time": now.isoformat(),
+        "date": now.date().isoformat(),
+    }
 
 
 async def reader(socket) -> None:
     async for raw in socket:
         message = json.loads(raw)
         event = message.get("event", "?")
-        if event == "error":
+        if message.get("code") == "RECORDING_STARTED":
+            current["session_id"] = (message.get("data") or {}).get("session_id")
+        if event in ("ack", "error") and "code" in message:
+            print(f"  [{message.get('command')}] {message['status']} {message['code']}"
+                  f" - {message.get('message')}")
+        elif event == "error":
             print(f"  [{event}] {message.get('message')}")
         elif event == "status":
             print(f"  [status] state={message.get('state')} "
@@ -64,7 +76,8 @@ async def main() -> int:
     print(f"Connecting to {url} as origin {origin}")
     async with websockets.connect(url, origin=origin) as socket:
         asyncio.create_task(reader(socket))
-        print("Connected. Commands: start <patient> | pause <reason> | resume | stop | status | quit")
+        print("Connected. Commands: start <patient> | built | pause <reason> | resume | "
+              "stop | status | quit")
 
         loop = asyncio.get_running_loop()
         while True:
@@ -78,10 +91,22 @@ async def main() -> int:
                 return 0
             if verb == "start":
                 patient = rest.strip() or "P12345"
+                current["patient_id"] = patient
                 await socket.send(json.dumps({
                     "command": "start",
-                    "grant": mint_grant(patient),
-                    "session": {"patient_name": "Development Patient"},
+                    "request_id": f"dev-{uuid.uuid4().hex[:8]}",
+                    "trigger": trigger(patient),
+                }))
+            elif verb == "built":
+                if not current["session_id"]:
+                    print("  nothing to arm - start a consultation first")
+                    continue
+                await socket.send(json.dumps({
+                    "command": "prescription_built",
+                    "request_id": f"dev-{uuid.uuid4().hex[:8]}",
+                    "patient_id": current["patient_id"],
+                    "session_id": current["session_id"],
+                    "occurred_at": datetime.now(DHAKA).isoformat(),
                 }))
             elif verb == "pause":
                 await socket.send(json.dumps({

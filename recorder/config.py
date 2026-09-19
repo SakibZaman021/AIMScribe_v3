@@ -159,12 +159,20 @@ class SegmentConfig:
 
 @dataclass(frozen=True)
 class SpoolConfig:
-    """Local store-and-forward buffer. Segments live here until purge-receipted."""
+    """
+    Local store-and-forward buffer. Segments live here until purge-receipted.
+
+    Sized for minutes, not weeks (SRS-SPL-06): clinic sites are networked, so
+    4 GB - about 13 hours of audio - is a shock absorber. Holding a quarter of
+    it means delivery has stalled (SRS-SPL-07), and a receipt deletes at once:
+    the server re-hashed the stored bytes before issuing it, so waiting longer
+    protects against nothing (SRS-SPL-08, SRS-REC-16).
+    """
     directory: Path = field(default_factory=lambda: data_dir() / "spool")
-    max_bytes: int = 40 * 1024 ** 3
-    warn_ratio: float = 0.5
-    critical_ratio: float = 0.8
-    purge_grace_hours: int = 24
+    max_bytes: int = 4 * 1024 ** 3
+    warn_ratio: float = 0.25
+    critical_ratio: float = 0.9
+    purge_grace_hours: int = 0
 
     @property
     def warn_bytes(self) -> int:
@@ -295,10 +303,10 @@ class Config:
 
         spool = SpoolConfig(
             directory=_path("AIMS_SPOOL_DIR", data_dir() / "spool"),
-            max_bytes=_int("AIMS_SPOOL_MAX_BYTES", 40 * 1024 ** 3),
-            warn_ratio=_float("AIMS_SPOOL_WARN_RATIO", 0.5),
-            critical_ratio=_float("AIMS_SPOOL_CRITICAL_RATIO", 0.8),
-            purge_grace_hours=_int("AIMS_PURGE_GRACE_HOURS", 24),
+            max_bytes=_int("AIMS_SPOOL_MAX_BYTES", 4 * 1024 ** 3),
+            warn_ratio=_float("AIMS_SPOOL_WARN_RATIO", 0.25),
+            critical_ratio=_float("AIMS_SPOOL_CRITICAL_RATIO", 0.9),
+            purge_grace_hours=_int("AIMS_PURGE_GRACE_HOURS", 0),
         )
 
         backoff = tuple(float(v) for v in _list("AIMS_RETRY_BACKOFF", "2,8,30,120,600"))
