@@ -25,6 +25,10 @@ services:
     environment:
       - AIMS_ARCHIVE_ROOT=/archive
       - TZ=${TZ:-Asia/Dhaka}
+      # The key for the lossless cloud copy (SRS-DAT-08). It stays at UIU: put
+      # it in .env on this machine, never in the repository and never on the
+      # server. Without it the worker archives as usual and makes no copies.
+      - AIMS_COPY_KEY=${AIMS_COPY_KEY:-}
 
     # No ports. The worker only makes outbound connections, which is what keeps
     # the AIMS LAB server free of any inbound attack surface.
@@ -32,9 +36,11 @@ services:
     # Hardening: the worker needs to write to /archive and nothing else.
     read_only: true
     tmpfs:
-      # Segments are downloaded here before joining. Sized for one session:
-      # about 320 MB per hour of 44.1 kHz audio, doubled for the join.
-      - /tmp:size=4g
+      # Segments are downloaded here before joining, and the cloud copy is
+      # compressed and encrypted here too. Sized for one session: about 320 MB
+      # per hour of 44.1 kHz audio, doubled for the join, plus the FLAC and its
+      # encrypted form.
+      - /tmp:size=6g
     cap_drop:
       - ALL
     security_opt:

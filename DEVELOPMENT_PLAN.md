@@ -56,7 +56,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 | **3. Recorder talks to the new server** — *done* | Grant requested from the server alongside capture; "confirming" state; unconfirmed handling; refusal deletes local pieces; alert when a piece waits over 15 minutes; final delivery and clean-up at start-up and shutdown | `AT-01`, `AT-03`, `AT-07`, `AT-08`, `AT-20`, `AT-58`, `AT-59`, `AT-77` |
 | **4. On-screen control** — *done* | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
 | **5. Two databases** — *done* | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
-| **6. Archive and cloud copy** | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
+| **6. Archive and cloud copy** — *done* | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
 | **7. UIU hosting** | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
 | **8. Tools for CMED and operators** | Test page; test Channel B environment; dummy CMED app on the new protocol; dashboard | `AT-27`, `AT-71`, `AT-72`; §8.9 |
 
@@ -125,3 +125,30 @@ out, and only there.
 **Still open for the databases.** Female and male details are kept whole in a
 `details` column until the clinical team agrees their fields (**OD-15**); paramedic
 readings outside the agreed columns are kept in `other` (**OD-16**).
+
+| 20 Sep 2026 | 6 | Each archived consultation now keeps a JSON file beside its WAV, under the same name (§8.8): what CMED holds about the visit - patient, paramedic readings, previous visit, the current prescription - assembled by the server, because only it can read the clinical database, and written by the worker as the recording is archived. Pieces are no longer deleted when a recording is archived. The worker compresses the archived WAV to FLAC, decodes it again and compares the samples, encrypts the FLAC and the JSON with a key that stays at UIU, uploads both to a separate copy bucket, reads them back, and only then does the server record the copy and delete the pieces (`SRS-ARC-09`, in that order). A failed step keeps everything and raises an alert; a copy still missing a day later is raised by the sweep. A prescription that arrives after archiving marks the recording, and the JSON is written again and uploaded as a new object, the earlier ones kept (`SRS-ARC-13`). `restore.py` brings a copy back to a WAV and checks it against the catalogue, so the copy is a restore path and not a hope. The recording's name now comes from the server (`SRS-SES-05`) instead of being built again at UIU. | 97 server tests, 92 worker tests, 30 PostgreSQL tests, 226 recorder tests pass |
+
+### Putting Phase 6 on the current server
+
+1. Apply `backend/scripts/012_v3_cloud_copy.sql` to the recordings database (additive).
+2. Make a **second** R2 bucket for the copies, with object lock and versioning on. It must not be the bucket that holds the pieces; the server refuses to start the copy step if the two names match.
+3. Issue a **separate** R2 API token, read and write, scoped to the copy bucket only — and check that the existing token, the one that deletes pieces, has no access to it (`AT-67`, `SRS-ARC-12`). The two credentials are the whole protection: one can delete pieces and cannot touch copies; the other can write copies and cannot delete them.
+4. On Render, set `AIMS_COPY_BUCKET`, `AIMS_COPY_ENDPOINT`, `AIMS_COPY_ACCESS_KEY`, `AIMS_COPY_SECRET_KEY`, `AIMS_COPY_REGION=auto`.
+5. On the UIU machine, generate the copy key and set `AIMS_COPY_KEY` in the worker's `.env` only:
+   `python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"`
+   Keep one sealed offline copy of it. It never goes to Render, to R2 or into either repository — and without it every cloud copy is unreadable, including ours.
+6. `pip install -r backend/archive_worker/requirements.txt` (this adds `soundfile` and `cryptography`), or rebuild the worker image.
+
+Until step 4 is done the server keeps the old behaviour - pieces deleted as soon
+as a recording is archived - and says so in the log on every archive. Until step 5
+is done the worker archives as usual and makes no copies.
+
+**Restoring.** `python restore.py restore <file or folder> <destination>` decrypts
+each object and decodes the FLAC back to WAV, refusing any file that does not
+decode cleanly; `python restore.py check <file> <sha256>` compares it with the
+hash in the catalogue (`AT-74`). Both need `AIMS_COPY_KEY`.
+
+**Still open for the archive.** The copy runs on the same machine as the archive
+and in the same process; if copying ever falls behind the recordings, it is the
+part to move to its own worker. `SRS-ARC-14` asks for the copy the same night,
+which the sweep now reports but nothing enforces.

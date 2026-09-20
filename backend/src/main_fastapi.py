@@ -175,6 +175,12 @@ class AsyncAppContext:
                 "data arrives (SRS-DBA-20).")
             api_v2.ctx.clinical = ClinicalStore(self.db.pool, separate=False)
 
+        # SRS-STO-01, SRS-ARC-12: the copy bucket, with its own credentials.
+        # That token is read-and-write to the copy bucket only, and the token
+        # above - which deletes pieces - has no access to it at all, so no one
+        # credential can both make a copy and destroy one.
+        api_v2.ctx.copy = self._copy_bucket()
+
         if api_v2.ctx.signer is None:
             logger.critical(
                 "AIMS_RECEIPT_PRIVATE_KEY is not set. Audio will be received and "
@@ -183,6 +189,41 @@ class AsyncAppContext:
             )
 
         logger.info("All async connections initialized")
+
+    @staticmethod
+    def _copy_bucket() -> Optional[MinIOClient]:
+        """
+        The locked bucket that holds the merged lossless copies.
+
+        Unset means the copy step is not running yet: the archive worker has
+        nothing to copy to, and /archive/complete keeps deleting the pieces as
+        it did before, saying so each time.
+        """
+        bucket = os.getenv("AIMS_COPY_BUCKET", "").strip()
+        if bucket and bucket == settings.minio_bucket:
+            logger.critical(
+                "AIMS_COPY_BUCKET is the same bucket as the pieces (%s). The copy "
+                "must be a separate bucket, locked against deletion (SRS-ARC-12). "
+                "No copies will be made until this is fixed.", bucket)
+            return None
+        if not bucket:
+            logger.warning(
+                "AIMS_COPY_BUCKET is not set - no lossless cloud copy is being kept "
+                "(SRS-ARC-08). Pieces are deleted as soon as a recording is archived.")
+            return None
+        try:
+            return MinIOClient(
+                endpoint=os.getenv("AIMS_COPY_ENDPOINT", settings.minio_endpoint).strip(),
+                access_key=os.getenv("AIMS_COPY_ACCESS_KEY", "").strip(),
+                secret_key=os.getenv("AIMS_COPY_SECRET_KEY", "").strip(),
+                bucket=bucket,
+                secure=os.getenv("AIMS_COPY_SECURE", "true").lower() != "false",
+                region=os.getenv("AIMS_COPY_REGION", settings.minio_region).strip(),
+            )
+        except Exception as exc:
+            # Never fatal: recordings must keep arriving. The copies simply wait.
+            logger.critical("Copy bucket %s could not be opened: %s", bucket, exc)
+            return None
 
     async def close(self):
         """Close all connections."""

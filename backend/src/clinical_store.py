@@ -11,8 +11,11 @@ This module is the only code that reads or writes patient names.
 """
 from __future__ import annotations
 
+import datetime
+import decimal
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import clinical_model as cm
@@ -26,6 +29,44 @@ _VISIT = """patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
 def _visit_args(visit) -> tuple:
     return (visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
             visit.start_time, visit.day)
+
+
+def _plain(value):
+    """Database values as JSON can carry them: no Decimal, no date objects."""
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, str):
+        # JSONB columns come back as text from asyncpg unless a codec is set.
+        return value
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _row(row, *, drop: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """One database row as a plain dictionary, empty fields left out."""
+    if row is None:
+        return {}
+    skip = set(drop) | {"created_at", "updated_at"}
+    out = {}
+    for key, value in dict(row).items():
+        if key in skip or value is None or value == {} or value == "":
+            continue
+        if key == "other" and isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                pass
+            if not value:
+                continue
+        out[key] = _plain(value)
+    return out
 
 
 class ClinicalStore:
@@ -301,6 +342,101 @@ class ClinicalStore:
                 "INSERT INTO clinical_access_log (actor, action, patient_id, detail) "
                 "VALUES ($1,$2,$3,$4)", actor, action, patient_id,
                 json.dumps(detail or {}, ensure_ascii=False))
+
+    async def json_document(self, visit, *, actor: str) -> Dict[str, Any]:
+        """
+        Everything CMED holds about one visit, as the JSON that is written
+        beside the recording and travels with it into the cloud copy
+        (SRS 3.2 §8.8, SRS-CRI-05).
+
+        Built from the loaded tables rather than the stored body, so it shows
+        what the database actually holds - if a field was refused on load, it is
+        missing here too, and the mismatch is visible instead of hidden.
+        """
+        await self.log_access(actor=actor, action="read_visit_json",
+                              patient_id=visit.patient_id)
+        async with self._pool.acquire() as conn:
+            encounter = await conn.fetchrow(
+                f"SELECT * FROM encounters WHERE {_VISIT} AND source = 'live'",
+                *_visit_args(visit))
+            if encounter is None:
+                return {}
+            eid = encounter["encounter_id"]
+            patient = await conn.fetchrow(
+                "SELECT patient_id, sex FROM patients WHERE patient_id = $1",
+                visit.patient_id)
+            demographics = await conn.fetchrow(
+                "SELECT * FROM encounter_demographics WHERE encounter_id = $1", eid)
+            paramedic = await conn.fetchrow(
+                "SELECT * FROM paramedic_observations WHERE encounter_id = $1", eid)
+            sex = (patient or {}).get("sex") or "unknown"
+            details = None
+            if sex in ("female", "male"):
+                details = await conn.fetchval(
+                    f"SELECT details FROM {sex}_details WHERE encounter_id = $1", eid)
+            prescription = await self._prescription_json(conn, eid)
+            earlier = await conn.fetchrow("""
+                SELECT encounter_id, visit_date FROM encounters
+                 WHERE patient_id = $1
+                   AND (visit_date, start_time) < ($2::date, $3)
+                 ORDER BY visit_date DESC, start_time DESC LIMIT 1
+            """, visit.patient_id, visit.day, visit.start_time)
+            previous = None
+            if earlier is not None:
+                previous = {
+                    "date": _plain(earlier["visit_date"]),
+                    "prescription": await self._prescription_json(
+                        conn, earlier["encounter_id"]),
+                }
+
+        document: Dict[str, Any] = {
+            "patient": {"patient_id": visit.patient_id, "sex": sex,
+                        **_row(demographics, drop=("encounter_id", "sex"))},
+            "visit": {"doctor_id": visit.doctor_id,
+                      "hospital_id": encounter["hospital_id"],
+                      "cmed_hospital_id": visit.cmed_hospital_id,
+                      "start_time": visit.start_time,
+                      "visit_date": _plain(visit.day)},
+            "paramedic": _row(paramedic, drop=("encounter_id",)),
+            "previous_visit": previous,
+            "prescription": prescription,
+        }
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except ValueError:
+                details = None
+        if details:
+            document[f"{sex}_details"] = _plain(details)
+        return document
+
+    @staticmethod
+    async def _prescription_json(conn, encounter_id) -> Optional[Dict[str, Any]]:
+        """The latest version for one encounter, with its medicines."""
+        row = await conn.fetchrow(
+            "SELECT * FROM prescriptions WHERE encounter_id = $1 "
+            "ORDER BY version DESC LIMIT 1", encounter_id)
+        if row is None:
+            return None
+        pid = row["prescription_id"]
+        items = await conn.fetch(
+            "SELECT line_no, drug, dose, frequency, duration, instructions "
+            "FROM prescription_items WHERE prescription_id = $1 ORDER BY line_no", pid)
+        diagnoses = await conn.fetch(
+            "SELECT text FROM diagnoses WHERE prescription_id = $1 ORDER BY line_no", pid)
+        investigations = await conn.fetch(
+            "SELECT name FROM investigations WHERE prescription_id = $1 ORDER BY line_no",
+            pid)
+        return {
+            "version": row["version"],
+            "issued_at": _plain(row["issued_at"]),
+            "advice": row["advice"],
+            "follow_up_date": _plain(row["follow_up_date"]),
+            "notes": row["notes"],
+            "diagnoses": [d["text"] for d in diagnoses],
+            "investigations": [i["name"] for i in investigations],
+            "items": [_row(i) for i in items],
+        }
 
     async def prescription_for(self, patient_id: str, *, which: str,
                                actor: str) -> Optional[Dict[str, Any]]:

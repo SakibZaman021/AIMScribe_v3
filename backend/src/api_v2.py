@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 # Identifiers allowed into a filename. Anything else and the clip goes unnamed
 # rather than letting a separator or a path fragment into the archive.
 _NAME_SAFE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# The recording's own name (SRS-SES-05): the same characters plus the
+# underscores that separate its fields.
+_STEM_SAFE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 
@@ -69,6 +72,11 @@ class V2Context:
         self.grants: Optional[GrantIssuer] = None
         # aims_clinical (SRS 3.2 §8.7.2): CMED's clinical records.
         self.clinical = None
+        # The copy bucket (SRS-STO-01): the merged lossless copy of each
+        # finished recording, locked against deletion. Its own client with its
+        # own credentials, because the credential that deletes pieces must not
+        # be able to reach the copies (SRS-ARC-12).
+        self.copy = None
 
     @property
     def ready(self) -> bool:
@@ -88,6 +96,12 @@ def _clinical():
     if ctx.clinical is None:
         raise HTTPException(status_code=503, detail="clinical database is not initialised")
     return ctx.clinical
+
+
+def _copy_bucket():
+    if ctx.copy is None:
+        raise HTTPException(status_code=503, detail="copy bucket is not configured")
+    return ctx.copy
 
 
 # ============================================================
@@ -713,6 +727,12 @@ async def _delete_bucket_objects(session_id: str) -> int:
 
 def _remove_object(object_key: str) -> None:
     """Delete one object. Sync; called in a thread."""
+    # The copies are never deleted here (SRS-ARC-12). The credential should not
+    # even reach them, but a bucket misconfigured into holding both would make
+    # this the code that destroyed the only remaining copy.
+    if ctx.copy is not None and (object_key.startswith("copies/")
+                                 or ctx.minio.bucket == ctx.copy.bucket):
+        raise RuntimeError(f"refusing to delete {object_key}: it is in the copy bucket")
     ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
 
 
@@ -1040,11 +1060,18 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
 
     await repo.mark_segments_archived(session_id)
 
-    # The bucket is transit. The AIMS LAB server holds a copy whose hash was
-    # recomputed from disk, and every receipt is signed, so the clips have no
-    # further purpose there. Deleting them last means a failure here costs storage,
-    # never audio.
-    removed = await _delete_bucket_objects(session_id)
+    # The pieces are not deleted here. SRS-ARC-08: a finished consultation is
+    # first kept in the cloud as one merged lossless copy, and only when that
+    # copy is verified and recorded do the pieces go (/archive/copy/complete).
+    # Where no copy bucket is configured the old behaviour stands, so an
+    # existing deployment keeps working - and says so in the log.
+    removed = 0
+    if ctx.copy is None:
+        logger.warning("No copy bucket configured; deleting the pieces for %s as "
+                       "soon as it is archived (SRS-ARC-08 needs a copy bucket)",
+                       session_id)
+        removed = await _delete_bucket_objects(session_id)
+        await repo.mark_segments_deleted(session_id)
 
     await repo.audit(
         event_type="session.archived", actor_type="service", actor_id="archive-worker",
@@ -1055,7 +1082,240 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
     logger.info("Archived %s to %s; issued %s receipt(s), deleted %s object(s)",
                 session_id, body.archive_relpath, issued + 1, removed)
     return {"status": "archived", "receipts_issued": issued + 1,
-            "objects_deleted": removed}
+            "objects_deleted": removed, "copy_pending": ctx.copy is not None}
+
+
+# ============================================================
+# The cloud copy (SRS-ARC-08..13)
+#
+# The worker at UIU holds the archive and the encryption key; this server
+# holds the bucket credentials and the database. So the worker compresses,
+# checks and encrypts, and asks here for the places to put the result.
+# ============================================================
+
+class CopyAuthorizeRequest(BaseModel):
+    session_id: str
+    kind: str = Field(..., pattern="^(audio|json)$")
+
+
+class CopyRecord(BaseModel):
+    kind: str = Field(..., pattern="^(audio|json)$")
+    object_key: str = Field(..., max_length=512)
+    version: int = Field(1, ge=1)
+    bytes: int = Field(..., ge=1)
+    sha256: str = Field(..., min_length=64, max_length=64)
+    plain_sha256: Optional[str] = Field(None, min_length=64, max_length=64)
+
+
+class CopyCompleteRequest(BaseModel):
+    session_id: str
+    copies: List[CopyRecord]
+    # False for a JSON written again after archiving (SRS-ARC-13): the audio
+    # copy already exists and the pieces are long gone.
+    final: bool = True
+
+
+class CopyFailedRequest(BaseModel):
+    session_id: str
+    step: str = Field(..., max_length=64)
+    message: str = Field("", max_length=1000)
+
+
+def copy_object_key(session: Dict[str, Any], kind: str, version: int) -> str:
+    """
+    Where a copy lives in the copy bucket. The same shape as the archive tree,
+    so a restore can walk one clinic or one day without an index.
+    """
+    stem = session.get("file_stem") or safe_session_id(str(session["session_id"]))
+    if not _STEM_SAFE.match(str(stem)):
+        raise HTTPException(status_code=409, detail="unsafe file name for this session")
+    day = session.get("session_date")
+    day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
+    suffix = "flac.enc" if kind == "audio" else "json.enc"
+    return (f"copies/{safe_identifier(session['hospital_id'], field='hospital_id')}"
+            f"/{safe_identifier(session['doctor_id'], field='doctor_id')}"
+            f"/{day}/{stem}.v{version}.{suffix}")
+
+
+@router.get("/archive/copy/pending")
+async def archive_copy_pending(limit: int = 5, _: None = Depends(require_worker)):
+    """Recordings archived at UIU whose cloud copy has still to be made."""
+    limit = max(1, min(limit, 20))
+    sessions = await _repo().pending_copy(limit)
+    return {"sessions": [{
+        "session_id": s["session_id"],
+        "file_stem": s["file_stem"],
+        "hospital_id": s["hospital_id"],
+        "doctor_id": s["doctor_id"],
+        "session_date": s["session_date"].isoformat() if s["session_date"] else None,
+        "archive_relpath": s["archive_relpath"],
+        "archive_sha256": bytes(s["archive_sha256"]).hex() if s["archive_sha256"] else None,
+        "archive_bytes": s["archive_bytes"],
+    } for s in sessions]}
+
+
+@router.get("/archive/json/pending")
+async def archive_json_pending(limit: int = 5, _: None = Depends(require_worker)):
+    """
+    Recordings whose JSON has to be written again because the prescription
+    arrived after archiving (SRS-ARC-13).
+    """
+    limit = max(1, min(limit, 20))
+    sessions = await _repo().pending_json(limit)
+    return {"sessions": [{
+        "session_id": s["session_id"],
+        "file_stem": s["file_stem"],
+        "archive_relpath": s["archive_relpath"],
+    } for s in sessions]}
+
+
+@router.get("/archive/clinical/{session_id}")
+async def archive_clinical_document(session_id: str,
+                                    _: None = Depends(require_worker)):
+    """
+    The JSON that is written beside the audio and travels with it into the
+    cloud copy (§8.8, SRS-CRI-05).
+
+    Assembled here rather than at UIU: the clinical database has its own
+    credentials and the worker holds none of them.
+    """
+    session_id = safe_session_id(session_id)
+    session = await _repo().get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return await _clinical_document(session)
+
+
+async def _clinical_document(session: Dict[str, Any]) -> Dict[str, Any]:
+    repo = _repo()
+    session_id = str(session["session_id"])
+    document: Dict[str, Any] = {"file_stem": session.get("file_stem")}
+
+    visit = None
+    if session.get("grant_jti"):
+        grant = await repo.get_authorisation(session["grant_jti"])
+        if grant and grant["patient_id"] != "REDACTED":
+            visit = _visit_from_grant(grant)
+
+    if visit is not None and ctx.clinical is not None:
+        document.update(await ctx.clinical.json_document(visit, actor="archive-worker"))
+
+    started = session.get("opened_at")
+    ended = session.get("closed_at")
+    document.setdefault("visit", {})
+    document["visit"].setdefault("doctor_id", session["doctor_id"])
+    document["visit"].setdefault("hospital_id", session["hospital_id"])
+    document["visit"]["end_time"] = ended.isoformat() if ended else None
+    document["visit"].setdefault("start_time", started.isoformat() if started else None)
+
+    archive_sha = session.get("archive_sha256")
+    document["recording"] = {
+        "session_id": session_id,
+        "confirmation": session.get("confirmation"),
+        "opened_at": started.isoformat() if started else None,
+        "closed_at": ended.isoformat() if ended else None,
+        "duration_seconds": float(session["total_duration_seconds"])
+                            if session.get("total_duration_seconds") is not None else None,
+        "audio_sha256": bytes(archive_sha).hex() if archive_sha else None,
+        "audio_bytes": session.get("archive_bytes"),
+        "archive_relpath": session.get("archive_relpath"),
+        "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    return document
+
+
+@router.post("/archive/copy/authorize")
+async def archive_copy_authorize(body: CopyAuthorizeRequest,
+                                 _: None = Depends(require_worker)):
+    """
+    One place in the copy bucket to put one object, and the address to read it
+    back from. The worker never holds bucket credentials (SRS-STO-02).
+    """
+    copy = _copy_bucket()
+    repo = _repo()
+    session_id = safe_session_id(body.session_id)
+    session = await repo.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if session.get("archived_at") is None:
+        raise HTTPException(status_code=409, detail="session is not archived yet")
+
+    version = await repo.next_copy_version(session_id, body.kind)
+    object_key = copy_object_key(session, body.kind, version)
+    loop = asyncio.get_event_loop()
+    upload = await loop.run_in_executor(
+        None, copy.get_presigned_upload_url, object_key, 3600)
+    download = await loop.run_in_executor(
+        None, copy.get_presigned_download_url, object_key, 3600)
+    return {"object_key": object_key, "version": version,
+            "upload_url": upload, "download_url": download}
+
+
+@router.post("/archive/copy/complete")
+async def archive_copy_complete(body: CopyCompleteRequest,
+                                _: None = Depends(require_worker)):
+    """
+    The worker has uploaded the copy, read it back and matched it. Record it -
+    and only now delete the pieces (SRS-ARC-09, steps 6 and 7).
+    """
+    repo = _repo()
+    session_id = safe_session_id(body.session_id)
+    session = await repo.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    for copy in body.copies:
+        try:
+            digest = bytes.fromhex(copy.sha256)
+            plain = bytes.fromhex(copy.plain_sha256) if copy.plain_sha256 else None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="sha256 must be hex")
+        await repo.record_cloud_copy(
+            session_id=session_id, kind=copy.kind, object_key=copy.object_key,
+            version=copy.version, byte_length=copy.bytes, sha256=digest,
+            plain_sha256=plain)
+
+    if not body.final:
+        # A JSON written again after archiving. Nothing else changes: the audio
+        # copy stands and the earlier JSON objects are kept (SRS-ARC-13).
+        await repo.clear_json_stale(session_id)
+        await repo.audit(
+            event_type="session.json_rewritten", actor_type="service",
+            actor_id="archive-worker", session_id=session_id,
+            detail={"objects": [c.object_key for c in body.copies]})
+        return {"status": "recorded", "objects_deleted": 0}
+
+    kinds = {c.kind for c in body.copies} | {
+        c["kind"] for c in await repo.copies_for(session_id)}
+    if "audio" not in kinds:
+        raise HTTPException(status_code=409,
+                            detail="no audio copy recorded for this session")
+
+    await repo.mark_copied(session_id)
+    removed = await _delete_bucket_objects(session_id)
+    await repo.mark_segments_deleted(session_id)
+    await repo.audit(
+        event_type="session.copied", actor_type="service", actor_id="archive-worker",
+        session_id=session_id,
+        detail={"objects": [c.object_key for c in body.copies],
+                "objects_deleted": removed})
+    logger.info("Cloud copy complete for %s; deleted %s piece(s) from the segment "
+                "bucket", session_id, removed)
+    return {"status": "copied", "objects_deleted": removed}
+
+
+@router.post("/archive/copy/failed")
+async def archive_copy_failed(body: CopyFailedRequest,
+                              _: None = Depends(require_worker)):
+    """
+    A step of the copy failed at UIU. The pieces stay where they are and the
+    step is retried; this is how the failure becomes visible (SRS-ARC-10).
+    """
+    session_id = safe_session_id(body.session_id)
+    await _repo().raise_alert(
+        alert_type="cloud_copy_failed", severity="warning", session_id=session_id,
+        detail={"step": body.step, "message": body.message[:500]})
+    return {"status": "recorded"}
 
 
 # ============================================================
@@ -1385,8 +1645,19 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
     # Clinical records that did not load first time (SRS-CRI-04).
     loaded = await ctx.clinical.load_pending() if ctx.clinical is not None else 0
 
+    # A recording should have its cloud copy the same night (SRS-ARC-14). One
+    # that still has none after a day is a step failing quietly, and the pieces
+    # are rightly still in the bucket waiting for it (SRS-ARC-10).
+    overdue = await repo.copies_overdue(hours=24) if ctx.copy is not None else []
+    for row in overdue:
+        await repo.raise_alert(
+            alert_type="cloud_copy_overdue", severity="warning",
+            session_id=row["session_id"],
+            detail={"archived_at": row["archived_at"].isoformat()
+                                   if row["archived_at"] else None})
+
     return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
-            "clinical_loaded": loaded}
+            "clinical_loaded": loaded, "copies_overdue": len(overdue)}
 
 
 # ============================================================

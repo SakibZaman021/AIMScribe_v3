@@ -129,6 +129,30 @@ def archive_filename(
             f"_{opened_at.strftime('%Y_%m_%d')}.wav")
 
 
+def name_for(session: Dict[str, Any], opened_local: datetime,
+             closed_local: datetime) -> str:
+    """
+    The recording's file name.
+
+    The server names every recording when it closes (`SRS-SES-05`) and stores
+    that name against the visit in the clinical database, so the audio, the
+    JSON beside it and the clinical record all carry the same name. The worker
+    uses it as given and derives nothing.
+
+    Only a session that closed before the server did this - or one from a
+    protocol-2 recorder - has no name, and then the older form is built here.
+    """
+    stem = session.get("file_stem")
+    if isinstance(stem, str) and FOLDER_PATTERN.match(stem):
+        return f"{stem}.wav"
+    if stem:
+        raise ArchiveError(f"unsafe file_stem: {stem!r}")
+    return archive_filename(
+        patient_ref=session["patient_ref"], doctor_id=session["doctor_id"],
+        hospital_id=session["hospital_id"],
+        opened_at=opened_local, closed_at=closed_local)
+
+
 def expected_join_bytes(segment_bytes: List[int]) -> int:
     """
     Size the joined WAV will have: one 44-byte header plus every segment's audio.
@@ -326,6 +350,28 @@ def write_manifest(audio_path: Path, session: Dict[str, Any], result: JoinResult
     return path
 
 
+def clinical_json_path(audio_path: Path) -> Path:
+    """`<name>.json`, beside `<name>.wav` (§8.8)."""
+    return audio_path.with_suffix(".json")
+
+
+def write_clinical_json(audio_path: Path, document: Dict[str, Any]) -> Path:
+    """
+    The clinical record as a file beside the audio (`SRS-CRI-05`).
+
+    The database is the index; this file is the portable copy that travels with
+    the recording, including into the cloud copy. It is written again if the
+    prescription arrives later (`SRS-ARC-13`), so it is replaced atomically -
+    a reader either sees the old file or the new one, never half of either.
+    """
+    path = clinical_json_path(audio_path)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(document, indent=2, ensure_ascii=False, sort_keys=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 def update_day_index(directory: Path) -> Path:
     """
     Rebuild `_index.json` so a day's folder can be read without the database.
@@ -383,8 +429,9 @@ def ensure_space(root: Path, needed: int, *, headroom: int) -> None:
 
 
 __all__ = [
-    "ArchiveError", "JoinResult", "archive_filename",
+    "ArchiveError", "JoinResult", "archive_filename", "clinical_json_path",
     "expected_join_bytes", "free_destination", "ensure_space", "free_bytes",
-    "join_wav", "local_times", "relative_path", "session_directory",
-    "sha256_bytes", "sha256_file", "update_day_index", "write_manifest",
+    "join_wav", "local_times", "name_for", "relative_path", "session_directory",
+    "sha256_bytes", "sha256_file", "update_day_index", "write_clinical_json",
+    "write_manifest",
 ]

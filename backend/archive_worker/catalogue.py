@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS archived_sessions (
 
     archived_at       TEXT NOT NULL,
     reported_at       TEXT,
-    verified_at       TEXT
+    verified_at       TEXT,
+
+    -- The lossless cloud copy (SRS-ARC-09). Until this is filled in, this
+    -- volume and the pieces in the segment bucket are the only copies.
+    copied_at         TEXT,
+    copy_object_key   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_cat_patient  ON archived_sessions(patient_id, session_date DESC);
@@ -102,6 +107,13 @@ class Catalogue:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript(SCHEMA)
+            # A catalogue written before the cloud copy existed has no columns
+            # for it. Adding them here keeps an in-place upgrade to one step.
+            existing = {row["name"] for row in
+                        conn.execute("PRAGMA table_info(archived_sessions)")}
+            for column in ("copied_at", "copy_object_key"):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE archived_sessions ADD COLUMN {column} TEXT")
             conn.commit()
         logger.info("Archive catalogue at %s", self.path)
 
@@ -180,6 +192,27 @@ class Catalogue:
                 conn.execute(
                     "UPDATE archived_sessions SET reported_at = ? WHERE session_id = ?",
                     (now, session_id))
+
+    def mark_copied(self, session_id: str, object_key: str) -> None:
+        """
+        The lossless cloud copy of this recording exists and was verified
+        (SRS-ARC-09). Kept here too, so "is this recording safe anywhere but
+        this volume?" can be answered on this machine with no network.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("UPDATE archived_sessions SET copied_at = ?, "
+                             "copy_object_key = ? WHERE session_id = ?",
+                             (now, object_key, session_id))
+
+    def uncopied(self) -> List[Dict[str, Any]]:
+        """Archived here, with no cloud copy yet: still only one copy in the world."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM archived_sessions WHERE copied_at IS NULL "
+                "ORDER BY archived_at").fetchall()
+        return [dict(r) for r in rows]
 
     def unreported(self) -> List[Dict[str, Any]]:
         """

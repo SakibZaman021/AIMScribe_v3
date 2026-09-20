@@ -19,14 +19,23 @@ Sequence per session:
   2. download each segment                 verify sha256 against the manifest
   3. join into one WAV                     atomic write, then fsync
   4. re-read from disk and hash            proves the bytes actually landed
-  5. write manifest.json and _index.json
+  5. write manifest.json, the clinical JSON, and _index.json
   6. POST /api/v2/archive/complete         backend issues the purge receipts
+
+Then, for each archived recording, the cloud copy (SRS-ARC-08-13):
+
+  7. compress the WAV to FLAC          decode it again and compare the samples
+  8. encrypt the FLAC and the JSON     with a key that never leaves this machine
+  9. upload to the copy bucket         read both back and compare
+ 10. POST /api/v2/archive/copy/complete   the server records the copy and only
+                                          then deletes the pieces
 
 A session is only reported complete after step 4 succeeds. Any failure leaves the
 session pending, the agent keeps its local audio, and the next pass retries.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import signal
@@ -43,7 +52,9 @@ from catalogue import Catalogue
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import archive
+import cloudcopy
 from archive import ArchiveError
+from cloudcopy import CopyError
 
 logging.basicConfig(
     level=os.getenv("AIMS_LOG_LEVEL", "INFO").upper(),
@@ -65,6 +76,10 @@ class Settings:
         self.download_timeout = int(os.getenv("AIMS_DOWNLOAD_TIMEOUT", "600"))
         self.disk_headroom = int(os.getenv("AIMS_DISK_HEADROOM_BYTES", str(20 * 1024 ** 3)))
         self.verify_tls = os.getenv("AIMS_VERIFY_TLS", "true").lower() != "false"
+        # The key for the cloud copy. It stays on this machine: the server and
+        # the storage provider never see it (SRS-DAT-08).
+        self.copy_key = cloudcopy.load_key(os.getenv("AIMS_COPY_KEY"))
+        self.copy_batch = int(os.getenv("AIMS_COPY_BATCH", "2"))
 
     def problems(self) -> List[str]:
         issues = []
@@ -90,6 +105,7 @@ class ArchiveWorker:
         self.catalogue = Catalogue(settings.archive_root / "catalogue.sqlite3")
         self.running = True
         self.archived = 0
+        self.copied = 0
         self.failed = 0
 
     # ---- lifecycle ----
@@ -108,6 +124,9 @@ class ArchiveWorker:
         logger.info("Archive : %s (%.1f GB free)",
                     root, archive.free_bytes(root) / 1024 ** 3)
         logger.info("Poll    : every %ss", self.settings.poll_seconds)
+        logger.info("Copies  : %s", "on, encrypted at UIU"
+                    if self.settings.copy_key else
+                    "OFF - AIMS_COPY_KEY is not set, so no cloud copy is kept")
         logger.info("=" * 64)
 
         while self.running:
@@ -124,8 +143,8 @@ class ArchiveWorker:
                 logger.error("Poll failed: %s", exc, exc_info=True)
                 self._sleep(self.settings.poll_seconds)
 
-        logger.info("Stopped. Archived %s session(s), %s failure(s)",
-                    self.archived, self.failed)
+        logger.info("Stopped. Archived %s session(s), copied %s, %s failure(s)",
+                    self.archived, self.copied, self.failed)
         return 0
 
     def _sleep(self, seconds: int) -> None:
@@ -140,7 +159,7 @@ class ArchiveWorker:
         self.sweep()
         sessions = self.fetch_pending()
         if not sessions:
-            return 0
+            return self.copy_pass()
 
         logger.info("%s session(s) pending", len(sessions))
         processed = 0
@@ -160,7 +179,9 @@ class ArchiveWorker:
                 self.failed += 1
                 logger.error("Session %s failed unexpectedly: %s",
                              session.get("session_id"), exc, exc_info=True)
-        return processed
+
+        # The cloud copy runs after the archiving, on what is already on disk.
+        return processed + self.copy_pass()
 
     def sweep(self) -> None:
         """
@@ -208,10 +229,7 @@ class ArchiveWorker:
         # The filename comes first: the folder is named after it, so that one
         # directory is one consultation. A patient seen twice in a day gets two
         # folders, distinguished by the times in the name.
-        filename = archive.archive_filename(
-            patient_ref=session["patient_ref"], doctor_id=session["doctor_id"],
-            hospital_id=session["hospital_id"],
-            opened_at=opened_local, closed_at=closed_local)
+        filename = archive.name_for(session, opened_local, closed_local)
         folder_name = filename[:-len(".wav")]
 
         directory = archive.session_directory(
@@ -233,6 +251,7 @@ class ArchiveWorker:
         if already_ours:
             existing = archive.sha256_file(destination)
             logger.info("Session %s already present on disk; re-reporting", session_id)
+            self.write_clinical_json(session_id, destination)
             self.report_complete(session_id, relpath, existing, destination.stat().st_size)
             return
 
@@ -256,6 +275,9 @@ class ArchiveWorker:
                 raise ArchiveError("archive file failed verification after write")
 
         archive.write_manifest(destination, session, result)
+        # The clinical record travels with the audio, in the same folder and
+        # under the same name (SRS-CRI-05, §8.8).
+        self.write_clinical_json(session_id, destination)
         archive.update_day_index(directory)
 
         # The hospital's own index, so "what audio do we hold?" is answerable on
@@ -280,6 +302,23 @@ class ArchiveWorker:
                 self.catalogue.mark_reported(session_id)
             except Exception as exc:
                 logger.warning("Catalogue not marked reported for %s: %s", session_id, exc)
+
+    def write_clinical_json(self, session_id: str, audio_path: Path) -> Path:
+        """
+        Fetch what CMED holds about this visit and write it beside the audio.
+
+        Only this server can read the clinical database, so the document is
+        assembled there. A failure leaves the session pending: an archive
+        without its clinical record is incomplete, and retrying costs one
+        request, since the audio is already on disk.
+        """
+        response = self.session.get(
+            f"{self.settings.backend_url}/api/v2/archive/clinical/{session_id}",
+            timeout=self.settings.request_timeout, verify=self.settings.verify_tls)
+        if response.status_code >= 300:
+            raise ArchiveError(f"clinical record unavailable "
+                               f"({response.status_code}); will retry")
+        return archive.write_clinical_json(audio_path, response.json())
 
     def download_segments(self, segments: List[Dict[str, Any]], scratch: Path) -> List[Path]:
         """
@@ -350,6 +389,195 @@ class ArchiveWorker:
                     "%s clip(s) deleted from the bucket", session_id,
                     body.get("receipts_issued", 0), body.get("objects_deleted", 0))
         return True
+
+
+    # ============================================================
+    # The cloud copy (SRS-ARC-08..13)
+    # ============================================================
+
+    def copy_pass(self) -> int:
+        """
+        Make the lossless cloud copy of everything archived but not yet copied,
+        and rewrite any JSON that a late prescription has changed.
+
+        Until a recording's copy exists, its pieces stay in the segment bucket:
+        the copy is what makes deleting them safe (SRS-ARC-08).
+        """
+        if self.settings.copy_key is None:
+            return 0
+
+        done = 0
+        for session in self.fetch("archive/copy/pending", self.settings.copy_batch):
+            if not self.running:
+                break
+            session_id = session["session_id"]
+            try:
+                self.copy_session(session)
+                self.copied += 1
+                done += 1
+            except (CopyError, ArchiveError) as exc:
+                self.failed += 1
+                logger.error("Cloud copy of %s failed: %s", session_id, exc)
+                self.report_copy_failure(session_id, "copy", str(exc))
+            except Exception as exc:
+                self.failed += 1
+                logger.error("Cloud copy of %s failed unexpectedly: %s",
+                             session_id, exc, exc_info=True)
+                self.report_copy_failure(session_id, "copy", str(exc))
+
+        for session in self.fetch("archive/json/pending", self.settings.copy_batch):
+            if not self.running:
+                break
+            try:
+                self.rewrite_json(session)
+                done += 1
+            except Exception as exc:
+                self.failed += 1
+                logger.error("Rewriting the JSON for %s failed: %s",
+                             session["session_id"], exc)
+                self.report_copy_failure(session["session_id"], "json", str(exc))
+        return done
+
+    def copy_session(self, session: Dict[str, Any]) -> None:
+        """The steps of SRS-ARC-09, in order, each proven before the next."""
+        session_id = session["session_id"]
+        audio = self.archive_file(session)
+
+        # 1. The archived WAV, still exactly what was reported.
+        if session.get("archive_sha256"):
+            on_disk = archive.sha256_file(audio).hex()
+            if on_disk != session["archive_sha256"]:
+                raise CopyError(f"{audio.name} on disk no longer matches what was "
+                                f"archived; not copying it")
+
+        json_path = archive.clinical_json_path(audio)
+        if not json_path.exists():
+            self.write_clinical_json(session_id, audio)
+
+        with tempfile.TemporaryDirectory(prefix=f"aimscopy_{session_id}_") as scratch:
+            work = Path(scratch)
+            stem = audio.stem
+
+            # 2 and 3. Compress, then decode again and compare the samples.
+            flac = cloudcopy.to_flac(audio, work / f"{stem}.flac")
+            if not cloudcopy.flac_matches_wav(flac, audio):
+                raise CopyError("the FLAC does not decode to the archived audio; "
+                                "the pieces stay where they are")
+
+            # 4 and 5. Encrypt here, upload, read back, compare.
+            audio_copy = self.upload_copy(
+                session_id, "audio",
+                cloudcopy.encrypt_file(flac, work / f"{stem}.flac.enc",
+                                       self.settings.copy_key))
+            json_copy = self.upload_copy(
+                session_id, "json",
+                cloudcopy.encrypt_file(json_path, work / f"{stem}.json.enc",
+                                       self.settings.copy_key))
+
+        # 6 and 7. Recorded on the server, which then - and only then - deletes
+        # the pieces from the segment bucket.
+        result = self.post("archive/copy/complete", {
+            "session_id": session_id, "final": True,
+            "copies": [audio_copy, json_copy],
+        })
+        try:
+            self.catalogue.mark_copied(session_id, audio_copy["object_key"])
+        except Exception as exc:
+            logger.warning("Catalogue not marked copied for %s: %s", session_id, exc)
+        logger.info("Cloud copy of %s stored (%.1f MB FLAC); %s piece(s) deleted",
+                    session_id, audio_copy["bytes"] / 1024 ** 2,
+                    result.get("objects_deleted", 0))
+
+    def rewrite_json(self, session: Dict[str, Any]) -> None:
+        """
+        A prescription arrived after archiving: write the JSON again and upload
+        it as a new object. The earlier ones are kept (SRS-ARC-13).
+        """
+        session_id = session["session_id"]
+        audio = self.archive_file(session)
+        json_path = self.write_clinical_json(session_id, audio)
+
+        copies = []
+        if self.settings.copy_key is not None:
+            with tempfile.TemporaryDirectory(prefix=f"aimsjson_{session_id}_") as scratch:
+                copies.append(self.upload_copy(
+                    session_id, "json",
+                    cloudcopy.encrypt_file(json_path,
+                                           Path(scratch) / f"{audio.stem}.json.enc",
+                                           self.settings.copy_key)))
+        self.post("archive/copy/complete",
+                  {"session_id": session_id, "final": False, "copies": copies})
+        logger.info("Wrote the JSON for %s again after a late prescription", session_id)
+
+    def archive_file(self, session: Dict[str, Any]) -> Path:
+        relpath = session.get("archive_relpath") or ""
+        audio = (self.settings.archive_root / relpath).resolve()
+        if not audio.is_file() or self.settings.archive_root.resolve() not in audio.parents:
+            raise CopyError(f"archived file missing or outside the archive: {relpath}")
+        return audio
+
+    def upload_copy(self, session_id: str, kind: str,
+                    encrypted: "cloudcopy.Encrypted") -> Dict[str, Any]:
+        """
+        Put one encrypted object in the copy bucket and read it back.
+
+        The read-back is the point: an upload that reported success but stored
+        nothing, or stored it short, is caught here rather than on the day the
+        copy is needed.
+        """
+        place = self.post("archive/copy/authorize",
+                          {"session_id": session_id, "kind": kind})
+        with open(encrypted.path, "rb") as handle:
+            response = self.session.put(
+                place["upload_url"], data=handle,
+                headers={"X-Worker-Key": None,
+                         "Content-Type": "application/octet-stream"},
+                timeout=self.settings.download_timeout, verify=self.settings.verify_tls)
+        response.raise_for_status()
+
+        back = self.session.get(place["download_url"], stream=True,
+                                headers={"X-Worker-Key": None},
+                                timeout=self.settings.download_timeout,
+                                verify=self.settings.verify_tls)
+        back.raise_for_status()
+        digest = hashlib.sha256()
+        length = 0
+        for block in back.iter_content(chunk_size=1 << 20):
+            if block:
+                digest.update(block)
+                length += len(block)
+        if digest.hexdigest() != encrypted.sha256 or length != encrypted.bytes:
+            raise CopyError(f"the {kind} copy read back from the bucket does not "
+                            f"match what was uploaded")
+
+        return {"kind": kind, "object_key": place["object_key"],
+                "version": place["version"], "bytes": encrypted.bytes,
+                "sha256": encrypted.sha256, "plain_sha256": encrypted.plain_sha256}
+
+    def report_copy_failure(self, session_id: str, step: str, message: str) -> None:
+        """Make a repeated failure visible instead of silent (SRS-ARC-10)."""
+        try:
+            self.post("archive/copy/failed",
+                      {"session_id": session_id, "step": step, "message": message})
+        except Exception as exc:
+            logger.warning("Could not report the copy failure for %s: %s",
+                           session_id, exc)
+
+    # ---- small helpers over the backend ----
+
+    def fetch(self, path: str, limit: int) -> List[Dict[str, Any]]:
+        response = self.session.get(
+            f"{self.settings.backend_url}/api/v2/{path}", params={"limit": limit},
+            timeout=self.settings.request_timeout, verify=self.settings.verify_tls)
+        response.raise_for_status()
+        return response.json().get("sessions", [])
+
+    def post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.session.post(
+            f"{self.settings.backend_url}/api/v2/{path}", json=body,
+            timeout=self.settings.request_timeout, verify=self.settings.verify_tls)
+        response.raise_for_status()
+        return response.json()
 
 
 def main() -> int:

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import HTTPException
 
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND / "src"))
@@ -60,6 +61,7 @@ class FakeRepo:
         self.sessions, self.refusals = {}, {}
         self.receipts, self.segments = [], {}
         self.alerts, self.audits, self.keys = [], [], {}
+        self.copies = []
 
     # clinics
     async def hospital_for_cmed_id(self, cmed_id):
@@ -196,6 +198,65 @@ class FakeRepo:
         self.sessions[session_id]["file_stem"] = file_stem
         return file_stem
 
+    # the cloud copy
+    async def copies_overdue(self, *, hours=24):
+        cutoff = NOW() - timedelta(hours=hours)
+        return [dict(s) for s in self.sessions.values()
+                if s.get("archived_at") and s["archived_at"] < cutoff
+                and not s.get("copied_at")]
+
+    async def pending_copy(self, limit=5):
+        return [dict(s) for s in self.sessions.values()
+                if s.get("archived_at") and not s.get("copied_at")][:limit]
+
+    async def pending_json(self, limit=5):
+        return [dict(s) for s in self.sessions.values() if s.get("json_stale")][:limit]
+
+    async def mark_json_stale(self, session_id):
+        session = self.sessions.get(session_id)
+        if not session or not session.get("archived_at"):
+            return False
+        session["json_stale"] = True
+        return True
+
+    async def clear_json_stale(self, session_id):
+        self.sessions[session_id]["json_stale"] = False
+
+    async def next_copy_version(self, session_id, kind):
+        return 1 + sum(1 for c in self.copies
+                       if (c["session_id"], c["kind"]) == (session_id, kind))
+
+    async def record_cloud_copy(self, **kw):
+        self.copies = [c for c in self.copies if c["object_key"] != kw["object_key"]]
+        self.copies.append(dict(kw, id=len(self.copies) + 1))
+        return self.copies[-1]["id"]
+
+    async def copies_for(self, session_id):
+        return [dict(c) for c in self.copies if c["session_id"] == session_id]
+
+    async def mark_copied(self, session_id):
+        self.sessions[session_id].update(copied_at=NOW(), json_stale=False)
+
+    async def mark_segments_deleted(self, session_id):
+        self.sessions[session_id]["segments_deleted_at"] = NOW()
+
+    async def mark_archived(self, session_id, *, relpath, sha256, byte_length):
+        self.sessions[session_id].update(
+            archive_relpath=relpath, archive_sha256=sha256, archive_bytes=byte_length,
+            archived_at=NOW(), status="archived")
+
+    async def mark_segments_archived(self, session_id):
+        for segment in self.segments.get(session_id, []):
+            segment["state"] = "archived"
+
+    async def session_for_visit(self, visit):
+        for grant in self.auths.values():
+            if grant["session_id"] and self._match(
+                    grant, visit, grant["hospital_id"]):
+                return dict(self.sessions[grant["session_id"]],
+                            session_id=grant["session_id"])
+        return None
+
     # audit and alerts
     async def raise_alert(self, **kw):
         self.alerts.append(kw)
@@ -249,11 +310,45 @@ class FakeClinical:
         self.linked.append(kw)
         return True
 
+    async def json_document(self, visit, *, actor):
+        body = next((r["body"] for r in self.records
+                     if r["kind"] == "patient_information"
+                     and r["patient_id"] == visit.patient_id), {})
+        scripts = [r for r in self.records if r["kind"] == "prescription"
+                   and r["patient_id"] == visit.patient_id]
+        self.read_by = actor
+        demographics = body.get("demographics") or {}
+        return {
+            "patient": {"patient_id": visit.patient_id,
+                        "full_name": demographics.get("name"),
+                        "sex": demographics.get("sex", "unknown")},
+            "visit": {"doctor_id": visit.doctor_id,
+                      "cmed_hospital_id": visit.cmed_hospital_id,
+                      "start_time": visit.start_time},
+            "paramedic": body.get("paramedic") or {},
+            "previous_visit": body.get("previous_visit"),
+            "prescription": ({"version": scripts[-1]["version"], **scripts[-1]["body"]}
+                             if scripts else None),
+        }
+
 
 class FakeBucket:
     def __init__(self):
         self.bucket, self.removed = "aimscribe-audio", []
         self.client = SimpleNamespace(remove_object=lambda b, key: self.removed.append(key))
+
+
+class FakeCopyBucket:
+    """The locked copy bucket. It hands out addresses; it never deletes."""
+
+    def __init__(self):
+        self.bucket = "aimscribe-copies"
+
+    def get_presigned_upload_url(self, key, expires):
+        return f"https://copies.example/put/{key}"
+
+    def get_presigned_download_url(self, key, expires):
+        return f"https://copies.example/get/{key}"
 
 
 @pytest.fixture
@@ -267,11 +362,13 @@ def server():
     api_v2.ctx.grants = GrantIssuer(grant_key)
     api_v2.ctx.signer = ReceiptSigner(receipt_key)
     api_v2.ctx.clinical = FakeClinical()
+    api_v2.ctx.copy = FakeCopyBucket()
     yield SimpleNamespace(repo=repo, bucket=api_v2.ctx.minio, clinical=api_v2.ctx.clinical,
+                          copy=api_v2.ctx.copy,
                           grant_public=grant_key.public_key(),
                           receipt_public=receipt_key.public_key())
     api_v2.ctx.repo = api_v2.ctx.minio = api_v2.ctx.grants = api_v2.ctx.signer = None
-    api_v2.ctx.clinical = None
+    api_v2.ctx.clinical = api_v2.ctx.copy = None
 
 
 # ============================================================
@@ -332,6 +429,7 @@ def open_session(server, jti=None, *, opened_ago=timedelta(seconds=5), device=DE
         status="active")
     server.repo.segments[sid] = [
         {"seq_no": n, "object_key": f"audio/{sid}/seg_{n:05d}.wav",
+         "sha256": integrity.sha256_bytes(f"{sid}/{n}".encode()), "state": "committed",
          "object_deleted_at": None} for n in range(1, segments + 1)]
     return sid
 
@@ -687,3 +785,178 @@ async def test_the_cmed_webhook_is_off_unless_switched_on(monkeypatch):
     assert cmed_webhook_enabled() is False
     monkeypatch.setenv("AIMS_CMED_WEBHOOK_ENABLED", "true")
     assert cmed_webhook_enabled() is True
+
+
+# ============================================================
+# The cloud copy (SRS-ARC-08..13)
+# ============================================================
+
+STEM = "P0012345_DR0042_HOSP003_101432_102847_20260913"
+
+
+async def archived(server, *, segments=3, stem=STEM):
+    """A consultation confirmed, closed and archived at UIU."""
+    await send("patient_information", api2())
+    _, reply = await mint()
+    sid = open_session(server, segments=segments)
+    await api_v2._link_grant(sid, reply["jti"], "P0012345", DEVICE)
+    server.repo.sessions[sid].update(
+        file_stem=stem, closed_at=NOW(), total_duration_seconds=855.0)
+    await api_v2.archive_complete(api_v2.ArchiveCompleteRequest(
+        session_id=sid, archive_relpath=f"HOSP003/DR0042/2026-09-13/{stem}/{stem}.wav",
+        sha256="ab" * 32, bytes=1_500_044))
+    return sid
+
+
+def copy_of(kind, key, *, version=1, bytes_=900_000):
+    return {"kind": kind, "object_key": key, "version": version, "bytes": bytes_,
+            "sha256": "cd" * 32, "plain_sha256": "ef" * 32}
+
+
+async def test_the_pieces_are_kept_until_the_copy_is_made(server):
+    """AT-64, SRS-ARC-08: archiving no longer empties the bucket."""
+    sid = await archived(server)
+    assert server.bucket.removed == []
+    assert server.repo.sessions[sid].get("copied_at") is None
+
+    pending = await api_v2.archive_copy_pending()
+    assert [p["session_id"] for p in pending["sessions"]] == [sid]
+    assert pending["sessions"][0]["archive_sha256"] == "ab" * 32
+
+
+async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
+    sid = await archived(server)
+    for kind, suffix in (("audio", "flac.enc"), ("json", "json.enc")):
+        place = await api_v2.archive_copy_authorize(
+            api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
+        assert place["object_key"] == \
+            f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v1.{suffix}"
+        assert place["upload_url"].startswith("https://copies.example/put/")
+        assert place["version"] == 1
+
+
+async def test_the_pieces_go_only_after_the_copy_is_recorded(server):
+    """AT-64, SRS-ARC-09 steps 6 and 7."""
+    sid = await archived(server, segments=4)
+    result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid, copies=[copy_of("audio", "copies/a.v1.flac.enc"),
+                                copy_of("json", "copies/a.v1.json.enc", bytes_=2048)]))
+    assert (result["status"], result["objects_deleted"]) == ("copied", 4)
+    assert len(server.bucket.removed) == 4
+    assert server.repo.sessions[sid]["copied_at"] is not None
+    assert server.repo.sessions[sid]["segments_deleted_at"] is not None
+    assert {c["kind"] for c in server.repo.copies} == {"audio", "json"}
+    assert any(a["event_type"] == "session.copied" for a in server.repo.audits)
+    # Copied once: it leaves the worker's list.
+    assert await api_v2.archive_copy_pending() == {"sessions": []}
+
+
+async def test_a_json_alone_never_deletes_the_pieces(server):
+    """The audio copy is what makes deletion safe, not the JSON beside it."""
+    sid = await archived(server, segments=2)
+    with pytest.raises(HTTPException) as refused:
+        await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+            session_id=sid, copies=[copy_of("json", "copies/b.v1.json.enc", bytes_=2048)]))
+    assert refused.value.status_code == 409
+    assert server.bucket.removed == []
+
+
+async def test_a_copy_recorded_twice_finishes_instead_of_failing(server):
+    """AT-65: stopped between the upload and the database, the retry completes."""
+    sid = await archived(server, segments=2)
+    body = api_v2.CopyCompleteRequest(
+        session_id=sid, copies=[copy_of("audio", "copies/c.v1.flac.enc")])
+    first = await api_v2.archive_copy_complete(body)
+    second = await api_v2.archive_copy_complete(body)
+    assert (first["objects_deleted"], second["objects_deleted"]) == (2, 0)
+    assert len([c for c in server.repo.copies if c["session_id"] == sid]) == 1
+
+
+async def test_a_late_prescription_asks_for_the_json_again(server):
+    """SRS-ARC-13."""
+    sid = await archived(server)
+    await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid, copies=[copy_of("audio", "copies/d.v1.flac.enc"),
+                                copy_of("json", "copies/d.v1.json.enc", bytes_=2048)]))
+
+    status, _ = await send("prescription", prescription())
+    assert status == 202
+    waiting = await api_v2.archive_json_pending()
+    assert [w["session_id"] for w in waiting["sessions"]] == [sid]
+
+    # The new JSON is a new object; the first one stays.
+    place = await api_v2.archive_copy_authorize(
+        api_v2.CopyAuthorizeRequest(session_id=sid, kind="json"))
+    assert place["version"] == 2 and ".v2.json.enc" in place["object_key"]
+    result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid, final=False,
+        copies=[copy_of("json", place["object_key"], version=2, bytes_=2500)]))
+    assert result["objects_deleted"] == 0
+    assert await api_v2.archive_json_pending() == {"sessions": []}
+    assert len([c for c in server.repo.copies if c["kind"] == "json"]) == 2
+    assert any(a["event_type"] == "session.json_rewritten" for a in server.repo.audits)
+
+
+async def test_a_prescription_before_archiving_asks_for_nothing(server):
+    """The JSON is written with the audio anyway."""
+    await send("patient_information", api2())
+    _, reply = await mint()
+    sid = open_session(server, segments=1)
+    await api_v2._link_grant(sid, reply["jti"], "P0012345", DEVICE)
+    await send("prescription", prescription())
+    assert await api_v2.archive_json_pending() == {"sessions": []}
+
+
+async def test_the_json_beside_the_audio_carries_both_halves(server):
+    """§8.8: what CMED holds, and what the recording is."""
+    sid = await archived(server)
+    document = await api_v2.archive_clinical_document(sid)
+
+    assert document["file_stem"] == STEM
+    assert document["patient"]["full_name"] == "Test"
+    assert document["visit"]["doctor_id"] == "DR0042"
+    assert document["recording"]["session_id"] == sid
+    assert document["recording"]["audio_sha256"] == "ab" * 32
+    assert document["recording"]["confirmation"] == "confirmed"
+    assert server.clinical.read_by == "archive-worker"
+
+
+async def test_a_refused_consultation_leaves_nothing_for_the_json(server):
+    """SRS-CNS-06: no patient, no name, nothing to write."""
+    sid = await archived(server)
+    await api_v2.refuse_session(api_v2.RefuseRequest(session_id=sid), device=DEVICE)
+    document = await api_v2.archive_clinical_document(sid)
+    assert "patient" not in document
+    assert document["recording"]["session_id"] == sid
+
+
+async def test_a_failed_copy_is_visible(server):
+    """SRS-ARC-10: it is retried, and it is not silent."""
+    sid = await archived(server)
+    await api_v2.archive_copy_failed(api_v2.CopyFailedRequest(
+        session_id=sid, step="decode",
+        message="the FLAC does not decode to the archived audio"))
+    alert = server.repo.alerts[-1]
+    assert alert["alert_type"] == "cloud_copy_failed"
+    assert alert["detail"]["step"] == "decode"
+    assert server.bucket.removed == []      # the pieces stay
+
+
+async def test_without_a_copy_bucket_the_old_behaviour_stands(server):
+    """An existing deployment keeps working until the bucket is configured."""
+    api_v2.ctx.copy = None
+    sid = await archived(server, segments=2,
+                         stem="P9_DR0042_HOSP003_101432_102847_20260913")
+    assert len(server.bucket.removed) == 2
+    assert server.repo.sessions[sid]["segments_deleted_at"] is not None
+
+
+async def test_the_clean_up_never_reaches_a_copy(server):
+    """AT-67, SRS-ARC-12: the credential that deletes pieces must not touch copies."""
+    sid = await archived(server, segments=1)
+    server.repo.segments[sid][0]["object_key"] = "copies/HOSP003/one.v1.flac.enc"
+
+    result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid, copies=[copy_of("audio", "copies/HOSP003/one.v1.flac.enc")]))
+    assert result["objects_deleted"] == 0
+    assert server.bucket.removed == []

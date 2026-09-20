@@ -504,11 +504,15 @@ def _server(dbs):
     api_v2.ctx.repo, api_v2.ctx.clinical = dbs.repo, dbs.clinical
     api_v2.ctx.minio = SimpleNamespace(bucket="b", client=SimpleNamespace(
         remove_object=lambda b, k: removed.append(k)))
+    api_v2.ctx.copy = SimpleNamespace(
+        bucket="copies",
+        get_presigned_upload_url=lambda key, expires: f"https://copies/put/{key}",
+        get_presigned_download_url=lambda key, expires: f"https://copies/get/{key}")
     return removed
 
 
 def _unserve():
-    api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.minio = None
+    api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.minio = api_v2.ctx.copy = None
 
 
 async def test_refusal_endpoint_on_postgres(dbs):
@@ -572,3 +576,256 @@ async def test_the_archive_list_runs_and_skips_unconfirmed(dbs):
     """The archive worker's query, with the confirmed-only filter (SRS §5.6)."""
     pending = await dbs.repo.pending_archive(10)
     assert all(p.get("session_id") for p in pending)
+
+
+# ============================================================
+# The cloud copy (SRS-ARC-08..13)
+# ============================================================
+
+async def _archived(dbs, device, v, *, stem):
+    """A confirmed recording, closed and archived."""
+    sid = await _linked_session(dbs, device, v)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET patient_id = $2, closed_at = now(), "
+                           "file_stem = $3 WHERE session_id = $1",
+                           sid, v.patient_id, stem)
+    await dbs.repo.mark_archived(sid, relpath=f"HOSP003/DR0042/2026-09-13/{stem}/{stem}.wav",
+                                 sha256=b"\x11" * 32, byte_length=1_500_044)
+    return sid
+
+
+async def test_an_archived_recording_waits_for_its_copy(dbs):
+    """SRS-ARC-08: archived is not finished; the pieces wait for the copy."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PCOPY1")
+    stem = "PCOPY1_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+
+    waiting = await dbs.repo.pending_copy(10)
+    assert sid in [w["session_id"] for w in waiting]
+    assert next(w for w in waiting if w["session_id"] == sid)["file_stem"] == stem
+
+    key = f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.flac.enc"
+    assert await dbs.repo.next_copy_version(sid, "audio") == 1
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", object_key=key, version=1,
+        byte_length=900_000, sha256=b"\x22" * 32, plain_sha256=b"\x33" * 32)
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="json", object_key=key.replace("flac", "json"), version=1,
+        byte_length=2048, sha256=b"\x44" * 32, plain_sha256=b"\x55" * 32)
+    await dbs.repo.mark_copied(sid)
+    await dbs.repo.mark_segments_deleted(sid)
+
+    assert sid not in [w["session_id"] for w in await dbs.repo.pending_copy(10)]
+    copies = await dbs.repo.copies_for(sid)
+    assert [c["kind"] for c in copies] == ["audio", "json"]
+    assert bytes(copies[0]["sha256"]) == b"\x22" * 32
+    assert all(c["verified_at"] is not None for c in copies)
+    session = await dbs.repo.get_session(sid)
+    assert session["copied_at"] is not None
+
+
+async def test_the_same_object_recorded_twice_is_one_row(dbs):
+    """AT-65: the retry after an interrupted run completes."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PCOPY2")
+    stem = "PCOPY2_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    key = f"copies/{stem}.v1.flac.enc"
+
+    first = await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", object_key=key, version=1, byte_length=900_000,
+        sha256=b"\x22" * 32, plain_sha256=None)
+    again = await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", object_key=key, version=1, byte_length=900_000,
+        sha256=b"\x22" * 32, plain_sha256=b"\x33" * 32)
+    assert first == again
+    assert len(await dbs.repo.copies_for(sid)) == 1
+
+
+async def test_a_late_prescription_marks_the_json_and_a_new_version_follows(dbs):
+    """SRS-ARC-13: the JSON is written again; earlier objects are kept."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PCOPY3")
+    stem = "PCOPY3_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="json", object_key=f"copies/{stem}.v1.json.enc", version=1,
+        byte_length=2048, sha256=b"\x44" * 32, plain_sha256=None)
+
+    found = await dbs.repo.session_for_visit(v)
+    assert found["session_id"] == sid and found["archived_at"] is not None
+    assert await dbs.repo.mark_json_stale(sid)
+    assert sid in [p["session_id"] for p in await dbs.repo.pending_json(10)]
+
+    assert await dbs.repo.next_copy_version(sid, "json") == 2
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="json", object_key=f"copies/{stem}.v2.json.enc", version=2,
+        byte_length=2500, sha256=b"\x66" * 32, plain_sha256=None)
+    await dbs.repo.clear_json_stale(sid)
+
+    assert await dbs.repo.pending_json(10) == []
+    assert [c["version"] for c in await dbs.repo.copies_for(sid)] == [1, 2]
+
+
+async def test_a_recording_never_archived_is_never_waiting_for_a_copy(dbs):
+    """SRS-ARC-16: unconfirmed and refused recordings have nothing to copy."""
+    device = await enrolled_device(dbs.repo)
+    open_only = await a_session(dbs.repo, device)
+    assert open_only not in [w["session_id"] for w in await dbs.repo.pending_copy(50)]
+
+
+async def test_the_json_document_is_what_cmed_holds_about_the_visit(dbs):
+    """§8.8, SRS-CRI-05: the file that travels with the audio."""
+    v = visit(patient_id="PJSON1")
+    earlier = visit(patient_id="PJSON1", start_time="2026-06-02T09:00:00+06:00",
+                    visit_date="2026-06-02")
+    await _send(dbs.clinical, "patient_information", earlier,
+                _api2(earlier, demographics={"name": "Ayesha Rahman", "sex": "female"}))
+    await _send(dbs.clinical, "prescription", earlier,
+                {"issued_at": "2026-06-02T09:20:00+06:00", "diagnoses": ["Gastritis"],
+                 "items": [{"drug": "Omeprazole", "dose": "20 mg"}]})
+    await _send(dbs.clinical, "patient_information", v, _api2(
+        v, demographics={"name": "Ayesha Rahman", "sex": "female", "age_years": 34},
+        paramedic={"blood_pressure": "120/80", "pulse_bpm": 78, "blood_sugar": 6.1}))
+    await _send(dbs.clinical, "prescription", v,
+                {"issued_at": "2026-09-13T10:26:11+06:00", "diagnoses": ["Hypertension"],
+                 "investigations": ["ECG"], "follow_up": "2026-10-13",
+                 "items": [{"drug": "Amlodipine", "dose": "5 mg", "frequency": "1+0+0"},
+                           {"drug": "Aspirin"}]})
+
+    document = await dbs.clinical.json_document(v, actor="archive-worker")
+
+    assert document["patient"]["full_name"] == "Ayesha Rahman"
+    assert document["patient"]["sex"] == "female"
+    assert document["patient"]["age_years"] == 34
+    assert document["visit"]["start_time"] == v.start_time
+    assert document["paramedic"]["blood_pressure"] == "120/80"
+    assert document["paramedic"]["pulse_bpm"] == 78
+    assert document["paramedic"]["other"] == {"blood_sugar": 6.1}      # OD-16
+    assert [i["drug"] for i in document["prescription"]["items"]] == ["Amlodipine",
+                                                                      "Aspirin"]
+    assert document["prescription"]["diagnoses"] == ["Hypertension"]
+    assert document["prescription"]["follow_up_date"] == "2026-10-13"
+    assert document["previous_visit"]["date"] == "2026-06-02"
+    assert [i["drug"] for i in document["previous_visit"]["prescription"]["items"]] \
+        == ["Omeprazole"]
+    # Read, and recorded as read (SRS-DBA-19).
+    async with dbs.cli.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM clinical_access_log WHERE patient_id = $1 "
+            "AND action = 'read_visit_json'", v.patient_id) == 1
+
+
+async def test_the_document_carries_the_latest_prescription_only(dbs):
+    v = visit(patient_id="PJSON2")
+    await _send(dbs.clinical, "patient_information", v,
+                _api2(v, demographics={"name": "Kamal", "sex": "male"}))
+    rx = {"issued_at": "2026-09-13T10:26:11+06:00", "items": [{"drug": "First"}]}
+    await _send(dbs.clinical, "prescription", v, rx)
+    await _send(dbs.clinical, "prescription", v, dict(rx, items=[{"drug": "Second"}]))
+
+    document = await dbs.clinical.json_document(v, actor="archive-worker")
+    assert document["prescription"]["version"] == 2
+    assert [i["drug"] for i in document["prescription"]["items"]] == ["Second"]
+    assert document["previous_visit"] is None
+
+
+async def test_a_visit_cmed_never_described_gives_an_empty_document(dbs):
+    assert await dbs.clinical.json_document(visit(patient_id="PJSON3"),
+                                            actor="archive-worker") == {}
+
+
+async def test_the_server_assembles_the_file_beside_the_audio(dbs):
+    """The whole §8.8 document, both halves, through the endpoint."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PJSON4")
+    stem = "PJSON4_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    await _send(dbs.clinical, "prescription", v,
+                {"issued_at": "2026-09-13T10:26:11+06:00",
+                 "items": [{"drug": "Amlodipine"}]})
+    _server(dbs)
+    try:
+        document = await api_v2.archive_clinical_document(sid)
+    finally:
+        _unserve()
+
+    assert document["file_stem"] == stem
+    assert document["patient"]["patient_id"] == "PJSON4"
+    assert document["recording"]["session_id"] == sid
+    assert document["recording"]["confirmation"] == "confirmed"
+    assert document["recording"]["audio_sha256"] == ("11" * 32)
+    assert document["prescription"]["items"][0]["drug"] == "Amlodipine"
+
+
+async def test_the_sweep_notices_a_copy_that_never_happened(dbs):
+    """SRS-ARC-10, SRS-ARC-14: a step failing every pass becomes visible."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PSTUCK1")
+    stem = "PSTUCK1_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET archived_at = now() - interval '2 days' "
+                           "WHERE session_id = $1", sid)
+
+    assert sid in [r["session_id"] for r in await dbs.repo.copies_overdue(hours=24)]
+    _server(dbs)
+    try:
+        result = await api_v2.maintenance_sweep()
+    finally:
+        _unserve()
+    assert result["copies_overdue"] >= 1
+    async with dbs.rec.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM integrity_alerts WHERE session_id = $1 "
+            "AND alert_type = 'cloud_copy_overdue'", sid) == 1
+
+    # Once copied, it stops being reported.
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", object_key=f"copies/{stem}.v9.flac.enc", version=9,
+        byte_length=1, sha256=bytes.fromhex("77") * 32, plain_sha256=None)
+    await dbs.repo.mark_copied(sid)
+    assert sid not in [r["session_id"] for r in await dbs.repo.copies_overdue(hours=24)]
+
+
+async def test_the_copy_endpoints_run_on_postgres(dbs):
+    """/archive/copy/authorize and /complete against the real tables."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PCOPY9")
+    stem = "PCOPY9_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    digest = bytes.fromhex("99") * 32
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
+                                       payload_sha256, prev_hash, entry_hash,
+                                       device_signature, occurred_at)
+            VALUES ($1, 1, 'segment', '{}', $2, $2, $2, $2, now())
+        """, sid, digest)
+        await conn.execute("""
+            INSERT INTO segments (session_id, seq_no, entry_no, object_key, sha256,
+                                  bytes, duration_seconds, state)
+            VALUES ($1, 1, 1, $2, $3, 100, 1.0, 'committed')
+        """, sid, f"audio/{sid}/seg_00001.wav", digest)
+
+    removed = _server(dbs)
+    try:
+        place = await api_v2.archive_copy_authorize(
+            api_v2.CopyAuthorizeRequest(session_id=sid, kind="audio"))
+        assert place["object_key"].endswith(f"{stem}.v1.flac.enc")
+        result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+            session_id=sid, copies=[{
+                "kind": "audio", "object_key": place["object_key"], "version": 1,
+                "bytes": 900_000, "sha256": "cd" * 32, "plain_sha256": "ef" * 32}]))
+    finally:
+        _unserve()
+
+    assert result["status"] == "copied"
+    assert removed == [f"audio/{sid}/seg_00001.wav"]
+    session = await dbs.repo.get_session(sid)
+    assert session["copied_at"] is not None and session["segments_deleted_at"] is not None
+    async with dbs.rec.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM audit_log WHERE session_id = $1 "
+            "AND event_type = 'session.copied'", sid) == 1

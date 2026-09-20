@@ -223,6 +223,8 @@ async def receive(request: Request, kind: str) -> JSONResponse:
         notice_id = await repo.record_notice(visit, hospital_id=hospital_id,
                                              clinical_record_id=record_id)
         await confirm_waiting(visit, hospital_id, notice_id)
+    elif kind == "prescription":
+        await mark_json_for_rewrite(visit)
 
     logger.info("Stored %s %s from %s", kind, record_id, label)
     extra = {"version": version} if kind == "prescription" else {}
@@ -255,9 +257,27 @@ async def confirm_waiting(visit: Visit, hospital_id: str, notice_id: int) -> Opt
     return None
 
 
+async def mark_json_for_rewrite(visit: Visit) -> Optional[str]:
+    """
+    A prescription for a consultation that is already archived: the JSON file
+    beside the audio is now out of date, so it is written again and uploaded to
+    the copy bucket as a new object (SRS-ARC-13). The archive worker picks this
+    up on its next pass.
+    """
+    repo = api_v2._repo()
+    session = await repo.session_for_visit(visit)
+    if session is None or session.get("archived_at") is None:
+        return None                         # not archived yet: the JSON is written
+    if await repo.mark_json_stale(session["session_id"]):    # with the audio anyway
+        logger.info("Prescription arrived after archiving; %s needs its JSON again",
+                    session["session_id"])
+        return session["session_id"]
+    return None
+
+
 def _now_iso() -> str:
     return integrity.iso_utc(datetime.now(timezone.utc))
 
 
-__all__ = ["router", "receive", "confirm_waiting", "problems_with", "key_digest",
-           "MAX_BODY_BYTES"]
+__all__ = ["router", "receive", "confirm_waiting", "mark_json_for_rewrite",
+           "problems_with", "key_digest", "MAX_BODY_BYTES"]

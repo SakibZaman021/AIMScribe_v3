@@ -287,8 +287,11 @@ class V2Repository:
                 SELECT session_id, patient_id, doctor_id, hospital_id, device_id,
                        protocol_version, status, session_date, opened_at, closed_at,
                        segment_count, chain_head_hash, archive_relpath, archived_at,
+                       archive_sha256, archive_bytes, total_duration_seconds,
                        quarantine_reason, sample_rate, channels, sample_width,
-                       object_prefix, confirmation, grant_jti, file_stem
+                       object_prefix, confirmation, grant_jti, file_stem,
+                       local_start, local_end, copied_at, segments_deleted_at,
+                       json_stale
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -598,7 +601,11 @@ class V2Repository:
                 SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id,
                        s.session_date, s.opened_at, s.closed_at,
                        s.total_duration_seconds, s.segment_count,
-                       s.sample_rate, s.channels, s.sample_width, s.manifest
+                       s.sample_rate, s.channels, s.sample_width, s.manifest,
+                       -- The name the server gave this recording when it closed
+                       -- (SRS-SES-05). The worker uses it as it stands, so the
+                       -- audio, the JSON and the clinical database agree.
+                       s.file_stem, s.local_start, s.local_end, s.confirmation
                 FROM sessions s
                 WHERE s.closed_at IS NOT NULL
                   AND s.archived_at IS NULL
@@ -628,6 +635,158 @@ class V2Repository:
                        status = 'archived', updated_at = now()
                  WHERE session_id = $1
             """, session_id, relpath, sha256, byte_length)
+
+    # ============================================================
+    # The cloud copy (SRS-ARC-08..13)
+    # ============================================================
+
+    async def pending_copy(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Archived recordings whose lossless cloud copy has not been made.
+
+        Until that copy exists and is verified, the pieces stay in the segment
+        bucket: they are the only other copy of the audio (SRS-ARC-08).
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
+                       file_stem, archive_relpath, archive_sha256, archive_bytes,
+                       grant_jti, confirmation
+                  FROM sessions
+                 WHERE archived_at IS NOT NULL
+                   AND copied_at IS NULL
+                   AND quarantine_reason IS NULL
+                   AND archive_relpath IS NOT NULL
+                 ORDER BY archived_at
+                 LIMIT $1
+            """, limit)
+        return [dict(row) for row in rows]
+
+    async def pending_json(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Archived recordings whose JSON has to be written again, because CMED
+        sent the prescription after the recording was archived (SRS-ARC-13).
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT session_id, hospital_id, doctor_id, session_date, file_stem,
+                       archive_relpath, grant_jti
+                  FROM sessions
+                 WHERE json_stale
+                   AND archived_at IS NOT NULL
+                   AND archive_relpath IS NOT NULL
+                 ORDER BY archived_at
+                 LIMIT $1
+            """, limit)
+        return [dict(row) for row in rows]
+
+    async def copies_overdue(self, *, hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        Archived this long ago and still not copied (SRS-ARC-14). Something is
+        failing every pass, so it is raised rather than retried in silence.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT session_id, archived_at FROM sessions
+                 WHERE archived_at < now() - make_interval(hours => $1)
+                   AND copied_at IS NULL
+                   AND quarantine_reason IS NULL
+                 ORDER BY archived_at
+                 LIMIT 50
+            """, hours)
+        return [dict(row) for row in rows]
+
+    async def mark_json_stale(self, session_id: str) -> bool:
+        """A prescription arrived for a recording already archived."""
+        async with self._pool.acquire() as conn:
+            updated = await conn.fetchval("""
+                UPDATE sessions SET json_stale = true, updated_at = now()
+                 WHERE session_id = $1 AND archived_at IS NOT NULL
+                RETURNING session_id
+            """, session_id)
+        return updated is not None
+
+    async def next_copy_version(self, session_id: str, kind: str) -> int:
+        async with self._pool.acquire() as conn:
+            return int(await conn.fetchval("""
+                SELECT COALESCE(MAX(version), 0) + 1 FROM cloud_copies
+                 WHERE session_id = $1 AND kind = $2
+            """, session_id, kind))
+
+    async def record_cloud_copy(
+        self, *, session_id: str, kind: str, object_key: str, version: int,
+        byte_length: int, sha256: bytes, plain_sha256: Optional[bytes],
+    ) -> int:
+        """
+        One verified object in the copy bucket, recorded only after the worker
+        has read it back and matched it (SRS-ARC-09, steps 5 and 6).
+
+        Recording the same object twice - a worker stopped between the upload
+        and this call - updates the row instead of failing, so the retry
+        finishes rather than blocking on its own earlier attempt (AT-65).
+        """
+        async with self._pool.acquire() as conn:
+            return int(await conn.fetchval("""
+                INSERT INTO cloud_copies
+                    (session_id, kind, object_key, version, bytes, sha256,
+                     plain_sha256, verified_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+                ON CONFLICT (object_key) DO UPDATE
+                    SET bytes = EXCLUDED.bytes, sha256 = EXCLUDED.sha256,
+                        plain_sha256 = EXCLUDED.plain_sha256,
+                        uploaded_at = now(), verified_at = now()
+                RETURNING id
+            """, session_id, kind, object_key, version, byte_length, sha256,
+                 plain_sha256))
+
+    async def copies_for(self, session_id: str) -> List[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT kind, object_key, version, bytes, sha256, plain_sha256,
+                       uploaded_at, verified_at
+                  FROM cloud_copies WHERE session_id = $1
+                 ORDER BY kind, version
+            """, session_id)
+        return [dict(row) for row in rows]
+
+    async def mark_copied(self, session_id: str) -> None:
+        """The cloud copy is complete: the audio and its JSON are both verified."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions SET copied_at = now(), json_stale = false,
+                                    updated_at = now()
+                 WHERE session_id = $1
+            """, session_id)
+
+    async def clear_json_stale(self, session_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET json_stale = false, updated_at = now() "
+                "WHERE session_id = $1", session_id)
+
+    async def mark_segments_deleted(self, session_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET segments_deleted_at = now(), updated_at = now() "
+                "WHERE session_id = $1", session_id)
+
+    async def session_for_visit(self, visit) -> Optional[Dict[str, Any]]:
+        """
+        The recording of this visit, if one was granted and opened. Used when a
+        prescription arrives late, to mark its JSON for writing again.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT s.session_id, s.archived_at, s.copied_at
+                  FROM grant_authorisations g
+                  JOIN sessions s ON s.session_id = g.session_id
+                 WHERE g.patient_id = $1 AND g.doctor_id = $2
+                   AND g.cmed_hospital_id = $3 AND g.start_time = $4
+                   AND g.visit_date = $5
+                 ORDER BY g.issued_at DESC LIMIT 1
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day)
+        return dict(row) if row else None
 
     # ============================================================
     # Purge receipts
