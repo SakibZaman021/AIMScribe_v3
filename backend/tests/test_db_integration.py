@@ -40,39 +40,12 @@ pytestmark = pytest.mark.asyncio
 # Every v2 and v3 migration, in order, as a deployment applies them.
 RECORDINGS_SCRIPTS = sorted((BACKEND / "scripts").glob("0[0-9][0-9]_*.sql"))
 
-# What the live database looks like before them. It was built by v1 scripts
-# that do not replay cleanly from an empty database (init_database.sql and
-# migration 001 disagree about legacy tables), so the v1 tables the v2+
-# migrations build on are stood up here as they are after migration 001.
-V1_BASELINE = """
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id             VARCHAR(255) PRIMARY KEY,
-    patient_id             VARCHAR(100) NOT NULL,
-    doctor_id              VARCHAR(100) NOT NULL,
-    hospital_id            VARCHAR(100) NOT NULL,
-    status                 VARCHAR(20) DEFAULT 'active',
-    total_clips            INTEGER DEFAULT 0,
-    total_duration_seconds DECIMAL(10,2) DEFAULT 0,
-    health_screening       JSONB,
-    recording_date         DATE,
-    start_time             TIME,
-    end_time               TIME,
-    created_at             TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at             TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    completed_at           TIMESTAMPTZ,
-    ner_webhook_url        TEXT,
-    status_webhook_url     TEXT
-);
-CREATE TABLE IF NOT EXISTS clips (
-    id          SERIAL PRIMARY KEY,
-    session_id  VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    clip_number INTEGER NOT NULL,
-    object_key  VARCHAR(255) NOT NULL
-);
-CREATE TABLE IF NOT EXISTS patients (
-    patient_id VARCHAR(100) PRIMARY KEY
-);
-"""
+# What the live database looks like before them: the v1 tables, as the UIU
+# server's own deployment creates them. Read from that file rather than
+# repeated here, so the tests and a new server cannot drift apart.
+V1_BASELINE = (BACKEND.parent / "deploy" / "uiu" / "postgres" / "schema"
+               / "00_v1_baseline.sql").read_text(encoding="utf-8")
+
 CLINICAL_SCRIPTS = sorted((BACKEND / "scripts" / "clinical").glob("001_*.sql"))
 
 

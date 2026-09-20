@@ -1,0 +1,85 @@
+# ================================================================
+# The one door into the UIU server (SRS-TOP-02, SRS-SRV-07)
+#
+# Caddy gets and renews the certificate by itself; port 80 exists for that
+# and for the redirect, and nothing is served on it. Everything else is
+# proxied to the API, which is reachable from nowhere else.
+# ================================================================
+
+{
+	email {$AIMS_ACME_EMAIL}
+	# The certificate is the thing most likely to expire unnoticed, so its
+	# renewals are logged where the monitor and a person can both see them.
+	log {
+		output stdout
+		format console
+	}
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+{$AIMS_PUBLIC_HOST} {
+	encode zstd gzip
+
+	header {
+		# One year, and only over HTTPS: a recorder that once reached this
+		# host must never be talked down to plain HTTP.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# The API answers machines, not browsers; nothing here should ever
+		# be framed, scripted or embedded.
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# Uploads never come through here - recorders upload pieces straight to
+	# the segment store - so a large body is a mistake or an attack.
+	request_body {
+		max_size 2MB
+	}
+
+	handle /health {
+		reverse_proxy api:6000
+	}
+
+	handle {
+		reverse_proxy api:6000 {
+			header_up X-Forwarded-Proto https
+			# A recorder waits on /grant/mint and /segment/commit; a slow
+			# upstream should keep the request rather than drop it, but not
+			# for ever.
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+			# During an update the API restarts. Caddy holds the connection
+			# and retries, so a consultation in progress sees a pause of a
+			# second or two instead of an error (AT-30).
+			lb_try_duration 30s
+			lb_try_interval 500ms
+			health_uri /health
+			health_interval 10s
+			health_timeout 5s
+		}
+	}
+
+	log {
+		output stdout
+		# A request path can carry a patient identifier and the headers carry
+		# credentials, so the log keeps the method, the path and the status,
+		# and drops the query string and every key.
+		format filter {
+			wrap console
+			fields {
+				request>uri query_delete
+				request>headers>X-Device-Token delete
+				request>headers>X-Cmed-Key delete
+				request>headers>X-Worker-Key delete
+				request>headers>X-Admin-Key delete
+			}
+		}
+	}
+}

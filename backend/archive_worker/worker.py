@@ -87,10 +87,21 @@ class Settings:
             issues.append("AIMS_BACKEND_URL is not set")
         if not self.worker_key:
             issues.append("AIMS_WORKER_KEY is not set")
-        if not self.backend_url.startswith("https://") and "localhost" not in self.backend_url:
+        if not self.backend_url.startswith("https://") and not self._internal():
             issues.append("AIMS_BACKEND_URL is not https - audio metadata would "
                           "cross the network in cleartext")
         return issues
+
+    def _internal(self) -> bool:
+        """
+        A plain-HTTP address that never leaves the machine: localhost, or a
+        name with no dots, which on the UIU server is another container on the
+        private Docker network (deploy/uiu). Nothing crosses a wire, so there
+        is nothing to encrypt - and warning about it every start would teach
+        people to ignore the warnings that matter.
+        """
+        host = self.backend_url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        return host in ("localhost", "127.0.0.1", "::1") or "." not in host
 
 
 class ArchiveWorker:

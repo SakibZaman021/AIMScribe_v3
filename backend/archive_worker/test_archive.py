@@ -335,3 +335,23 @@ def test_refuses_to_start_without_room(tmp_path):
 
 def test_allows_when_space_is_available(tmp_path):
     archive.ensure_space(tmp_path, 1024, headroom=1024)
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+@pytest.mark.parametrize("url,complains", [
+    ("https://aimscribe.uiu.ac.bd", False),
+    ("http://api:6000", False),            # another container on the UIU server
+    ("http://localhost:6000", False),      # a bench
+    ("http://127.0.0.1:6000", False),
+    ("http://aimscribe.uiu.ac.bd", True),  # across the internet, in the clear
+    ("http://203.0.113.10", True),
+])
+def test_plain_http_is_only_allowed_inside_the_machine(monkeypatch, url, complains):
+    import worker
+    monkeypatch.setenv("AIMS_BACKEND_URL", url)
+    monkeypatch.setenv("AIMS_WORKER_KEY", "k")
+    problems = worker.Settings().problems()
+    assert bool([p for p in problems if "https" in p]) is complains

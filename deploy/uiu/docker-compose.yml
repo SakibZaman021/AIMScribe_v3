@@ -1,0 +1,342 @@
+# ================================================================
+# AIMScribe on the UIU server (SRS 3.3 §10.3, SRS-SRV-01..09)
+#
+#   docker compose up -d
+#   docker compose ps
+#   docker compose logs -f api archive-worker
+#
+# Everything the server runs is in this file and the files beside it, so a
+# replacement server can be built from the repository alone (SRS-SRV-09).
+#
+# **One way in.** Only the gateway publishes ports, and only 80 and 443:
+# 80 exists so certificates can be renewed, and redirects to 443. Nothing
+# else is reachable from outside the machine - not the database, not Redis,
+# not the API (SRS-TOP-02, SRS-SRV-07). Workers make outbound connections
+# only.
+#
+# **Three kinds of disk**, as §10.3 requires, mounted here from the paths in
+# .env: the database on power-loss-protected NVMe, the working disks for
+# pieces being checked and merged, and the archive array. They are separate
+# so a long merge never slows a query a recorder is waiting on (SRS-SRV-03).
+# ================================================================
+
+name: aimscribe
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging: *logging
+
+services:
+
+  # ------------------------------------------------------------
+  # The only way in: TLS, and a redirect from 80 (SRS-SRV-07)
+  # ------------------------------------------------------------
+  gateway:
+    image: caddy:2.8-alpine
+    container_name: aims-gateway
+    <<: *hardening
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3
+    environment:
+      AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST:?set AIMS_PUBLIC_HOST in .env}
+      AIMS_ACME_EMAIL: ${AIMS_ACME_EMAIL:?set AIMS_ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data           # certificates and their renewals
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [edge, internal]
+
+  # ------------------------------------------------------------
+  # PostgreSQL 16: both databases, on the database disks
+  # ------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: aims-postgres
+    <<: *hardening
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-aims_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Read by the init scripts, which create the two databases and the
+      # roles that reach them (SRS-DBA-20).
+      AIMS_RECORDINGS_PASSWORD: ${AIMS_RECORDINGS_PASSWORD:?set AIMS_RECORDINGS_PASSWORD in .env}
+      AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD:?set AIMS_CLINICAL_PASSWORD in .env}
+      AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD:?set AIMS_MONITOR_PASSWORD in .env}
+      # initdb runs before the config file is read, so the collation and
+      # checksums have to be settled here.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    volumes:
+      - ${AIMS_DB_PATH:?set AIMS_DB_PATH in .env}:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/schema:/aims/baseline:ro
+      - ../../backend/scripts:/aims/scripts:ro
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # PgBouncer: many short-lived API connections, few to PostgreSQL
+  # ------------------------------------------------------------
+  pgbouncer:
+    build: ./pgbouncer
+    image: aimscribe/pgbouncer:3.3
+    container_name: aims-pgbouncer
+    <<: *hardening
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 500
+      DEFAULT_POOL_SIZE: 25
+      # The application users it may pass through, with the passwords it
+      # needs to authenticate them. Nothing else may connect.
+      AIMS_RECORDINGS_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD}
+      AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U aims_recordings -d aims_recordings"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # Redis: the transcription queue
+  # ------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: aims-redis
+    <<: *hardening
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction          # a dropped job is a lost transcription
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # The API: recorders, CMED's Channel B, the archive handshake
+  # ------------------------------------------------------------
+  api:
+    build:
+      context: ../../backend
+      dockerfile: docker/Dockerfile
+    image: aimscribe/api:3.3
+    container_name: aims-api
+    <<: *hardening
+    env_file: [.env]
+    environment:
+      # Through the pooler, in transaction mode - which is why the driver's
+      # statement cache is turned off (AIMS_DB_POOLER).
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_DB: aims_recordings
+      POSTGRES_USER: aims_recordings
+      POSTGRES_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      POSTGRES_SSLMODE: disable        # one machine, one private network
+      POSTGRES_POOL_MIN: 4
+      POSTGRES_POOL_MAX: 20
+      AIMS_DB_POOLER: transaction
+      # The second database, with its own role (SRS-DBA-20).
+      AIMS_CLINICAL_DATABASE_URL: postgresql://aims_clinical_writer:${AIMS_CLINICAL_PASSWORD}@pgbouncer:6432/aims_clinical
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 6000
+      PROMPTS_DIR: /app/src/prompts
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # Transcription and NER
+  # ------------------------------------------------------------
+  worker:
+    build:
+      context: ../../backend
+      dockerfile: docker/Dockerfile.worker
+    image: aimscribe/worker:3.3
+    container_name: aims-worker
+    <<: *hardening
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_DB: aims_recordings
+      POSTGRES_USER: aims_recordings
+      POSTGRES_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      POSTGRES_SSLMODE: disable
+      AIMS_DB_POOLER: transaction
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      PROMPTS_DIR: /app/src/prompts
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=2g
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # The archive worker: pulls pieces, merges, copies to cold storage
+  # ------------------------------------------------------------
+  archive-worker:
+    build: ../../backend/archive_worker
+    image: aimscribe/archive-worker:3.3
+    container_name: aims-archive-worker
+    <<: *hardening
+    environment:
+      # Inside the machine, so it does not go out to the internet and back.
+      AIMS_BACKEND_URL: http://api:6000
+      AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
+      AIMS_ARCHIVE_ROOT: /archive
+      # The key for the cloud copy. It exists on this machine and nowhere
+      # else - not on the API, not at either storage provider (SRS-DAT-08).
+      AIMS_COPY_KEY: ${AIMS_COPY_KEY:-}
+      AIMS_COPY_BATCH: ${AIMS_COPY_BATCH:-2}
+      AIMS_POLL_SECONDS: ${AIMS_POLL_SECONDS:-30}
+      AIMS_BATCH_SIZE: ${AIMS_BATCH_SIZE:-5}
+      AIMS_DISK_HEADROOM_BYTES: ${AIMS_DISK_HEADROOM_BYTES:-21474836480}
+      TZ: ${TZ:-Asia/Dhaka}
+    volumes:
+      - ${AIMS_ARCHIVE_PATH:?set AIMS_ARCHIVE_PATH in .env}:/archive
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      # The working disks: pieces are downloaded and joined here, and the
+      # copy is compressed and encrypted here, before anything is written to
+      # the archive array (SRS-SRV-03). About 320 MB per recorded hour, twice
+      # over for the join, plus the FLAC and its encrypted form.
+      - /tmp:size=${AIMS_WORK_TMPFS:-6g}
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # Nightly backups of both databases (SRS-STO-06, SRS-DAT-16)
+  # ------------------------------------------------------------
+  backup:
+    image: postgres:16-alpine
+    container_name: aims-backup
+    <<: *hardening
+    entrypoint: ["/bin/sh", "/opt/aims/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_SUPERUSER:-aims_admin}
+      PGPASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      AIMS_BACKUP_DIR: /backups
+      AIMS_BACKUP_AT: ${AIMS_BACKUP_AT:-02:30}
+      AIMS_BACKUP_KEEP_DAYS: ${AIMS_BACKUP_KEEP_DAYS:-30}
+      # Backups hold patient names. Without this they are written in the
+      # clear and the script says so on every run.
+      AIMS_BACKUP_KEY: ${AIMS_BACKUP_KEY:-}
+      TZ: ${TZ:-Asia/Dhaka}
+    volumes:
+      - ./backup:/opt/aims:ro
+      - ${AIMS_BACKUP_PATH:?set AIMS_BACKUP_PATH in .env}:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  # ------------------------------------------------------------
+  # Watching the things a doctor would otherwise notice first
+  # (SRS-SRV-08)
+  # ------------------------------------------------------------
+  monitor:
+    build: ./monitor
+    image: aimscribe/monitor:3.3
+    container_name: aims-monitor
+    <<: *hardening
+    environment:
+      AIMS_MONITOR_DSN: postgresql://aims_monitor:${AIMS_MONITOR_PASSWORD}@postgres:5432/aims_recordings
+      AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST}
+      AIMS_ALERT_WEBHOOK: ${AIMS_ALERT_WEBHOOK:-}
+      AIMS_MONITOR_EVERY: ${AIMS_MONITOR_EVERY:-300}
+      AIMS_CLINIC_HOURS: ${AIMS_CLINIC_HOURS:-08:00-22:00}
+      AIMS_DISK_FLOOR_GB: ${AIMS_DISK_FLOOR_GB:-500}
+      TZ: ${TZ:-Asia/Dhaka}
+    volumes:
+      # Read-only: it looks at how full they are, never at what is in them.
+      - ${AIMS_ARCHIVE_PATH}:/watch/archive:ro
+      - ${AIMS_DB_PATH}:/watch/db:ro
+      - ${AIMS_BACKUP_PATH}:/watch/backups:ro
+      - monitor_state:/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    networks: [internal, edge]
+
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:
+  monitor_state:
+
+networks:
+  # Only the gateway and the monitor sit on `edge`: the gateway to answer
+  # the internet, the monitor to check the certificate from outside.
+  edge:
+    name: aims-edge
+  internal:
+    name: aims-internal
+    internal: true

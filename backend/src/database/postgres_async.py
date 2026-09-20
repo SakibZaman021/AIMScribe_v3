@@ -4,6 +4,7 @@ Uses asyncpg for true async database operations.
 """
 
 import json
+import os
 import uuid
 import logging
 from datetime import date, datetime
@@ -13,6 +14,16 @@ import asyncpg
 from asyncpg import Pool
 
 logger = logging.getLogger(__name__)
+
+
+def pooler_options() -> dict:
+    """
+    Extra asyncpg settings when a transaction-mode pooler sits in front of
+    PostgreSQL (AIMS_DB_POOLER=transaction). Nothing changes without it.
+    """
+    if os.getenv("AIMS_DB_POOLER", "").strip().lower() != "transaction":
+        return {}
+    return {"statement_cache_size": 0, "max_cacheable_statement_size": 0}
 
 
 class AsyncPostgreSQLDatabase:
@@ -44,7 +55,13 @@ class AsyncPostgreSQLDatabase:
             self.dsn,
             min_size=self.min_connections,
             max_size=self.max_connections,
-            ssl=ssl_config
+            ssl=ssl_config,
+            # Behind PgBouncer in transaction mode a connection is handed to
+            # whichever client needs it next, so a statement this driver
+            # prepared on one connection may be looked up on another - which
+            # fails with "prepared statement does not exist", sometimes only
+            # under load. Turning the cache off is what makes the pooler safe.
+            **pooler_options()
         )
         await self._init_database()
         logger.info(f"Async PostgreSQL pool initialized (min={self.min_connections}, max={self.max_connections}, ssl={self.sslmode})")

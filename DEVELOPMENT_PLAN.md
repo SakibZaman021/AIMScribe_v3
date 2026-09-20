@@ -57,7 +57,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 | **4. On-screen control** — *done* | Always-on-top Stop and Pause with reason form; "Patient did not consent" first | `AT-13`–`AT-15` |
 | **5. Two databases** — *done* | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
 | **6. Archive and cloud copy** — *done* | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
-| **7. UIU hosting** | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
+| **7. UIU hosting** — *done* | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
 | **8. Tools for CMED and operators** | Test page; test Channel B environment; dummy CMED app on the new protocol; dashboard | `AT-27`, `AT-71`, `AT-72`; §8.9 |
 
 ## Rules while building
@@ -169,3 +169,23 @@ part to move to its own worker. `SRS-ARC-14` asks for the copy the same night,
 which the sweep now reports but nothing enforces.
 
 | 20 Sep 2026 | 6b | The cloud copy moves to cold storage at a second provider. R2 keeps the pieces, where every download is free; the lossless copy goes to S3 Glacier Deep Archive at about $1 per TB a month against R2's $15, and the two-kilobyte clinical JSON is kept warm in its own bucket (`AIMS_JSON_*`), because cold storage bills a minimum object size and answers in hours. With that, a copy can no longer be downloaded again to check it - and doing so would have cost more each month in traffic than the copies cost to keep - so the server now asks the store what it holds and compares the size and the store's own fingerprint with what UIU sent, refusing anything that does not match: nothing is recorded, no piece is deleted, and a critical alert is raised. The quarterly restore drill is what now proves a copy usable. SRS 3.3 records the change (§10.4, `SRS-STO-01`, `SRS-ARC-09` step 5, `SRS-ARC-12` governance lock, `AT-65b`). | 103 server tests, 93 worker tests, 30 PostgreSQL tests, 226 recorder tests pass |
+
+| 20 Sep 2026 | 7 | The whole server, as files: `deploy/uiu/` holds the Compose stack - gateway, API, transcription worker, archive worker, PostgreSQL 16, PgBouncer, Redis, nightly backups and a monitor - so a replacement machine is built from the repository and nothing else (`SRS-SRV-09`). Only the gateway publishes ports, 443 and the 80 that renews the certificate; the database, Redis and every worker sit on a Docker network with no route out (`SRS-TOP-02`, `SRS-SRV-07`). On first start PostgreSQL creates both databases with their own roles and applies the v1 baseline, every migration in order and the clinical schema - the same order and the same baseline file the PostgreSQL tests use, so a new server gets what the tests ran against. PgBouncer pools in transaction mode, and the driver's statement cache is turned off where that applies (`AIMS_DB_POOLER`), which is the failure that would otherwise appear only under load. Backups run nightly, encrypted, with a restore script that refuses to write over a live database. The monitor watches the four things that stop a clinic - disks, the archive queue, cloud copies falling behind, silent recorders, and the certificate - and says each thing once rather than every five minutes (`SRS-SRV-08`). `tools/load_test.py` runs a clinic day of fourteen rooms against a real server using the recorder's own signing code, and reports against §9.1 (`AT-29`). The README is the build: disks, LUKS, firewall, UPS, the move from Neon, updating one service at a time without interrupting a consultation (`AT-30`), what to check after an outage (`AT-73`), and the quarterly restore drill. | 51 deployment tests, 17 load-test tests, 103 server tests, 99 worker tests, 30 PostgreSQL tests, 226 recorder tests pass |
+
+### Putting Phase 7 on the UIU machine
+
+`deploy/uiu/README.md` is the procedure, start to finish. In short: prepare the
+three kinds of disk and the firewall, fill in `.env`, `docker compose up -d`,
+map the clinics and issue CMED's key, then move the data from Neon. Run
+`tools/load_test.py` before the first clinic day, not after.
+
+**Two things that must not be lost.** `AIMS_COPY_KEY` decrypts every cloud copy;
+`AIMS_GRANT_PRIVATE_KEY` signs the grants whose public half is built into every
+installed recorder. Each needs one sealed offline copy, and neither belongs in
+either repository.
+
+**Still open for the server.** Hardware, hosting and the line into the building
+are `SRS-SRV-01`-`06` and are bought, not written: ECC memory, power-loss-
+protected NVMe, RAID 6, a UPS that shuts the machine down cleanly, and a
+symmetric 50 Mbit/s line (**OD-18**). The compose stack assumes them and says so,
+but cannot check them from inside a container.

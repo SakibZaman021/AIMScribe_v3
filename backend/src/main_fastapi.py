@@ -165,8 +165,10 @@ class AsyncAppContext:
         self.clinical_pool = None
         if clinical_url:
             import asyncpg
+            from database.postgres_async import pooler_options
             self.clinical_pool = await asyncpg.create_pool(
-                clinical_url, min_size=1, max_size=5, command_timeout=30)
+                clinical_url, min_size=1, max_size=5, command_timeout=30,
+                **pooler_options())
             api_v2.ctx.clinical = ClinicalStore(self.clinical_pool, separate=True)
         else:
             logger.critical(
