@@ -75,8 +75,15 @@ class V2Context:
         # The copy bucket (SRS-STO-01): the merged lossless copy of each
         # finished recording, locked against deletion. Its own client with its
         # own credentials, because the credential that deletes pieces must not
-        # be able to reach the copies (SRS-ARC-12).
+        # be able to reach the copies (SRS-ARC-12). This one is cold storage -
+        # cheap to keep for years, hours to read back - so nothing routine ever
+        # reads from it.
         self.copy = None
+        # Where the clinical JSON copies go. A visit's JSON is about two
+        # kilobytes and is worth reading at once, while cold storage bills a
+        # minimum object size and answers in hours, so the JSON is kept warm.
+        # Unset, it shares the audio's bucket.
+        self.copy_json = None
 
     @property
     def ready(self) -> bool:
@@ -98,9 +105,12 @@ def _clinical():
     return ctx.clinical
 
 
-def _copy_bucket():
+def _copy_bucket(kind: str = "audio"):
+    """The store one kind of copy belongs in: audio cold, JSON warm."""
     if ctx.copy is None:
         raise HTTPException(status_code=503, detail="copy bucket is not configured")
+    if kind == "json" and ctx.copy_json is not None:
+        return ctx.copy_json
     return ctx.copy
 
 
@@ -1105,6 +1115,10 @@ class CopyRecord(BaseModel):
     bytes: int = Field(..., ge=1)
     sha256: str = Field(..., min_length=64, max_length=64)
     plain_sha256: Optional[str] = Field(None, min_length=64, max_length=64)
+    # The MD5 of the uploaded object - what the store returns as its ETag for
+    # a single-part upload, and so what the store can be asked to prove
+    # without sending the object back (SRS-ARC-09, step 5).
+    md5: Optional[str] = Field(None, min_length=32, max_length=32)
 
 
 class CopyCompleteRequest(BaseModel):
@@ -1231,7 +1245,7 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
     One place in the copy bucket to put one object, and the address to read it
     back from. The worker never holds bucket credentials (SRS-STO-02).
     """
-    copy = _copy_bucket()
+    copy = _copy_bucket(body.kind)
     repo = _repo()
     session_id = safe_session_id(body.session_id)
     session = await repo.get_session(session_id)
@@ -1245,10 +1259,50 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
     loop = asyncio.get_event_loop()
     upload = await loop.run_in_executor(
         None, copy.get_presigned_upload_url, object_key, 3600)
-    download = await loop.run_in_executor(
-        None, copy.get_presigned_download_url, object_key, 3600)
     return {"object_key": object_key, "version": version,
-            "upload_url": upload, "download_url": download}
+            "bucket": copy.bucket, "upload_url": upload}
+
+
+async def _confirm_stored(session_id: str, copy: "CopyRecord") -> None:
+    """
+    Ask the store what it holds, and refuse to go on unless it matches what UIU
+    sent (SRS-ARC-09, step 5).
+
+    The copy is not downloaded to check it. The audio copy is in cold storage,
+    where reading it back takes hours, and reading every copy back would cost
+    more each month in traffic than keeping the copies costs at all. What the
+    store will answer for nothing is the object's size and its own fingerprint
+    of it, and that is what is checked here. Whether the copy can really be
+    turned back into a recording is proven by the restore drill (AT-74), not by
+    fetching every file twice.
+    """
+    store = _copy_bucket(copy.kind)
+    loop = asyncio.get_event_loop()
+    try:
+        stored = await loop.run_in_executor(
+            None, store.client.stat_object, store.bucket, copy.object_key)
+    except Exception as exc:
+        await _copy_refused(session_id, copy, f"the store does not hold it: {exc}")
+
+    size = getattr(stored, "size", None)
+    if size is not None and int(size) != copy.bytes:
+        await _copy_refused(session_id, copy,
+                            f"the store holds {size} bytes, {copy.bytes} were sent")
+
+    etag = (getattr(stored, "etag", "") or "").strip('"').lower()
+    # A multipart upload's ETag is not the object's MD5 (it ends in "-<parts>"),
+    # so there is nothing to compare; the size check stands alone.
+    if copy.md5 and etag and "-" not in etag and etag != copy.md5.lower():
+        await _copy_refused(session_id, copy,
+                            "the store's fingerprint does not match what was sent")
+
+
+async def _copy_refused(session_id: str, copy: "CopyRecord", why: str):
+    await _repo().raise_alert(
+        alert_type="cloud_copy_unverified", severity="critical", session_id=session_id,
+        detail={"object_key": copy.object_key, "kind": copy.kind, "problem": why})
+    logger.error("Copy %s for %s not verified: %s", copy.object_key, session_id, why)
+    raise HTTPException(status_code=409, detail=f"copy not verified: {why}")
 
 
 @router.post("/archive/copy/complete")
@@ -1270,6 +1324,7 @@ async def archive_copy_complete(body: CopyCompleteRequest,
             plain = bytes.fromhex(copy.plain_sha256) if copy.plain_sha256 else None
         except ValueError:
             raise HTTPException(status_code=400, detail="sha256 must be hex")
+        await _confirm_stored(session_id, copy)
         await repo.record_cloud_copy(
             session_id=session_id, kind=copy.kind, object_key=copy.object_key,
             version=copy.version, byte_length=copy.bytes, sha256=digest,

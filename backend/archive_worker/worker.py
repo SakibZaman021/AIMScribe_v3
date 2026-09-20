@@ -26,16 +26,16 @@ Then, for each archived recording, the cloud copy (SRS-ARC-08-13):
 
   7. compress the WAV to FLAC          decode it again and compare the samples
   8. encrypt the FLAC and the JSON     with a key that never leaves this machine
-  9. upload to the copy bucket         read both back and compare
- 10. POST /api/v2/archive/copy/complete   the server records the copy and only
-                                          then deletes the pieces
+  9. upload them                       the audio to cold storage, the JSON hot
+ 10. POST /api/v2/archive/copy/complete   the server checks what the store holds
+                                          against what was sent, records the
+                                          copy, and only then deletes the pieces
 
 A session is only reported complete after step 4 succeeds. Any failure leaves the
 session pending, the agent keeps its local audio, and the next pass retries.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import signal
@@ -519,11 +519,14 @@ class ArchiveWorker:
     def upload_copy(self, session_id: str, kind: str,
                     encrypted: "cloudcopy.Encrypted") -> Dict[str, Any]:
         """
-        Put one encrypted object in the copy bucket and read it back.
+        Put one encrypted object in the copy bucket.
 
-        The read-back is the point: an upload that reported success but stored
-        nothing, or stored it short, is caught here rather than on the day the
-        copy is needed.
+        The copy is not read back here. The audio copy lives in cold storage,
+        where reading it back means a restore of hours; and reading every copy
+        back would cost more in traffic each month than the copies cost to
+        keep. What proves the store holds it is the store's own fingerprint of
+        the object, which the server asks for after this returns - so the size
+        and the fingerprint go with the report.
         """
         place = self.post("archive/copy/authorize",
                           {"session_id": session_id, "kind": kind})
@@ -535,24 +538,10 @@ class ArchiveWorker:
                 timeout=self.settings.download_timeout, verify=self.settings.verify_tls)
         response.raise_for_status()
 
-        back = self.session.get(place["download_url"], stream=True,
-                                headers={"X-Worker-Key": None},
-                                timeout=self.settings.download_timeout,
-                                verify=self.settings.verify_tls)
-        back.raise_for_status()
-        digest = hashlib.sha256()
-        length = 0
-        for block in back.iter_content(chunk_size=1 << 20):
-            if block:
-                digest.update(block)
-                length += len(block)
-        if digest.hexdigest() != encrypted.sha256 or length != encrypted.bytes:
-            raise CopyError(f"the {kind} copy read back from the bucket does not "
-                            f"match what was uploaded")
-
         return {"kind": kind, "object_key": place["object_key"],
                 "version": place["version"], "bytes": encrypted.bytes,
-                "sha256": encrypted.sha256, "plain_sha256": encrypted.plain_sha256}
+                "sha256": encrypted.sha256, "plain_sha256": encrypted.plain_sha256,
+                "md5": encrypted.md5}
 
     def report_copy_failure(self, session_id: str, step: str, message: str) -> None:
         """Make a repeated failure visible instead of silent (SRS-ARC-10)."""

@@ -181,7 +181,7 @@ async def a_session(repo, device, *, opened_ago=timedelta(seconds=5)):
 
 async def test_migrations_can_run_again(pg):
     """A deployment re-running the v3 scripts changes nothing and fails nothing."""
-    v3 = [p for p in RECORDINGS_SCRIPTS if p.name.startswith(("010_", "011_"))]
+    v3 = [p for p in RECORDINGS_SCRIPTS if p.name.startswith(("010_", "011_", "012_"))]
     await _apply(pg.recordings, v3)
     await _apply(pg.clinical, CLINICAL_SCRIPTS)
 
@@ -504,15 +504,20 @@ def _server(dbs):
     api_v2.ctx.repo, api_v2.ctx.clinical = dbs.repo, dbs.clinical
     api_v2.ctx.minio = SimpleNamespace(bucket="b", client=SimpleNamespace(
         remove_object=lambda b, k: removed.append(k)))
+    # The copy store, as the server sees it: it hands out one address to put an
+    # object, and answers what it holds. Whatever is asked for is held here.
     api_v2.ctx.copy = SimpleNamespace(
         bucket="copies",
         get_presigned_upload_url=lambda key, expires: f"https://copies/put/{key}",
-        get_presigned_download_url=lambda key, expires: f"https://copies/get/{key}")
+        client=SimpleNamespace(stat_object=lambda bucket, key: SimpleNamespace(
+            size=900_000, etag="ab" * 16)))
+    api_v2.ctx.copy_json = None
     return removed
 
 
 def _unserve():
     api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.minio = api_v2.ctx.copy = None
+    api_v2.ctx.copy_json = None
 
 
 async def test_refusal_endpoint_on_postgres(dbs):
@@ -817,7 +822,8 @@ async def test_the_copy_endpoints_run_on_postgres(dbs):
         result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
             session_id=sid, copies=[{
                 "kind": "audio", "object_key": place["object_key"], "version": 1,
-                "bytes": 900_000, "sha256": "cd" * 32, "plain_sha256": "ef" * 32}]))
+                "bytes": 900_000, "sha256": "cd" * 32, "plain_sha256": "ef" * 32,
+                "md5": "ab" * 16}]))
     finally:
         _unserve()
 

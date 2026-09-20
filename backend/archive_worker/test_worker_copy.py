@@ -2,15 +2,16 @@
 The worker's copy pass, end to end against a stand-in server and bucket.
 
 The order in `SRS-ARC-09` is the whole point of these tests: compress, prove
-the compression lossless, encrypt, upload, read back, record - and only then
-may the pieces go. Each test here breaks one step and checks that the pieces
-survive it.
+the compression lossless, encrypt, upload, have the store confirm what it
+holds, record - and only then may the pieces go. Each test here breaks one
+step and checks that the pieces survive it.
 
     cd archive_worker && python -m pytest -q test_worker_copy.py
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import wave
@@ -54,7 +55,16 @@ class Response:
 
 
 class FakeBackend:
-    """Answers the worker like the real server, and keeps what it was told."""
+    """
+    Answers the worker like the real server, and keeps what it was told.
+
+    Two stores, as in production: the audio's is cold, so nothing may ever read
+    an object back out of it - a GET here is a test failure, not a fallback.
+    The server checks a copy by what the store says it holds, so this stand-in
+    does the same and refuses anything that does not match.
+    """
+
+    AUDIO, JSON = "aimscribe-copies", "aimscribe-clinical-json"
 
     def __init__(self):
         self.pending_copy = []
@@ -63,6 +73,7 @@ class FakeBackend:
         self.objects: Dict[str, bytes] = {}
         self.recorded = []
         self.failures = []
+        self.refused = []
         self.pieces_deleted = 0
         self.versions: Dict[str, int] = {}
         self.truncate_uploads = False
@@ -76,12 +87,9 @@ class FakeBackend:
             return Response({"sessions": self.pending_json})
         if "/archive/clinical/" in url:
             return Response(self.document)
-        if url.startswith("https://copies.example/get/"):
-            key = url.split("/get/", 1)[1]
-            if key not in self.objects:
-                return Response(status=404)
-            return Response(body=self.objects[key])
-        raise AssertionError(f"unexpected GET {url}")
+        raise AssertionError(
+            f"unexpected GET {url} - copies are never read back (they are in cold "
+            f"storage, and the traffic would cost more than keeping them)")
 
     def put(self, url, data=None, **kw):
         key = url.split("/put/", 1)[1]
@@ -95,12 +103,18 @@ class FakeBackend:
             kind = body["kind"]
             version = self.versions.get(kind, 0) + 1
             self.versions[kind] = version
+            bucket = self.AUDIO if kind == "audio" else self.JSON
             key = f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v{version}." + \
                   ("flac.enc" if kind == "audio" else "json.enc")
-            return Response({"object_key": key, "version": version,
-                             "upload_url": f"https://copies.example/put/{key}",
-                             "download_url": f"https://copies.example/get/{key}"})
+            return Response({"object_key": key, "version": version, "bucket": bucket,
+                             "upload_url": f"https://{bucket}.example/put/{key}"})
         if url.endswith("/archive/copy/complete"):
+            for copy in body.get("copies", []):
+                held = self.objects.get(copy["object_key"])
+                if held is None or len(held) != copy["bytes"] \
+                        or hashlib.md5(held).hexdigest() != copy.get("md5"):
+                    self.refused.append(copy)
+                    return Response({"detail": "copy not verified"}, status=409)
             self.recorded.append(body)
             deleted = 0
             if body.get("final", True):
@@ -190,6 +204,16 @@ def test_the_copy_is_made_and_only_then_are_the_pieces_released(setup, tmp_path)
     audio_copy = next(c for c in recorded["copies"] if c["kind"] == "audio")
     assert audio_copy["sha256"] == cloudcopy.sha256_file(sealed)
     assert audio_copy["plain_sha256"] == cloudcopy.sha256_file(flac)
+    # The fingerprint the store can be asked for, without sending the file back.
+    assert audio_copy["md5"] == hashlib.md5(sealed.read_bytes()).hexdigest()
+
+
+def test_the_audio_and_the_json_go_to_their_own_stores(setup):
+    """Cold storage for the recording, a warm bucket for the two-kilobyte JSON."""
+    worker, backend, _ = setup
+    worker.copy_pass()
+    assert {c["kind"] for c in backend.recorded[0]["copies"]} == {"audio", "json"}
+    assert backend.versions == {"audio": 1, "json": 1}
 
 
 def test_the_uploaded_json_is_the_one_beside_the_audio(setup, tmp_path):
@@ -230,15 +254,19 @@ def test_a_flac_that_does_not_decode_to_the_audio_stops_everything(setup, monkey
     assert backend.failures[0]["step"] == "copy"
 
 
-def test_a_short_upload_is_caught_on_the_way_back(setup):
-    """The read-back is what proves the bucket really holds the copy."""
+def test_a_short_upload_is_refused_by_the_server(setup):
+    """
+    What proves the store holds the copy is the store's own account of it, not
+    a download. A truncated upload is refused, the pieces stay, and it is
+    reported rather than retried in silence (SRS-ARC-10).
+    """
     worker, backend, _ = setup
     backend.truncate_uploads = True
 
     assert worker.copy_pass() == 0
     assert backend.recorded == []
     assert backend.pieces_deleted == 0
-    assert "read back" in backend.failures[0]["message"]
+    assert backend.refused and backend.failures
 
 
 def test_an_archive_file_that_changed_is_not_copied(setup):

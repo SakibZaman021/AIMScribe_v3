@@ -130,18 +130,33 @@ readings outside the agreed columns are kept in `other` (**OD-16**).
 
 ### Putting Phase 6 on the current server
 
-1. Apply `backend/scripts/012_v3_cloud_copy.sql` to the recordings database (additive).
-2. Make a **second** R2 bucket for the copies, with object lock and versioning on. It must not be the bucket that holds the pieces; the server refuses to start the copy step if the two names match.
-3. Issue a **separate** R2 API token, read and write, scoped to the copy bucket only — and check that the existing token, the one that deletes pieces, has no access to it (`AT-67`, `SRS-ARC-12`). The two credentials are the whole protection: one can delete pieces and cannot touch copies; the other can write copies and cannot delete them.
-4. On Render, set `AIMS_COPY_BUCKET`, `AIMS_COPY_ENDPOINT`, `AIMS_COPY_ACCESS_KEY`, `AIMS_COPY_SECRET_KEY`, `AIMS_COPY_REGION=auto`.
-5. On the UIU machine, generate the copy key and set `AIMS_COPY_KEY` in the worker's `.env` only:
-   `python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"`
-   Keep one sealed offline copy of it. It never goes to Render, to R2 or into either repository — and without it every cloud copy is unreadable, including ours.
-6. `pip install -r backend/archive_worker/requirements.txt` (this adds `soundfile` and `cryptography`), or rebuild the worker image.
+**Where each half goes (6b).** The two halves of the journey have opposite costs,
+so they go to different providers: **Cloudflare R2** keeps the pieces, because the
+UIU server downloads every one of them and R2 charges nothing for that; **Amazon
+S3 Glacier Deep Archive** keeps the lossless copy, because it is written once,
+read almost never, and costs about a fifteenth of R2 to hold for years. The
+clinical JSON is two kilobytes a visit, so it stays warm where it can be read at
+once. SRS 3.3 records the change and the reasoning (§10.4).
 
-Until step 4 is done the server keeps the old behaviour - pieces deleted as soon
-as a recording is archived - and says so in the log on every archive. Until step 5
+1. Apply `backend/scripts/012_v3_cloud_copy.sql` to the recordings database (additive).
+2. In AWS, make the copy bucket: versioning on, Object Lock in **governance** mode (not compliance - a copy may one day have to be erased for a refusal), and a lifecycle rule moving objects to `DEEP_ARCHIVE` at day 0. Choose the region for where the data may sit, not for price: `ap-south-1` (Mumbai) or `ap-southeast-1` (Singapore).
+3. Issue an IAM user for it with `PutObject` and `GetObject`/`HeadObject` on that bucket and nothing else — **no delete**. Check that the existing R2 token, the one that deletes pieces, has no access to it, and that this one cannot touch the segment bucket (`AT-67`, `SRS-ARC-12`). The two credentials are the whole protection.
+4. Make the warm bucket for the JSON — an R2 bucket is simplest — with its own token.
+5. On Render, set `AIMS_COPY_BUCKET`, `AIMS_COPY_ENDPOINT` (e.g. `s3.ap-south-1.amazonaws.com`), `AIMS_COPY_ACCESS_KEY`, `AIMS_COPY_SECRET_KEY`, `AIMS_COPY_REGION` (the real region, not `auto`), and the matching `AIMS_JSON_*`. Leave `AIMS_JSON_*` unset to keep the JSON with the audio.
+6. On the UIU machine, generate the copy key and set `AIMS_COPY_KEY` in the worker's `.env` only:
+   `python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"`
+   Keep one sealed offline copy of it. It never goes to Render, to either provider, or into either repository — and without it every cloud copy is unreadable, including ours.
+7. `pip install -r backend/archive_worker/requirements.txt` (this adds `soundfile` and `cryptography`), or rebuild the worker image.
+
+Until step 5 is done the server keeps the old behaviour - pieces deleted as soon
+as a recording is archived - and says so in the log on every archive. Until step 6
 is done the worker archives as usual and makes no copies.
+
+**Put the restore drill in the calendar.** Copies are no longer fetched back one
+by one, so the quarterly drill is what proves they can still become recordings
+(`AT-74`, `SRS-ARC-07`): restore one day's copies to a spare machine with
+`restore.py` and compare them with the archive. Allow a day - cold storage takes
+hours to hand anything back.
 
 **Restoring.** `python restore.py restore <file or folder> <destination>` decrypts
 each object and decodes the FLAC back to WAV, refusing any file that does not
@@ -152,3 +167,5 @@ hash in the catalogue (`AT-74`). Both need `AIMS_COPY_KEY`.
 and in the same process; if copying ever falls behind the recordings, it is the
 part to move to its own worker. `SRS-ARC-14` asks for the copy the same night,
 which the sweep now reports but nothing enforces.
+
+| 20 Sep 2026 | 6b | The cloud copy moves to cold storage at a second provider. R2 keeps the pieces, where every download is free; the lossless copy goes to S3 Glacier Deep Archive at about $1 per TB a month against R2's $15, and the two-kilobyte clinical JSON is kept warm in its own bucket (`AIMS_JSON_*`), because cold storage bills a minimum object size and answers in hours. With that, a copy can no longer be downloaded again to check it - and doing so would have cost more each month in traffic than the copies cost to keep - so the server now asks the store what it holds and compares the size and the store's own fingerprint with what UIU sent, refusing anything that does not match: nothing is recorded, no piece is deleted, and a critical alert is raised. The quarterly restore drill is what now proves a copy usable. SRS 3.3 records the change (§10.4, `SRS-STO-01`, `SRS-ARC-09` step 5, `SRS-ARC-12` governance lock, `AT-65b`). | 103 server tests, 93 worker tests, 30 PostgreSQL tests, 226 recorder tests pass |

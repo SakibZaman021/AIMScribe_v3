@@ -151,6 +151,7 @@ class Encrypted:
     bytes: int
     sha256: str            # the object as it is uploaded
     plain_sha256: str      # the FLAC or JSON before encryption
+    md5: str               # what the store returns as the object's ETag
 
 
 def encrypt_file(source: Path, target: Path, key: bytes) -> Encrypted:
@@ -158,11 +159,18 @@ def encrypt_file(source: Path, target: Path, key: bytes) -> Encrypted:
     aes = _cipher(key)
     plain = hashlib.sha256()
     cipher_digest = hashlib.sha256()
+    # The store's own fingerprint of a single-part upload is the MD5 of the
+    # object. Weak as a hash, but here it is only used to ask the store "is
+    # what you hold what we sent?" - and it is the only fingerprint the store
+    # will give back without handing over the whole object, which would cost
+    # more in traffic than keeping the copy costs in storage.
+    etag = hashlib.md5()
     partial = target.with_suffix(target.suffix + ".partial")
 
     def write(handle, data: bytes) -> None:
         handle.write(data)
         cipher_digest.update(data)
+        etag.update(data)
 
     try:
         with open(source, "rb") as reader, open(partial, "wb") as writer:
@@ -189,7 +197,8 @@ def encrypt_file(source: Path, target: Path, key: bytes) -> Encrypted:
         raise CopyError(f"could not encrypt {source.name}: {exc}") from exc
 
     return Encrypted(path=target, bytes=target.stat().st_size,
-                     sha256=cipher_digest.hexdigest(), plain_sha256=plain.hexdigest())
+                     sha256=cipher_digest.hexdigest(), plain_sha256=plain.hexdigest(),
+                     md5=etag.hexdigest())
 
 
 def decrypt_file(source: Path, target: Path, key: bytes) -> Path:

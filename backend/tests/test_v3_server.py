@@ -339,16 +339,28 @@ class FakeBucket:
 
 
 class FakeCopyBucket:
-    """The locked copy bucket. It hands out addresses; it never deletes."""
+    """
+    A copy store. It hands out addresses and answers what it holds; it never
+    deletes, and it never hands an object back - the audio one is cold storage.
+    """
 
-    def __init__(self):
-        self.bucket = "aimscribe-copies"
+    def __init__(self, bucket="aimscribe-copies"):
+        self.bucket = bucket
+        self.objects = {}                        # key -> (size, md5)
+        self.client = SimpleNamespace(stat_object=self._stat)
+
+    def _stat(self, bucket, key):
+        if key not in self.objects:
+            raise RuntimeError(f"NoSuchKey: {key}")
+        size, etag = self.objects[key]
+        return SimpleNamespace(size=size, etag=etag)
+
+    def accept(self, key, size, md5):
+        """Stand in for the worker's upload having landed."""
+        self.objects[key] = (size, md5)
 
     def get_presigned_upload_url(self, key, expires):
-        return f"https://copies.example/put/{key}"
-
-    def get_presigned_download_url(self, key, expires):
-        return f"https://copies.example/get/{key}"
+        return f"https://{self.bucket}.example/put/{key}"
 
 
 @pytest.fixture
@@ -363,12 +375,13 @@ def server():
     api_v2.ctx.signer = ReceiptSigner(receipt_key)
     api_v2.ctx.clinical = FakeClinical()
     api_v2.ctx.copy = FakeCopyBucket()
+    api_v2.ctx.copy_json = FakeCopyBucket("aimscribe-clinical-json")
     yield SimpleNamespace(repo=repo, bucket=api_v2.ctx.minio, clinical=api_v2.ctx.clinical,
-                          copy=api_v2.ctx.copy,
+                          copy=api_v2.ctx.copy, copy_json=api_v2.ctx.copy_json,
                           grant_public=grant_key.public_key(),
                           receipt_public=receipt_key.public_key())
     api_v2.ctx.repo = api_v2.ctx.minio = api_v2.ctx.grants = api_v2.ctx.signer = None
-    api_v2.ctx.clinical = api_v2.ctx.copy = None
+    api_v2.ctx.clinical = api_v2.ctx.copy = api_v2.ctx.copy_json = None
 
 
 # ============================================================
@@ -808,9 +821,14 @@ async def archived(server, *, segments=3, stem=STEM):
     return sid
 
 
-def copy_of(kind, key, *, version=1, bytes_=900_000):
+def copy_of(server, kind, key, *, version=1, bytes_=900_000, md5="ab" * 16,
+            uploaded=True):
+    """One object as the worker reports it, and as the store then holds it."""
+    if uploaded:
+        store = server.copy_json if kind == "json" and server.copy_json else server.copy
+        store.accept(key, bytes_, md5)
     return {"kind": kind, "object_key": key, "version": version, "bytes": bytes_,
-            "sha256": "cd" * 32, "plain_sha256": "ef" * 32}
+            "sha256": "cd" * 32, "plain_sha256": "ef" * 32, "md5": md5}
 
 
 async def test_the_pieces_are_kept_until_the_copy_is_made(server):
@@ -831,16 +849,21 @@ async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
             api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
         assert place["object_key"] == \
             f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v1.{suffix}"
-        assert place["upload_url"].startswith("https://copies.example/put/")
         assert place["version"] == 1
+        # The audio goes to cold storage; the JSON to the warm bucket beside it.
+        assert place["bucket"] == ("aimscribe-copies" if kind == "audio"
+                                   else "aimscribe-clinical-json")
+        assert place["upload_url"].startswith(f"https://{place['bucket']}.example/put/")
+        # Nothing is ever read back from cold storage, so no address for it.
+        assert "download_url" not in place
 
 
 async def test_the_pieces_go_only_after_the_copy_is_recorded(server):
     """AT-64, SRS-ARC-09 steps 6 and 7."""
     sid = await archived(server, segments=4)
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of("audio", "copies/a.v1.flac.enc"),
-                                copy_of("json", "copies/a.v1.json.enc", bytes_=2048)]))
+        session_id=sid, copies=[copy_of(server, "audio", "copies/a.v1.flac.enc"),
+                                copy_of(server, "json", "copies/a.v1.json.enc", bytes_=2048)]))
     assert (result["status"], result["objects_deleted"]) == ("copied", 4)
     assert len(server.bucket.removed) == 4
     assert server.repo.sessions[sid]["copied_at"] is not None
@@ -856,7 +879,7 @@ async def test_a_json_alone_never_deletes_the_pieces(server):
     sid = await archived(server, segments=2)
     with pytest.raises(HTTPException) as refused:
         await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-            session_id=sid, copies=[copy_of("json", "copies/b.v1.json.enc", bytes_=2048)]))
+            session_id=sid, copies=[copy_of(server, "json", "copies/b.v1.json.enc", bytes_=2048)]))
     assert refused.value.status_code == 409
     assert server.bucket.removed == []
 
@@ -865,7 +888,7 @@ async def test_a_copy_recorded_twice_finishes_instead_of_failing(server):
     """AT-65: stopped between the upload and the database, the retry completes."""
     sid = await archived(server, segments=2)
     body = api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of("audio", "copies/c.v1.flac.enc")])
+        session_id=sid, copies=[copy_of(server, "audio", "copies/c.v1.flac.enc")])
     first = await api_v2.archive_copy_complete(body)
     second = await api_v2.archive_copy_complete(body)
     assert (first["objects_deleted"], second["objects_deleted"]) == (2, 0)
@@ -876,8 +899,8 @@ async def test_a_late_prescription_asks_for_the_json_again(server):
     """SRS-ARC-13."""
     sid = await archived(server)
     await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of("audio", "copies/d.v1.flac.enc"),
-                                copy_of("json", "copies/d.v1.json.enc", bytes_=2048)]))
+        session_id=sid, copies=[copy_of(server, "audio", "copies/d.v1.flac.enc"),
+                                copy_of(server, "json", "copies/d.v1.json.enc", bytes_=2048)]))
 
     status, _ = await send("prescription", prescription())
     assert status == 202
@@ -890,7 +913,7 @@ async def test_a_late_prescription_asks_for_the_json_again(server):
     assert place["version"] == 2 and ".v2.json.enc" in place["object_key"]
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
         session_id=sid, final=False,
-        copies=[copy_of("json", place["object_key"], version=2, bytes_=2500)]))
+        copies=[copy_of(server, "json", place["object_key"], version=2, bytes_=2500)]))
     assert result["objects_deleted"] == 0
     assert await api_v2.archive_json_pending() == {"sessions": []}
     assert len([c for c in server.repo.copies if c["kind"] == "json"]) == 2
@@ -957,6 +980,83 @@ async def test_the_clean_up_never_reaches_a_copy(server):
     server.repo.segments[sid][0]["object_key"] = "copies/HOSP003/one.v1.flac.enc"
 
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of("audio", "copies/HOSP003/one.v1.flac.enc")]))
+        session_id=sid, copies=[copy_of(server, "audio", "copies/HOSP003/one.v1.flac.enc")]))
     assert result["objects_deleted"] == 0
     assert server.bucket.removed == []
+
+
+# ============================================================
+# The copy is verified by asking the store (SRS-ARC-09 step 5)
+# ============================================================
+
+async def test_a_copy_the_store_does_not_have_is_refused(server):
+    """An upload that reported success and stored nothing must not free the pieces."""
+    sid = await archived(server, segments=3)
+    with pytest.raises(HTTPException) as refused:
+        await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+            session_id=sid,
+            copies=[copy_of(server, "audio", "copies/missing.v1.flac.enc",
+                            uploaded=False)]))
+    assert refused.value.status_code == 409
+    assert server.bucket.removed == []                      # the pieces stay
+    assert server.repo.copies == []                         # nothing recorded
+    assert server.repo.alerts[-1]["alert_type"] == "cloud_copy_unverified"
+
+
+async def test_a_copy_stored_short_is_refused(server):
+    """The size the store holds must be the size that was sent."""
+    sid = await archived(server, segments=3)
+    server.copy.accept("copies/short.v1.flac.enc", 500_000, "ab" * 16)
+    with pytest.raises(HTTPException) as refused:
+        await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+            session_id=sid,
+            copies=[copy_of(server, "audio", "copies/short.v1.flac.enc",
+                            bytes_=900_000, uploaded=False)]))
+    assert "900000 were sent" in refused.value.detail
+    assert server.bucket.removed == []
+
+
+async def test_a_copy_whose_fingerprint_differs_is_refused(server):
+    """Right size, wrong bytes - the store's own fingerprint catches it."""
+    sid = await archived(server, segments=3)
+    server.copy.accept("copies/wrong.v1.flac.enc", 900_000, "99" * 16)
+    with pytest.raises(HTTPException) as refused:
+        await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+            session_id=sid,
+            copies=[copy_of(server, "audio", "copies/wrong.v1.flac.enc",
+                            md5="ab" * 16, uploaded=False)]))
+    assert refused.value.status_code == 409
+    assert server.repo.alerts[-1]["detail"]["problem"].startswith("the store's fingerprint")
+    assert server.bucket.removed == []
+
+
+async def test_a_multipart_upload_is_checked_by_size(server):
+    """A large object's ETag is not its MD5; the size check stands alone."""
+    sid = await archived(server, segments=2)
+    server.copy.accept("copies/big.v1.flac.enc", 900_000, "d41d8cd98f00b204e9800998ecf8427e-3")
+    result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid,
+        copies=[copy_of(server, "audio", "copies/big.v1.flac.enc", uploaded=False)]))
+    assert result["status"] == "copied"
+
+
+async def test_the_json_is_verified_in_its_own_store(server):
+    """The warm bucket is a different store with its own credentials."""
+    sid = await archived(server, segments=1)
+    # Reported as in the audio store, but only the JSON store was written to.
+    server.copy_json.accept("copies/only-json.v1.json.enc", 2048, "ab" * 16)
+    result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
+        session_id=sid, final=False,
+        copies=[copy_of(server, "json", "copies/only-json.v1.json.enc",
+                        bytes_=2048, uploaded=False)]))
+    assert result["status"] == "recorded"
+    assert "copies/only-json.v1.json.enc" not in server.copy.objects
+
+
+async def test_one_store_for_both_when_no_warm_bucket_is_configured(server):
+    """AIMS_JSON_BUCKET unset: the JSON simply goes with the audio."""
+    api_v2.ctx.copy_json = None
+    sid = await archived(server, segments=1)
+    place = await api_v2.archive_copy_authorize(
+        api_v2.CopyAuthorizeRequest(session_id=sid, kind="json"))
+    assert place["bucket"] == "aimscribe-copies"

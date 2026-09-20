@@ -180,6 +180,11 @@ class AsyncAppContext:
         # above - which deletes pieces - has no access to it at all, so no one
         # credential can both make a copy and destroy one.
         api_v2.ctx.copy = self._copy_bucket()
+        # The JSON copies, if they are kept somewhere warmer than the audio -
+        # cold storage bills a minimum object size and answers in hours, and a
+        # visit's JSON is two kilobytes that someone may want to read today.
+        api_v2.ctx.copy_json = self._copy_bucket(prefix="AIMS_JSON") \
+            if os.getenv("AIMS_JSON_BUCKET", "").strip() else None
 
         if api_v2.ctx.signer is None:
             logger.critical(
@@ -191,34 +196,41 @@ class AsyncAppContext:
         logger.info("All async connections initialized")
 
     @staticmethod
-    def _copy_bucket() -> Optional[MinIOClient]:
+    def _copy_bucket(prefix: str = "AIMS_COPY") -> Optional[MinIOClient]:
         """
-        The locked bucket that holds the merged lossless copies.
+        A store for the copies. `AIMS_COPY_*` is the audio's, normally cold
+        storage at another provider; `AIMS_JSON_*` is the warm one for the
+        clinical JSON, and is optional.
 
         Unset means the copy step is not running yet: the archive worker has
         nothing to copy to, and /archive/complete keeps deleting the pieces as
         it did before, saying so each time.
         """
-        bucket = os.getenv("AIMS_COPY_BUCKET", "").strip()
+        bucket = os.getenv(f"{prefix}_BUCKET", "").strip()
         if bucket and bucket == settings.minio_bucket:
             logger.critical(
-                "AIMS_COPY_BUCKET is the same bucket as the pieces (%s). The copy "
-                "must be a separate bucket, locked against deletion (SRS-ARC-12). "
-                "No copies will be made until this is fixed.", bucket)
+                "%s_BUCKET is the same bucket as the pieces (%s). The copy must be "
+                "a separate bucket, locked against deletion (SRS-ARC-12). No copies "
+                "will be made until this is fixed.", prefix, bucket)
             return None
         if not bucket:
-            logger.warning(
-                "AIMS_COPY_BUCKET is not set - no lossless cloud copy is being kept "
-                "(SRS-ARC-08). Pieces are deleted as soon as a recording is archived.")
+            if prefix == "AIMS_COPY":
+                logger.warning(
+                    "AIMS_COPY_BUCKET is not set - no lossless cloud copy is being "
+                    "kept (SRS-ARC-08). Pieces are deleted as soon as a recording "
+                    "is archived.")
             return None
         try:
+            # Each store is reached with its own credentials. The segment
+            # bucket's token must not open either of these, and neither of
+            # these may delete from the segment bucket (SRS-ARC-12, SRS-STO-02).
             return MinIOClient(
-                endpoint=os.getenv("AIMS_COPY_ENDPOINT", settings.minio_endpoint).strip(),
-                access_key=os.getenv("AIMS_COPY_ACCESS_KEY", "").strip(),
-                secret_key=os.getenv("AIMS_COPY_SECRET_KEY", "").strip(),
+                endpoint=os.getenv(f"{prefix}_ENDPOINT", settings.minio_endpoint).strip(),
+                access_key=os.getenv(f"{prefix}_ACCESS_KEY", "").strip(),
+                secret_key=os.getenv(f"{prefix}_SECRET_KEY", "").strip(),
                 bucket=bucket,
-                secure=os.getenv("AIMS_COPY_SECURE", "true").lower() != "false",
-                region=os.getenv("AIMS_COPY_REGION", settings.minio_region).strip(),
+                secure=os.getenv(f"{prefix}_SECURE", "true").lower() != "false",
+                region=os.getenv(f"{prefix}_REGION", settings.minio_region).strip(),
             )
         except Exception as exc:
             # Never fatal: recordings must keep arriving. The copies simply wait.
