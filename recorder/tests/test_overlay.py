@@ -282,11 +282,52 @@ def test_the_window_builds(tmp_path):
         overlay.build()
     except tk.TclError as exc:
         pytest.skip(f"no display: {exc}")
+    def drawn(overlay):
+        """Every piece of text currently on the card."""
+        canvas = overlay.canvas
+        return [canvas.itemcget(item, "text") for item in canvas.find_all()
+                if canvas.type(item) == "text"]
+
     try:
-        overlay.apply(OverlayState().view(recording()))
-        assert overlay.headline.cget("text") == "Recording  01:05"
-        overlay.apply(OverlayState().view(paused()))
+        status = recording()
+        overlay.apply(OverlayState().view(status), status)
+        words = drawn(overlay)
+        assert "RECORDING" in words
+        assert "01:05" in words              # the elapsed time, read across a desk
+
+        status = paused()
+        overlay.apply(OverlayState().view(status), status)
+        assert "PAUSED" in drawn(overlay)
         assert overlay._pause_text == "Resume"
         assert overlay.window.state() == "withdrawn"
+    finally:
+        overlay.root.destroy()
+
+
+def test_a_silent_microphone_is_said_plainly(tmp_path):
+    """The meter's whole purpose: a muted microphone must be visible."""
+    tk = pytest.importorskip("tkinter")
+    from ui.overlay import Overlay
+
+    runtime = SimpleNamespace(cfg=SimpleNamespace(pause=SimpleNamespace(
+        reasons=("patient_declined", "other"))), controller=None, loop=None)
+    overlay = Overlay(runtime, visible=False)
+    try:
+        overlay.build()
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    try:
+        silent = dict(recording(), level=0.0)
+        overlay.apply(OverlayState().view(silent), silent)
+        words = [overlay.canvas.itemcget(i, "text") for i in overlay.canvas.find_all()
+                 if overlay.canvas.type(i) == "text"]
+        assert "no sound from the microphone" in words
+
+        loud = dict(recording(), level=0.6)
+        for _ in range(4):
+            overlay.apply(OverlayState().view(loud), loud)
+        words = [overlay.canvas.itemcget(i, "text") for i in overlay.canvas.find_all()
+                 if overlay.canvas.type(i) == "text"]
+        assert "no sound from the microphone" not in words
     finally:
         overlay.root.destroy()

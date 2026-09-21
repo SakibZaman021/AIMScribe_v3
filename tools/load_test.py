@@ -452,7 +452,7 @@ async def _drive(plan, rooms, args, timings: Timings) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--server", default="http://localhost:6000")
+    parser.add_argument("--server", default="http://localhost:6060")
     parser.add_argument("--admin-key", default=os.getenv("AIMS_ADMIN_KEY", ""))
     parser.add_argument("--hospital", default="HOSP003", help="the AIMS LAB clinic code")
     parser.add_argument("--cmed-hospital", default="", help="CMED's code for it")

@@ -1,38 +1,65 @@
 """
-The on-screen Stop and Pause control, drawn with tkinter (SRS 3.2 §7.8).
+The on-screen control, drawn with tkinter (SRS 3.2 §7.8).
 
-A small always-on-top window at the top right of the screen, shown only while
-a consultation is recording or paused. Two controls: a red circular Stop and a
-blue rectangular Pause (SRS-UIX-03). It needs nothing from CMED (SRS-UIX-12).
+A card at the top right of the screen, shown only while a consultation is
+recording or paused. It answers, without anyone having to click anything:
+
+    is it recording        the state chip, and a dot that pulses
+    for how long           the elapsed time, large enough to read across a desk
+    who                    the patient this recording belongs to
+    can it hear the room   a live meter driven by the microphone itself
+    is it safe             how many pieces are sealed, and whether CMED has
+                           confirmed the visit
+
+and it carries the two controls a doctor may need: Stop and Pause
+(SRS-UIX-03). It needs nothing from CMED to work (SRS-UIX-12), and it does not
+move (SRS-UIX-02) - a control that can be dragged can be dragged off-screen,
+and then Stop is not where anybody left it.
 
 tkinter runs on its own thread, which owns every widget. Button presses are
 handed to the agent's event loop, as the tray menu's are; events from the
-controller arrive through a queue this thread drains a few times a second.
-What to show is decided in overlay_model.py.
+controller arrive through a queue this thread drains several times a second.
+What to show is decided in overlay_model.py, which has no tkinter in it and is
+tested on its own; this file only draws.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import queue
 import threading
 from typing import Any, Dict, Optional
 
 from ui.overlay_model import (DELETE_QUESTION, NEEDS_DELETE_CONFIRMATION, OverlayActions,
-                              OverlayState, pause_reasons)
+                              OverlayState, format_duration, pause_reasons)
 
 logger = logging.getLogger(__name__)
 
-RED = "#c62828"
-BLUE = "#1f5fbf"
+# The card. Dark, because it sits over whatever CMED is showing and has to be
+# separate from it at a glance - and because the same teal is the agent's mark.
+CARD = "#12252b"
+CARD_EDGE = "#1d3a42"
+TEXT = "#f2f7f7"
+DIM = "#8fa8ae"
+RED = "#e0424c"
+RED_DEEP = "#b4232c"
+AMBER = "#e0a02a"
+TEAL = "#2bb39b"
+BLUE = "#4f8ff0"
+PAPER = "#ffffff"
 INK = "#1b1b1f"
 MUTED = "#5f5f68"
-PAPER = "#ffffff"
 FONT = "Segoe UI"
+
+WIDTH, HEIGHT = 330, 186
+BARS = 38                      # how many bars the meter keeps
 
 
 class Overlay:
-    POLL_MS = 300
+    # Fast enough that the meter looks alive and the seconds never appear to
+    # stick; still only a few hundred cheap redraws a minute.
+    POLL_MS = 120
 
     def __init__(self, runtime, *, visible: bool = True):
         self.runtime = runtime
@@ -44,6 +71,10 @@ class Overlay:
         self.root = None
         self.window = None
         self.form = None
+        self.canvas = None
+        self._levels = collections.deque([0.0] * BARS, maxlen=BARS)
+        self._phase = 0.0
+        self._pause_text = "Pause"
 
     # ---- lifecycle ----
 
@@ -97,63 +128,236 @@ class Overlay:
 
         self.root = tk.Tk()
         self.root.withdraw()
-        win = tk.Toplevel(self.root, bg=PAPER, highlightthickness=1,
-                          highlightbackground="#c9c9cf")
+
+        win = tk.Toplevel(self.root, bg=CARD)
         win.overrideredirect(True)                  # fixed, not draggable (SRS-UIX-02)
         win.attributes("-topmost", True)
         win.withdraw()
+        try:
+            # Rounded corners need the space outside them to disappear. Where
+            # the window manager cannot do it the card is simply square, which
+            # is a matter of looks and nothing else.
+            win.attributes("-transparentcolor", "#010203")
+            self._backdrop = "#010203"
+        except Exception:
+            self._backdrop = CARD
         self.window = win
 
-        text = tk.Frame(win, bg=PAPER)
-        text.pack(side="left", padx=(12, 8), pady=8)
-        self.headline = tk.Label(text, text="", font=(FONT, 11, "bold"), fg=INK, bg=PAPER,
-                                 anchor="w", width=22)
-        self.headline.pack(anchor="w")
-        self.note = tk.Label(text, text="", font=(FONT, 9), fg=MUTED, bg=PAPER, anchor="w",
-                             width=30, wraplength=230, justify="left")
-        self.note.pack(anchor="w")
+        self.canvas = tk.Canvas(win, width=WIDTH, height=HEIGHT, bg=self._backdrop,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack()
 
-        self.stop_button = self._control(win, width=54, draw=self._draw_stop,
-                                         action=self._on_stop, name="Stop")
-        self.stop_button.pack(side="left", padx=4, pady=8)
-        self.pause_button = self._control(win, width=78, draw=self._draw_pause,
-                                          action=self._on_pause, name="Pause")
-        self.pause_button.pack(side="left", padx=(4, 12), pady=8)
-        self._pause_text = "Pause"
+        self.stop_button = self._button(win, "Stop", RED, filled=True,
+                                        action=self._on_stop)
+        self.stop_button.place(x=18, y=HEIGHT - 56, width=136, height=40)
+        self.pause_button = self._button(win, "Pause", BLUE, filled=False,
+                                         action=self._on_pause)
+        self.pause_button.place(x=WIDTH - 154, y=HEIGHT - 56, width=136, height=40)
+
         self._place()
 
-    def _control(self, parent, *, width, draw, action, name):
-        """A shaped button that works by mouse and by keyboard (SRS-UIX-11)."""
+    def _button(self, parent, label, colour, *, filled, action):
+        """
+        A pill that works by mouse and by keyboard (SRS-UIX-11).
+
+        Drawn rather than themed: tk's own buttons take the operating system's
+        look, which on a clinical PC is whatever that PC happens to be set to,
+        and next to this card they look like a mistake.
+        """
         import tkinter as tk
 
-        canvas = tk.Canvas(parent, width=width, height=54, bg=PAPER, highlightthickness=2,
-                           highlightbackground=PAPER, highlightcolor=INK, takefocus=1,
-                           cursor="hand2")
+        canvas = tk.Canvas(parent, bg=CARD, highlightthickness=0, bd=0,
+                           takefocus=1, cursor="hand2")
         canvas.enabled = True
-        canvas.draw = lambda: draw(canvas)
+        canvas.label = label
+        canvas.colour = colour
+        canvas.filled = filled
+        canvas.hover = False
+        canvas.pressed = False
+        canvas.focused = False
+        canvas.draw = lambda: self._draw_button(canvas)
+
+        def press(_event=None):
+            if not canvas.enabled:
+                return
+            canvas.pressed = True
+            canvas.draw()
+            canvas.after(90, lambda: (setattr(canvas, "pressed", False), canvas.draw()))
+            action()
+
         for sequence in ("<Button-1>", "<Return>", "<space>"):
-            canvas.bind(sequence, lambda _event, c=canvas: action() if c.enabled else None)
-        canvas.draw()
+            canvas.bind(sequence, press)
+        canvas.bind("<Enter>", lambda _e: (setattr(canvas, "hover", True), canvas.draw()))
+        canvas.bind("<Leave>", lambda _e: (setattr(canvas, "hover", False), canvas.draw()))
+        canvas.bind("<FocusIn>", lambda _e: (setattr(canvas, "focused", True), canvas.draw()))
+        canvas.bind("<FocusOut>", lambda _e: (setattr(canvas, "focused", False), canvas.draw()))
         return canvas
 
-    def _draw_stop(self, canvas) -> None:
-        canvas.delete("all")
-        colour = RED if canvas.enabled else "#d9a3a3"
-        canvas.create_oval(5, 3, 49, 47, fill=colour, outline=colour)
-        canvas.create_text(27, 25, text="Stop", fill=PAPER, font=(FONT, 9, "bold"))
+    # ---- drawing ----
 
-    def _draw_pause(self, canvas) -> None:
+    @staticmethod
+    def _round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+        """A rounded rectangle, which tkinter does not have."""
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _draw_button(self, canvas) -> None:
         canvas.delete("all")
-        colour = BLUE if canvas.enabled else "#a9bddf"
-        canvas.create_rectangle(4, 8, 74, 44, fill=colour, outline=colour)
-        canvas.create_text(39, 26, text=getattr(self, "_pause_text", "Pause"),
-                           fill=PAPER, font=(FONT, 9, "bold"))
+        width = canvas.winfo_width() or 136
+        height = canvas.winfo_height() or 40
+        colour = canvas.colour if canvas.enabled else "#4a5c62"
+
+        if canvas.filled:
+            shade = colour
+            if canvas.pressed:
+                shade = RED_DEEP if colour == RED else shade
+            elif canvas.hover and canvas.enabled:
+                shade = self._lighten(colour, 0.12)
+            self._round_rect(canvas, 1, 1, width - 1, height - 1, 12,
+                             fill=shade, outline=shade)
+            text_colour = "#ffffff"
+        else:
+            fill = self._lighten(CARD, 0.10) if (canvas.hover and canvas.enabled) else CARD
+            self._round_rect(canvas, 1, 1, width - 1, height - 1, 12,
+                             fill=fill, outline=colour, width=2)
+            text_colour = colour if canvas.enabled else "#4a5c62"
+
+        if canvas.focused and canvas.enabled:
+            self._round_rect(canvas, 3, 3, width - 3, height - 3, 10,
+                             fill="", outline="#ffffff", width=1)
+
+        canvas.create_text(width / 2, height / 2, text=canvas.label,
+                           fill=text_colour, font=(FONT, 11, "bold"))
+
+    @staticmethod
+    def _lighten(colour: str, amount: float) -> str:
+        red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+        mix = lambda c: int(round(c + (255 - c) * amount))    # noqa: E731
+        return f"#{mix(red):02x}{mix(green):02x}{mix(blue):02x}"
+
+    def _paint(self, view, status: Dict[str, Any]) -> None:
+        """The card itself, redrawn from scratch each tick."""
+        canvas = self.canvas
+        canvas.delete("all")
+
+        recording = bool(status.get("is_recording"))
+        paused = bool(status.get("is_paused"))
+        accent = AMBER if paused else (RED if recording else DIM)
+
+        canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=self._backdrop,
+                                outline=self._backdrop)
+        self._round_rect(canvas, 1, 1, WIDTH - 1, HEIGHT - 1, 16,
+                         fill=CARD, outline=CARD_EDGE, width=1)
+        # A band of the state's colour down the left edge: the card's state is
+        # then readable even from the corner of an eye.
+        canvas.create_rectangle(1, 18, 5, HEIGHT - 18, fill=accent, outline=accent)
+
+        # ---- the state, and the dot that pulses with it ----
+        import math
+
+        if recording and not paused:
+            self._phase += self.POLL_MS / 1000.0
+            glow = 0.5 + 0.5 * math.sin(self._phase * 2.4)
+        else:
+            glow = 0.0
+        radius = 5 + 2.2 * glow
+        canvas.create_oval(22 - radius, 30 - radius, 22 + radius, 30 + radius,
+                           fill=accent, outline=self._lighten(accent, 0.4 * glow))
+
+        label = "PAUSED" if paused else ("RECORDING" if recording else "READY")
+        canvas.create_text(38, 30, text=label, anchor="w", fill=accent,
+                           font=(FONT, 10, "bold"))
+
+        elapsed = format_duration(status.get("duration_seconds", 0))
+        canvas.create_text(WIDTH - 20, 30, text=elapsed, anchor="e", fill=TEXT,
+                           font=("Consolas", 19, "bold"))
+
+        # ---- who ----
+        patient = (status.get("patient_name") or status.get("patient_ref") or "").strip()
+        if patient:
+            canvas.create_text(22, 55, text=patient[:34], anchor="w", fill=TEXT,
+                               font=(FONT, 11))
+
+        # ---- what the microphone is hearing ----
+        self._paint_meter(canvas, status, accent, paused)
+
+        # ---- what is safe, and what CMED has said ----
+        pieces = int(status.get("segment_count", 0) or 0)
+        held = int((status.get("upload") or {}).get("pending_segments", 0) or 0)
+        sent = max(0, pieces - held)
+        canvas.create_text(22, 118, anchor="w", fill=DIM, font=(FONT, 9),
+                           text=f"{sent} of {pieces} piece(s) safe at UIU" if pieces
+                           else "No pieces sealed yet")
+
+        confirmation = status.get("confirmation")
+        if confirmation == "confirmed":
+            self._chip(canvas, WIDTH - 20, 118, "CMED confirmed", TEAL)
+        elif confirmation == "confirming":
+            self._chip(canvas, WIDTH - 20, 118, "Checking with CMED", AMBER)
+        elif recording or paused:
+            self._chip(canvas, WIDTH - 20, 118, "Not confirmed", AMBER)
+
+        # ---- anything the agent needs to say ----
+        note = (view.note or "")[:64]
+        if note:
+            canvas.create_text(22, 136, text=note, anchor="w", fill=DIM,
+                               font=(FONT, 9))
+
+    def _paint_meter(self, canvas, status: Dict[str, Any], accent: str,
+                     paused: bool) -> None:
+        """
+        A bar per tick, scrolling left: the room, as the microphone hears it.
+
+        A flat line is the fault this catches - a muted or unplugged microphone
+        looks exactly like a working one until somebody plays the recording
+        back, and by then the consultation is over.
+        """
+        level = 0.0 if paused else float(status.get("level", 0.0) or 0.0)
+        self._levels.append(level)
+
+        left, right, middle = 22, WIDTH - 20, 88
+        span = (right - left) / BARS
+        for index, value in enumerate(self._levels):
+            height = 1.5 + value * 17
+            x = left + index * span
+            fade = 0.25 + 0.75 * (index / max(1, BARS - 1))
+            colour = self._mix(CARD, accent if value > 0.02 else DIM, fade)
+            canvas.create_rectangle(x, middle - height, x + span - 1.6, middle + height,
+                                    fill=colour, outline=colour)
+
+        if paused:
+            canvas.create_text((left + right) / 2, middle, text="paused",
+                               fill=DIM, font=(FONT, 9, "italic"))
+        elif max(self._levels) < 0.02:
+            # Said plainly, because it is the one thing on this card that means
+            # the consultation is being lost.
+            canvas.create_text((left + right) / 2, middle, text="no sound from the microphone",
+                               fill=AMBER, font=(FONT, 9, "bold"))
+
+    @staticmethod
+    def _mix(base: str, colour: str, amount: float) -> str:
+        a = [int(base[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(colour[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#" + "".join(f"{int(round(x + (y - x) * amount)):02x}"
+                             for x, y in zip(a, b))
+
+    def _chip(self, canvas, x, y, text, colour) -> None:
+        """A small right-aligned label in its own tinted pill."""
+        item = canvas.create_text(x - 8, y, text=text, anchor="e", fill=colour,
+                                  font=(FONT, 8, "bold"))
+        x1, y1, x2, y2 = canvas.bbox(item)
+        self._round_rect(canvas, x1 - 7, y1 - 3, x2 + 7, y2 + 3, 8,
+                         fill=self._mix(CARD, colour, 0.16), outline="")
+        canvas.tag_raise(item)
 
     def _place(self) -> None:
         self.window.update_idletasks()
-        width = self.window.winfo_reqwidth()
-        x = self.window.winfo_screenwidth() - width - 16
-        self.window.geometry(f"+{x}+16")
+        x = self.window.winfo_screenwidth() - WIDTH - 20
+        self.window.geometry(f"{WIDTH}x{HEIGHT}+{x}+20")
 
     # ---- refresh ----
 
@@ -165,19 +369,22 @@ class Overlay:
         except queue.Empty:
             pass
         try:
-            self.apply(self.state.view(self._status()))
+            status = self._status()
+            self.apply(self.state.view(status), status)
         except Exception as exc:
             logger.debug("On-screen control refresh failed: %s", exc)
         self.root.after(self.POLL_MS, self._tick)
 
-    def apply(self, view) -> None:
-        self.headline.configure(text=view.headline)
-        self.note.configure(text=view.note)
+    def apply(self, view, status: Optional[Dict[str, Any]] = None) -> None:
+        status = status if status is not None else {}
         self.stop_button.enabled = view.stop_enabled
         self.pause_button.enabled = view.pause_enabled
+        self.pause_button.label = view.pause_label
         self._pause_text = view.pause_label
         self.stop_button.draw()
         self.pause_button.draw()
+        self._paint(view, status)
+
         if view.visible and self._visible:
             if self.window.state() == "withdrawn":
                 self._place()
@@ -221,29 +428,40 @@ class Overlay:
         import tkinter as tk
 
         self.state.form_open = True
-        form = tk.Toplevel(self.window, bg=PAPER, padx=16, pady=12)
+        form = tk.Toplevel(self.window, bg=PAPER)
         form.title(title)
         form.attributes("-topmost", True)
         form.transient(self.window)
         form.resizable(False, False)
         self.form = form
 
-        tk.Label(form, text=title, font=(FONT, 11, "bold"), bg=PAPER, fg=INK
-                 ).pack(anchor="w", pady=(0, 6))
+        # A band of the card's colour, so the form reads as part of the same
+        # thing rather than as a Windows dialog that appeared from nowhere.
+        header = tk.Frame(form, bg=CARD, height=44)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text=title, font=(FONT, 11, "bold"), bg=CARD, fg=TEXT
+                 ).pack(anchor="w", padx=16, pady=10)
+
+        body = tk.Frame(form, bg=PAPER, padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+
         # Not "": tkinter draws every radio button as selected while the
         # variable is empty, which would look as if a reason were chosen.
         unset = "__none__"
         choice = tk.StringVar(value=unset)
         for value, label in choices:
-            tk.Radiobutton(form, text=label, value=value, variable=choice, bg=PAPER,
-                           fg=INK, font=(FONT, 10), anchor="w", activebackground=PAPER
-                           ).pack(fill="x", anchor="w")
-        tk.Label(form, text="Comment (needed for Other)", font=(FONT, 9), bg=PAPER,
-                 fg=MUTED).pack(anchor="w", pady=(8, 0))
-        comment = tk.Entry(form, font=(FONT, 10), width=40)
-        comment.pack(fill="x")
-        problem = tk.Label(form, text="", font=(FONT, 9), bg=PAPER, fg=RED, anchor="w")
-        problem.pack(fill="x", pady=(4, 0))
+            tk.Radiobutton(body, text=label, value=value, variable=choice, bg=PAPER,
+                           fg=INK, font=(FONT, 10), anchor="w", activebackground=PAPER,
+                           selectcolor=PAPER, padx=0
+                           ).pack(fill="x", anchor="w", pady=1)
+        tk.Label(body, text="Comment (needed for Other)", font=(FONT, 9), bg=PAPER,
+                 fg=MUTED).pack(anchor="w", pady=(10, 2))
+        comment = tk.Entry(body, font=(FONT, 10), width=40, relief="solid", bd=1)
+        comment.pack(fill="x", ipady=4)
+        problem = tk.Label(body, text="", font=(FONT, 9), bg=PAPER, fg=RED_DEEP,
+                           anchor="w")
+        problem.pack(fill="x", pady=(6, 0))
 
         def close():
             self.state.form_open = False
@@ -264,20 +482,24 @@ class Overlay:
                 cancel()
             close()
 
-        buttons = tk.Frame(form, bg=PAPER)
-        buttons.pack(fill="x", pady=(10, 0))
-        tk.Button(buttons, text="Confirm", width=12, command=on_confirm, default="active"
-                  ).pack(side="right")
-        tk.Button(buttons, text="Cancel", width=12, command=on_cancel).pack(side="right",
-                                                                            padx=6)
+        buttons = tk.Frame(body, bg=PAPER)
+        buttons.pack(fill="x", pady=(12, 0))
+        tk.Button(buttons, text="Confirm", width=12, command=on_confirm,
+                  default="active", bg=RED_DEEP, fg="#ffffff", relief="flat",
+                  activebackground=RED, activeforeground="#ffffff",
+                  font=(FONT, 10, "bold"), cursor="hand2"
+                  ).pack(side="right", ipady=3)
+        tk.Button(buttons, text="Cancel", width=12, command=on_cancel, relief="flat",
+                  bg="#e8eaec", fg=INK, font=(FONT, 10), cursor="hand2"
+                  ).pack(side="right", padx=8, ipady=3)
         # Closing the window is cancelling the action entirely, never a silent
         # confirmation (SRS-UIX-07).
         form.protocol("WM_DELETE_WINDOW", on_cancel)
         form.bind("<Escape>", on_cancel)
         form.bind("<Return>", on_confirm)
         form.update_idletasks()
-        x = self.window.winfo_rootx() + self.window.winfo_width() - form.winfo_reqwidth()
-        y = self.window.winfo_rooty() + self.window.winfo_height() + 8
+        x = self.window.winfo_rootx() + WIDTH - form.winfo_reqwidth()
+        y = self.window.winfo_rooty() + HEIGHT + 10
         form.geometry(f"+{max(0, x)}+{y}")
         form.grab_set()
         form.focus_force()

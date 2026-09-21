@@ -176,6 +176,12 @@ class Segmenter:
         self._rms_weighted_sum = 0.0
         self._rms_samples = 0
         self._segment_started_at: Optional[datetime] = None
+
+        # What the microphone is hearing right now, as a decaying peak. The
+        # on-screen control reads it and nothing else does: a plain float
+        # written from the capture thread, never part of a decision about the
+        # audio, so it needs no lock and can never hold capture up.
+        self.live_level = 0.0
         # (end_offset, rms, is_speech) for every 20 ms of the clip so far, and
         # how much of the buffer has been analysed.
         self._frames: list = []
@@ -268,6 +274,10 @@ class Segmenter:
         self._buffer.extend(chunk)
 
         level = _rms(chunk, self.sample_width)
+        # Rises at once, falls slowly: a meter following the raw value would
+        # flicker too fast to read, and an averaged one would miss the moment
+        # somebody starts speaking.
+        self.live_level = max(level, self.live_level * 0.72)
         self._rms_weighted_sum += level * len(chunk)
         self._rms_samples += len(chunk)
 

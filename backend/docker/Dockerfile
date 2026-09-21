@@ -57,10 +57,11 @@ ENV PYTHONPATH=/app \
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${SERVER_PORT:-6000}/health || exit 1
+    CMD curl -f http://localhost:${SERVER_PORT:-6060}/health || exit 1
 
 # Expose port
-EXPOSE 6000
+# 6060, not 6000: browsers and Node's fetch both refuse 6000.
+EXPOSE 6060
 
 # Run the FastAPI application
 CMD ["python", "src/main_fastapi.py"]

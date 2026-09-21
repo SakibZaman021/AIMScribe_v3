@@ -82,7 +82,10 @@ class Settings(BaseSettings):
     # ================================================================
     # Server Configuration
     # ================================================================
-    server_port: int = Field(default=6000)
+    # 6000 is X11's port, and both browsers and Node's fetch refuse to
+    # connect to it whatever is listening. A server nobody can dial looks
+    # exactly like a server that is down.
+    server_port: int = Field(default=6060)
     server_host: str = Field(default="0.0.0.0")
     log_level: str = Field(default="INFO")
     debug: bool = Field(default=False)

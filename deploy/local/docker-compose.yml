@@ -143,7 +143,10 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       SERVER_HOST: 0.0.0.0
-      SERVER_PORT: 6000
+      # Not 6000. Browsers and Node's fetch both refuse that port - it is
+      # X11's - so CMED's page could not deliver API 2 to it from inside
+      # this network any more than Chrome could open the dashboard.
+      SERVER_PORT: 6060
       # Inside this network the server reaches MinIO by its service name; the
       # links it hands out have to work from the doctor's PC as well, which is
       # what the external endpoint is for.
@@ -175,9 +178,9 @@ services:
       minio-setup:
         condition: service_completed_successfully
     ports:
-      - "${AIMS_PORT:-6000}:6000"
+      - "${AIMS_PORT:-6060}:6060"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:6060/health"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -192,7 +195,7 @@ services:
     restart: unless-stopped
     logging: *logging
     environment:
-      AIMS_BACKEND_URL: http://api:6000
+      AIMS_BACKEND_URL: http://api:6060
       AIMS_WORKER_KEY: ${AIMS_WORKER_KEY}
       AIMS_ARCHIVE_ROOT: /archive
       AIMS_COPY_KEY: ${AIMS_COPY_KEY}
@@ -233,9 +236,9 @@ services:
     logging: *logging
     environment:
       AIMS_CMED_KEY: ${AIMS_CMED_KEY:-}
-      AIMS_SERVER_URL: http://api:6000
+      AIMS_SERVER_URL: http://api:6060
       NEXT_PUBLIC_RECORDER_WS: ws://localhost:5050/ws
-      NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6000}
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6060}
       NEXT_PUBLIC_HOSPITAL_ID: HOSP003
     depends_on:
       api:

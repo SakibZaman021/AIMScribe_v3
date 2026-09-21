@@ -20,6 +20,9 @@ stops - which is what the archive worker then picks up. Give it `--cmed-key`
 (printed by `deploy/local/bootstrap.py`) or the recording stays unconfirmed and
 is never archived, exactly as a real consultation CMED never described.
 
+The server is on 6060, not 6000: browsers and Node's fetch both refuse to
+dial 6000, so nothing in this system uses it any more.
+
 The five fields identify the visit and must match character for character
 between Channel A and Channel B; that is why `start_time` is generated once and
 reused rather than taken twice from the clock.
@@ -218,7 +221,7 @@ def main(argv=None) -> int:
                         help="doctor_stopped, or patient_did_not_consent to "
                              "erase the consultation everywhere")
     parser.add_argument("--session", default="", help="for built/pause/resume")
-    parser.add_argument("--server", default="http://localhost:6000",
+    parser.add_argument("--server", default="http://localhost:6060",
                         help="the AIMS LAB server, for CMED's two messages")
     parser.add_argument("--cmed-key", default="",
                         help="CMED's key; without it the recording is never "

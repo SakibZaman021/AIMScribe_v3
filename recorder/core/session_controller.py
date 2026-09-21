@@ -968,6 +968,21 @@ class SessionController:
 
     # ---- status ----
 
+    @staticmethod
+    def _live_level(active) -> float:
+        """What the microphone is hearing, scaled for a meter."""
+        segmenter = getattr(active, "segmenter", None) if active else None
+        if segmenter is None:
+            return 0.0
+        try:
+            raw = float(segmenter.live_level)
+        except Exception:
+            return 0.0
+        # 16-bit RMS runs to 32767, but a consulting room never approaches it:
+        # quiet speech is around 300 and a raised voice around 4000, so the
+        # meter is scaled to the room rather than to the format.
+        return round(max(0.0, min(1.0, raw / 4000.0)), 3)
+
     def status(self) -> Dict[str, Any]:
         active = self._active
         upload = self._uploader.status()
@@ -992,6 +1007,10 @@ class SessionController:
             "paused_seconds": round(active.paused_seconds, 1) if active else 0.0,
             "upload": upload,
             "spool_capacity_hours": round(self.cfg.spool_seconds() / 3600, 1),
+            # 0.0 to 1.0, for the meter on the on-screen control. Speech
+            # sits around 0.3 to 0.7; a dead microphone stays at 0.0,
+            # which is the thing a doctor most needs to be able to see.
+            "level": self._live_level(active),
         }
         if active and active.pause:
             payload["pause"] = {
