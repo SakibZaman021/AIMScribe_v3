@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -41,6 +43,26 @@ SILENT_AFTER = timedelta(seconds=3 * HEARTBEAT_SECONDS)
 def _pool():
     repo = api_v2._repo()
     return repo._pool
+
+
+def clinic_today() -> date:
+    """
+    Today where the clinic is, not today at Greenwich.
+
+    Recordings are filed under the hospital's own date (`SRS-SES-05`), so a
+    dashboard defaulting to the UTC date shows an empty day for the six hours
+    either side of midnight in Dhaka - which is exactly when someone checking
+    on an evening clinic would look. The server's own zone is the clinic's;
+    it is set in the compose file and on the UIU server.
+    """
+    name = os.getenv("TZ", "").strip()
+    if name:
+        try:
+            return datetime.now(ZoneInfo(name)).date()
+        except Exception:
+            logger.warning("TZ=%s is not a zone this machine knows; "
+                           "the dashboard is using UTC", name)
+    return datetime.now(timezone.utc).date()
 
 
 def _day(value: Optional[str], fallback: date) -> date:
@@ -76,7 +98,7 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
     Everything §8.9 asks for, for a span of days: volume, confirmation,
     integrity, recorder health, reconciliation and the state of the copies.
     """
-    today = datetime.now(timezone.utc).date()
+    today = clinic_today()
     start = _day(from_date, today)
     end = _day(to_date, today)
     if end < start:
@@ -350,7 +372,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         confirmed | pending | unconfirmed | refused | expired | legacy
         quarantined | stopped_early | unarchived | uncopied
     """
-    today = datetime.now(timezone.utc).date()
+    today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
     end = _day(to_date, today)
     clinic = _clinic(hospital_id)
