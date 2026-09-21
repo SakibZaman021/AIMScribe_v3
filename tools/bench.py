@@ -221,7 +221,12 @@ class BenchServer:
             "grant_private": _pem(grant_key), "receipt_private": _pem(receipt_key),
         })
 
-        keys = ROOT / "recorder" / "keys"
+        # The bench's own public keys go in the bench's own folder. They used
+        # to be written into recorder/keys, which overwrote the ones the
+        # installer ships - a throwaway bench key standing where the real
+        # server's key belongs is exactly the mistake that ends with a fleet
+        # that cannot record.
+        keys = self.bench.recorder_state / "keys"
         keys.mkdir(parents=True, exist_ok=True)
         (keys / "aimslab_grant_pub.pem").write_bytes(_public_pem(grant_key))
         (keys / "aimslab_receipt_pub.pem").write_bytes(_public_pem(receipt_key))
@@ -360,8 +365,8 @@ def write_recorder_env(bench: Bench, server: BenchServer, token: str) -> Path:
     keys = bench.recorder_state / "keys"
     for folder in (state, keys, bench.recorder_state / "logs"):
         folder.mkdir(parents=True, exist_ok=True)
-    for name in ("aimslab_grant_pub.pem", "aimslab_receipt_pub.pem"):
-        shutil.copyfile(ROOT / "recorder" / "keys" / name, keys / name)
+    # The keys the bench server signs with are already here: BenchServer
+    # wrote them when it started. Nothing is copied out of the repository.
 
     identity = state / "device.json"
     if token and not identity.exists():
