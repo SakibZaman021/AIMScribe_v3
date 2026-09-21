@@ -98,7 +98,7 @@ def make_env() -> Dict[str, str]:
         "AIMS_COPY_KEY": base64.b64encode(os.urandom(32)).decode(),
         "AIMS_ALLOWED_ORIGINS": "http://localhost:3000",
         "AIMS_CMED_WEBHOOK_ENABLED": "false",
-        "AIMS_PORT": "6000",
+        "AIMS_PORT": "6060",
         "POSTGRES_PORT": "5433",
         "ARCHIVE_PATH": "./archive",
         "TZ": "Asia/Dhaka",
@@ -135,6 +135,19 @@ def this_machine() -> str:
         return "127.0.0.1"
     finally:
         probe.close()
+
+
+# Ports a browser refuses to open, whatever is listening on them. Chrome and
+# Firefox both keep this list: they are ports where a crafted HTTP request
+# could be read as some other protocol's command. 6000 is X11 - and it was
+# version 1's port, so it is the one a browser will silently refuse while
+# curl, the recorder and every test carry on working perfectly. The error a
+# browser shows for it says the site may be "temporarily down", which sends
+# you looking at the server.
+BROWSER_BLOCKED = {
+    1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666,
+    6667, 6668, 6669, 6697, 10080,
+}
 
 
 def port_is_taken(port: int) -> bool:
@@ -448,7 +461,20 @@ def main(argv=None) -> int:
     print("AIMScribe - starting the local stack\n")
     values = make_env()
 
-    port = int(values.get("AIMS_PORT", "6000"))
+    port = int(values.get("AIMS_PORT", "6060"))
+    if port in BROWSER_BLOCKED:
+        moved = 6060 if 6060 not in BROWSER_BLOCKED else 8060
+        update_env({"AIMS_PORT": str(moved)})
+        values = read_env()
+        print(f"""
+  Port {port} has been moved to {moved}.
+
+  Browsers refuse to open {port} whatever is listening there - it is on the
+  list of ports they will not dial - so the dashboard was unreachable from
+  Chrome while curl, the recorder and the tests were all fine. Anything
+  pointing at :{port} needs the new number, which is in out\\recorder\\.env
+  for the agent.""")
+        port = moved
     ours = subprocess.run(["docker", "compose", "ps", "-q", "api"], cwd=HERE,
                           capture_output=True, text=True).stdout.strip()
     if port_is_taken(port) and not ours:

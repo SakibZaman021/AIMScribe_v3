@@ -22,7 +22,7 @@ To start again from nothing: `python bootstrap.py --reset`.
 
 | Container | What it is | Where it is |
 |---|---|---|
-| `aimscribe-v3-server` | the AIMS LAB server | http://localhost:6000 |
+| `aimscribe-v3-server` | the AIMS LAB server | http://localhost:6060 |
 | `aimscribe-v3-postgres` | `aims_recordings` and `aims_clinical`, separate roles | localhost:5433 |
 | `aimscribe-v3-redis` | queues and locks | inside only |
 | `aimscribe-v3-storage` | stands in for Cloudflare R2 and the copy store | console on :9001 |
@@ -53,7 +53,7 @@ Three more ways to be sure, from the outside:
 | Ask | Version 1 | This |
 |---|---|---|
 | Open the server in a browser | no page - `{"detail":"Not Found"}` | a page that names itself, in green |
-| `curl http://localhost:6000/health` | `"version":"6.0.0"` | `"system":"AIMScribe v3 - AIMS LAB server"`, `"srs":"3.3"` |
+| `curl http://localhost:6060/health` | `"version":"6.0.0"` | `"system":"AIMScribe v3 - AIMS LAB server"`, `"srs":"3.3"` |
 | `docker compose ls` | `aimscribe_backend_render-main` | `aimscribe-v3` |
 
 They also do not share anything: separate containers, separate volumes,
@@ -73,13 +73,13 @@ Right after `start.bat`:
 
 | Link | |
 |---|---|
-| http://localhost:6000 | the front page: what this is, and where everything else is |
-| http://localhost:6000/health | one line saying the server, database, Redis and storage are up |
-| http://localhost:6000/api/v2/dashboard | the day as UIU sees it - **it asks for the administrator key** printed at startup |
+| http://localhost:6060 | the front page: what this is, and where everything else is |
+| http://localhost:6060/health | one line saying the server, database, Redis and storage are up |
+| http://localhost:6060/api/v2/dashboard | the day as UIU sees it - **it asks for the administrator key** printed at startup |
 | http://localhost:9001 | the storage console - user `aimslocal`, password in `.env` |
 | http://localhost:3000 | CMED's test site, **only** if you started with `--cmed` |
 
-`http://localhost:6000/api/v2/...` on its own will say `Not Found` or ask for a
+`http://localhost:6060/api/v2/...` on its own will say `Not Found` or ask for a
 credential: those are the recorder's and CMED's doors, not pages to browse.
 
 ---
@@ -116,7 +116,7 @@ same way but held by an administrator — see `../uiu`.
 
 | Setting | What it does |
 |---|---|
-| `AIMS_PORT` | the server's port (6000) |
+| `AIMS_PORT` | the server's port (6060 - see below) |
 | `POSTGRES_PORT` | where psql can reach the database (5433) |
 | `ARCHIVE_PATH` | where recordings are filed |
 | `AIMS_STORAGE_HOST` | the address upload links name; set for you each run |
@@ -127,8 +127,8 @@ same way but held by an administrator — see `../uiu`.
 ## Proving it works
 
 ```
-python tools\channel_b_test.py --server http://localhost:6000 --key <CMED key>
-python tools\load_test.py --server http://localhost:6000 ^
+python tools\channel_b_test.py --server http://localhost:6060 --key <CMED key>
+python tools\load_test.py --server http://localhost:6060 ^
        --admin-key <admin key> --cmed-key <CMED key> ^
        --hospital HOSP003 --cmed-hospital CMED-LOCAL-01 --rooms 14
 ```
@@ -142,7 +142,7 @@ confirm, archive, and are copied. Watch it happen:
 docker compose logs -f archive-worker
 ```
 
-The dashboard at http://localhost:6000/api/v2/dashboard asks for the
+The dashboard at http://localhost:6060/api/v2/dashboard asks for the
 administrator key and shows the day as UIU sees it.
 
 ---
@@ -154,6 +154,14 @@ administrator key and shows the day as UIU sees it.
 both will answer to `localhost`, and requests will be split between two
 systems with different databases: half of them refused with credentials the
 other one issued. Stop it, or set `AIMS_PORT` to something else.
+
+**The browser says the page "may be temporarily down" while curl works.**
+The port is one a browser refuses to dial. Chrome and Firefox keep a list of
+them - 6000 is X11's, 6665-6669 are IRC's - and they will not connect
+whatever is listening there, so the recorder, the tests and curl all work
+while the dashboard appears dead. That is why this stack publishes **6060**
+and not 6000. `bootstrap.py` moves the port for you if `.env` names a
+blocked one.
 
 **"Docker is not running."** Start Docker Desktop and try again.
 
