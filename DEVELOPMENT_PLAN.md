@@ -58,7 +58,7 @@ Each phase ends with its tests passing. Acceptance tests (`AT-nn`) are from SRS 
 | **5. Two databases** — *done* | Split into `aims_recordings` and `aims_clinical`; file-name columns; views for current and previous prescription; female and male tables | `AT-50`–`AT-56` |
 | **6. Archive and cloud copy** — *done* | JSON beside each WAV; one catalogue; FLAC copy, two buckets, deletion order | `AT-33`, `AT-64`–`AT-67`, `AT-74`, `AT-75` |
 | **7. UIU hosting** — *done* | Compose file for the UIU server: gateway, API, PostgreSQL, PgBouncer, workers, monitoring, backups | `AT-29`, `AT-30`, `AT-73` |
-| **8. Tools for CMED and operators** | Test page; test Channel B environment; dummy CMED app on the new protocol; dashboard | `AT-27`, `AT-71`, `AT-72`; §8.9 |
+| **8. Tools for CMED and operators** — *done* | Test page; test Channel B environment; dummy CMED app on the new protocol; dashboard | `AT-27`, `AT-71`, `AT-72`; §8.9 |
 
 ## Rules while building
 
@@ -189,3 +189,24 @@ are `SRS-SRV-01`-`06` and are bought, not written: ECC memory, power-loss-
 protected NVMe, RAID 6, a UPS that shuts the machine down cleanly, and a
 symmetric 50 Mbit/s line (**OD-18**). The compose stack assumes them and says so,
 but cannot check them from inside a container.
+
+| 21 Sep 2026 | 8 | The dashboard (§8.9) answers one question - is anything wrong today, and where: volume by clinic and doctor, confirmation, quarantines and early stops against the room they happened in, every recorder and what it is holding, recordings that CMED never described and messages with no recording, and what is not yet safe in two places. Every count opens into the rows behind it, and a restore test can be written down where the dashboard can show it. It reads the recordings database only and holds no credential for the clinical one, so it cannot show a name (`SRS-DSH-06`); the page is one HTML file with no build step and keeps the administrator key in memory, never in storage. `tools/channel_b_test.py` gives CMED both halves of a test environment: a local check that applies the server's own rules to a message with nothing running, and a run of every case that matters against a test server - a good message, the same message twice, a broken one, a changed prescription, a wrong key, an oversized body - each checked against the code §6.2.4 promises. The dummy CMED app moves to the v3 protocol: it mints no grants (that code is deleted), sends the five fields and acts on the reply code, sends API 2 and API 3 from its own server with the key that never reaches a browser (`AT-72`), and has a protocol bench at `/protocol-test` showing every message and reply side by side. Consent left the interface: the page says where a refusal is recorded instead of collecting one. | 41 PostgreSQL tests (11 for the dashboard), 39 tool tests, 103 server tests, 99 worker tests, 51 deployment tests, 226 recorder tests; the CMED app type-checks and builds |
+
+### Using what Phase 8 added
+
+**The dashboard** is at `https://<server>/api/v2/dashboard`, behind the
+administrator key. Leave it open on a wall screen: it refreshes every minute,
+and clicking any count shows the recordings behind it. After a restore drill,
+record it (`POST /api/v2/dashboard/restore-test`) so the "last restore test"
+figure stops saying never.
+
+**For CMED**, `cmed-web/README.md` is the integration in two pages: the order of
+the four messages, the codes to act on, and the two commands that check a
+message with nothing running. The protocol bench at `/protocol-test` is where
+their engineers should start.
+
+**Still open.** The dashboard has no chart library and draws its bars in CSS -
+enough to see a pattern, not enough for analysis; if the research team wants
+trends, that is a separate tool reading the same endpoints. `SRS-DSH-04` asks
+for speech levels per room, which needs the per-piece level figures the
+recorder does not compute yet (`SRS-LVL-01`).

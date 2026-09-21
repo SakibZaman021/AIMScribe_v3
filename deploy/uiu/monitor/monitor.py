@@ -79,7 +79,7 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
         """)
         alerts = await conn.fetch("""
             SELECT alert_type, severity FROM integrity_alerts
-             WHERE created_at > now() - interval '1 hour'
+             WHERE raised_at > now() - interval '1 hour'
                AND resolved_at IS NULL
         """)
         devices = await conn.fetch("""

@@ -1,20 +1,23 @@
 /**
- * Client for the local AIMScribe agent (protocol 2).
+ * Client for the AIMScribe recorder on the same PC (Channel A, SRS 3.3 §6.1).
  *
- * Runs in the browser and talks to the agent on the same PC over
- * ws://localhost:5050/ws. Three things changed from v1:
+ * What changed in v3, and why it matters to whoever maintains CMED's real site:
  *
- *  - **Starting requires a grant.** The browser can no longer name the doctor or
- *    the hospital; it asks this app's server for a signed grant and forwards it.
- *  - **Commands are acknowledged separately from events.** The agent replies to a
- *    command with `{event:'ack'}` and broadcasts state changes to every connected
- *    tab. v1 did both with the same object, so each change arrived two or three
- *    times and the UI could not tell an acknowledgement from an event.
- *  - **Pause and resume exist.** A pause carries a reason and, past the agent's
- *    threshold, a supervisor's name.
+ *  - **The page no longer authorises anything.** It sends five plain fields -
+ *    patient, doctor, clinic, start time, date - and the AIMS LAB server
+ *    decides. There is no key here and nothing to sign, so this page cannot be
+ *    the thing that is stolen (§5, `SRS-GRT-01`).
+ *  - **Every command is answered once, with a code.** The reply carries
+ *    `request_id`, `status` and `code`; act on the code, never on the wording
+ *    (`SRS-IF1-09`). `200 RECORDING_STARTED` and `202 RECORDING_PROVISIONAL`
+ *    both mean recording; the second means permission is still being checked.
+ *  - **`prescription_built` ends a consultation.** Opening the next patient no
+ *    longer cuts the last one off mid-sentence (§7.7): the recorder refuses
+ *    with `GATE_NOT_ARMED` until this is sent.
  *
- * Recording is owned by the agent, not by this page. Closing the tab, reloading,
- * or losing the socket does not stop a recording; reconnecting re-syncs state.
+ * Recording belongs to the recorder, not to this page. Closing the tab,
+ * reloading, or losing the socket does not stop a recording; reconnecting
+ * re-syncs what is on screen.
  */
 
 export const RECORDER_WS_URL =
@@ -22,18 +25,42 @@ export const RECORDER_WS_URL =
 
 export type AgentState = 'idle' | 'recording' | 'paused' | 'closing' | 'unknown';
 
+/** The five fields that identify one consultation (§6.1.3). */
+export interface Trigger {
+  patient_id: string;
+  doctor_id: string;
+  /** CMED's own clinic identifier. The server maps it to the clinic's code. */
+  hospital_id: string;
+  /** Exactly as CMED's server wrote it, and sent unchanged in API 2. */
+  start_time: string;
+  /** YYYY-MM-DD. */
+  date: string;
+}
+
+/** Every reply, whether it succeeded or not (Appendix A). */
+export interface Reply {
+  ok: boolean;
+  status: number;
+  code: string;
+  message: string;
+  requestId?: string;
+  data?: Record<string, unknown>;
+}
+
 export interface AgentStatus {
   state: AgentState;
   isRecording: boolean;
   isPaused: boolean;
   sessionId: string | null;
   patientRef: string | null;
-  /** The hospital this machine is enrolled at. Authoritative; not a page choice. */
+  /** The clinic this machine is enrolled at. Authoritative; not a page choice. */
   hospitalId: string | null;
   doctorId: string | null;
   durationSeconds: number;
   pausedSeconds: number;
   segmentCount: number;
+  /** What §5.6 decided: pending, confirming, confirmed, unconfirmed. */
+  confirmation?: string | null;
   pause?: { reason: string; authorisedBy: string; since: string } | null;
   upload?: {
     online?: boolean;
@@ -74,14 +101,21 @@ const EMPTY_STATUS: AgentStatus = {
   durationSeconds: 0,
   pausedSeconds: 0,
   segmentCount: 0,
+  confirmation: null,
 };
+
+/** The codes that mean "it is recording" (§6.1.4). */
+export const RECORDING_CODES = ['RECORDING_STARTED', 'RECORDING_PROVISIONAL'];
 
 export class AimscribeClient {
   private socket: WebSocket | null = null;
   private listeners = new Map<string, Set<Listener>>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private pending = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void }>();
+  private pending = new Map<string, {
+    resolve: (reply: Reply) => void; timer: ReturnType<typeof setTimeout>;
+  }>();
   private closedByUs = false;
+  private counter = 0;
 
   connected = false;
   status: AgentStatus = { ...EMPTY_STATUS };
@@ -101,7 +135,7 @@ export class AimscribeClient {
       socket.onopen = () => {
         this.connected = true;
         this.emit('connection', { connected: true });
-        this.send({ command: 'status' });
+        void this.command('status', {});
       };
 
       socket.onmessage = (event) => this.receive(event.data);
@@ -111,7 +145,7 @@ export class AimscribeClient {
         this.socket = null;
         this.failPending('Connection to AIMScribe was lost.');
         this.emit('connection', { connected: false });
-        // The agent keeps recording regardless; this only restores the view.
+        // The recorder keeps recording regardless; this only restores the view.
         if (!this.closedByUs) {
           this.reconnectTimer = setTimeout(() => this.connect(), 3000);
         }
@@ -137,63 +171,52 @@ export class AimscribeClient {
     this.socket = null;
   }
 
-  // ---- commands ----
+  // ---- the two commands CMED sends ----
 
   /**
-   * Start recording.
+   * API 1: a patient has been opened (§6.1.3).
    *
-   * Fetches a grant from our own server first. The agent refuses to record
-   * without one, and only that route can mint one - so the browser cannot start
-   * a recording on its own, even though it now names the doctor.
+   * Sends the five fields and nothing else. No consent flag: consent is asked
+   * at reception, and a refusal is recorded on the recorder's own Stop button,
+   * which deletes the recording everywhere (§7.8a). Nothing about consent
+   * crosses this interface, so CMED has nothing to store or prove.
    */
-  async start(options: {
-    patientRef: string;
-    patientName?: string;
-    doctorId: string;
-    hospitalId?: string;
-    consentObtained: boolean;
-    consentMethod?: string;
-  }): Promise<any> {
-    if (!options.consentObtained) {
-      throw new Error('Record the patient\'s consent before starting.');
-    }
-
-    const response = await fetch('/api/recording-grant', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        patient_ref: options.patientRef,
-        doctor_id: options.doctorId,
-        hospital_id: options.hospitalId ?? '',
-        consent_obtained: options.consentObtained,
-        consent_method: options.consentMethod ?? 'verbal_at_reception',
-      }),
-    });
-
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(data.error || 'Recording could not be authorised.');
-    }
-
-    return this.command('start', {
-      grant: data.grant,
-      session: { patient_name: options.patientName ?? '' },
-    });
+  async start(trigger: Trigger): Promise<Reply> {
+    return this.command('start', { trigger });
   }
 
   /**
-   * The doctors credentialed to record at this PC's hospital.
+   * API 3, part one: the prescription is built (§6.1.5).
    *
-   * Asked of the agent rather than fetched here: the agent holds the device
-   * token, and it knows which hospital this machine belongs to. The browser
-   * only picks from what comes back.
+   * Until this arrives, opening the next patient is refused with
+   * `GATE_NOT_ARMED` - which is what stops a consultation being cut off
+   * because someone clicked ahead.
+   */
+  async prescriptionBuilt(patientId: string, sessionId: string,
+                          occurredAt?: string): Promise<Reply> {
+    return this.command('prescription_built', {
+      patient_id: patientId,
+      session_id: sessionId,
+      occurred_at: occurredAt ?? new Date().toISOString(),
+    });
+  }
+
+  // ---- the rest: for this test app, not for CMED's site ----
+
+  /**
+   * The doctors this PC's clinic has seen, as suggestions.
+   *
+   * A directory, not a gate: CMED is the authority on who is on shift, and a
+   * doctor who is not in this list is still recorded (decision D4). Asked of
+   * the recorder because it knows which clinic the machine belongs to.
    */
   async doctors(): Promise<DoctorRegister> {
-    const data = await this.command('doctors', {});
+    const reply = await this.command('doctors', {});
+    const data: any = reply.data ?? {};
     return {
-      hospitalId: data?.hospital_id ?? null,
-      assignedDoctorId: data?.assigned_doctor_id ?? null,
-      doctors: Array.isArray(data?.doctors)
+      hospitalId: data.hospital_id ?? null,
+      assignedDoctorId: data.assigned_doctor_id ?? null,
+      doctors: Array.isArray(data.doctors)
         ? data.doctors.map((d: any) => ({
             doctorId: String(d.doctor_id ?? ''),
             fullName: String(d.full_name ?? d.doctor_id ?? ''),
@@ -202,7 +225,7 @@ export class AimscribeClient {
     };
   }
 
-  async pause(request: PauseRequest): Promise<any> {
+  async pause(request: PauseRequest): Promise<Reply> {
     return this.command('pause', {
       reason: request.reason,
       reason_detail: request.reasonDetail ?? '',
@@ -211,42 +234,52 @@ export class AimscribeClient {
     });
   }
 
-  async resume(): Promise<any> {
+  async resume(): Promise<Reply> {
     return this.command('resume', {});
   }
 
-  async stop(): Promise<any> {
+  /**
+   * Stop from here rather than from the recorder's own window.
+   *
+   * The doctor's Stop button is on the recorder, because that is where
+   * "Patient did not consent" has to be (§7.8a). This exists so this test
+   * page can end a consultation.
+   */
+  async stop(): Promise<Reply> {
     return this.command('stop', {});
   }
 
-  refreshStatus(): void {
-    this.send({ command: 'status' });
+  async refreshStatus(): Promise<Reply> {
+    return this.command('status', {});
   }
 
   /**
-   * Send a command and wait for its acknowledgement.
+   * Send one command and wait for its reply.
    *
-   * The agent processes one command at a time, so matching the next ack for a
-   * given command name is sufficient and avoids inventing a correlation id the
-   * agent does not implement.
+   * Replies are matched by `request_id`, so two commands in flight cannot be
+   * confused with one another - matching by command name, as this did before,
+   * could hand the wrong answer to the wrong caller.
    */
-  private command(name: string, payload: Record<string, unknown>): Promise<any> {
+  command(name: string, payload: Record<string, unknown>): Promise<Reply> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('Not connected to AIMScribe.'));
+      return Promise.resolve({
+        ok: false, status: 503, code: 'AGENT_NOT_READY',
+        message: 'Not connected to AIMScribe on this PC.',
+      });
     }
 
-    return new Promise((resolve, reject) => {
+    const requestId = `cmed-${Date.now()}-${++this.counter}`;
+    return new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.pending.delete(name);
-        reject(new Error('AIMScribe did not respond.'));
+        this.pending.delete(requestId);
+        resolve({
+          ok: false, status: 504, code: 'NO_REPLY',
+          message: 'AIMScribe did not answer.', requestId,
+        });
       }, 20000);
 
-      this.pending.set(name, {
-        resolve: (value) => { clearTimeout(timer); resolve(value); },
-        reject: (error) => { clearTimeout(timer); reject(error); },
-      });
-
-      this.send({ command: name, ...payload });
+      this.pending.set(requestId, { resolve, timer });
+      this.send({ command: name, request_id: requestId, ...payload });
     });
   }
 
@@ -268,25 +301,25 @@ export class AimscribeClient {
 
     const event = message.event;
 
-    if (event === 'ack') {
-      const waiting = this.pending.get(message.command);
-      if (waiting) {
-        this.pending.delete(message.command);
-        waiting.resolve(message.data ?? {});
+    if (event === 'ack' || event === 'error') {
+      const reply: Reply = {
+        ok: Number(message.status ?? 0) < 400,
+        status: Number(message.status ?? 0),
+        code: String(message.code ?? ''),
+        message: String(message.message ?? ''),
+        requestId: message.request_id,
+        data: message.data,
+      };
+      const waiting = reply.requestId ? this.pending.get(reply.requestId) : undefined;
+      if (waiting && reply.requestId) {
+        clearTimeout(waiting.timer);
+        this.pending.delete(reply.requestId);
+        waiting.resolve(reply);
+      } else if (event === 'error') {
+        // Nothing was waiting for it: a refusal the recorder raised by itself.
+        this.emit('error', reply);
       }
-      return;
-    }
-
-    if (event === 'error') {
-      // Refusals ("no recording in progress", "reason required") answer whatever
-      // command is outstanding; otherwise it is an unsolicited problem.
-      const outstanding = this.pending.keys().next();
-      if (!outstanding.done) {
-        const key = outstanding.value;
-        this.pending.get(key)?.reject(new Error(message.message || 'Command refused.'));
-        this.pending.delete(key);
-      }
-      this.emit('error', message);
+      this.emit('reply', reply);
       return;
     }
 
@@ -299,7 +332,11 @@ export class AimscribeClient {
   }
 
   private failPending(reason: string): void {
-    this.pending.forEach((entry) => entry.reject(new Error(reason)));
+    this.pending.forEach((entry, requestId) => {
+      clearTimeout(entry.timer);
+      entry.resolve({ ok: false, status: 503, code: 'AGENT_NOT_READY',
+                      message: reason, requestId });
+    });
     this.pending.clear();
   }
 
@@ -328,12 +365,13 @@ function mapStatus(message: any): AgentStatus {
     isRecording: Boolean(message.is_recording),
     isPaused: Boolean(message.is_paused),
     sessionId: message.session_id ?? null,
-    patientRef: message.patient_ref ?? null,
+    patientRef: message.patient_ref ?? message.patient_id ?? null,
     hospitalId: message.hospital_id ?? null,
     doctorId: message.doctor_id ?? null,
     durationSeconds: Number(message.duration_seconds ?? 0),
     pausedSeconds: Number(message.paused_seconds ?? 0),
     segmentCount: Number(message.segment_count ?? 0),
+    confirmation: message.confirmation ?? null,
     pause: message.pause
       ? {
           reason: message.pause.reason,
@@ -345,7 +383,24 @@ function mapStatus(message: any): AgentStatus {
   };
 }
 
-/** Matches AIMS_PAUSE_REASONS on the agent; 'other' requires written detail. */
+/** What a doctor may be told about a code, in plain words (`SRS-IF1-09`). */
+export const CODE_NOTES: Record<string, string> = {
+  RECORDING_STARTED: 'Recording.',
+  RECORDING_PROVISIONAL: 'Recording. Permission is still being checked.',
+  GATE_ARMED: 'This consultation will end when the next patient is opened.',
+  GATE_ALREADY_ARMED: 'Already marked as finished.',
+  GATE_NOT_ARMED: 'Finish the current consultation first.',
+  SESSION_ALREADY_ACTIVE: 'This consultation is already being recorded.',
+  CLINIC_MISMATCH: 'This PC belongs to a different clinic.',
+  DEVICE_NOT_ENROLLED: 'This PC is not registered with AIMS LAB.',
+  AUTHORISATION_FAILED: 'The server did not authorise this recording.',
+  AGENT_NOT_READY: 'AIMScribe is not running on this PC.',
+  MISSING_FIELD: 'A field is missing or malformed.',
+  INVALID_IDENTIFIER: 'An identifier contains characters that are not allowed.',
+  NO_REPLY: 'AIMScribe did not answer.',
+};
+
+/** Matches the recorder's own list; 'other' requires written detail. */
 export const PAUSE_REASONS = [
   { value: 'patient_declined', label: 'Patient declined recording' },
   { value: 'sensitive_personal_matter', label: 'Sensitive personal matter' },

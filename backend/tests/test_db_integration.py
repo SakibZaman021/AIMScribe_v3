@@ -30,6 +30,7 @@ sys.path.insert(0, str(BACKEND / "src"))
 sys.path.insert(0, str(BACKEND.parent / "recorder"))
 
 import api_v2                                  # noqa: E402
+import dashboard                              # noqa: E402
 import clinical                                # noqa: E402
 from clinical_store import ClinicalStore       # noqa: E402
 from confirmation import Visit                 # noqa: E402
@@ -808,3 +809,253 @@ async def test_the_copy_endpoints_run_on_postgres(dbs):
         assert await conn.fetchval(
             "SELECT count(*) FROM audit_log WHERE session_id = $1 "
             "AND event_type = 'session.copied'", sid) == 1
+
+
+# ============================================================
+# The operational dashboard (§8.9)
+# ============================================================
+
+async def _a_days_work(dbs, device, day, tag):
+    """
+    A day's recordings in every state the dashboard reports.
+
+    The day is deliberately not today: every test shares one database, and
+    sessions opened by other tests are filed under the real date.
+    """
+    made = {}
+    for n, (suffix, state) in enumerate([
+        ("1", "confirmed"), ("2", "confirmed"), ("3", "pending"),
+        ("4", "unconfirmed"), ("5", "legacy"),
+    ]):
+        patient = f"{tag}{suffix}"
+        sid = await a_session(dbs.repo, device)
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions
+                   SET patient_id = $2, confirmation = $3, session_date = $4,
+                       doctor_id = $5, total_duration_seconds = $6,
+                       closed_at = now(), segment_count = 3
+                 WHERE session_id = $1
+            """, sid, patient, state, day,
+                 "DR0042" if n % 2 == 0 else "DR0099", 900 + n * 60)
+        made[patient] = sid
+    return made
+
+
+async def test_the_dashboard_counts_a_day(dbs):
+    """SRS-DSH-01, -08: volume and confirmation, by clinic and doctor."""
+    device = await enrolled_device(dbs.repo)
+    await _a_days_work(dbs, device, date(2027, 3, 1), "PDASH")
+    _server(dbs)
+    try:
+        result = await dashboard.summary(from_date="2027-03-01", to_date="2027-03-01")
+    finally:
+        _unserve()
+
+    volume = result["volume"]
+    assert volume["total_recordings"] == 5
+    assert volume["total_hours"] > 1.2
+    assert {d["doctor_id"] for d in volume["by_doctor"]} == {"DR0042", "DR0099"}
+    assert result["confirmation"]["totals"]["confirmed"] == 2
+    assert result["confirmation"]["totals"]["unconfirmed"] == 1
+    assert result["volume"]["by_clinic"][0]["hospital_id"] == "HOSP003"
+
+
+async def test_a_refused_consultation_is_not_counted_as_work(dbs):
+    """SRS-CNS-06: it was erased; it is not part of the day's volume."""
+    device = await enrolled_device(dbs.repo)
+    sid = await a_session(dbs.repo, device)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET confirmation = 'refused', "
+                           "session_date = $2, total_duration_seconds = 600 "
+                           "WHERE session_id = $1", sid, date(2027, 3, 6))
+    _server(dbs)
+    try:
+        result = await dashboard.summary(from_date="2027-03-06", to_date="2027-03-06")
+    finally:
+        _unserve()
+    assert result["volume"]["total_recordings"] == 0
+    assert result["confirmation"]["totals"]["refused"] == 1
+
+
+async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
+    """SRS-DSH-03: quarantines and early stops, against clinic and doctor."""
+    device = await enrolled_device(dbs.repo)
+    quarantined = await a_session(dbs.repo, device)
+    stopped = await a_session(dbs.repo, device)
+    # Today, because an alert is stamped when it is raised: the dashboard
+    # shows the alerts of the days it is asked about.
+    day = datetime.now(timezone.utc).date()
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET session_date = $2, "
+                           "quarantine_reason = 'chain_broken' WHERE session_id = $1",
+                           quarantined, day)
+        await conn.execute("UPDATE sessions SET session_date = $2, "
+                           "close_reason = 'doctor_stopped' WHERE session_id = $1",
+                           stopped, day)
+    await dbs.repo.raise_alert(alert_type="dashboard_test_alert", severity="warning",
+                               session_id=stopped, detail={})
+    _server(dbs)
+    try:
+        result = await dashboard.summary(from_date=day.isoformat(),
+                                         to_date=day.isoformat())
+    finally:
+        _unserve()
+
+    integrity = result["integrity"]
+    assert integrity["quarantined_total"] == 1
+    assert integrity["quarantined"][0]["quarantine_reason"] == "chain_broken"
+    assert integrity["stopped_early_total"] == 1
+    assert integrity["stopped_early"][0]["close_reason"] == "doctor_stopped"
+    assert any(a["alert_type"] == "dashboard_test_alert" for a in integrity["alerts"])
+
+
+async def test_the_dashboard_shows_every_room(dbs):
+    """SRS-DSH-04: heard from, holding audio, or silent."""
+    device = await enrolled_device(dbs.repo)
+    await dbs.repo.touch_device(device["device_id"], spool_bytes=42 * 1024 ** 2,
+                                pending_segments=4)
+    _server(dbs)
+    try:
+        result = await dashboard.summary()
+    finally:
+        _unserve()
+
+    rooms = result["recorders"]
+    assert rooms["enrolled"] >= 1
+    mine = next(r for r in rooms["rooms"] if r["device_id"] == str(device["device_id"]))
+    assert (mine["pending_segments"], mine["spool_mb"]) == (4, 42.0)
+    assert mine["silent"] is False
+
+
+async def test_a_recorder_not_heard_from_is_called_silent(dbs):
+    device = await enrolled_device(dbs.repo)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE devices SET last_seen_at = now() - interval '2 hours' "
+                           "WHERE device_id = $1", device["device_id"])
+    _server(dbs)
+    try:
+        result = await dashboard.summary()
+    finally:
+        _unserve()
+    mine = next(r for r in result["recorders"]["rooms"]
+                if r["device_id"] == str(device["device_id"]))
+    assert mine["silent"] is True
+    assert result["recorders"]["silent"] >= 1
+
+
+async def test_the_dashboard_matches_recordings_against_cmed(dbs):
+    """SRS-DSH-05: a recording with no record, and a record with no recording."""
+    device = await enrolled_device(dbs.repo)
+    waiting = await a_session(dbs.repo, device)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET confirmation = 'pending', "
+                           "session_date = $2 WHERE session_id = $1",
+                           waiting, date(2027, 3, 5))
+    orphan = visit(patient_id="PORPHAN", visit_date="2027-03-05")
+    notice = await dbs.repo.record_notice(orphan, hospital_id="HOSP003",
+                                          clinical_record_id=1)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE confirmation_notices SET received_at = "
+                           "now() - interval '30 minutes' WHERE id = $1", notice)
+    _server(dbs)
+    try:
+        result = await dashboard.summary(from_date="2027-03-05", to_date="2027-03-05")
+    finally:
+        _unserve()
+
+    matching = result["reconciliation"]
+    assert matching["recordings_without_a_record"] == 1
+    assert matching["records_without_a_recording"] == 1
+
+
+async def test_the_dashboard_shows_what_is_not_yet_safe_in_two_places(dbs):
+    """SRS-DSH-09: copies outstanding, old pieces, and the last restore test."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PSAFE1")
+    await _archived(dbs, device, v, stem="PSAFE1_DR0042_HOSP003_101432_102847_20260913")
+    _server(dbs)
+    try:
+        before = await dashboard.summary()
+        await dashboard.record_restore_test({"by": "tester", "result": "passed",
+                                             "what": "one day from the copy store"})
+        after = await dashboard.summary()
+    finally:
+        _unserve()
+
+    assert before["copies"]["recordings_without_a_cloud_copy"] >= 1
+    assert before["copies"]["last_restore_test"]["at"] is None
+    assert after["copies"]["last_restore_test"]["at"] is not None
+    assert after["copies"]["last_restore_test"]["detail"]["result"] == "passed"
+
+
+async def test_every_count_opens_into_its_rows(dbs):
+    """SRS-DSH-07, SRS-DSH-02: clinic, doctor, date, patient - and the recording."""
+    device = await enrolled_device(dbs.repo)
+    made = await _a_days_work(dbs, device, date(2027, 3, 2), "PROWS")
+    _server(dbs)
+    try:
+        unconfirmed = await dashboard.recordings(
+            from_date="2027-03-02", to_date="2027-03-02", state="unconfirmed")
+        one_doctor = await dashboard.recordings(
+            from_date="2027-03-02", to_date="2027-03-02", doctor_id="DR0099")
+        one_patient = await dashboard.recordings(
+            from_date="2027-03-02", to_date="2027-03-02", patient_id="PROWS1")
+    finally:
+        _unserve()
+
+    assert [r["patient_id"] for r in unconfirmed["recordings"]] == ["PROWS4"]
+    assert {r["doctor_id"] for r in one_doctor["recordings"]} == {"DR0099"}
+    assert one_patient["recordings"][0]["session_id"] == made["PROWS1"]
+
+
+async def test_the_dashboard_finds_a_recording_by_part_of_its_name(dbs):
+    """SRS-DBA-24: search part of a file name."""
+    device = await enrolled_device(dbs.repo)
+    sid = await a_session(dbs.repo, device)
+    stem = "PFIND9_DR0042_HOSP003_101432_102847_20270304"
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET file_stem = $2, session_date = $3 "
+                           "WHERE session_id = $1", sid, stem, date(2027, 3, 4))
+    _server(dbs)
+    try:
+        found = await dashboard.recordings(from_date="2027-03-04", to_date="2027-03-04",
+                                           search="102847")
+    finally:
+        _unserve()
+    assert [r["session_id"] for r in found["recordings"]] == [sid]
+
+
+async def test_the_dashboard_never_reaches_the_clinical_database(dbs):
+    """SRS-DSH-06: it holds no credential for it, and asks it nothing."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id="PNAME9")
+    await _send(dbs.clinical, "patient_information", v,
+                _api2(v, demographics={"name": "Should Not Appear", "sex": "female"}))
+    sid = await _linked_session(dbs, device, v)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET patient_id = $2, session_date = $3 "
+                           "WHERE session_id = $1", sid, v.patient_id, date(2027, 3, 3))
+    _server(dbs)
+    try:
+        api_v2.ctx.clinical = None              # the dashboard must not need it
+        result = await dashboard.summary(from_date="2027-03-03", to_date="2027-03-03")
+        rows = await dashboard.recordings(from_date="2027-03-03", to_date="2027-03-03")
+    finally:
+        _unserve()
+
+    assert "Should Not Appear" not in json.dumps(result)
+    assert "Should Not Appear" not in json.dumps(rows, default=str)
+    assert rows["recordings"][0]["patient_id"] == "PNAME9"   # the number, not a name
+
+
+async def test_the_dashboard_page_is_one_file_with_no_build_step(dbs):
+    _server(dbs)
+    try:
+        page = await dashboard.page()
+    finally:
+        _unserve()
+    body = page.body.decode("utf-8")
+    assert "<title>AIMScribe" in body
+    assert "src=" not in body.replace('src="', "")        # nothing fetched from a CDN
+    assert "localStorage.setItem" not in body              # the key is never stored

@@ -1,20 +1,24 @@
 'use client';
 
 /**
- * Doctor dashboard.
+ * Doctor dashboard - the dummy CMED site, on the v3 protocol (SRS 3.3).
  *
- * Rewritten for AIMScribe protocol 2. What changed and why:
+ * What changed from the version before it, and why:
  *
- *  - The browser no longer names the doctor or the hospital. It asks this app's
- *    server for a signed grant, and the agent takes identity from that. A page
- *    the doctor happens to visit can no longer start a recording, and a typo can
- *    no longer file a consultation under the wrong hospital.
- *  - Consent is captured before recording can begin, and travels in the grant.
- *  - Pause is a first-class action with a mandatory reason, and a supervisor's
- *    name once it runs long. The pause is written into the recording's hash chain,
- *    so the gap in the audio is explained rather than unaccounted for.
- *  - Commands are acknowledged; state changes arrive as events. v1 conflated the
- *    two, so every change was processed two or three times.
+ *  - **This page authorises nothing.** Opening a patient sends five plain
+ *    fields to the recorder; the AIMS LAB server decides whether to allow the
+ *    recording (§5). There is no signing key in this app any more, so it is no
+ *    longer the thing worth stealing.
+ *  - **Opening a patient also sends API 2** over Channel B, from this app's
+ *    server, with CMED's key (§6.2). That message is what confirms the
+ *    recording; without it the recording is kept out of the dataset (§5.6).
+ *  - **Consent left this interface.** Reception asks, as it always did. If a
+ *    patient says no, the doctor presses Stop on the recorder and chooses
+ *    "Patient did not consent", which deletes the recording everywhere
+ *    (§7.8a). Nothing about consent is stored here.
+ *  - **A consultation ends when the prescription is built**, not when the next
+ *    patient is opened (§7.7): the recorder refuses a new patient with
+ *    GATE_NOT_ARMED until "Prescription built" is sent.
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
@@ -24,8 +28,40 @@ import {
   AimscribeClient,
   AgentStatus,
   DoctorRegister,
+  Reply,
+  RECORDING_CODES,
+  CODE_NOTES,
   PAUSE_REASONS,
 } from '@/lib/aimscribe-client';
+
+/**
+ * Send one Channel B message through this app's server, which holds CMED's
+ * key. A failure never stops the consultation - the real site would queue and
+ * retry in the background (`SRS-CHB-05`, `AT-71`).
+ */
+async function sendChannelB(kind: 'patient_information' | 'prescription',
+                            message: Record<string, unknown>): Promise<Reply> {
+  try {
+    const response = await fetch('/api/cmed/channel-b', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, message }),
+    });
+    const body = await response.json().catch(() => ({}));
+    return {
+      ok: response.status < 300,
+      status: response.status,
+      code: String(body.code ?? ''),
+      message: String(body.message ?? ''),
+      data: body,
+    };
+  } catch (error) {
+    return {
+      ok: false, status: 0, code: 'NOT_DELIVERED',
+      message: error instanceof Error ? error.message : 'Channel B is unreachable.',
+    };
+  }
+}
 
 const BACKEND_API = process.env.NEXT_PUBLIC_BACKEND_URL
   ? `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/v1`
@@ -70,7 +106,11 @@ export default function DashboardPage() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [consentGiven, setConsentGiven] = useState(false);
+  // What this consultation is, as CMED described it. Kept so API 3 carries
+  // exactly the same five fields as API 2 and the trigger.
+  const [visit, setVisit] = useState<Record<string, string> | null>(null);
+  const [lastReply, setLastReply] = useState<Reply | null>(null);
+  const [channelB, setChannelB] = useState<Reply | null>(null);
   // The consulting room is fixed, the doctor in it is not. The register comes
   // from the agent; the choice is remembered for the session so a doctor seeing
   // twenty patients picks their name once, not twenty times.
@@ -285,20 +325,67 @@ export default function DashboardPage() {
   const handleStart = () =>
     withBusy(async () => {
       if (!patientData) throw new Error('No patient selected.');
-      if (!consentGiven) {
-        throw new Error('Confirm the patient has agreed to be recorded before starting.');
-      }
       if (!doctorId.trim()) {
         throw new Error('Enter the doctor ID, as CMED would send it.');
       }
-      await clientRef.current!.start({
-        patientRef: patientData.patient_id,
-        patientName: patientData.patient_name,
-        doctorId,
-        hospitalId,
-        consentObtained: true,
-        consentMethod: 'verbal_at_reception',
+
+      // One moment, written once, and sent unchanged in both messages: this
+      // is what ties the recording to CMED's record of the visit (SRS-CNF-02).
+      const startedAt = new Date().toISOString();
+      const trigger = {
+        patient_id: patientData.patient_id,
+        doctor_id: doctorId.trim(),
+        hospital_id: hospitalId.trim() || status?.hospitalId || '',
+        start_time: startedAt,
+        date: startedAt.slice(0, 10),
+      };
+
+      const reply = await clientRef.current!.start(trigger);
+      setLastReply(reply);
+      if (!reply.ok) {
+        throw new Error(CODE_NOTES[reply.code] ?? reply.message ?? 'Refused.');
+      }
+
+      // API 2, from this app's server. It is what confirms the recording, so
+      // a failure here is reported rather than hidden - but it never stops the
+      // consultation, and the recorder keeps recording either way.
+      const api2 = await sendChannelB('patient_information', {
+        ...trigger,
+        demographics: {
+          name: patientData.patient_name,
+          sex: (patientData.gender || '').toLowerCase() === 'male' ? 'male' : 'female',
+          age_years: Number(patientData.age) || undefined,
+        },
+        paramedic: patientData.health_screening ?? {},
+        previous_visit: null,
       });
+      setChannelB(api2);
+      setVisit(trigger);
+    });
+
+  /**
+   * API 3: the prescription is built. Sent both ways - to the recorder, which
+   * arms the gate so the next patient may be opened, and over Channel B, which
+   * is where the prescription itself is kept.
+   */
+  const handlePrescriptionBuilt = () =>
+    withBusy(async () => {
+      if (!visit) throw new Error('Open a patient first.');
+      const sessionId = status?.sessionId ?? '';
+      const reply = await clientRef.current!.prescriptionBuilt(visit.patient_id,
+                                                               sessionId);
+      setLastReply(reply);
+      if (!reply.ok) {
+        throw new Error(CODE_NOTES[reply.code] ?? reply.message ?? 'Refused.');
+      }
+      setChannelB(await sendChannelB('prescription', {
+        ...visit,
+        issued_at: new Date().toISOString(),
+        diagnoses: [],
+        investigations: [],
+        items: [],
+        advice: '',
+      }));
     });
 
   const handlePause = () =>
@@ -643,20 +730,31 @@ export default function DashboardPage() {
                 )}
               </div>
 
-              {/* Consent - a precondition, not a formality */}
+              {/* Consent is asked at reception and is not part of this
+                  interface (§7.8a). If the patient says no, the doctor uses
+                  Stop on the recorder and chooses "Patient did not consent",
+                  which deletes the recording everywhere. */}
               {!status?.isRecording && (
-                <div className="mt-6 pt-4 border-t">
-                  <label className="flex items-start gap-2 text-sm text-gray-700">
-                    <input
-                      type="checkbox"
-                      checked={consentGiven}
-                      onChange={(e) => setConsentGiven(e.target.checked)}
-                      className="mt-1"
-                    />
-                    <span>
-                      The patient has been told this consultation will be recorded and has agreed.
-                    </span>
-                  </label>
+                <div className="mt-6 pt-4 border-t text-sm text-gray-600">
+                  Reception asks the patient. If they decline, press Stop on the
+                  AIMScribe window and choose &ldquo;Patient did not consent&rdquo; -
+                  the recording is then deleted everywhere.
+                </div>
+              )}
+
+              {/* What the recorder and the AIMS LAB server actually answered.
+                  Pages act on the code, never on the wording (SRS-IF1-09). */}
+              {(lastReply || channelB) && (
+                <div className="mt-4 space-y-1 text-xs font-mono text-gray-600">
+                  {lastReply && (
+                    <div>
+                      recorder: {lastReply.status} {lastReply.code}
+                      {CODE_NOTES[lastReply.code] ? ` - ${CODE_NOTES[lastReply.code]}` : ''}
+                    </div>
+                  )}
+                  {channelB && (
+                    <div>API 2/3: {channelB.status} {channelB.code} {channelB.message}</div>
+                  )}
                 </div>
               )}
 
@@ -665,20 +763,16 @@ export default function DashboardPage() {
                   <>
                     <button
                       onClick={handleStart}
-                      disabled={!connected || busy || !consentGiven || !doctorId}
+                      disabled={!connected || busy || !doctorId}
                       className={`w-full py-3 rounded-lg font-semibold transition-colors ${
-                        !connected || !consentGiven || !doctorId
+                        !connected || !doctorId
                           ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                          : recordingOtherPatient
-                          ? 'bg-orange-500 text-white hover:bg-orange-600'
                           : 'bg-green-600 text-white hover:bg-green-700'
                       }`}
                     >
                       {!connected ? 'Waiting for AIMScribe…'
                         : !doctorId ? 'Enter the doctor ID to continue'
-                        : !consentGiven ? 'Confirm consent to continue'
-                        : recordingOtherPatient ? 'Start (stops previous patient)'
-                        : 'Start Consultation'}
+                        : 'Open patient (starts recording)'}
                     </button>
                     <p className="text-xs text-gray-500 text-center">
                       Recording runs in AIMScribe on this PC and continues if you close this page.
@@ -698,6 +792,16 @@ export default function DashboardPage() {
                         Recording patient {status.patientRef}, not the one shown here.
                       </p>
                     )}
+                    {/* API 3, part one. Until this is sent, the recorder
+                        refuses to open the next patient (§7.7) - which is what
+                        stops a consultation being cut off mid-sentence. */}
+                    <button
+                      onClick={handlePrescriptionBuilt}
+                      disabled={busy}
+                      className="w-full py-3 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700"
+                    >
+                      Prescription built (ends this consultation)
+                    </button>
                     <button
                       onClick={() => setShowPause(true)}
                       disabled={busy}

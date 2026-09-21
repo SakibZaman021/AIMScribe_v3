@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIMScribe — operations</title>
+<!--
+  The operational dashboard (SRS 3.3 §8.9).
+
+  One file, no packages, no build step: a dashboard that cannot be opened
+  because a toolchain broke is worse than a plain one. It reads the
+  recordings database only, through /api/v2/dashboard, and shows no patient
+  name and nothing clinical (SRS-DSH-06).
+
+  Every count opens into the rows behind it (SRS-DSH-07) — click one.
+-->
+<style>
+  :root {
+    --ink: #17202a; --muted: #5b6b7c; --line: #dfe5ec; --bg: #f5f7fa;
+    --card: #ffffff; --good: #1f7a4d; --warn: #9a6400; --bad: #a32020;
+    --accent: #1b4f8a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
+  header { background: var(--card); border-bottom: 1px solid var(--line);
+           padding: 14px 20px; display: flex; gap: 16px; align-items: center;
+           flex-wrap: wrap; position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  header .spacer { flex: 1; }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  .figure { font-size: 30px; font-weight: 650; line-height: 1.1; }
+  .figure small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .row { display: flex; justify-content: space-between; padding: 3px 0;
+         border-bottom: 1px dotted var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .clickable { cursor: pointer; }
+  .clickable:hover { color: var(--accent); text-decoration: underline; }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  section { margin-top: 22px; }
+  section > h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: .06em; }
+  table { width: 100%; border-collapse: collapse; background: var(--card);
+          border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line);
+           font-size: 14px; white-space: nowrap; }
+  th { background: #eef2f7; font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { background: #e3e9f1; border-radius: 3px; height: 8px; min-width: 2px; }
+  .bar > div { background: var(--accent); height: 100%; border-radius: 3px; }
+  input, select, button { font: inherit; padding: 6px 10px; border-radius: 7px;
+                          border: 1px solid var(--line); background: var(--card); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  dialog { border: 1px solid var(--line); border-radius: 12px; padding: 0;
+           max-width: 95vw; width: 1100px; }
+  dialog header { position: static; }
+  dialog .body { padding: 0 16px 16px; max-height: 70vh; overflow: auto; }
+  .empty { color: var(--muted); padding: 14px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
+          font-size: 12px; background: #eef2f7; color: var(--muted); }
+  .pill.good { background: #e6f4ec; color: var(--good); }
+  .pill.warn { background: #fdf2dd; color: var(--warn); }
+  .pill.bad { background: #fbeaea; color: var(--bad); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>AIMScribe — operations</h1>
+  <label>From <input type="date" id="from"></label>
+  <label>To <input type="date" id="to"></label>
+  <label>Clinic <select id="clinic"><option value="">all</option></select></label>
+  <button class="primary" id="refresh">Refresh</button>
+  <span class="spacer"></span>
+  <span id="when" class="pill"></span>
+</header>
+
+<main>
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>Volume by doctor</h2>
+    <div id="byDoctor"></div>
+  </section>
+
+  <section>
+    <h2>Recorders</h2>
+    <div id="rooms"></div>
+  </section>
+
+  <section>
+    <h2>Problems worth a look</h2>
+    <div id="problems"></div>
+  </section>
+</main>
+
+<dialog id="rows">
+  <header><strong id="rowsTitle">Recordings</strong><span class="spacer"></span>
+    <button id="closeRows">Close</button></header>
+  <div class="body"><div id="rowsBody"></div></div>
+</dialog>
+
+<script>
+"use strict";
+
+// The admin key is asked for once and kept in memory for this tab only.
+// Not in localStorage: every script on the machine can read that.
+let ADMIN_KEY = "";
+
+const $ = (id) => document.getElementById(id);
+const today = () => new Date().toISOString().slice(0, 10);
+const esc = (value) => String(value ?? "").replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path, params) {
+  if (!ADMIN_KEY) {
+    ADMIN_KEY = window.prompt("Administrator key") || "";
+  }
+  const query = new URLSearchParams(
+    Object.entries(params || {}).filter(([, v]) => v !== "" && v != null));
+  const response = await fetch(`/api/v2/dashboard${path}?${query}`,
+    { headers: { "X-Admin-Key": ADMIN_KEY } });
+  if (response.status === 401 || response.status === 403) {
+    ADMIN_KEY = "";
+    throw new Error("That key was not accepted.");
+  }
+  if (!response.ok) throw new Error(`${path} answered ${response.status}`);
+  return response.json();
+}
+
+function card(title, body) {
+  return `<div class="card"><h2>${esc(title)}</h2>${body}</div>`;
+}
+
+function figure(value, note, tone) {
+  return `<div class="figure ${tone || ""}">${esc(value)}` +
+         (note ? ` <small>${esc(note)}</small>` : "") + `</div>`;
+}
+
+function rowLine(label, value, state, tone) {
+  const attrs = state ? ` class="row clickable" data-state="${esc(state)}"`
+                      : ` class="row"`;
+  return `<div${attrs}><span>${esc(label)}</span>` +
+         `<strong class="${tone || ""}">${esc(value)}</strong></div>`;
+}
+
+function tone(count, warnAt) {
+  if (!count) return "good";
+  return count >= (warnAt || 1) * 3 ? "bad" : "warn";
+}
+
+// ---- drawing ----
+
+function drawCards(data) {
+  const v = data.volume, c = data.confirmation.totals || {},
+        i = data.integrity, r = data.recorders, x = data.reconciliation,
+        p = data.copies;
+
+  $("cards").innerHTML = [
+    card("Recordings", figure(v.total_recordings, `${v.total_hours} hours`) +
+      rowLine("Confirmed", c.confirmed || 0, "confirmed", "good") +
+      rowLine("Still confirming", c.pending || 0, "pending",
+              tone(c.pending, 2)) +
+      rowLine("Unconfirmed", c.unconfirmed || 0, "unconfirmed",
+              tone(c.unconfirmed, 1)) +
+      rowLine("From older recorders", c.legacy || 0, "legacy")),
+
+    card("Consent and refusals",
+      figure((c.refused || 0) + (c.expired || 0), "erased everywhere") +
+      rowLine("Patient did not consent", c.refused || 0, "refused") +
+      rowLine("Erased after 24 hours unconfirmed", c.expired || 0, "expired")),
+
+    card("Integrity",
+      figure(i.quarantined_total + i.stopped_early_total,
+             "quarantined or stopped early",
+             tone(i.quarantined_total + i.stopped_early_total, 1)) +
+      rowLine("Quarantined", i.quarantined_total, "quarantined",
+              tone(i.quarantined_total, 1)) +
+      rowLine("Stopped before the end", i.stopped_early_total, "stopped_early",
+              tone(i.stopped_early_total, 2)) +
+      rowLine("Alerts raised", i.alerts_total, null, tone(i.alerts_total, 3))),
+
+    card("Recorders",
+      figure(`${r.enrolled - r.silent}/${r.enrolled}`, "heard from",
+             r.silent ? "warn" : "good") +
+      rowLine("Silent", r.silent, null, tone(r.silent, 1)) +
+      rowLine("Holding audio", r.holding_audio, null, tone(r.holding_audio, 2))),
+
+    card("Matching with CMED",
+      figure(x.recordings_without_a_record + x.records_without_a_recording,
+             "unmatched",
+             tone(x.recordings_without_a_record + x.records_without_a_recording, 2)) +
+      rowLine("Recordings with no record", x.recordings_without_a_record, "pending") +
+      rowLine("Records with no recording", x.records_without_a_recording)),
+
+    card("Safe in two places",
+      figure(p.recordings_without_a_cloud_copy, "awaiting a cloud copy",
+             tone(p.recordings_without_a_cloud_copy, 5)) +
+      rowLine("Oldest waiting", p.oldest_uncopied_hours
+              ? `${p.oldest_uncopied_hours} h` : "—", "uncopied") +
+      rowLine("Pieces over 48 h old", p.pieces_older_than_48h, null,
+              tone(p.pieces_older_than_48h, 1)) +
+      rowLine("Last restore test", p.last_restore_test.at
+              ? p.last_restore_test.at.slice(0, 10) : "never",
+              null, p.last_restore_test.at ? "" : "warn")),
+  ].join("");
+
+  document.querySelectorAll("#cards .clickable").forEach((element) => {
+    element.addEventListener("click",
+      () => openRows(element.dataset.state, element.textContent.trim()));
+  });
+}
+
+function drawDoctors(data) {
+  const rows = data.volume.by_doctor;
+  if (!rows.length) { $("byDoctor").innerHTML = `<div class="empty">Nothing yet.</div>`; return; }
+  const most = Math.max(...rows.map((r) => r.recordings));
+  $("byDoctor").innerHTML = `<table><thead><tr>
+      <th>Clinic</th><th>Doctor</th><th class="num">Recordings</th>
+      <th class="num">Hours</th><th style="width:40%"></th></tr></thead><tbody>` +
+    rows.map((r) => `<tr>
+      <td>${esc(r.hospital_id)}</td><td>${esc(r.doctor_id)}</td>
+      <td class="num">${r.recordings}</td><td class="num">${r.hours}</td>
+      <td><div class="bar"><div style="width:${(100 * r.recordings / most).toFixed(1)}%"></div></div></td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
+function drawRooms(data) {
+  const rooms = data.recorders.rooms;
+  if (!rooms.length) { $("rooms").innerHTML = `<div class="empty">No recorders enrolled.</div>`; return; }
+  $("rooms").innerHTML = `<table><thead><tr>
+      <th>Clinic</th><th>PC</th><th>Version</th><th>Last heard from</th>
+      <th class="num">Waiting</th><th class="num">Buffer</th><th></th>
+    </tr></thead><tbody>` + rooms.map((room) => `<tr>
+      <td>${esc(room.hospital_id)}</td>
+      <td>${esc(room.machine_name || room.device_id.slice(0, 8))}</td>
+      <td>${esc(room.app_version || "—")}</td>
+      <td>${room.minutes_since_seen == null ? "never"
+            : room.minutes_since_seen < 60 ? `${room.minutes_since_seen} min ago`
+            : `${(room.minutes_since_seen / 60).toFixed(1)} h ago`}</td>
+      <td class="num">${room.pending_segments}</td>
+      <td class="num">${room.spool_mb} MB</td>
+      <td>${room.revoked ? `<span class="pill">revoked</span>`
+            : room.silent ? `<span class="pill bad">silent</span>`
+            : `<span class="pill good">recording</span>`}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
+function drawProblems(data) {
+  const parts = [];
+  const i = data.integrity;
+
+  if (i.quarantined.length) {
+    parts.push(`<table><thead><tr><th>Clinic</th><th>Doctor</th>
+      <th>Why it was quarantined</th><th class="num">Count</th></tr></thead><tbody>` +
+      i.quarantined.map((q) => `<tr><td>${esc(q.hospital_id)}</td>
+        <td>${esc(q.doctor_id)}</td><td>${esc(q.quarantine_reason)}</td>
+        <td class="num">${q.n}</td></tr>`).join("") + `</tbody></table>`);
+  }
+  if (i.stopped_early.length) {
+    parts.push(`<table><thead><tr><th>Clinic</th><th>Doctor</th>
+      <th>Stopped because</th><th class="num">Count</th></tr></thead><tbody>` +
+      i.stopped_early.map((s) => `<tr><td>${esc(s.hospital_id)}</td>
+        <td>${esc(s.doctor_id)}</td><td>${esc(s.close_reason)}</td>
+        <td class="num">${s.n}</td></tr>`).join("") + `</tbody></table>`);
+  }
+  if (i.alerts.length) {
+    parts.push(`<table><thead><tr><th>Alert</th><th>Severity</th>
+      <th class="num">Count</th></tr></thead><tbody>` +
+      i.alerts.map((a) => `<tr><td>${esc(a.alert_type)}</td>
+        <td><span class="pill ${a.severity === "critical" ? "bad" : "warn"}">
+        ${esc(a.severity)}</span></td><td class="num">${a.n}</td></tr>`).join("") +
+      `</tbody></table>`);
+  }
+  $("problems").innerHTML = parts.length
+    ? parts.join('<div style="height:12px"></div>')
+    : `<div class="empty good">Nothing quarantined, nothing stopped early, no alerts.</div>`;
+}
+
+// ---- the rows behind a number (SRS-DSH-07) ----
+
+async function openRows(state, label) {
+  $("rowsTitle").textContent = `Recordings — ${label || state}`;
+  $("rowsBody").innerHTML = `<div class="empty">Loading…</div>`;
+  $("rows").showModal();
+  try {
+    const data = await api("/recordings", {
+      from: $("from").value, to: $("to").value,
+      hospital_id: $("clinic").value, state, limit: 300,
+    });
+    $("rowsBody").innerHTML = data.recordings.length ? `<table><thead><tr>
+        <th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th><th>File</th>
+        <th class="num">Minutes</th><th>State</th><th>Archived</th><th>Copied</th>
+      </tr></thead><tbody>` + data.recordings.map((r) => `<tr>
+        <td>${esc(r.date)}</td><td>${esc(r.hospital_id)}</td>
+        <td>${esc(r.doctor_id)}</td><td>${esc(r.patient_id)}</td>
+        <td>${esc(r.file_stem || "—")}</td><td class="num">${r.minutes}</td>
+        <td><span class="pill ${r.confirmation === "confirmed" ? "good"
+              : r.confirmation === "unconfirmed" ? "warn" : ""}">${esc(r.confirmation)}</span></td>
+        <td>${r.archived ? "yes" : "—"}</td><td>${r.copied ? "yes" : "—"}</td>
+      </tr>`).join("") + `</tbody></table>`
+      : `<div class="empty">Nothing here — which is usually the right answer.</div>`;
+  } catch (error) {
+    $("rowsBody").innerHTML = `<div class="empty bad">${esc(error.message)}</div>`;
+  }
+}
+
+// ---- loading ----
+
+async function refresh() {
+  $("when").textContent = "loading…";
+  try {
+    const data = await api("/summary", {
+      from: $("from").value, to: $("to").value, hospital_id: $("clinic").value,
+    });
+    drawCards(data);
+    drawDoctors(data);
+    drawRooms(data);
+    drawProblems(data);
+    $("when").textContent = `as at ${new Date().toLocaleTimeString()}`;
+  } catch (error) {
+    $("when").textContent = error.message;
+  }
+}
+
+async function start() {
+  $("from").value = today();
+  $("to").value = today();
+  try {
+    const { clinics } = await api("/clinics", {});
+    $("clinic").innerHTML = `<option value="">all</option>` +
+      clinics.map((c) => `<option value="${esc(c.hospital_id)}">` +
+        `${esc(c.name || c.hospital_id)}</option>`).join("");
+  } catch (error) {
+    $("when").textContent = error.message;
+  }
+  await refresh();
+  // Quiet enough to leave open on a wall screen all day.
+  setInterval(refresh, 60000);
+}
+
+$("refresh").addEventListener("click", refresh);
+$("closeRows").addEventListener("click", () => $("rows").close());
+["from", "to", "clinic"].forEach((id) => $(id).addEventListener("change", refresh));
+start();
+</script>
+</body>
+</html>

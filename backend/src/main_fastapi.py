@@ -22,6 +22,7 @@ from message_queue.redis_async import AsyncRedisClient, push_transcription_job_a
 import api_v2
 from api_v2 import router as v2_router
 from clinical import router as clinical_router
+from dashboard import router as dashboard_router
 from grants import GrantIssuer
 from clinical_store import ClinicalStore
 from db_v2 import V2Repository
@@ -304,6 +305,9 @@ app.add_middleware(
 app.include_router(v2_router)
 # Channel B: CMED's server sends API 2 and prescriptions here (SRS 3.2 §6.2).
 app.include_router(clinical_router)
+# The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
+# only, behind the administrator key.
+app.include_router(dashboard_router)
 
 
 # ============================================================================
