@@ -243,7 +243,11 @@ END $$;
 -- ----------------------------------------------------------------
 
 -- The latest version of each visit's prescription.
-CREATE OR REPLACE VIEW latest_prescriptions AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS latest_prescriptions CASCADE;
+CREATE VIEW latest_prescriptions AS
 SELECT DISTINCT ON (p.encounter_id)
        e.patient_id, e.encounter_id, e.visit_date, e.start_time, e.source,
        e.doctor_id, e.hospital_id, e.file_stem,
@@ -254,14 +258,22 @@ SELECT DISTINCT ON (p.encounter_id)
  ORDER BY p.encounter_id, p.version DESC;
 
 -- The patient's most recent recorded visit.
-CREATE OR REPLACE VIEW current_encounter AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS current_encounter CASCADE;
+CREATE VIEW current_encounter AS
 SELECT DISTINCT ON (patient_id) *
   FROM encounters
  WHERE source = 'live'
  ORDER BY patient_id, visit_date DESC, start_time DESC;
 
 -- That visit's prescription, once it is built.
-CREATE OR REPLACE VIEW current_prescription AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS current_prescription CASCADE;
+CREATE VIEW current_prescription AS
 SELECT l.*
   FROM latest_prescriptions l
   JOIN current_encounter c USING (encounter_id);
@@ -269,7 +281,11 @@ SELECT l.*
 -- The latest prescription from any visit strictly before the current one,
 -- so a second visit on the same day never returns the visit in progress
 -- (SRS-DBA-09).
-CREATE OR REPLACE VIEW previous_prescription AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS previous_prescription CASCADE;
+CREATE VIEW previous_prescription AS
 SELECT DISTINCT ON (l.patient_id) l.*
   FROM latest_prescriptions l
   JOIN current_encounter c ON c.patient_id = l.patient_id

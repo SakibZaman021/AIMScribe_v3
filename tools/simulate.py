@@ -174,7 +174,7 @@ class _S3Handler(BaseHTTPRequestHandler):
 
 PG_BOOT = r'''
 import sys, tempfile, pgserver
-data = tempfile.mkdtemp(prefix="aimssim")
+data = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="aimssim")
 server = pgserver.get_server(data, cleanup_mode="stop")
 print(server.get_uri(), flush=True)
 sys.stdin.readline()
@@ -190,21 +190,72 @@ class Postgres:
     process and told to stop when the run ends.
     """
 
-    def __init__(self, interpreter: str):
+    def __init__(self, interpreter: str, data_dir: Optional[str] = None):
         self.interpreter = interpreter
+        # A data directory that is kept means the bench still has yesterday's
+        # recordings in it; without one, each run starts empty.
+        self.data_dir = data_dir
         self.process: Optional[subprocess.Popen] = None
         self.uri = ""
 
-    def start(self) -> str:
+    def start(self, *, seconds: int = 120) -> str:
+        self._clear_stale_lock()
+        command = [self.interpreter, "-c", PG_BOOT]
+        if self.data_dir:
+            command.append(self.data_dir)
         self.process = subprocess.Popen(
-            [self.interpreter, "-c", PG_BOOT], stdin=subprocess.PIPE,
+            command, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        line = self.process.stdout.readline().strip()
+
+        # Read the address it prints, but never wait for ever: a data
+        # directory left by a hard stop can leave PostgreSQL waiting, and a
+        # tool that hangs silently is worse than one that says what to do.
+        answer: List[str] = []
+        reader = threading.Thread(
+            target=lambda: answer.append(self.process.stdout.readline().strip()),
+            daemon=True)
+        reader.start()
+        reader.join(seconds)
+
+        line = answer[0] if answer else ""
         if not line.startswith("postgres"):
-            error = self.process.stderr.read()[:2000]
-            raise RuntimeError(f"PostgreSQL did not start: {line} {error}")
+            self.stop()
+            raise RuntimeError(
+                f"PostgreSQL did not start within {seconds}s"
+                + (f": {line}" if line else "")
+                + (f". The data directory is {self.data_dir}; if it was left by "
+                   f"a bench that was stopped abruptly, start again with --reset"
+                   if self.data_dir else ""))
         self.uri = line
         return line
+
+    def _clear_stale_lock(self) -> None:
+        """
+        A `postmaster.pid` left behind by a process that is gone stops
+        PostgreSQL from starting. Removing it is safe only when nothing holds
+        the directory, so the owning process is checked first.
+        """
+        if not self.data_dir:
+            return
+        lock = Path(self.data_dir) / "postmaster.pid"
+        if not lock.is_file():
+            return
+        try:
+            pid = int(lock.read_text(encoding="utf-8").splitlines()[0])
+        except Exception:
+            return
+        alive = False
+        with contextlib.suppress(Exception):
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                alive = True
+        if not alive:
+            logger_line = f"clearing a lock left by process {pid}"
+            print(f"  ({logger_line})")
+            with contextlib.suppress(Exception):
+                lock.unlink()
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
@@ -215,15 +266,24 @@ class Postgres:
                 self.process.wait(timeout=30)
 
 
-async def build_databases(base_uri: str) -> Tuple[str, str]:
-    """Both databases, from the same scripts and in the same order as deploy/uiu."""
+async def build_databases(base_uri: str, *, fresh: bool = True) -> Tuple[str, str]:
+    """
+    Both databases, from the same scripts and in the same order as deploy/uiu.
+
+    `fresh` drops what is there first. The migrations themselves are written
+    to be re-run, so applying them to an existing bench changes nothing.
+    """
     import asyncpg
 
     admin = await asyncpg.connect(base_uri)
     try:
         for name in ("aims_recordings", "aims_clinical"):
-            await admin.execute(f"DROP DATABASE IF EXISTS {name}")
-            await admin.execute(f"CREATE DATABASE {name}")
+            if fresh:
+                await admin.execute(f"DROP DATABASE IF EXISTS {name}")
+            exists = await admin.fetchval(
+                "SELECT 1 FROM pg_database WHERE datname = $1", name)
+            if not exists:
+                await admin.execute(f"CREATE DATABASE {name}")
     finally:
         await admin.close()
 
@@ -515,6 +575,10 @@ class Room:
         os.environ["PROGRAMDATA"] = str(self.home)
 
         for name, value in {
+            # Said outright, not left to PROGRAMDATA: the bench writes an .env
+            # beside the recorder, and a room that inherited its data directory
+            # would share the bench's keys and enrolment.
+            "AIMS_DATA_DIR": str(self.home / "AIMScribe"),
             "AIMS_BACKEND_URL": self.server.url,
             "AIMS_SPOOL_DIR": str(self.home / "spool"),
             "AIMS_GRANT_PUBLIC_KEY_PATH": str(keys / "aimslab_grant_pub.pem"),
@@ -957,6 +1021,16 @@ async def verify(checks: Checks, *, server: Server, visits: List[Consultation],
     checks.check(named == len(archived),
                  "every recording is named Patient_Doctor_Clinic_start_end_date",
                  "SRS-SES-05")
+
+    # The name in the database is not the point; the name on the disk is. They
+    # drifted apart once, because the server knew the name and never sent it to
+    # the worker, and a check that only read the database could not see it.
+    same_name = sum(1 for s in archived
+                    if s["file_stem"] and (archive / (s["archive_relpath"] or "")).name
+                    == f"{s['file_stem']}.wav")
+    checks.check(same_name == len(archived),
+                 "the file on disk is called what the database calls it",
+                 "SRS-SES-05, SRS-DBA-21")
     checks.check(with_json == len(archived),
                  "every recording has its clinical JSON beside it", "SRS-CRI-05")
     checks.check(chain_ok == len(archived),

@@ -63,7 +63,11 @@ ON CONFLICT (doctor_id, hospital_id) DO NOTHING;
 
 
 -- Who may record where, for the CMED selector and for review.
-CREATE OR REPLACE VIEW v_doctor_register AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS v_doctor_register CASCADE;
+CREATE VIEW v_doctor_register AS
 SELECT
     d.hospital_id,
     h.name                AS hospital_name,

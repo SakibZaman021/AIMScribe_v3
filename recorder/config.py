@@ -41,7 +41,18 @@ def app_dir() -> Path:
 
 
 def data_dir() -> Path:
-    """Per-machine writable state. Created with inherited ACLs by the installer."""
+    """
+    Per-machine writable state: keys, enrolment, spool and logs. Created with
+    inherited ACLs by the installer.
+
+    `AIMS_DATA_DIR` moves the whole lot somewhere else. That is for a bench -
+    a second agent on a machine that already has one enrolled, or a test rig -
+    and it is the only way to run one without disturbing the other. A clinical
+    PC leaves it unset and uses ProgramData.
+    """
+    override = os.getenv("AIMS_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
     base = os.getenv("PROGRAMDATA") or os.getenv("LOCALAPPDATA") or str(Path.home())
     return Path(base) / "AIMScribe"
 

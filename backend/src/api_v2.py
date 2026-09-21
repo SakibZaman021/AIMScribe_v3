@@ -1024,6 +1024,12 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
             "patient_ref": session["patient_id"],
             "session_date": session["session_date"].isoformat()
                             if session["session_date"] else None,
+            # The name this recording was given when it closed (SRS-SES-05).
+            # Without it the worker falls back to the older form and the file
+            # on disk no longer matches what the database, the clinical record
+            # and the cloud copy all call it - which is exactly what happened
+            # on the bench before this line existed.
+            "file_stem": session.get("file_stem"),
             # The worker needs this to name files by local wall-clock time, so a
             # folder's contents match the day the consultations happened.
             "timezone": await _repo().hospital_timezone(session["hospital_id"]),

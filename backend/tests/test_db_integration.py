@@ -154,9 +154,19 @@ async def a_session(repo, device, *, opened_ago=timedelta(seconds=5)):
 # ============================================================
 
 async def test_migrations_can_run_again(pg):
-    """A deployment re-running the v3 scripts changes nothing and fails nothing."""
-    v3 = [p for p in RECORDINGS_SCRIPTS if p.name.startswith(("010_", "011_", "012_"))]
-    await _apply(pg.recordings, v3)
+    """
+    Re-running the scripts changes nothing and fails nothing - all of them,
+    from the baseline, not only the v3 ones.
+
+    `CREATE OR REPLACE VIEW` cannot remove or reorder a column, so a script
+    that replaces a view a later migration widened fails the second time it
+    is applied. That is what happened when the bench was started for a second
+    time on a database it had already built, so the views are dropped first.
+    """
+    await _apply(pg.recordings, RECORDINGS_SCRIPTS)
+    await _apply(pg.clinical, CLINICAL_SCRIPTS)
+    # And again: idempotent means idempotent, however many times.
+    await _apply(pg.recordings, RECORDINGS_SCRIPTS)
     await _apply(pg.clinical, CLINICAL_SCRIPTS)
 
 

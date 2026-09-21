@@ -208,6 +208,18 @@ class FakeRepo:
         self.sessions[session_id]["file_stem"] = file_stem
         return file_stem
 
+    # the archive
+    async def pending_archive(self, limit=10):
+        return [dict(s) for s in self.sessions.values()
+                if s.get("closed_at") and not s.get("archived_at")
+                and not s.get("quarantine_reason")][:limit]
+
+    async def hospital_timezone(self, hospital_id):
+        return "Asia/Dhaka"
+
+    async def pauses_for(self, session_id):
+        return []
+
     # the cloud copy
     async def copies_overdue(self, *, hours=24):
         cutoff = NOW() - timedelta(hours=hours)
@@ -347,6 +359,12 @@ class FakeBucket:
         self.bucket, self.removed = "aimscribe-audio", []
         self.client = SimpleNamespace(remove_object=lambda b, key: self.removed.append(key))
 
+    def get_presigned_download_url(self, key, expires):
+        return f"https://segments.example/get/{key}"
+
+    def get_presigned_upload_url(self, key, expires):
+        return f"https://segments.example/put/{key}"
+
 
 class FakeCopyBucket:
     """
@@ -453,6 +471,7 @@ def open_session(server, jti=None, *, opened_ago=timedelta(seconds=5), device=DE
     server.repo.segments[sid] = [
         {"seq_no": n, "object_key": f"audio/{sid}/seg_{n:05d}.wav",
          "sha256": integrity.sha256_bytes(f"{sid}/{n}".encode()), "state": "committed",
+         "bytes": 1_000_000, "duration_seconds": 30.0, "clip_name": None,
          "object_deleted_at": None} for n in range(1, segments + 1)]
     return sid
 
@@ -1167,3 +1186,28 @@ async def test_a_piece_that_never_reads_back_is_refused(server, monkeypatch):
         await _commit(sid, "ab" * 32)
     assert refused.value.status_code == 502
     assert attempts["n"] == 3          # tried, waited, tried, waited, tried
+
+
+async def test_the_worker_is_told_the_name_the_recording_was_given(server):
+    """
+    SRS-SES-05: the file on disk, the database, the clinical record and the
+    cloud copy must all call a recording the same thing.
+
+    The name is decided when the recording closes, and the worker is what
+    writes the file - so it has to be told. It was not, and the archive got
+    the older form while everything else used the new one. Found on the bench.
+    """
+    sid = open_session(server, segments=2)
+    server.repo.sessions[sid].update(
+        file_stem="P0012345_DR0042_HOSP003_101432_102847_20260913",
+        closed_at=NOW(), sample_rate=44100, channels=1, sample_width=2,
+        manifest={}, total_duration_seconds=855.0)
+
+    pending = await api_v2.archive_pending()
+    mine = next(s for s in pending["sessions"] if s["session_id"] == sid)
+    assert mine["file_stem"] == "P0012345_DR0042_HOSP003_101432_102847_20260913"
+
+    # And the worker uses it as given, rather than building its own.
+    sys.path.insert(0, str(BACKEND / "archive_worker"))
+    import archive
+    assert archive.name_for(mine, NOW(), NOW()) ==         "P0012345_DR0042_HOSP003_101432_102847_20260913.wav"

@@ -231,3 +231,22 @@ why the load phase drives the server with no recorders in the process, and only
 those figures are asserted against §9.1.
 
 | 21 Sep 2026 | QA | The simulation run with all 14 rooms - the fleet's real size - found two more defects, both only visible under load, both fixed. **A recording could stay unconfirmed for ever**: when CMED's API 2 and the recording opening crossed, each side correctly deferred to the other and neither confirmed, so the recording was never archived and would have been erased at 24 hours (`SRS-CNF-07`). Channel B now re-reads the grant after claiming the notice, and the sweep reconciles whatever is left, every pass. **Two retries of the same piece, in flight at once**, both found nothing stored and both inserted; the loser got a unique-violation 500 and the recorder retried it for ever. A duplicate is now recognised however the two arrive (`SRS-REC-13`). | 14 rooms, 28 consultations: 34/34 checks; 27 archived, copied and matched; 425 receipts; the refusal erased everywhere |
+
+| 21 Sep 2026 | Bench | `tools/bench.py` runs the system and leaves it running: PostgreSQL, the server, object storage on disk and the archive worker, with the real agent recording from the machine's own microphone and CMED's page driving it. It prints what happens as it happens - patient opened, each piece sealed and receipted, CMED's message, the file landing in the archive - and keeps its databases, storage and the recorder's state under one folder, so it can be stopped and started again. The recorder gained `AIMS_DATA_DIR`, which is what lets a bench agent run on a machine that already has one enrolled. Recording live found the defect the simulation was too kind to catch: the server names a recording when it closes but **never sent that name to the archive worker**, so the file on disk kept the older form while the database, the clinical record and the cloud copy used the new one. The simulation now compares the two rather than trusting the database. | live: recorded, confirmed, receipted, archived with its JSON; 108 server tests, 42 PostgreSQL, 99 worker, 226 recorder, 90 tools |
+
+### Recording something yourself
+
+```
+python tools/bench.py                      # leaves everything running
+start-bench-recorder.bat                   # the real agent, its own state
+cd cmed-web && npm run dev                 # CMED's page on :3000
+```
+
+Open `http://localhost:3000`, enter a patient, press **Open patient**, and
+speak. The bench window narrates it. Press **Prescription built**, then Stop,
+and the recording appears in the bench's `archive` folder with its JSON beside
+it. `--reset` starts from empty, and clears the bench agent's enrolment with it.
+
+**Stop any agent already running on the machine first.** One instance is
+allowed at a time, and the older one holds the port - which is how an hour went
+into wondering why a v3 bench was answering with v2 codes.

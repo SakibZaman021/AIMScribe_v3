@@ -33,7 +33,11 @@ CREATE INDEX IF NOT EXISTS idx_segments_awaiting_object_delete
 -- ================================================================
 
 -- "Where is this patient's audio on the AIMS LAB server?"
-CREATE OR REPLACE VIEW v_audio_files AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS v_audio_files CASCADE;
+CREATE VIEW v_audio_files AS
 SELECT
     s.patient_id,
     s.doctor_id,
@@ -63,7 +67,11 @@ WHERE s.protocol_version = 2;
 --
 -- Read straight from the signed chain rather than a summary table, so the
 -- reason shown is the one the device signed at the time.
-CREATE OR REPLACE VIEW v_session_pauses AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS v_session_pauses CASCADE;
+CREATE VIEW v_session_pauses AS
 SELECT
     s.patient_id,
     s.doctor_id,

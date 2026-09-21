@@ -45,7 +45,11 @@ UPDATE devices d
 -- "DR001 saw 5 patients today" is a question about the recordings, so it is
 -- answered from the recordings.
 -- ================================================================
-CREATE OR REPLACE VIEW v_doctor_activity AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS v_doctor_activity CASCADE;
+CREATE VIEW v_doctor_activity AS
 SELECT
     s.hospital_id,
     s.doctor_id,
@@ -67,7 +71,11 @@ GROUP BY s.hospital_id, s.doctor_id, s.session_date;
 -- Every doctor the system has ever seen, and whether a machine is enrolled to
 -- them. A doctor appearing here with no device is a typo from the era when the
 -- browser could name anyone.
-CREATE OR REPLACE VIEW v_doctors AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS v_doctors CASCADE;
+CREATE VIEW v_doctors AS
 SELECT
     COALESCE(d.doctor_id, s.doctor_id)          AS doctor_id,
     COALESCE(d.hospital_id, s.hospital_id)      AS hospital_id,

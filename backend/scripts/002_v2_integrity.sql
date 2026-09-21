@@ -305,7 +305,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
 -- ================================================================
 -- R6 lookup: patient -> file on the AIMS LAB server
 -- ================================================================
-CREATE OR REPLACE VIEW patient_recordings AS
+-- Dropped first: CREATE OR REPLACE cannot remove or reorder a column,
+-- so re-running this script over a view a later migration widened
+-- would fail. A view holds no data, so dropping it costs nothing.
+DROP VIEW IF EXISTS patient_recordings CASCADE;
+CREATE VIEW patient_recordings AS
 SELECT s.patient_id,
        s.session_id,
        s.hospital_id,
