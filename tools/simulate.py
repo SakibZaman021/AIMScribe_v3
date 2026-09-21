@@ -453,9 +453,10 @@ class ToneMicrophone:
         return self.stats()
 
     def stats(self):
-        from types import SimpleNamespace
-        return SimpleNamespace(overruns=0, chunks=self._chunks, duration_seconds=0.0,
-                               as_dict=lambda: {"overruns": 0, "chunks": self._chunks})
+        from core.recorder import CaptureStats
+        return CaptureStats(frames=self._chunks * self.frames,
+                            bytes_captured=self._chunks * self.frames
+                            * self.channels * self.sample_width)
 
     def _run(self):
         period = (self.frames / self.sample_rate) / max(self.speed, 1.0)
@@ -584,8 +585,9 @@ class Cmed:
 
     async def connect(self):
         import websockets
+        patience = float(os.environ.get("AIMS_SIM_PATIENCE", "180"))
         self.socket = await websockets.connect(
-            self.room.ws_url, open_timeout=20, ping_interval=None,
+            self.room.ws_url, open_timeout=patience, ping_interval=None,
             origin=CMED_ORIGIN)
         return self
 
@@ -600,9 +602,10 @@ class Cmed:
         started = time.perf_counter()
         await self.socket.send(json.dumps({"command": name, "request_id": request_id,
                                            **payload}))
-        deadline = time.monotonic() + 40
+        patience = float(os.environ.get("AIMS_SIM_PATIENCE", "180"))
+        deadline = time.monotonic() + patience
         while time.monotonic() < deadline:
-            raw = await asyncio.wait_for(self.socket.recv(), timeout=40)
+            raw = await asyncio.wait_for(self.socket.recv(), timeout=patience)
             message = json.loads(raw)
             if message.get("request_id") == request_id:
                 self.timings.record(name, time.perf_counter() - started)
@@ -794,19 +797,36 @@ class Archiver:
         self.module = worker_module
         self.worker = worker_module.ArchiveWorker(worker_module.Settings())
 
-    async def run_until_quiet(self, *, passes: int = 12) -> int:
+    async def run_until_quiet(self, recordings_uri: str = "", *,
+                              seconds: int = 300) -> int:
         """
-        Work until nothing moves. Each pass archives what is closed and copies
-        what is archived, exactly as it does on the real machine.
+        Work until there is nothing outstanding, or the time budget runs out.
+
+        Each pass archives what is closed and copies what is archived, exactly
+        as it does on the real machine; this just keeps calling it, the way the
+        worker's own loop would over the following minutes.
         """
         loop = asyncio.get_running_loop()
-        done = 0
-        for _ in range(passes):
+        done, started, idle = 0, time.perf_counter(), 0
+        while time.perf_counter() - started < seconds:
             moved = await loop.run_in_executor(None, self.worker.drain_once)
             done += moved
-            if moved == 0:
-                break
-            await asyncio.sleep(0.2)
+            if moved:
+                idle = 0
+            else:
+                idle += 1
+                if not recordings_uri or idle >= 3:
+                    break
+                async with asyncpg_connection(recordings_uri) as conn:
+                    outstanding = await conn.fetchval("""
+                        SELECT count(*) FROM sessions
+                         WHERE closed_at IS NOT NULL AND copied_at IS NULL
+                           AND quarantine_reason IS NULL
+                           AND confirmation IN ('confirmed', 'legacy')
+                    """)
+                if not outstanding:
+                    break
+            await asyncio.sleep(0.5)
         return done
 
 
@@ -870,8 +890,16 @@ async def verify(checks: Checks, *, server: Server, visits: List[Consultation],
               FROM sessions
         """)}
         receipts = await conn.fetchval("SELECT count(*) FROM purge_receipts")
-        pieces_left = await conn.fetchval(
-            "SELECT count(*) FROM segments WHERE object_deleted_at IS NULL")
+        pieces_held_for_copied = await conn.fetchval("""
+            SELECT count(*) FROM segments g
+              JOIN sessions s ON s.session_id = g.session_id
+             WHERE g.object_deleted_at IS NULL AND s.copied_at IS NOT NULL
+        """)
+        pieces_in_flight = await conn.fetchval("""
+            SELECT count(*) FROM segments g
+              JOIN sessions s ON s.session_id = g.session_id
+             WHERE g.object_deleted_at IS NULL AND s.copied_at IS NULL
+        """)
         audit = {r["event_type"]: r["n"] for r in await conn.fetch(
             "SELECT event_type, count(*) AS n FROM audit_log GROUP BY event_type")}
         notices = await conn.fetchval("SELECT count(*) FROM confirmation_notices")
@@ -955,9 +983,10 @@ async def verify(checks: Checks, *, server: Server, visits: List[Consultation],
     checks.check(copies >= 2 * len(copied),
                  f"{copies} objects recorded in the copy store (audio and JSON)",
                  "SRS-ARC-12")
-    checks.check(pieces_left == 0,
-                 "the pieces were deleted - and only after the copy was verified",
-                 "SRS-ARC-09 step 7")
+    checks.check(pieces_held_for_copied == 0,
+                 f"every copied recording had its pieces deleted, and nothing else "
+                 f"did ({pieces_in_flight} piece(s) still held for recordings not "
+                 f"yet copied)", "SRS-ARC-09 step 7")
 
     # A copy is only worth keeping if it comes back. Take one, decrypt it,
     # decode it, and compare the samples with the archived recording (AT-74).
@@ -1111,6 +1140,9 @@ async def simulate(args) -> int:
         started_at = time.perf_counter()
 
         async def run_room(room: Room) -> List[Consultation]:
+            # A clinic drifts: rooms open their first patient over a couple of
+            # minutes, not together.
+            await asyncio.sleep(0.3 * (room.number - 1))
             cmed = await Cmed(room, server, timings).connect()
             made = []
             try:
@@ -1124,8 +1156,17 @@ async def simulate(args) -> int:
                 await cmed.close()
             return made
 
-        results = await asyncio.gather(*(run_room(room) for room in rooms))
-        visits = [visit for room_visits in results for visit in room_visits]
+        results = await asyncio.gather(*(run_room(room) for room in rooms),
+                                       return_exceptions=True)
+        visits = []
+        for room, outcome in zip(rooms, results):
+            if isinstance(outcome, Exception):
+                # One room in trouble must not end the run: the others carry on,
+                # and the checks below see exactly what was and was not done.
+                print(f"  room {room.number} stopped early: "
+                      f"{type(outcome).__name__}: {outcome}")
+                continue
+            visits.extend(outcome)
         elapsed = time.perf_counter() - started_at
         print(f"  {len(visits)} consultations in {elapsed:.1f}s of real time "
               f"({len(visits) * args.minutes:.0f} simulated minutes)\n")
@@ -1140,7 +1181,7 @@ async def simulate(args) -> int:
             await room.stop()
         await asyncio.sleep(1)
         print(f"  the recorders delivered everything in {settled:.0f}s")
-        moved = await archiver.run_until_quiet()
+        moved = await archiver.run_until_quiet(recordings)
         print(f"  the worker archived and copied in {moved} step(s)\n")
 
         print("Checking what happened")

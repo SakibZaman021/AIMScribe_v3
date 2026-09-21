@@ -1059,3 +1059,46 @@ async def test_the_dashboard_page_is_one_file_with_no_build_step(dbs):
     assert "<title>AIMScribe" in body
     assert "src=" not in body.replace('src="', "")        # nothing fetched from a CDN
     assert "localStorage.setItem" not in body              # the key is never stored
+
+
+async def test_the_same_piece_committed_twice_at_once_is_a_duplicate(dbs):
+    """
+    Two retries of one piece, racing.
+
+    A recorder retries a commit whose reply it never saw. If the original is
+    still in flight, both find nothing stored and both insert; the loser used
+    to get a unique-violation 500, and the recorder retried it for ever.
+    Found by the 14-room simulation (SRS-REC-13).
+    """
+    device = await enrolled_device(dbs.repo)
+    sid = await a_session(dbs.repo, device)
+    digest = bytes.fromhex("5a") * 32
+
+    def commit(entry_no: int):
+        from integrity import ChainEntry
+        entry = ChainEntry(entry_no=entry_no, entry_type="segment", payload={"n": 1},
+                           payload_sha256=digest, prev_hash=None, entry_hash=digest,
+                           signature=digest)
+        return dbs.repo.commit_segment(
+            session_id=sid, seq_no=1, entry=entry,
+            object_key=f"audio/{sid}/seg_00001.wav", byte_length=1000,
+            duration_seconds=30.0, sha256=digest, rms_mean=100.0,
+            captured_start_at=datetime.now(timezone.utc),
+            captured_end_at=datetime.now(timezone.utc), is_final=False)
+
+    first, second = await asyncio.gather(commit(1), commit(2), return_exceptions=True)
+    outcomes = {first, second}
+    assert not any(isinstance(o, Exception) for o in (first, second)), (first, second)
+    assert outcomes == {"stored", "duplicate"}
+
+    # And a different piece claiming the same place is still a conflict.
+    other = bytes.fromhex("77") * 32
+    from integrity import ChainEntry
+    entry = ChainEntry(entry_no=3, entry_type="segment", payload={"n": 1},
+                       payload_sha256=other, prev_hash=None, entry_hash=other,
+                       signature=other)
+    assert await dbs.repo.commit_segment(
+        session_id=sid, seq_no=1, entry=entry, object_key="audio/other.wav",
+        byte_length=10, duration_seconds=1.0, sha256=other, rms_mean=1.0,
+        captured_start_at=datetime.now(timezone.utc),
+        captured_end_at=datetime.now(timezone.utc), is_final=False) == "conflict"

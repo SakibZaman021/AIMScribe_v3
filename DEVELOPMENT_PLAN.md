@@ -229,3 +229,5 @@ stand-in. Above three rooms, every recorder, the server and the worker share one
 interpreter on one machine, so the reply times measure the harness - which is
 why the load phase drives the server with no recorders in the process, and only
 those figures are asserted against §9.1.
+
+| 21 Sep 2026 | QA | The simulation run with all 14 rooms - the fleet's real size - found two more defects, both only visible under load, both fixed. **A recording could stay unconfirmed for ever**: when CMED's API 2 and the recording opening crossed, each side correctly deferred to the other and neither confirmed, so the recording was never archived and would have been erased at 24 hours (`SRS-CNF-07`). Channel B now re-reads the grant after claiming the notice, and the sweep reconciles whatever is left, every pass. **Two retries of the same piece, in flight at once**, both found nothing stored and both inserted; the loser got a unique-violation 500 and the recorder retried it for ever. A duplicate is now recognised however the two arrive (`SRS-REC-13`). | 14 rooms, 28 consultations: 34/34 checks; 27 archived, copied and matched; 425 receipts; the refusal erased everywhere |

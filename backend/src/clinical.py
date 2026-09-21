@@ -243,9 +243,18 @@ async def confirm_waiting(visit: Visit, hospital_id: str, notice_id: int) -> Opt
         return None                         # a grant may still ask for it (5 minutes)
     if not await repo.claim_notice(notice_id, grant["jti"]):
         return None
-    session_id = grant.get("session_id")
+
+    # Read the grant again now the notice is claimed. The recording may have
+    # opened in the moment between finding the grant and claiming it, and the
+    # copy read earlier would still say there is no session - which is how a
+    # recording used to end up pending for ever, with each side waiting for
+    # the other (found by the 14-room simulation).
+    fresh = await repo.get_authorisation(grant["jti"])
+    session_id = (fresh or {}).get("session_id") or grant.get("session_id")
     if not session_id:
-        return None                         # confirmed at session open instead
+        # Still nothing: the session opens next, sees the claimed notice, and
+        # opens confirmed. If it crosses even that, the sweep reconciles it.
+        return None
     row = await repo.session_confirmation(session_id)
     if row and row["confirmation"] in conf.WAITING:
         await repo.set_session_confirmation(session_id, "confirmed")

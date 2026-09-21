@@ -133,6 +133,16 @@ class FakeRepo:
     async def session_confirmation(self, session_id):
         return await self.get_session(session_id)
 
+    async def reconcile_pending_confirmations(self, limit=200):
+        confirmed = []
+        for session_id, session in self.sessions.items():
+            grant = self.auths.get(session.get("grant_jti") or "")
+            if (session["confirmation"] in ("pending", "unconfirmed")
+                    and grant and grant.get("notice_id")):
+                session["confirmation"] = "confirmed"
+                confirmed.append(session_id)
+        return confirmed
+
     async def sessions_in_confirmation(self, states, *, opened_before):
         return [dict(s) for s in self.sessions.values()
                 if s["confirmation"] in states and s["opened_at"] < opened_before]
@@ -1060,3 +1070,49 @@ async def test_one_store_for_both_when_no_warm_bucket_is_configured(server):
     place = await api_v2.archive_copy_authorize(
         api_v2.CopyAuthorizeRequest(session_id=sid, kind="json"))
     assert place["bucket"] == "aimscribe-copies"
+
+
+async def test_a_recording_is_confirmed_when_cmed_and_the_open_cross(server):
+    """
+    SRS-CNF-07: API 2 and the recording opening at the same moment.
+
+    Channel B looks for the grant, sees no session yet, and leaves the
+    confirming to the open; the open looks at the grant, sees no notice yet,
+    and leaves it to Channel B. Each defers to the other, and the recording
+    used to stay pending for ever - never archived, and erased at 24 hours.
+    Found by the 14-room simulation.
+    """
+    _, reply = await mint()
+    jti = reply["jti"]
+    sid = open_session(server, segments=1)
+
+    # Channel B gets as far as claiming the notice while the session is still
+    # opening: the grant it read has no session_id.
+    notice = await server.repo.record_notice(visit_of(), hospital_id="HOSP003",
+                                             clinical_record_id=1)
+    assert await server.repo.claim_notice(notice, jti)
+
+    # Now the open completes. It sees the claimed notice and opens confirmed.
+    assert await api_v2._link_grant(sid, jti, "P0012345", DEVICE) == "confirmed"
+
+
+async def test_the_sweep_confirms_what_the_crossing_left_behind(server):
+    """The backstop: whatever the interleaving, it resolves on the next sweep."""
+    _, reply = await mint()
+    jti = reply["jti"]
+    sid = open_session(server, segments=1)
+    await api_v2._link_grant(sid, jti, "P0012345", DEVICE)
+    assert server.repo.sessions[sid]["confirmation"] == "pending"
+
+    # CMED's notice arrives and is claimed, but the moment passes without
+    # either side confirming the session.
+    notice = await server.repo.record_notice(visit_of(), hospital_id="HOSP003",
+                                             clinical_record_id=1)
+    await server.repo.claim_notice(notice, jti)
+    assert server.repo.sessions[sid]["confirmation"] == "pending"
+
+    result = await api_v2.maintenance_sweep()
+    assert result["reconciled"] == 1
+    assert server.repo.sessions[sid]["confirmation"] == "confirmed"
+    assert any(a["event_type"] == "session.confirmed" and a["detail"].get("reconciled")
+               for a in server.repo.audits)

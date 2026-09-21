@@ -444,32 +444,46 @@ class V2Repository:
         an identical hash - a retry, which must succeed rather than error.
         """
         async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                existing = await conn.fetchrow(
+            try:
+                async with conn.transaction():
+                    existing = await conn.fetchrow(
+                        "SELECT sha256 FROM segments "
+                        " WHERE session_id = $1 AND seq_no = $2", session_id, seq_no)
+
+                    if existing is not None:
+                        return ("duplicate" if bytes(existing["sha256"]) == sha256
+                                else "conflict")
+
+                    await self._insert_chain_entry(conn, session_id, entry)
+                    await conn.execute("""
+                        INSERT INTO segments
+                            (session_id, seq_no, entry_no, object_key, bytes,
+                             duration_seconds, sha256, rms_mean, captured_start_at,
+                             captured_end_at, is_final, state, clip_name)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed',$12)
+                    """, session_id, seq_no, entry.entry_no, object_key, byte_length,
+                         duration_seconds, sha256, rms_mean, captured_start_at,
+                         captured_end_at, is_final, clip_name)
+
+                    await conn.execute("""
+                        UPDATE sessions
+                           SET segment_count = (SELECT count(*) FROM segments
+                                                 WHERE session_id = $1),
+                               updated_at = now()
+                         WHERE session_id = $1
+                    """, session_id)
+            except asyncpg.UniqueViolationError:
+                # Two retries of the same piece, in flight at once: the check
+                # above found nothing for either, and one of them lost the
+                # insert. That is still a duplicate, not a failure - the
+                # recorder must be told so rather than being handed a 500 and
+                # retrying for ever. Found by the 14-room simulation.
+                stored = await conn.fetchrow(
                     "SELECT sha256 FROM segments WHERE session_id = $1 AND seq_no = $2",
                     session_id, seq_no)
-
-                if existing is not None:
-                    return "duplicate" if bytes(existing["sha256"]) == sha256 else "conflict"
-
-                await self._insert_chain_entry(conn, session_id, entry)
-                await conn.execute("""
-                    INSERT INTO segments
-                        (session_id, seq_no, entry_no, object_key, bytes,
-                         duration_seconds, sha256, rms_mean, captured_start_at,
-                         captured_end_at, is_final, state, clip_name)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed',$12)
-                """, session_id, seq_no, entry.entry_no, object_key, byte_length,
-                     duration_seconds, sha256, rms_mean, captured_start_at,
-                     captured_end_at, is_final, clip_name)
-
-                await conn.execute("""
-                    UPDATE sessions
-                       SET segment_count = (SELECT count(*) FROM segments
-                                             WHERE session_id = $1),
-                           updated_at = now()
-                     WHERE session_id = $1
-                """, session_id)
+                if stored is None:
+                    raise
+                return "duplicate" if bytes(stored["sha256"]) == sha256 else "conflict"
         return "stored"
 
     async def segments_for(self, session_id: str) -> List[Dict[str, Any]]:
@@ -1020,6 +1034,33 @@ class V2Repository:
                   FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
+
+    async def reconcile_pending_confirmations(self, limit: int = 200) -> List[str]:
+        """
+        Sessions that are waiting although their grant already holds CMED's
+        notice: confirm them.
+
+        This is the backstop for the two sides crossing - Channel B claiming
+        the notice at the same moment the recording opens - and it is cheap
+        enough to run on every sweep.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                UPDATE sessions s
+                   SET confirmation = 'confirmed', unconfirmed_at = NULL,
+                       updated_at = now()
+                  FROM grant_authorisations g
+                 WHERE g.jti = s.grant_jti
+                   AND g.notice_id IS NOT NULL
+                   AND s.confirmation IN ('pending', 'unconfirmed')
+                   AND s.session_id IN (
+                       SELECT session_id FROM sessions
+                        WHERE confirmation IN ('pending', 'unconfirmed')
+                          AND grant_jti IS NOT NULL
+                        ORDER BY opened_at LIMIT $1)
+                RETURNING s.session_id
+            """, limit)
+        return [r["session_id"] for r in rows]
 
     async def sessions_in_confirmation(self, states: List[str], *,
                                        opened_before: datetime) -> List[Dict[str, Any]]:

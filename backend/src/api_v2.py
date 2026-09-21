@@ -1702,6 +1702,17 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
                          detail={"objects_deleted": removed})
         erased += 1
 
+    # First, anything that is only waiting because Channel B and the recording
+    # crossed: the notice is claimed, so the recording is confirmed (SRS-CNF-07).
+    reconciled = await repo.reconcile_pending_confirmations()
+    for session_id in reconciled:
+        await repo.audit(event_type="session.confirmed", actor_type="service",
+                         actor_id="sweep", session_id=session_id,
+                         detail={"reconciled": True})
+    if reconciled:
+        logger.info("Sweep confirmed %s recording(s) whose notice had arrived",
+                    len(reconciled))
+
     marked = 0
     for row in await repo.sessions_in_confirmation(
             ["pending"], opened_before=now - conf.CONFIRM_DEADLINE):
@@ -1723,7 +1734,8 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
                                    if row["archived_at"] else None})
 
     return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
-            "clinical_loaded": loaded, "copies_overdue": len(overdue)}
+            "clinical_loaded": loaded, "copies_overdue": len(overdue),
+            "reconciled": len(reconciled)}
 
 
 # ============================================================
