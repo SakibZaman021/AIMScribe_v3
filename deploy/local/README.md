@@ -20,14 +20,14 @@ To start again from nothing: `python bootstrap.py --reset`.
 
 ## What starts
 
-| | What it is | Where it is |
+| Container | What it is | Where it is |
 |---|---|---|
-| `api` | the AIMS LAB server | http://localhost:6000 |
-| `postgres` | `aims_recordings` and `aims_clinical`, separate roles | localhost:5433 |
-| `redis` | queues and locks | inside only |
-| `minio` | stands in for Cloudflare R2 and the copy store | console on :9001 |
-| `archive-worker` | joins, files, copies, and issues purge receipts | writes `archive\` |
-| `cmed-web` | CMED's test site, only with `--cmed` | http://localhost:3000 |
+| `aimscribe-v3-server` | the AIMS LAB server | http://localhost:6000 |
+| `aimscribe-v3-postgres` | `aims_recordings` and `aims_clinical`, separate roles | localhost:5433 |
+| `aimscribe-v3-redis` | queues and locks | inside only |
+| `aimscribe-v3-storage` | stands in for Cloudflare R2 and the copy store | console on :9001 |
+| `aimscribe-v3-archive-worker` | joins, files, copies, and issues purge receipts | writes `archive\` |
+| `aimscribe-v3-cmed-web` | CMED's test site, only with `--cmed` | http://localhost:3000 |
 
 The recorder is not here: it needs a microphone, so it runs on the doctor's
 PC. Everything else is a container.
@@ -35,6 +35,52 @@ PC. Everything else is a container.
 Recordings land in `deploy\local\archive\` — sorted by clinic, doctor and
 date, each with its clinical JSON. Point `ARCHIVE_PATH` in `.env` somewhere
 else and they land there instead; on the UIU server that is the archive array.
+
+---
+
+## Which system am I looking at?
+
+Version 1 runs in Docker on this machine too, and its containers are named
+`aimscribe-*`. Everything here is named **`aimscribe-v3-*`** and carries a
+label, so one command lists this stack and nothing else:
+
+```
+docker ps --filter label=com.aimslab.system=aimscribe-v3
+```
+
+Three more ways to be sure, from the outside:
+
+| Ask | Version 1 | This |
+|---|---|---|
+| Open the server in a browser | no page - `{"detail":"Not Found"}` | a page that names itself, in green |
+| `curl http://localhost:6000/health` | `"version":"6.0.0"` | `"system":"AIMScribe v3 - AIMS LAB server"`, `"srs":"3.3"` |
+| `docker compose ls` | `aimscribe_backend_render-main` | `aimscribe-v3` |
+
+They also do not share anything: separate containers, separate volumes,
+separate network. Stopping one never touches the other, and
+`bootstrap.py --down` only ever stops `aimscribe-v3`.
+
+The one thing they *can* share is a port. If version 1 is already using 6000
+on this machine, set `AIMS_PORT` in `.env` to something else - `bootstrap.py`
+checks, and refuses to start rather than letting the two of them answer to the
+same address.
+
+---
+
+## The links, and which of them work
+
+Right after `start.bat`:
+
+| Link | |
+|---|---|
+| http://localhost:6000 | the front page: what this is, and where everything else is |
+| http://localhost:6000/health | one line saying the server, database, Redis and storage are up |
+| http://localhost:6000/api/v2/dashboard | the day as UIU sees it - **it asks for the administrator key** printed at startup |
+| http://localhost:9001 | the storage console - user `aimslocal`, password in `.env` |
+| http://localhost:3000 | CMED's test site, **only** if you started with `--cmed` |
+
+`http://localhost:6000/api/v2/...` on its own will say `Not Found` or ask for a
+credential: those are the recorder's and CMED's doors, not pages to browse.
 
 ---
 

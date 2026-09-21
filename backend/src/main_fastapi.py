@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from config import settings
@@ -311,6 +312,66 @@ app.include_router(dashboard_router)
 
 
 # ============================================================================
+# The front page
+#
+# Opening the server in a browser used to give `{"detail":"Not Found"}`, which
+# says nothing at all - least of all whether this is the new server or the one
+# that has been running the clinics. This page answers that first.
+# ============================================================================
+
+SYSTEM_NAME = "AIMScribe v3 - AIMS LAB server"
+SYSTEM_VERSION = "3.3.0"
+SRS_VERSION = "3.3"
+
+_FRONT_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIMScribe v3</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 16px/1.6 system-ui, "Segoe UI", sans-serif; margin: 0;
+         padding: 3rem 1.5rem; display: flex; justify-content: center; }}
+  main {{ max-width: 44rem; width: 100%; }}
+  h1 {{ font-size: 1.6rem; margin: 0 0 .25rem; }}
+  .sub {{ opacity: .7; margin: 0 0 2rem; }}
+  .tag {{ display: inline-block; padding: .15rem .6rem; border-radius: 999px;
+          background: #1f7a3f; color: #fff; font-size: .8rem;
+          vertical-align: middle; margin-left: .5rem; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 0 0 2rem; }}
+  td {{ padding: .5rem .75rem; border-bottom: 1px solid rgba(128,128,128,.25);
+        vertical-align: top; }}
+  td:first-child {{ white-space: nowrap; opacity: .7; width: 12rem; }}
+  code {{ font-size: .9em; }}
+  footer {{ opacity: .65; font-size: .9rem; }}
+</style>
+</head>
+<body><main>
+  <h1>AIMScribe v3 <span class="tag">{version}</span></h1>
+  <p class="sub">The AIMS LAB server - SRS {srs}. This is <strong>not</strong>
+     the version&nbsp;1 backend on Render.</p>
+  <table>
+    <tr><td>Health</td><td><a href="/health">/health</a></td></tr>
+    <tr><td>Dashboard</td><td><a href="/api/v2/dashboard">/api/v2/dashboard</a>
+        - asks for the administrator key</td></tr>
+    <tr><td>Recorders talk to</td><td><code>/api/v2/…</code></td></tr>
+    <tr><td>CMED talks to</td><td><code>/api/v2/clinical/patient-information</code>,
+        <code>/api/v2/clinical/prescription</code></td></tr>
+  </table>
+  <footer>Recordings are held at UIU. Nothing on this page reads a
+  consultation.</footer>
+</main></body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def front_page():
+    return _FRONT_PAGE.format(version=SYSTEM_VERSION, srs=SRS_VERSION)
+
+
+# ============================================================================
 # Health Check
 # ============================================================================
 
@@ -325,8 +386,15 @@ async def health():
         "database": "connected" if db_healthy else "disconnected",
         "redis": "connected" if redis_healthy else "disconnected",
         "minio": "connected",
-        "version": "6.0.0",
-        "mode": "FastAPI Async"
+        # Which AIMScribe this is. A machine can be running the live v1
+        # server and this one at the same time, and they answer on ports
+        # that look alike; anything talking to the wrong one is a long
+        # afternoon. The name is the first thing in the answer for that
+        # reason.
+        "system": SYSTEM_NAME,
+        "srs": SRS_VERSION,
+        "version": SYSTEM_VERSION,
+        "mode": "FastAPI Async",
     }
 
 

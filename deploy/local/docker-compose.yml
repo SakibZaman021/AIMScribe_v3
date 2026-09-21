@@ -18,7 +18,10 @@
 # handed over. Use ../uiu for the server that carries patients.
 # ================================================================
 
-name: aimscribe-local
+# Everything this file starts is named aimscribe-v3-*. The version 1 system
+# uses aimscribe-* on the same machine, and `aims-api` beside
+# `aimscribe-api` is not a difference anyone should have to notice at 2am.
+name: aimscribe-v3
 
 x-logging: &logging
   driver: json-file
@@ -30,7 +33,9 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: aims-postgres
+    container_name: aimscribe-v3-postgres
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
     logging: *logging
     environment:
@@ -58,7 +63,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: aims-redis
+    container_name: aimscribe-v3-redis
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
     logging: *logging
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?}"]
@@ -76,7 +83,9 @@ services:
   # same presigned URLs, on this machine.
   minio:
     image: minio/minio:latest
-    container_name: aims-minio
+    container_name: aimscribe-v3-storage
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
     logging: *logging
     command: ["server", "/data", "--console-address", ":9001"]
@@ -96,7 +105,9 @@ services:
 
   minio-setup:
     image: minio/mc:latest
-    container_name: aims-minio-setup
+    container_name: aimscribe-v3-storage-setup
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     depends_on:
       minio:
         condition: service_healthy
@@ -114,7 +125,9 @@ services:
       context: ../../backend
       dockerfile: docker/Dockerfile
     image: aimscribe/api:3.3
-    container_name: aims-api
+    container_name: aimscribe-v3-server
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
     logging: *logging
     env_file: [.env]
@@ -173,7 +186,9 @@ services:
   archive-worker:
     build: ../../backend/archive_worker
     image: aimscribe/archive-worker:3.3
-    container_name: aims-archive-worker
+    container_name: aimscribe-v3-archive-worker
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
     logging: *logging
     environment:
@@ -203,7 +218,9 @@ services:
       context: ../../cmed-web
       dockerfile: ../deploy/local/cmed-web.Dockerfile
     image: aimscribe/cmed-web:3.3
-    container_name: aims-cmed-web
+    container_name: aimscribe-v3-cmed-web
+    labels:
+      com.aimslab.system: "aimscribe-v3"
     profiles: [cmed]
     restart: unless-stopped
     logging: *logging

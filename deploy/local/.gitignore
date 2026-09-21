@@ -7,5 +7,7 @@
 # sheet is a credential.
 out/
 
-# Recordings. Consultations, with patients in them.
-archive/
+# Recordings. Consultations, with patients in them - including a folder
+# renamed out of the way, which is how a hundred of them once reached a
+# commit.
+archive*/

@@ -480,18 +480,30 @@ def main(argv=None) -> int:
         configure_agent(folder, Path(args.agent).resolve(),
                         Path(args.agent_data).resolve() if args.agent_data else None)
     summary = write_summary(url, values, issued)
+    cmed_line = ("\n  CMED's site http://localhost:3000"
+                 if args.cmed else "")
 
     print(f"""
 ================================================================
 Running.
 ================================================================
 
-  Server      {url}
-  Dashboard   {url}/api/v2/dashboard
-              administrator key: {values['AIMS_ADMIN_KEY']}
-  Storage     http://localhost:9001 (console)
+  Open this    {url}
+               it says which AIMScribe it is, and links to the rest
 
-  CMED key    {issued['cmed_key']}
+  Dashboard    {url}/api/v2/dashboard
+               it asks for this key: {values['AIMS_ADMIN_KEY']}
+  Storage      http://localhost:9001 (console)
+               user {values['MINIO_ACCESS_KEY']}, password in .env{cmed_line}
+
+  CMED key     {issued['cmed_key']}
+
+  This stack is every container named aimscribe-v3-*:
+
+    docker ps --filter label=com.aimslab.system=aimscribe-v3
+
+  Anything named aimscribe-* without the v3 belongs to version 1 and is
+  not touched by this.
 
 For a doctor's PC, copy this folder to it:
 
