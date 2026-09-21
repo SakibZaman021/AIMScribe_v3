@@ -33,7 +33,11 @@ export default function EntryPage() {
     age: '',
     gender: '',
     doctor_id: 'DR001',
-    hospital_id: 'HOSP001',
+    // The clinic CMED knows this hospital by. It is set for the whole
+    // deployment at build time; typing it per patient is how a visit ends
+    // up described under a clinic the recorder does not belong to, and
+    // then never confirmed.
+    hospital_id: process.env.NEXT_PUBLIC_HOSPITAL_ID || 'HOSP001',
     health_screening: {
       bp_systolic: '',
       bp_diastolic: '',

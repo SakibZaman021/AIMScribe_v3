@@ -17,6 +17,9 @@
 
 #define AppName        "AIMScribe Agent"
 #define AppVersion     "3.3.0"
+
+; The same mark as the agent, drawn by scripts/make_icon.py.
+#define AppIcon        "assets\aimscribe.ico"
 #define AppPublisher   "AIMS LAB"
 #define AppExe         "AIMScribe_Agent.exe"
 
@@ -25,6 +28,7 @@
 #define DefaultOrigin  "https://aim-scribe-exe.vercel.app"
 
 [Setup]
+SetupIconFile={#AppIcon}
 AppId={{8F3A2C41-6E5B-4D77-9A18-3C7E5B2D9F04}
 AppName={#AppName}
 AppVersion={#AppVersion}

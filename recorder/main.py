@@ -48,12 +48,14 @@ PAUSED = "paused"
 OFFLINE = "offline"
 BLOCKED = "blocked"
 
-_PALETTE = {
-    READY:     ((38, 132, 90), "Ready"),
-    RECORDING: ((198, 40, 40), "Recording"),
-    PAUSED:    ((176, 122, 26), "Paused"),
-    OFFLINE:   ((70, 100, 130), "Recording - backend unreachable"),
-    BLOCKED:   ((110, 110, 118), "Not configured"),
+# What each state is called. The colours belong to the mark and live with it
+# in ui/brand.py, so the tray and the executable's icon cannot drift apart.
+_LABEL = {
+    READY:     "Ready",
+    RECORDING: "Recording",
+    PAUSED:    "Paused",
+    OFFLINE:   "Recording - backend unreachable",
+    BLOCKED:   "Not configured",
 }
 
 
@@ -141,35 +143,18 @@ def is_administrator() -> bool:
 # Icon
 # ============================================================
 
-def build_icon(state: str):
-    """A ringed microphone glyph tinted by state, drawn at 64 px."""
-    from PIL import Image, ImageDraw
+def build_icon(state: str, *, pulse: float = 0.0, badge=None):
+    """
+    The tray icon: the same mark that is compiled into the executable, so the
+    taskbar, the tray and the installer all show one thing (`ui/brand.py`).
 
-    colour, _ = _PALETTE.get(state, _PALETTE[READY])
-    size = 64
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+    `pulse` makes it breathe while recording. A tray icon that moves is the
+    only way a doctor can tell, without looking anywhere else, that the room
+    is still being recorded - and the only way they can tell it has stopped.
+    """
+    from ui import brand
 
-    draw.ellipse([2, 2, size - 2, size - 2], fill=colour + (255,))
-    draw.ellipse([9, 9, size - 9, size - 9], fill=(252, 252, 253, 255))
-
-    # Microphone capsule and stand.
-    draw.rounded_rectangle([27, 18, 37, 36], radius=5, fill=colour + (255,))
-    draw.arc([22, 27, 42, 43], start=0, end=180, fill=colour + (255,), width=3)
-    draw.line([32, 43, 32, 48], fill=colour + (255,), width=3)
-
-    if state == RECORDING:
-        draw.ellipse([44, 44, 58, 58], fill=(198, 40, 40, 255),
-                     outline=(255, 255, 255, 255), width=2)
-    elif state == PAUSED:
-        draw.rectangle([46, 45, 49, 57], fill=(176, 122, 26, 255))
-        draw.rectangle([53, 45, 56, 57], fill=(176, 122, 26, 255))
-    elif state in (OFFLINE, BLOCKED):
-        draw.ellipse([44, 44, 58, 58], fill=colour + (255,),
-                     outline=(255, 255, 255, 255), width=2)
-        draw.line([48, 51, 54, 51], fill=(255, 255, 255, 255), width=2)
-
-    return image
+    return brand.mark(64, state, pulse=pulse, badge=badge)
 
 
 # ============================================================
@@ -185,6 +170,8 @@ class AgentTray:
         self.summary = "Starting…"
         self._last_alert_seen = ""
         self._stop = threading.Event()
+        self._beat = 0                 # where the breathing is in its cycle
+        self._waiting = -1             # pieces this PC still holds; -1 = unknown
 
     # ---- menu ----
 
@@ -405,7 +392,7 @@ class AgentTray:
         return READY
 
     def _derive_summary(self, status: dict, state: str) -> str:
-        label = _PALETTE.get(state, _PALETTE[READY])[1]
+        label = _LABEL.get(state, _LABEL[READY])
         if state == PAUSED:
             pause = status.get("pause") or {}
             reason = str(pause.get("reason", "")).replace("_", " ")
@@ -417,18 +404,33 @@ class AgentTray:
         return label
 
     def refresh_loop(self) -> None:
-        while not self._stop.wait(2.0):
+        while not self._stop.wait(1.0):
             try:
                 status = self._status()
                 state = self._derive_state(status)
                 summary = self._derive_summary(status, state)
+                waiting = int((status.get("upload") or {}).get("pending_segments", 0))
 
-                if self.icon is not None and (state != self.state or summary != self.summary):
+                # While recording, the icon is redrawn every second whether or
+                # not anything has changed: that is the breathing. The rest of
+                # the time it is drawn only when something actually changes, so
+                # an idle agent costs nothing.
+                moving = state in (RECORDING, OFFLINE)
+                self._beat = (self._beat + 1) % 6 if moving else 0
+                pulse = (0, 0.35, 0.7, 1.0, 0.7, 0.35)[self._beat]
+
+                changed = (state != self.state or summary != self.summary
+                           or waiting != self._waiting)
+                if self.icon is not None and (changed or moving):
                     self.state = state
                     self.summary = summary
-                    self.icon.icon = build_icon(state)
-                    self.icon.title = f"AIMScribe - {summary}"
-                    self.icon.update_menu()
+                    self._waiting = waiting
+                    self.icon.icon = build_icon(
+                        state, pulse=pulse,
+                        badge=waiting if waiting else None)
+                    self.icon.title = self._tooltip(summary, waiting)
+                    if changed:
+                        self.icon.update_menu()
 
                 controller = self.runtime.controller
                 if controller is not None and controller.last_alert != self._last_alert_seen:
@@ -437,6 +439,17 @@ class AgentTray:
                         self.notify("AIMScribe integrity alert", self._last_alert_seen[:200])
             except Exception as exc:
                 logger.debug("Tray refresh error: %s", exc)
+
+    def _tooltip(self, summary: str, waiting: int) -> str:
+        """
+        What hovering over the tray icon says.
+
+        Windows truncates this at 127 characters, so it carries the two things
+        somebody hovering actually wants: what the agent is doing, and whether
+        this PC is still holding audio the server has not receipted.
+        """
+        held = f" - {waiting} piece(s) still on this PC" if waiting else ""
+        return f"AIMScribe {config.app_version} - {summary}{held}"[:127]
 
     def notify(self, title: str, message: str) -> None:
         try:
@@ -453,7 +466,7 @@ class AgentTray:
         self.icon = Icon(
             name="AIMScribe",
             icon=build_icon(self.state),
-            title="AIMScribe - starting",
+            title=f"AIMScribe {config.app_version} - starting",
             menu=self.build_menu(),
         )
         threading.Thread(target=self.refresh_loop, name="TrayRefresh", daemon=True).start()

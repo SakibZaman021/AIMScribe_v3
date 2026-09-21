@@ -31,7 +31,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/6] Installing build dependencies...
+echo [1/7] Installing build dependencies...
 python -m pip install --disable-pip-version-check -q -r requirements-build.txt
 if errorlevel 1 (
     echo ERROR: dependency installation failed.
@@ -39,7 +39,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/6] Auditing dependencies for known vulnerabilities...
+echo [2/7] Auditing dependencies for known vulnerabilities...
 python -m pip_audit -r requirements.txt
 if errorlevel 1 (
     echo.
@@ -52,7 +52,7 @@ if errorlevel 1 (
     )
 )
 
-echo [3/6] Running the test suite...
+echo [3/7] Running the test suite...
 python -m pytest -q tests
 if errorlevel 1 (
     echo ERROR: tests failed. Not building.
@@ -60,11 +60,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [4/6] Cleaning previous builds...
+echo [4/7] Drawing the icon...
+python scripts\make_icon.py
+if errorlevel 1 (
+    echo ERROR: the icon could not be drawn.
+    pause
+    exit /b 1
+)
+
+echo [5/7] Cleaning previous builds...
 if exist "dist"  rmdir /s /q dist
 if exist "build" rmdir /s /q build
 
-echo [5/6] Building executable...
+echo [6/7] Building executable...
 pyinstaller ^
     --name=AIMScribe_Agent ^
     --onedir ^
@@ -72,6 +80,7 @@ pyinstaller ^
     --noconfirm ^
     --clean ^
     --version-file=version_info.txt ^
+    --icon=assets\aimscribe.ico ^
     --hidden-import=pystray._win32 ^
     --hidden-import=uvicorn.logging ^
     --hidden-import=uvicorn.loops.auto ^
@@ -99,7 +108,7 @@ if errorlevel 1 (
 
 copy /y ".env.example" "dist\AIMScribe_Agent\.env.example" >nul
 
-echo [6/6] Signing...
+echo [7/7] Signing...
 if "%SIGN_CERT_THUMBPRINT%"=="" (
     echo.
     echo ************************************************************

@@ -217,6 +217,13 @@ services:
     build:
       context: ../../cmed-web
       dockerfile: ../deploy/local/cmed-web.Dockerfile
+      args:
+        # The browser bundle is built with these; CMED-LOCAL-01 is the clinic
+        # code bootstrap.py registers, and the page must send that one or the
+        # visit it describes belongs to a clinic the recorder is not in.
+        NEXT_PUBLIC_HOSPITAL_ID: CMED-LOCAL-01
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6060}
+        NEXT_PUBLIC_RECORDER_WS: ws://localhost:5050/ws
     image: aimscribe/cmed-web:3.3
     container_name: aimscribe-v3-cmed-web
     labels:
