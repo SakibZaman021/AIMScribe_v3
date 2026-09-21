@@ -300,29 +300,36 @@ class V2Repository:
         self, session_id: str, *, closed_at: datetime, duration_seconds: float,
         paused_seconds: float, segment_count: int, chain_head: bytes,
         manifest: Dict[str, Any], close_reason: str = "",
+        local_date=None, local_start=None, local_end=None,
     ) -> None:
+        """
+        Close the session and record its wall-clock columns.
+
+        The wall clock is worked out by the caller, in Python, and passed in.
+        It used to be `AT TIME ZONE h.timezone` inside this statement, which
+        made every close depend on the database knowing the clinic's zone by
+        name: a PostgreSQL build without the timezone database, or a clinic
+        registered with a zone that does not exist, turned every close into a
+        500 that the recorder retried for ever while nothing was archived.
+        opened_at and closed_at stay UTC - one set of columns is for reading,
+        the other for arithmetic, and conflating them is how evening
+        consultations end up filed under the previous day.
+        """
         async with self._pool.acquire() as conn:
             await conn.execute("""
-                UPDATE sessions s
+                UPDATE sessions
                    SET closed_at = $2, total_duration_seconds = $3,
                        paused_seconds = $4, segment_count = $5,
                        chain_head_hash = $6, chain_verified_at = now(),
                        manifest = $7, close_reason = $8,
                        status = 'closed', updated_at = now(),
-
-                       -- Wall-clock columns, in the hospital's own timezone, so
-                       -- what the console shows matches the filename. opened_at
-                       -- and closed_at stay UTC: one is for reading, the other
-                       -- for arithmetic, and conflating them is how evening
-                       -- consultations end up filed under the previous day.
-                       recording_date = (s.opened_at AT TIME ZONE h.timezone)::date,
-                       start_time     = (s.opened_at AT TIME ZONE h.timezone)::time,
-                       end_time       = ($2 AT TIME ZONE h.timezone)::time
-                  FROM hospitals h
-                 WHERE s.session_id = $1 AND h.hospital_id = s.hospital_id
+                       recording_date = COALESCE($9::date, recording_date),
+                       start_time     = COALESCE($10::time, start_time),
+                       end_time       = COALESCE($11::time, end_time)
+                 WHERE session_id = $1
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
-                 close_reason or None)
+                 close_reason or None, local_date, local_start, local_end)
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
         async with self._pool.acquire() as conn:

@@ -262,7 +262,11 @@ class ArchiveWorker:
         if already_ours:
             existing = archive.sha256_file(destination)
             logger.info("Session %s already present on disk; re-reporting", session_id)
-            self.write_clinical_json(session_id, destination)
+            self.write_clinical_json(session_id, destination, recording={
+                "audio_sha256": existing.hex(),
+                "audio_bytes": destination.stat().st_size,
+                "archive_relpath": relpath,
+            })
             self.report_complete(session_id, relpath, existing, destination.stat().st_size)
             return
 
@@ -287,8 +291,14 @@ class ArchiveWorker:
 
         archive.write_manifest(destination, session, result)
         # The clinical record travels with the audio, in the same folder and
-        # under the same name (SRS-CRI-05, §8.8).
-        self.write_clinical_json(session_id, destination)
+        # under the same name (SRS-CRI-05, §8.8), carrying the fingerprint of
+        # the file it sits beside.
+        self.write_clinical_json(session_id, destination, recording={
+            "audio_sha256": result.sha256.hex(),
+            "audio_bytes": result.bytes,
+            "duration_seconds": round(result.duration_seconds, 3),
+            "archive_relpath": relpath,
+        })
         archive.update_day_index(directory)
 
         # The hospital's own index, so "what audio do we hold?" is answerable on
@@ -314,7 +324,8 @@ class ArchiveWorker:
             except Exception as exc:
                 logger.warning("Catalogue not marked reported for %s: %s", session_id, exc)
 
-    def write_clinical_json(self, session_id: str, audio_path: Path) -> Path:
+    def write_clinical_json(self, session_id: str, audio_path: Path,
+                            recording: Optional[Dict[str, Any]] = None) -> Path:
         """
         Fetch what CMED holds about this visit and write it beside the audio.
 
@@ -322,6 +333,14 @@ class ArchiveWorker:
         assembled there. A failure leaves the session pending: an archive
         without its clinical record is incomplete, and retrying costs one
         request, since the audio is already on disk.
+
+        `recording` fills in what the server cannot know yet. The JSON is
+        written as the recording is archived, which is before the server has
+        been told the merged file's fingerprint - so the worker, which just
+        computed it, puts it in (§8.8). Without this the JSON travelled into
+        the cloud copy with an empty `audio_sha256`, and the one field that
+        ties the file to the chain was missing from the copy that would be
+        used to rebuild it.
         """
         response = self.session.get(
             f"{self.settings.backend_url}/api/v2/archive/clinical/{session_id}",
@@ -329,7 +348,10 @@ class ArchiveWorker:
         if response.status_code >= 300:
             raise ArchiveError(f"clinical record unavailable "
                                f"({response.status_code}); will retry")
-        return archive.write_clinical_json(audio_path, response.json())
+        document = response.json()
+        if recording:
+            document["recording"] = {**(document.get("recording") or {}), **recording}
+        return archive.write_clinical_json(audio_path, document)
 
     def download_segments(self, segments: List[Dict[str, Any]], scratch: Path) -> List[Path]:
         """

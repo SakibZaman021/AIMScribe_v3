@@ -836,7 +836,7 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
     """
     repo = _repo()
     session_id = safe_session_id(body.session_id)
-    await _session_for_device(session_id, device)
+    session = await _session_for_device(session_id, device)
 
     if body.chain_entry:
         entry = await _entry_or_400(body.chain_entry)
@@ -877,15 +877,26 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
                 "server_segments": len(stored_segments), "agent_segments": body.segment_count}
 
     chain_head = chain[-1].entry_hash if chain else None
+    closed_at = _parse_time(body.closed_at)
+    # The clinic's wall clock, resolved here rather than by the database
+    # (SRS-SES-04). An unresolvable zone is logged and falls back to UTC; it
+    # never fails the close, because a close that fails is a recording that is
+    # never archived.
+    opened_local = await _local_time(session["hospital_id"], session["opened_at"]) \
+        if session.get("opened_at") else None
+    closed_local = await _local_time(session["hospital_id"], closed_at)
     await repo.close_session(
         session_id,
-        closed_at=_parse_time(body.closed_at),
+        closed_at=closed_at,
         duration_seconds=body.duration_seconds,
         paused_seconds=body.paused_seconds,
         segment_count=len(stored_segments),
         chain_head=chain_head,
         manifest=body.manifest or {},
         close_reason=body.close_reason,
+        local_date=opened_local.date() if opened_local else None,
+        local_start=opened_local.time() if opened_local else None,
+        local_end=closed_local.time(),
     )
 
     # The shared file name, and the clinical visit it belongs to.
@@ -1744,6 +1755,18 @@ class TokenRequest(BaseModel):
 
 @router.post("/admin/hospital")
 async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)):
+    # A zone this server cannot resolve would put every recording from this
+    # clinic on the wrong day, and the wall-clock columns with it, so it is
+    # refused here rather than discovered later in a file name (SRS-SES-04).
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(body.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"timezone {body.timezone!r} is not a known zone name, "
+                   f"for example Asia/Dhaka")
+
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
     await _repo().upsert_hospital(hospital_id, body.name, body.timezone)
     cmed_id = (safe_identifier(body.cmed_hospital_id, field="cmed_hospital_id")
@@ -1771,6 +1794,7 @@ async def admin_doctor(body: DoctorRequest, _: None = Depends(require_admin)):
     false stops new consultations without touching the ones already archived,
     which still resolve to a name.
     """
+
     doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
     await _repo().upsert_doctor(doctor_id=doctor_id, hospital_id=hospital_id,

@@ -210,3 +210,22 @@ enough to see a pattern, not enough for analysis; if the research team wants
 trends, that is a separate tool reading the same endpoints. `SRS-DSH-04` asks
 for speech levels per room, which needs the per-piece level figures the
 recorder does not compute yet (`SRS-LVL-01`).
+
+| 21 Sep 2026 | QA | `tools/simulate.py` runs the whole system on one machine: a real PostgreSQL 16 with both databases built from the migration scripts, the real server, the real recorder (`Runtime` from the shipping agent, driven over its WebSocket exactly as CMED's page drives it, with only the microphone synthetic), CMED sending API 2 and API 3 with a key, and the real archive worker merging, writing the JSON, making the lossless copy and deleting the pieces. It checks 36 things against their requirements and exits non-zero if any fails, then drives a full clinic day of protocol traffic for the load figures. It found four defects, all fixed: closing a session asked the **database** to convert times by zone name, so a PostgreSQL build without that zone - or a clinic registered with a zone that does not exist - turned every close into a 500 that the recorder retried for ever while nothing was archived (now computed in Python, and a bad zone is refused when the clinic is registered); the clinical JSON was written before the server knew the merged file's fingerprint, so `audio_sha256` travelled into the cloud copy empty; and the load tool enrolled at the wrong path and numbered its chain from 1 instead of 0, so it had never actually reached a live server. | 36/36 checks; 14 rooms, 359 consultations, 10,845 pieces, none lost, every reply inside §9.1 |
+
+### Running the simulation
+
+```
+python tools/simulate.py                                   # a short run, all checks
+python tools/simulate.py --rooms 8 --consultations 4       # a busier morning
+python tools/simulate.py --load-rooms 14 --load-hours 8    # a clinic day, for AT-29
+python tools/simulate.py --keep                            # leave the data to look at
+```
+
+It needs an interpreter with `pgserver` (`--pg-python`, or `AIMS_PG_PYTHON`).
+Two things in it are not real, and are named as such in its output: the
+microphone is a tone generator, and object storage is a small in-process
+stand-in. Above three rooms, every recorder, the server and the worker share one
+interpreter on one machine, so the reply times measure the harness - which is
+why the load phase drives the server with no recorders in the process, and only
+those figures are asserted against §9.1.

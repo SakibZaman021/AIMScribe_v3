@@ -210,7 +210,7 @@ class Room:
             "/api/v2/admin/enrollment-token",
             {"hospital_id": self.hospital, "created_by": "load-test"},
             headers={"X-Admin-Key": admin_key})
-        enrolled = await self.client.post("/api/v2/enroll", {
+        enrolled = await self.client.post("/api/v2/device/enroll", {
             "enrollment_token": token["enrollment_token"],
             "device_pubkey": self.key.public_bytes_raw().hex(),
             "machine_name": f"LOADTEST-ROOM{self.room:02d}",
@@ -236,7 +236,7 @@ class Room:
 
         # 2. The session, with its genesis chain entry.
         genesis = crypto.build_entry(
-            entry_no=1, entry_type="open", prev_hash=None, signer=self.key,
+            entry_no=0, entry_type="open", prev_hash=None, signer=self.key,
             payload=crypto.open_payload(
                 device_id=session_id, doctor_id=plan.doctor_id,
                 hospital_id=self.hospital, patient_ref=plan.patient_id,
@@ -257,7 +257,7 @@ class Room:
             return
 
         # 3. The pieces, one every 30 seconds of consultation.
-        previous, entry_no = genesis.entry_hash, 1
+        previous, entry_no = genesis.entry_hash, 0
         audio = wav_bytes(30)
         for seq_no in range(1, plan.segments + 1):
             await asyncio.sleep(30 / speed)
