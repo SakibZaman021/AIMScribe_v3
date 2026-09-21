@@ -103,9 +103,26 @@ class LocalStore(ThreadingHTTPServer):
 
 class _StoreHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Without this, a two-megabyte upload to this stand-in took twenty
+    # seconds: small writes waiting on delayed acknowledgements, which is
+    # invisible until something uploads a whole recording.
+    disable_nagle_algorithm = True
+    rbufsize = 1 << 20
 
     def log_message(self, *_args):
         pass
+
+    def _read_body(self) -> bytes:
+        """The body, read in large pieces rather than one blocking call."""
+        remaining = int(self.headers.get("Content-Length", 0))
+        chunks = []
+        while remaining > 0:
+            block = self.rfile.read(min(remaining, 1 << 20))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
 
     def _path(self) -> Optional[Path]:
         key = unquote(urlparse(self.path).path.lstrip("/").split("?")[0])
@@ -124,39 +141,48 @@ class _StoreHandler(BaseHTTPRequestHandler):
         if target is None:
             self.send_error(400, "bad key")
             return
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = self._read_body()
         if self._is_bucket():
             # Creating the bucket, not writing an object. Writing a file here
             # is what broke the first bench run: every later object under that
             # name then had a file where it needed a folder.
             target.mkdir(parents=True, exist_ok=True)
-            self._ok(0, b"")
+            self._respond(b"")
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(body)
-        self._ok(len(body), body)
+        # The reply carries nothing, and its length says so. Claiming a body
+        # that never came left every client that reads a response waiting -
+        # the recorder did not notice, because it only looks at the status
+        # line, but the archive worker's upload timed out every time.
+        self._respond(b"", etag_of=body)
 
     def do_GET(self):
         target = self._path()
         if self._is_bucket():
-            self._ok(0, b"") if target and target.is_dir() else self.send_error(404)
+            if target and target.is_dir():
+                self._respond(b"")
+            else:
+                self.send_error(404, "NoSuchBucket")
             return
         if target is None or not target.is_file():
             self.send_error(404, "NoSuchKey")
             return
         body = target.read_bytes()
-        self._ok(len(body), body)
-        self.wfile.write(body)
+        self._respond(body)
 
     def do_HEAD(self):
         target = self._path()
         if self._is_bucket():
-            self._ok(0, b"") if target and target.is_dir() else self.send_error(404)
+            if target and target.is_dir():
+                self._respond(b"", head=True)
+            else:
+                self.send_error(404, "NoSuchBucket")
             return
         if target is None or not target.is_file():
             self.send_error(404, "NoSuchKey")
             return
-        self._ok(target.stat().st_size, target.read_bytes())
+        self._respond(target.read_bytes(), head=True)
 
     def do_DELETE(self):
         target = self._path()
@@ -166,12 +192,25 @@ class _StoreHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _ok(self, length: int, body: bytes) -> None:
+    def _respond(self, body: bytes, *, head: bool = False,
+                 etag_of: Optional[bytes] = None) -> None:
+        """
+        One reply, with a length that matches what is actually sent.
+
+        `etag_of` is for a PUT: the fingerprint belongs to what was stored,
+        while the reply itself carries nothing.
+        """
         import hashlib
         self.send_response(200)
-        self.send_header("Content-Length", str(length) if self.command != "GET" else str(length))
-        self.send_header("ETag", f'"{hashlib.md5(body).hexdigest()}"')
+        # A HEAD says how big the object is and sends nothing; that length is
+        # how the server learns the size of what the store holds, so reporting
+        # zero made every copy look empty and be refused.
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag",
+                         f'"{hashlib.md5(etag_of if etag_of is not None else body).hexdigest()}"')
         self.end_headers()
+        if body and not head:
+            self.wfile.write(body)
 
 
 # ============================================================
