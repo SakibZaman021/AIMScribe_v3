@@ -250,3 +250,17 @@ it. `--reset` starts from empty, and clears the bench agent's enrolment with it.
 **Stop any agent already running on the machine first.** One instance is
 allowed at a time, and the older one holds the port - which is how an hour went
 into wondering why a v3 bench was answering with v2 codes.
+
+| 22 Sep 2026 | Deployment | **The whole system in Docker**, started with one command on a laptop or on the AIMS LAB server (`deploy/local`, `start.bat` / `start.sh`). `bootstrap.py` makes every password and both signing keys once, brings the containers up, waits until the server truly answers, registers the clinic, issues CMED's key, mints an enrolment token, and writes the folder that configures a doctor's PC - `--agent` puts those files where the agent looks for them, which is three different places. Bringing a *new* server up this way found three faults that only a first run can show: the API image was missing `psycopg2`; the v1 legacy tables declared `session_id UUID` against a `VARCHAR` parent, so **the database could not be created at all** on a machine with no history (fixed, and that step can no longer be fatal - recording and the archive do not depend on it); and the archive worker's image never shipped `cloudcopy.py`, so it restarted for ever and no copy was made. Upload links now name the machine's address on the network rather than `localhost` or `host.docker.internal`, neither of which means the same thing to the server, a doctor's PC and the worker. | 14 rooms, 97 consultations, 2,894/2,894 pieces, every reply inside §9.1; 100 recordings archived with their JSON, 100 encrypted copies verified |
+
+| 22 Sep 2026 | Deployment | **`AIMScribe.exe` 3.3.0** built against that stack and proved on it: the shipping agent, installed from the folder `bootstrap.py` wrote, enrolled itself, recorded a live consultation from the machine's microphone, and was archived with its clinical record and copied. The copy was then fetched from the bucket, decrypted and decoded, and came back **byte for byte identical** to the archived recording. The agent's version had been left at 2.3.1 while the system moved to SRS 3.3; it now reports 3.3.0, in the executable's version resource and to the server. | 227 recorder tests; live: `RECORDING_STARTED`, 75.2 s, 5 pieces, archived, copied, restored identical, spool empty |
+
+### An afternoon lost to a port
+
+Half of every load-test request was answered with *unknown device token* while
+the same token worked perfectly by hand. Nothing was wrong with the server: an
+older `tools/bench.py` was still listening on `127.0.0.1:6000`, Docker had
+published the same port on every other address, and both answered to
+`localhost`. Requests were split between two systems with different databases.
+`bootstrap.py` now refuses to start when something else holds the port, and
+says what to do about it.

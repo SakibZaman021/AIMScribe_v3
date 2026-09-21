@@ -13,9 +13,10 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+# Install Python dependencies. The API's own list, not the whole pipeline's:
+# the transcription worker has its own image and its own requirements.txt.
+COPY requirements-api.txt .
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements-api.txt
 
 # ================================================================
 # Production Stage

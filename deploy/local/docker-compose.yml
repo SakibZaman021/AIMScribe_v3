@@ -1,0 +1,225 @@
+# ================================================================
+# AIMScribe, whole, in Docker - for a laptop or a test server.
+#
+#   start.bat          (Windows)        ./start.sh   (Linux)
+#
+# or, if you prefer to drive it yourself:
+#
+#   python bootstrap.py                 writes .env and sets the clinic up
+#   docker compose up -d --build
+#
+# What runs: PostgreSQL with both databases, Redis, MinIO standing in for
+# Cloudflare R2, the AIMS LAB server, and the archive worker. The recorder
+# runs on the doctor's PC, not here - it needs a microphone.
+#
+# This is the same software as the UIU stack in ../uiu, with the parts that
+# belong to a real deployment taken out: no TLS gateway, no separate cloud
+# account, no PgBouncer, and secrets generated on first run instead of
+# handed over. Use ../uiu for the server that carries patients.
+# ================================================================
+
+name: aimscribe-local
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aims-postgres
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-aims_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?run bootstrap.py first}
+      POSTGRES_DB: postgres
+      AIMS_RECORDINGS_PASSWORD: ${AIMS_RECORDINGS_PASSWORD:?}
+      AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD:?}
+      AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD:?}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - db:/var/lib/postgresql/data
+      # The same scripts, in the same order, as a new UIU server applies.
+      - ../uiu/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ../uiu/postgres/schema:/aims/baseline:ro
+      - ../../backend/scripts:/aims/scripts:ro
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"        # for psql from the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: aims-redis
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Stands in for Cloudflare R2 and, for the copies, for Amazon. Same API,
+  # same presigned URLs, on this machine.
+  minio:
+    image: minio/minio:latest
+    container_name: aims-minio
+    restart: unless-stopped
+    logging: *logging
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?}
+    volumes:
+      - objects:/data
+    ports:
+      - "9000:9000"        # the recorder uploads here, from the host
+      - "9001:9001"        # the console: look at what is stored
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: aims-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY};
+      mc mb --ignore-existing local/aims-segments;
+      mc mb --ignore-existing local/aims-copies;
+      mc mb --ignore-existing local/aims-clinical-json;
+      echo 'buckets ready';
+      "
+
+  api:
+    build:
+      context: ../../backend
+      dockerfile: docker/Dockerfile
+    image: aimscribe/api:3.3
+    container_name: aims-api
+    restart: unless-stopped
+    logging: *logging
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: aims_recordings
+      POSTGRES_USER: aims_recordings
+      POSTGRES_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      POSTGRES_SSLMODE: disable
+      AIMS_CLINICAL_DATABASE_URL: postgresql://aims_clinical_writer:${AIMS_CLINICAL_PASSWORD}@postgres:5432/aims_clinical
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 6000
+      # Inside this network the server reaches MinIO by its service name; the
+      # links it hands out have to work from the doctor's PC as well, which is
+      # what the external endpoint is for.
+      MINIO_ENDPOINT: minio:9000
+      MINIO_EXTERNAL_ENDPOINT: ${AIMS_STORAGE_HOST:-host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: aims-segments
+      MINIO_SECURE: "false"
+      MINIO_REGION: us-east-1
+      AIMS_COPY_BUCKET: aims-copies
+      AIMS_COPY_ENDPOINT: minio:9000
+      AIMS_COPY_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      AIMS_COPY_SECRET_KEY: ${MINIO_SECRET_KEY}
+      AIMS_COPY_SECURE: "false"
+      AIMS_COPY_REGION: us-east-1
+      AIMS_JSON_BUCKET: aims-clinical-json
+      AIMS_JSON_ENDPOINT: minio:9000
+      AIMS_JSON_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      AIMS_JSON_SECRET_KEY: ${MINIO_SECRET_KEY}
+      AIMS_JSON_SECURE: "false"
+      AIMS_JSON_REGION: us-east-1
+      PROMPTS_DIR: /app/src/prompts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    ports:
+      - "${AIMS_PORT:-6000}:6000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  archive-worker:
+    build: ../../backend/archive_worker
+    image: aimscribe/archive-worker:3.3
+    container_name: aims-archive-worker
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      AIMS_BACKEND_URL: http://api:6000
+      AIMS_WORKER_KEY: ${AIMS_WORKER_KEY}
+      AIMS_ARCHIVE_ROOT: /archive
+      AIMS_COPY_KEY: ${AIMS_COPY_KEY}
+      AIMS_POLL_SECONDS: "10"
+      AIMS_COPY_BATCH: "3"
+      TZ: ${TZ:-Asia/Dhaka}
+    volumes:
+      # The recordings, where you can open them. Change ARCHIVE_PATH in .env
+      # to put them somewhere else - on a server, that is the archive array.
+      - ${ARCHIVE_PATH:-./archive}:/archive
+    depends_on:
+      api:
+        condition: service_healthy
+    extra_hosts:
+      # So the presigned links, which name the host, work from in here too.
+      - "host.docker.internal:host-gateway"
+    tmpfs:
+      - /tmp:size=4g
+
+  # CMED's test site. Started only with:  docker compose --profile cmed up -d
+  cmed-web:
+    build:
+      context: ../../cmed-web
+      dockerfile: ../deploy/local/cmed-web.Dockerfile
+    image: aimscribe/cmed-web:3.3
+    container_name: aims-cmed-web
+    profiles: [cmed]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      AIMS_CMED_KEY: ${AIMS_CMED_KEY:-}
+      AIMS_SERVER_URL: http://api:6000
+      NEXT_PUBLIC_RECORDER_WS: ws://localhost:5050/ws
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6000}
+      NEXT_PUBLIC_HOSPITAL_ID: HOSP003
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+volumes:
+  db:
+  redis:
+  objects:

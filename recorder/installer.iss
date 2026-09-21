@@ -16,7 +16,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "2.3.1"
+#define AppVersion     "3.3.0"
 #define AppPublisher   "AIMS LAB"
 #define AppExe         "AIMScribe_Agent.exe"
 

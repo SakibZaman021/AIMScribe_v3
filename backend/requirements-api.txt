@@ -1,0 +1,34 @@
+# What the API process itself needs - nothing more.
+#
+# The transcription and NER pipeline pulls in langchain, chromadb and the
+# rest (requirements.txt); the worker needs those, the API never imports
+# them. Keeping them out of the API image takes its build from a quarter of
+# an hour to about a minute, and a smaller image is less to keep patched.
+
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+
+# The two databases. asyncpg is what the server uses; psycopg2 comes with
+# it because database/__init__.py still imports the older synchronous module
+# the v1 pipeline used, and an import is an import.
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+
+# Object storage: the segment bucket, and the copy buckets (S3-compatible).
+minio>=7.2.0
+
+# The transcription queue the API pushes to.
+redis>=5.0.0
+
+# Grants, receipts, the hash chain.
+cryptography>=42.0.0
+pyjwt[crypto]>=2.8.0
+
+# Outbound calls: webhooks, and anything the API fetches.
+httpx>=0.26.0
+requests>=2.31.0
+aiohttp>=3.9.0

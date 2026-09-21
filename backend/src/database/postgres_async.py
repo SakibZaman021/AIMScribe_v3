@@ -63,7 +63,16 @@ class AsyncPostgreSQLDatabase:
             # under load. Turning the cache off is what makes the pooler safe.
             **pooler_options()
         )
-        await self._init_database()
+        # A problem in the v1 tables above must not stop the server: the
+        # recordings path does not use them, and a server that refuses to
+        # start is a clinic that cannot record.
+        try:
+            await self._init_database()
+        except Exception as exc:
+            logger.critical(
+                "The legacy tables could not be created (%s). Recording and the "
+                "archive are unaffected; transcription may not work until this "
+                "is fixed.", exc)
         logger.info(f"Async PostgreSQL pool initialized (min={self.min_connections}, max={self.max_connections}, ssl={self.sslmode})")
 
     @property
@@ -92,7 +101,16 @@ class AsyncPostgreSQLDatabase:
             return False
 
     async def _init_database(self):
-        """Initialize database tables."""
+        """
+        Create the v1 tables if they are not there.
+
+        These belong to the transcription pipeline, not to recording. Their
+        `session_id` columns say VARCHAR(255) because that is what
+        `sessions.session_id` is: they said UUID, which cannot reference it, so
+        on a database that did not already have them - a new server, exactly
+        the case that matters - every start failed with "foreign key
+        constraint cannot be implemented" and nothing recorded at all.
+        """
         async with self._pool.acquire() as conn:
             # Sessions table - session_id can be client-provided or UUID string
             await conn.execute('''
@@ -135,7 +153,7 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS clips (
                     id SERIAL PRIMARY KEY,
-                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     clip_number INTEGER NOT NULL,
                     object_key VARCHAR(255) NOT NULL,
                     clip_transcript TEXT,
@@ -152,7 +170,7 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id SERIAL PRIMARY KEY,
-                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     full_transcript TEXT,
                     clip_count INTEGER NOT NULL,
                     last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -163,7 +181,7 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS ner_results (
                     id SERIAL PRIMARY KEY,
-                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     patient_id VARCHAR(100),
                     version INTEGER NOT NULL,
                     patient_name TEXT,
@@ -192,7 +210,7 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS doctor_reviews (
                     id SERIAL PRIMARY KEY,
-                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     doctor_id VARCHAR(100) NOT NULL,
                     field_name VARCHAR(100) NOT NULL,
                     original_value JSONB,
@@ -205,7 +223,7 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS prescription_data (
                     id SERIAL PRIMARY KEY,
-                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                     patient_id VARCHAR(100),
                     doctor_id VARCHAR(100) NOT NULL,
                     patient_name TEXT,
@@ -261,7 +279,7 @@ class AsyncPostgreSQLDatabase:
                 CREATE TABLE IF NOT EXISTS previous_visits (
                     id SERIAL PRIMARY KEY,
                     patient_id VARCHAR(100) REFERENCES patients(patient_id) ON DELETE CASCADE,
-                    session_id UUID,
+                    session_id VARCHAR(255),
                     visit_date DATE NOT NULL,
                     chief_complaints JSONB,
                     diagnosis JSONB,

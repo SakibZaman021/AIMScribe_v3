@@ -17,7 +17,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py archive.py catalogue.py ./
+# restore.py is not run by the worker, but it is the only way to read a
+# cloud copy back, so it ships in the image that made them.
+COPY worker.py archive.py catalogue.py cloudcopy.py restore.py ./
+
+# Fail the build, not the night shift, if the FLAC codec is not usable.
+RUN python -c "import soundfile; print(soundfile.__libsndfile_version__)"
 
 # The archive volume is mounted here and must be writable by this user.
 RUN useradd --create-home --uid 10001 aimscribe \

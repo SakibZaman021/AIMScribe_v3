@@ -70,3 +70,8 @@ backend/.env
 **/node_modules/
 **/.venv/
 **/__pycache__/
+
+# PyInstaller writes this next to the build; the flags live in BUILD.bat.
+recorder/AIMScribe_Agent.spec
+recorder/build/
+recorder/dist/

@@ -1,0 +1,128 @@
+# AIMScribe in Docker
+
+The whole system — server, both databases, Redis, object storage and the
+archive worker — in one command. Use it on a laptop to try things, and on the
+AIMS LAB server to run the study.
+
+```
+start.bat            (Windows)              ./start.sh      (Linux)
+```
+
+That is the whole of it. The first run takes a few minutes while the images
+build; after that it is seconds. When it finishes it prints the server
+address, the administrator key, CMED's key, and where to find the folder that
+configures a doctor's PC.
+
+To stop, keeping everything: `python bootstrap.py --down`.
+To start again from nothing: `python bootstrap.py --reset`.
+
+---
+
+## What starts
+
+| | What it is | Where it is |
+|---|---|---|
+| `api` | the AIMS LAB server | http://localhost:6000 |
+| `postgres` | `aims_recordings` and `aims_clinical`, separate roles | localhost:5433 |
+| `redis` | queues and locks | inside only |
+| `minio` | stands in for Cloudflare R2 and the copy store | console on :9001 |
+| `archive-worker` | joins, files, copies, and issues purge receipts | writes `archive\` |
+| `cmed-web` | CMED's test site, only with `--cmed` | http://localhost:3000 |
+
+The recorder is not here: it needs a microphone, so it runs on the doctor's
+PC. Everything else is a container.
+
+Recordings land in `deploy\local\archive\` — sorted by clinic, doctor and
+date, each with its clinical JSON. Point `ARCHIVE_PATH` in `.env` somewhere
+else and they land there instead; on the UIU server that is the archive array.
+
+---
+
+## Connecting a doctor's PC
+
+`bootstrap.py` writes `out\recorder\` — the two public keys the agent pins,
+its `.env`, and one enrolment token. Copy that folder to the PC and follow the
+README inside; or, on a PC that has the agent unpacked already:
+
+```
+python bootstrap.py --agent "C:\Path\To\AIMScribe_Agent"
+```
+
+which puts each file where the agent looks for it. Start
+`AIMScribe_Agent.exe`: it enrols itself once and shows a tray icon.
+
+The agent's `.env` points at this machine's address on the network, not at
+`localhost`, so a PC in another room works with no further changes. If the
+machine's address changes — a new network, a new DHCP lease — run
+`bootstrap.py` again and copy `out\recorder\.env` across.
+
+---
+
+## The settings
+
+`.env` is written on the first run and never rewritten: every password, both
+signing keys, and the key that encrypts the cloud copies. Keep it. Delete it
+and the stack comes up with new keys, which means every enrolled PC has to
+enrol again.
+
+It is a bench file, not a clinic's. A real deployment's secrets are made the
+same way but held by an administrator — see `../uiu`.
+
+| Setting | What it does |
+|---|---|
+| `AIMS_PORT` | the server's port (6000) |
+| `POSTGRES_PORT` | where psql can reach the database (5433) |
+| `ARCHIVE_PATH` | where recordings are filed |
+| `AIMS_STORAGE_HOST` | the address upload links name; set for you each run |
+| `TZ` | the clinic's zone, for the date a recording is filed under |
+
+---
+
+## Proving it works
+
+```
+python tools\channel_b_test.py --server http://localhost:6000 --key <CMED key>
+python tools\load_test.py --server http://localhost:6000 ^
+       --admin-key <admin key> --cmed-key <CMED key> ^
+       --hospital HOSP003 --cmed-hospital CMED-LOCAL-01 --rooms 14
+```
+
+The first checks CMED's two messages against the server's own rules. The
+second runs a clinic day through it — fourteen rooms, real chains, real
+uploads — and with `--cmed-key` it plays CMED's side too, so the recordings
+confirm, archive, and are copied. Watch it happen:
+
+```
+docker compose logs -f archive-worker
+```
+
+The dashboard at http://localhost:6000/api/v2/dashboard asks for the
+administrator key and shows the day as UIU sees it.
+
+---
+
+## When it will not start
+
+**"Something is already answering on port 6000."** Another server — often
+`tools\bench.py` left running — has the port. Docker will publish it anyway,
+both will answer to `localhost`, and requests will be split between two
+systems with different databases: half of them refused with credentials the
+other one issued. Stop it, or set `AIMS_PORT` to something else.
+
+**"Docker is not running."** Start Docker Desktop and try again.
+
+**The server never answers.** `docker compose logs api` says why. A first run
+on a fresh machine may simply be slow to build.
+
+**A PC says `DEVICE_NOT_ENROLLED`.** The databases were reset while the agent
+kept its identity. Delete `state\device.json` and `state\device.token` in its
+data folder, give it a fresh token from `out\recorder\`, and start it again.
+
+---
+
+## The same thing, for real
+
+`../uiu` is this stack as UIU runs it: TLS at the edge, PgBouncer, secrets
+handed over rather than generated, Cloudflare R2 and Amazon Glacier instead of
+MinIO, and backups. The software in the containers is identical — which is the
+point of running this one.

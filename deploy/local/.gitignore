@@ -1,0 +1,11 @@
+# Nothing this stack produces belongs in the repository.
+
+# Every password, both signing keys, and the key that encrypts the copies.
+.env
+
+# The administrator key, CMED's key, and a live enrolment token - a token
+# sheet is a credential.
+out/
+
+# Recordings. Consultations, with patients in them.
+archive/

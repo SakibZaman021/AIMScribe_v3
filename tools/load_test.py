@@ -189,13 +189,19 @@ class Room:
     """One enrolled PC, doing one consultation after another."""
 
     def __init__(self, client, room: int, hospital: str, cmed_hospital: str,
-                 timings: Timings, *, dry_run: bool, key_dir: Path):
+                 timings: Timings, *, dry_run: bool, key_dir: Path,
+                 cmed_key: str = ""):
         self.client = client
         self.room = room
         self.hospital = hospital
         self.cmed_hospital = cmed_hospital
         self.timings = timings
         self.dry_run = dry_run
+        # With CMED's key, the room also plays CMED: the visit is described
+        # and prescribed over Channel B, which is what confirms a recording
+        # and lets it archive. Without it the run stops at the recorder,
+        # which is all AT-29 needs but leaves nothing for the worker to do.
+        self.cmed_key = cmed_key
         # A real device key, made the way the recorder makes one, so the
         # chain the server checks here is signed as a clinic PC signs it.
         self.key = DeviceKey.load_or_create(key_dir / f"room{room:02d}.key",
@@ -233,6 +239,21 @@ class Room:
         })
         if grant is None:
             return
+        five = {"patient_id": plan.patient_id, "doctor_id": plan.doctor_id,
+                "hospital_id": self.cmed_hospital,
+                "start_time": started.isoformat(),
+                "date": started.date().isoformat()}
+        await self.channel_b("patient-information", {
+            **five,
+            "demographics": {"name": f"Load Test {plan.patient_id}",
+                             "sex": "female", "age_years": 34,
+                             "phone": "01700000000", "address": "Load test"},
+            "paramedic": {"recorded_at": five["start_time"], "weight_kg": 58,
+                          "height_cm": 156, "blood_pressure": "120/80",
+                          "pulse_bpm": 78, "temperature_c": 37.1,
+                          "spo2_percent": 98},
+            "previous_visit": None,
+        })
 
         # 2. The session, with its genesis chain entry.
         genesis = crypto.build_entry(
@@ -291,7 +312,31 @@ class Room:
             "segment_count": plan.segments, "reason": "prescription_built",
             "chain_entry": close_entry.to_wire(),
         })
+        await self.channel_b("prescription", {
+            **five,
+            "issued_at": crypto.iso_utc(closed),
+            "diagnoses": ["Load test diagnosis"],
+            "investigations": ["Load test investigation"],
+            "advice": "Load test advice",
+            "follow_up": (closed.date() + timedelta(days=30)).isoformat(),
+            "items": [{"drug": "Load Test Medicine", "dose": "5 mg",
+                       "frequency": "1+0+0", "duration": "30 days",
+                       "instructions": "after food"}],
+        })
         self.timings.consultations += 1
+
+    async def channel_b(self, path: str, body: Dict[str, Any]) -> None:
+        """CMED's half: API 2 and API 3, with CMED's key, not the device's."""
+        if self.dry_run or not self.cmed_key:
+            return
+        started = time.perf_counter()
+        try:
+            await self.client.post(f"/api/v2/clinical/{path}", body,
+                                   headers={"X-CMED-Key": self.cmed_key})
+        except Exception as exc:
+            self.timings.fail(f"{path}: {exc}")
+        finally:
+            self.timings.record(path, time.perf_counter() - started)
 
     async def send_piece(self, session_id: str, seq_no: int, audio: bytes,
                          digest: bytes, entry, at: datetime, *, final: bool) -> None:
@@ -325,7 +370,7 @@ class Room:
         try:
             result = await self.client.post(path, body, headers=self.headers())
         except Exception as exc:
-            self.timings.fail(f"{call}: {exc}")
+            self.timings.fail(f"room{self.room} {call}: {exc}")
             return None
         finally:
             self.timings.record(call, time.perf_counter() - started)
@@ -382,7 +427,8 @@ async def run(args) -> Dict[str, Any]:
             rooms = {}
             for n in range(1, args.rooms + 1):
                 room = Room(client, n, args.hospital, args.cmed_hospital, timings,
-                            dry_run=False, key_dir=key_dir)
+                            dry_run=False, key_dir=key_dir,
+                            cmed_key=args.cmed_key)
                 await room.enrol(args.admin_key)
                 rooms[n] = room
             print(f"{len(rooms)} virtual recorder(s) enrolled")
@@ -410,6 +456,10 @@ def main(argv=None) -> int:
     parser.add_argument("--admin-key", default=os.getenv("AIMS_ADMIN_KEY", ""))
     parser.add_argument("--hospital", default="HOSP003", help="the AIMS LAB clinic code")
     parser.add_argument("--cmed-hospital", default="", help="CMED's code for it")
+    parser.add_argument("--cmed-key", default="",
+                        help="CMED's key. Given, every consultation is also "
+                             "described and prescribed over Channel B, so the "
+                             "recordings confirm and archive")
     parser.add_argument("--rooms", type=int, default=14)
     parser.add_argument("--hours", type=float, default=8.0)
     parser.add_argument("--minutes", type=float, default=15.0,
