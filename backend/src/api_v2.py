@@ -538,12 +538,32 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         raise HTTPException(status_code=400, detail="sha256 must be hex")
 
     # --- the verification that makes the chain meaningful ---
+    #
+    # Object storage fails transiently: a dropped connection, a moment of
+    # throttling, a read that arrives before the write has settled. Refusing
+    # on the first failure makes the recorder upload the whole piece again, so
+    # a busy minute costs the network several times what it should. One short
+    # retry absorbs that; a piece that still cannot be read is refused, and
+    # refusing is right - the server must never record a piece it has not
+    # verified. (Seen in the 28-room load test.)
     loop = asyncio.get_event_loop()
-    try:
-        stored = await loop.run_in_executor(None, _read_object, body.object_key)
-    except Exception as exc:
-        logger.error("Could not read %s back from storage: %s", body.object_key, exc)
-        raise HTTPException(status_code=502, detail="uploaded object could not be read back")
+    stored = None
+    for attempt, pause in enumerate((0.25, 0.75)):
+        try:
+            stored = await loop.run_in_executor(None, _read_object, body.object_key)
+            break
+        except Exception as exc:
+            logger.warning("Could not read %s back from storage (attempt %s): %s",
+                           body.object_key, attempt + 1, exc)
+            await asyncio.sleep(pause)
+    if stored is None:
+        try:
+            stored = await loop.run_in_executor(None, _read_object, body.object_key)
+        except Exception as exc:
+            logger.error("Could not read %s back from storage: %s",
+                         body.object_key, exc)
+            raise HTTPException(status_code=502,
+                                detail="uploaded object could not be read back")
 
     actual = integrity.sha256_bytes(stored)
     if not hmac.compare_digest(actual, claimed):

@@ -1116,3 +1116,54 @@ async def test_the_sweep_confirms_what_the_crossing_left_behind(server):
     assert server.repo.sessions[sid]["confirmation"] == "confirmed"
     assert any(a["event_type"] == "session.confirmed" and a["detail"].get("reconciled")
                for a in server.repo.audits)
+
+
+async def _commit(session_id, audio_sha: str):
+    return await api_v2.commit_segment(api_v2.CommitRequest(
+        session_id=session_id, seq_no=1, object_key=f"audio/{session_id}/1.wav",
+        sha256=audio_sha, bytes=15, duration_seconds=1.0,
+        captured_start_at=NOW().isoformat(), captured_end_at=NOW().isoformat(),
+        is_final=False, chain_entry={"entry_no": 1, "entry_type": "segment"}),
+        device=DEVICE)
+
+
+async def test_a_piece_that_reads_back_on_the_second_try_is_not_refused(server, monkeypatch):
+    """
+    Storage fails transiently. Refusing on the first failure makes the
+    recorder upload the whole piece again, so a busy minute costs the network
+    several times what it should (seen in the 28-room load test).
+    """
+    audio = b"simulated audio"
+    attempts = {"n": 0}
+
+    def flaky(object_key):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ConnectionError("connection reset by the bucket")
+        return audio
+
+    monkeypatch.setattr(api_v2, "_read_object", flaky)
+    sid = open_session(server)
+    with pytest.raises(HTTPException) as stopped:
+        await _commit(sid, integrity.sha256_bytes(audio).hex())
+
+    # It read the piece on the second try and went on to the chain, which is
+    # where this malformed entry is refused - not at the storage read.
+    assert attempts["n"] == 2
+    assert stopped.value.status_code == 400
+
+
+async def test_a_piece_that_never_reads_back_is_refused(server, monkeypatch):
+    """The server must never record a piece it has not verified (SRS-REC-13)."""
+    attempts = {"n": 0}
+
+    def always_fails(object_key):
+        attempts["n"] += 1
+        raise ConnectionError("gone")
+
+    monkeypatch.setattr(api_v2, "_read_object", always_fails)
+    sid = open_session(server)
+    with pytest.raises(HTTPException) as refused:
+        await _commit(sid, "ab" * 32)
+    assert refused.value.status_code == 502
+    assert attempts["n"] == 3          # tried, waited, tried, waited, tried
