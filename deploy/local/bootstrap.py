@@ -96,7 +96,11 @@ def make_env() -> Dict[str, str]:
         "AIMS_RECEIPT_PRIVATE_KEY": pem(Ed25519PrivateKey.generate()),
         # Encrypts every cloud copy. On a real server this never leaves it.
         "AIMS_COPY_KEY": base64.b64encode(os.urandom(32)).decode(),
-        "AIMS_ALLOWED_ORIGINS": "http://localhost:3000",
+        # Both spellings of this machine. They are the same address, and a
+        # page opened at one while only the other is trusted is refused with
+        # a 403 - which the page reports as "the recorder is not running",
+        # sending you to look at an agent that is running perfectly.
+        "AIMS_ALLOWED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",
         "AIMS_CMED_WEBHOOK_ENABLED": "false",
         "AIMS_PORT": "6060",
         "POSTGRES_PORT": "5433",
@@ -312,7 +316,7 @@ def write_recorder_folder(url_for_pc: str, values: Dict[str, str],
         "# Written by deploy/local/bootstrap.py - the local stack.",
         "# Copy this file and the keys folder next to AIMScribe_Agent.exe.",
         f"AIMS_BACKEND_URL={url_for_pc}",
-        "AIMS_ALLOWED_ORIGINS=http://localhost:3000",
+        "AIMS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000",
         "AIMS_ALLOWED_HOSTS=localhost:5050,127.0.0.1:5050",
         "AIMS_LOCAL_API_KEY=" + secrets.token_urlsafe(16),
         "",
