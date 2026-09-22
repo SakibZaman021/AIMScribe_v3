@@ -343,9 +343,34 @@ class Overlay:
             if self.window.state() == "withdrawn":
                 self._place()
                 self.window.deiconify()
-                self.window.attributes("-topmost", True)
+            self._keep_on_top()
         elif self.window.state() != "withdrawn":
+            # Say why, every time. "The control disappeared" is otherwise a
+            # report nobody can act on: this line distinguishes a card that
+            # hid because the consultation ended from one that hid because
+            # the agent briefly had no status to read.
+            logger.info("On-screen control hidden: recording=%s paused=%s "
+                        "session=%s form_open=%s",
+                        status.get("is_recording"), status.get("is_paused"),
+                        status.get("session_id"), self.state.form_open)
             self.window.withdraw()
+
+    def _keep_on_top(self) -> None:
+        """
+        Stay in front, for as long as the consultation lasts.
+
+        Asking once, when the card appears, is not enough. Windows drops the
+        flag when another window takes focus in certain ways - opening the
+        reason form and closing it again is one of them - and the card then
+        sits behind CMED's browser. It has not gone, but it is gone as far as
+        anyone can tell, and Stop is what they cannot find.
+        """
+        try:
+            if not self.window.attributes("-topmost"):
+                self.window.attributes("-topmost", True)
+                self.window.lift()
+        except Exception as exc:                    # a window manager that will not
+            logger.debug("Could not keep the control on top: %s", exc)
 
     # ---- presses ----
 
@@ -412,6 +437,10 @@ class Overlay:
             self.form = None
             form.grab_release()
             form.destroy()
+            # The card lost the front to this form; take it back at once
+            # rather than at the next tick, so it never blinks out of sight.
+            self.window.attributes("-topmost", True)
+            self.window.lift()
 
         def on_confirm(_event=None):
             chosen = choice.get()
