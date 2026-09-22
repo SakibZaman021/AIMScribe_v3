@@ -97,10 +97,37 @@ python bootstrap.py --agent "C:\Path\To\AIMScribe_Agent"
 which puts each file where the agent looks for it. Start
 `AIMScribe_Agent.exe`: it enrols itself once and shows a tray icon.
 
+### A PC in another room
+
 The agent's `.env` points at this machine's address on the network, not at
-`localhost`, so a PC in another room works with no further changes. If the
-machine's address changes — a new network, a new DHCP lease — run
-`bootstrap.py` again and copy `out\recorder\.env` across.
+`localhost`, so a second PC works with no further changes:
+
+1. Copy `out\recorder\` and the agent folder to that PC.
+2. There, run `python bootstrap.py --agent "<the agent folder>"`, or place the
+   three files by hand as the README inside that folder says.
+3. Start `AIMScribe_Agent.exe`. It enrols itself with the token in that folder.
+4. On that PC, open CMED's page from **this** machine - `http://<this
+   machine>:3000` - not from its own localhost. The page drives the agent on
+   whichever PC is displaying it.
+
+**One token is one PC, once.** Run `bootstrap.py` again for the next PC; it
+mints a fresh token into `out\recorder\` every run.
+
+Three things worth knowing first:
+
+* **The address moves.** A new network or a new DHCP lease gives this machine
+  a different address, and every recorder pointed at the old one goes quiet.
+  It happened here: 192.168.1.101 became 192.168.0.108 while the laptop
+  slept, and every upload link named a host that no longer existed. Run
+  `bootstrap.py` again - it finds the new address, rewrites
+  `out\recorder\.env` and fixes the links - then copy that `.env` to each PC.
+  On the UIU server the problem disappears: it has one address that stays.
+* **Windows may ask.** The first time another PC connects, Windows Firewall
+  may prompt to allow Docker Desktop on private networks. Say yes; without it
+  the ports are open and nothing reaches them.
+* **Check from the other PC** before suspecting the recorder:
+  `curl http://<this machine>:6060/health` should answer with
+  `"system":"AIMScribe v3 - AIMS LAB server"`.
 
 ---
 
