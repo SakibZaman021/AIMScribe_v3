@@ -100,7 +100,7 @@ def make_env() -> Dict[str, str]:
         # page opened at one while only the other is trusted is refused with
         # a 403 - which the page reports as "the recorder is not running",
         # sending you to look at an agent that is running perfectly.
-        "AIMS_ALLOWED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",
+        "AIMS_ALLOWED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",   # this machine's own address is added each run
         "AIMS_CMED_WEBHOOK_ENABLED": "false",
         "AIMS_PORT": "6060",
         "POSTGRES_PORT": "5433",
@@ -293,7 +293,7 @@ def set_up_clinic(url: str, admin_key: str, values: Dict[str, str]) -> Dict[str,
 # ============================================================
 
 def write_recorder_folder(url_for_pc: str, values: Dict[str, str],
-                          token: str) -> Path:
+                          token: str, host: str = "localhost") -> Path:
     """
     `out\\recorder\\`: the two public keys the agent pins, its `.env`, and the
     enrolment token. Copy it to the PC and the agent is configured.
@@ -316,7 +316,12 @@ def write_recorder_folder(url_for_pc: str, values: Dict[str, str],
         "# Written by deploy/local/bootstrap.py - the local stack.",
         "# Copy this file and the keys folder next to AIMScribe_Agent.exe.",
         f"AIMS_BACKEND_URL={url_for_pc}",
-        "AIMS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000",
+        # Three spellings of the one page. On this machine CMED's site is
+        # localhost; on a doctor's PC in another room the same page is
+        # served from here, so its origin is this machine's address. An
+        # origin the agent does not know is refused with a 403, and the
+        # page reports that as "AIMScribe is not running".
+        f"AIMS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://{host}:3000",
         "AIMS_ALLOWED_HOSTS=localhost:5050,127.0.0.1:5050",
         "AIMS_LOCAL_API_KEY=" + secrets.token_urlsafe(16),
         "",
@@ -489,6 +494,13 @@ def main(argv=None) -> int:
     update_env({"AIMS_STORAGE_HOST": f"{host}:9000"})
     values = read_env()
     print(f"  this machine is {host} on the network; upload links will say so")
+    # The browser on a doctor's PC loads CMED's page from this address, so
+    # the server has to accept it as an origin as well as localhost.
+    origins = [o for o in values.get("AIMS_ALLOWED_ORIGINS", "").split(",") if o]
+    page = f"http://{host}:3000"
+    if page not in origins:
+        update_env({"AIMS_ALLOWED_ORIGINS": ",".join(origins + [page])})
+        values = read_env()
 
     print("\nBuilding and starting")
     profile = ["--profile", "cmed"] if args.cmed else []
@@ -505,7 +517,8 @@ def main(argv=None) -> int:
     issued = set_up_clinic(url, values["AIMS_ADMIN_KEY"], read_env())
     values = read_env()
     url_for_pc = f"http://{host}:{port}"
-    folder = write_recorder_folder(url_for_pc, values, issued["enrollment_token"])
+    folder = write_recorder_folder(url_for_pc, values,
+                                   issued["enrollment_token"], host)
     if args.agent:
         configure_agent(folder, Path(args.agent).resolve(),
                         Path(args.agent_data).resolve() if args.agent_data else None)
