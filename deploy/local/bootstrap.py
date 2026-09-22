@@ -121,33 +121,49 @@ def make_env() -> Dict[str, str]:
 
 def this_machine() -> str:
     """
-    The address other machines reach this one on.
+    The address other machines reach this one on - and one that stays put.
 
-    Upload links name a host, and that host has to mean the same thing to
-    three different places: the server writing the link, a doctor's PC
-    following it, and the archive worker inside Docker. `localhost` means a
-    different machine to each of them, and `host.docker.internal` does not
-    resolve outside Docker at all - so the address on the network is used,
-    which is the same everywhere and works from a second PC as well.
+    The name first, the number second. A DHCP lease is temporary: this laptop
+    went from 192.168.1.101 to 192.168.0.108 overnight, and every recorder
+    pointed at the old number went quiet, because upload links and settings
+    both carry the address in writing. The machine's name survives that, and
+    Windows resolves it on a local network without anything being set up.
+
+    The number is still used when the name does not resolve to this machine -
+    some networks do not carry names - and `--host` overrides both, which is
+    what a real deployment uses: one DNS name that never moves.
     """
     import socket
+
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         probe.connect(("8.8.8.8", 80))          # nothing is sent
-        return probe.getsockname()[0]
+        address = probe.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        address = "127.0.0.1"
     finally:
         probe.close()
 
+    # Lower case, always. An upload link is signed with the host inside it,
+    # and HTTP clients send the host lower-cased: signed as DESKTOP-S3AS8QK,
+    # sent as desktop-s3as8qk, and every upload is refused with
+    # SignatureDoesNotMatch - which reads like a credentials problem and is a
+    # capital letter.
+    name = socket.gethostname().lower()
+    try:
+        if name and socket.gethostbyname(name) == address:
+            return name
+    except Exception:
+        pass
+    return address
+
 
 # Ports a browser refuses to open, whatever is listening on them. Chrome and
-# Firefox both keep this list: they are ports where a crafted HTTP request
-# could be read as some other protocol's command. 6000 is X11 - and it was
-# version 1's port, so it is the one a browser will silently refuse while
-# curl, the recorder and every test carry on working perfectly. The error a
-# browser shows for it says the site may be "temporarily down", which sends
-# you looking at the server.
+# Firefox both keep this list, and so does Node's fetch: they are ports where a
+# crafted HTTP request could be read as some other protocol's command. 6000 is
+# X11 - and it was version 1's port, so it is the one that will be tried again.
+# The error a browser shows for it says the site may be "temporarily down",
+# which sends you looking at the server.
 BROWSER_BLOCKED = {
     1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666,
     6667, 6668, 6669, 6697, 10080,
@@ -166,6 +182,7 @@ def port_is_taken(port: int) -> bool:
     server fault and is not one.
     """
     import socket
+
     for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
         probe = socket.socket(family, socket.SOCK_STREAM)
         probe.settimeout(0.5)
@@ -491,7 +508,10 @@ def main(argv=None) -> int:
         return 2
 
     host = args.host or this_machine()
-    update_env({"AIMS_STORAGE_HOST": f"{host}:9000"})
+    # The archive worker runs in a container, where this machine's name means
+    # nothing until it is mapped to the gateway. Without this it cannot follow
+    # the upload links it is given, and nothing is ever archived.
+    update_env({"AIMS_STORAGE_HOST": f"{host}:9000", "AIMS_HOST_NAME": host})
     values = read_env()
     print(f"  this machine is {host} on the network; upload links will say so")
     # The browser on a doctor's PC loads CMED's page from this address, so

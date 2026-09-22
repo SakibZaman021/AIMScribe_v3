@@ -210,8 +210,10 @@ services:
       api:
         condition: service_healthy
     extra_hosts:
-      # So the presigned links, which name the host, work from in here too.
-      - "host.docker.internal:host-gateway"
+      # The upload links name this machine, by the name bootstrap.py found for
+      # it. Inside a container that name means nothing, so it is mapped to the
+      # gateway - otherwise the worker cannot fetch a single piece.
+      - "${AIMS_HOST_NAME:-host.docker.internal}:host-gateway"
     tmpfs:
       - /tmp:size=4g
 
@@ -245,6 +247,31 @@ services:
         condition: service_healthy
     ports:
       - "3000:3000"
+
+  # A browser for the two databases, so the tables can be looked at rather
+  # than queried. Started only when asked for:
+  #
+  #     docker compose --profile db up -d dbviewer      http://localhost:8080
+  #
+  # It is off by default and bound to this machine: it reaches both databases
+  # with the administrator's credentials, and a clinic's server should not
+  # carry a way in that nobody asked for.
+  dbviewer:
+    image: adminer:4
+    container_name: aimscribe-v3-dbviewer
+    profiles: [db]
+    restart: unless-stopped
+    logging: *logging
+    labels:
+      com.aimslab.system: "aimscribe-v3"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
 
 volumes:
   db:
