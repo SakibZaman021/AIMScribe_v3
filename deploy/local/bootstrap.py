@@ -417,8 +417,48 @@ def configure_agent(folder: Path, agent_dir: Path, data_dir: Optional[Path]) -> 
     settings   {agent_dir / '.env'}
     keys       {data / 'keys'}
     enrolment  {enrolment}
+    at login   {start_with_windows(agent_dir / 'AIMScribe_Agent.exe')}
 
   Start AIMScribe_Agent.exe. It shows a tray icon when it is recording-ready.""")
+
+
+def start_with_windows(exe: Path) -> str:
+    """
+    A shortcut in the Startup folder, so the recorder is simply there.
+
+    Starting Docker brings every container back on its own; the recorder is
+    not a container, and a PC where it is missing looks exactly like a broken
+    server - CMED's page says "AIMScribe is not running" and the port refuses.
+    It starts before Docker has finished, which is harmless: it holds what it
+    records and sends it when the server answers.
+
+    A clinical PC gets this from the installer instead. This is for the
+    machines we set up by hand.
+    """
+    if sys.platform != "win32":
+        return "not Windows; start the recorder however this machine does it"
+    try:
+        startup = Path(os.environ["APPDATA"]) / ("Microsoft/Windows/Start Menu"
+                                                 "/Programs/Startup")
+        startup.mkdir(parents=True, exist_ok=True)
+        link = startup / "AIMScribe.lnk"
+
+        script = (
+            "$s = (New-Object -ComObject WScript.Shell)."
+            f"CreateShortcut('{link}');"
+            f"$s.TargetPath = '{exe}';"
+            f"$s.WorkingDirectory = '{exe.parent}';"
+            f"$s.IconLocation = '{exe}';"
+            "$s.Description = 'AIMScribe v3 recorder - starts with Windows';"
+            "$s.Save()")
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True)
+        if result.returncode != 0 or not link.is_file():
+            return f"could not be set up ({result.stderr.strip()[:80]})"
+        return "starts with Windows"
+    except Exception as exc:
+        return f"could not be set up ({exc})"
 
 
 def write_summary(url: str, values: Dict[str, str], issued: Dict[str, str]) -> Path:

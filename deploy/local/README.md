@@ -13,6 +13,24 @@ build; after that it is seconds. When it finishes it prints the server
 address, the administrator key, CMED's key, and where to find the folder that
 configures a doctor's PC.
 
+### After that: start Docker, and nothing else
+
+Once it has run once, the machine looks after itself. Every container is
+`unless-stopped`, so **starting Docker Desktop brings the whole stack back** -
+the server, both databases, storage, the archive worker, CMED's page - with
+nothing typed.
+
+The recorder is not a container, so it has its own way in: a shortcut in the
+Windows Startup folder, which `bootstrap.py --agent` puts there. It starts at
+login, before Docker has finished, and that is fine - it holds what it records
+and sends it when the server answers. Proved, not assumed: an agent started
+against a stopped server recorded, recovered when the server came back, and
+the consultation archived.
+
+So after a restart: start Docker Desktop, wait for its whale to settle, and
+everything is already running. `start.bat` is still there for the first run
+and for a stack that has been taken down on purpose.
+
 To stop, keeping everything: `python bootstrap.py --down`.
 To start again from nothing: `python bootstrap.py --reset`.
 
