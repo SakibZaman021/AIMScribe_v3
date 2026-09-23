@@ -11,7 +11,7 @@ Say UIU gives us `aimscribe.uiu.ac.bd`.
 | Who | Setting | Where |
 |---|---|---|
 | The server itself | `AIMS_PUBLIC_HOST=aimscribe.uiu.ac.bd` | `deploy/uiu/.env` — the gateway gets its certificate for this name |
-| The archive worker | nothing | it talks to the API inside the machine (`http://api:6000`) |
+| The archive worker | nothing | it talks to the API inside the machine (`http://api:6060`) |
 | CMED | `AIMS_SERVER_URL=https://aimscribe.uiu.ac.bd` | CMED's own server environment (`cmed-web/.env.local` in the test app) |
 | Every recorder | `AIMS_BACKEND_URL=https://aimscribe.uiu.ac.bd` | `.env` beside `AIMScribe_Agent.exe` on each PC, written by the installer |
 
