@@ -89,13 +89,35 @@ same address.
 
 Right after `start.bat`:
 
-| Link | |
+| Link | From another PC too? | |
+|---|---|---|
+| http://localhost:6060 | yes | the front page: what this is, and where everything else is |
+| http://localhost:6060/health | yes | one line saying the server, database, Redis and storage are up |
+| http://localhost:6060/api/v2/dashboard | yes | the day as UIU sees it - **it asks for the administrator key** printed at startup |
+| http://localhost:9001 | yes | the storage console - user `aimslocal`, password in `.env` |
+| http://localhost:3000 | yes | CMED's test site, **only** if you started with `--cmed` |
+| http://localhost:8080 | **no** | the database viewer, **only** with `--profile db`, and **only from this machine** |
+
+From another PC, swap `localhost` for this machine's name - `http://<machine>:6060`
+and so on. The database viewer is the exception: it holds the administrator's
+credentials for both databases, so it listens on this machine alone. Set
+`AIMS_DBVIEWER_BIND=0.0.0.0` in `.env` if you want it from elsewhere, knowing
+what that opens.
+
+### "Connection refused"
+
+It always means nothing is listening on **that** address and port. Which one
+tells you what is wrong:
+
+| Refused | What it is |
 |---|---|
-| http://localhost:6060 | the front page: what this is, and where everything else is |
-| http://localhost:6060/health | one line saying the server, database, Redis and storage are up |
-| http://localhost:6060/api/v2/dashboard | the day as UIU sees it - **it asks for the administrator key** printed at startup |
-| http://localhost:9001 | the storage console - user `aimslocal`, password in `.env` |
-| http://localhost:3000 | CMED's test site, **only** if you started with `--cmed` |
+| everything | Docker Desktop is not running. Start it; the containers come back by themselves |
+| `:5050` only | `AIMScribe_Agent.exe` is not running on **that** PC. CMED's page reports this as "AIMScribe is not running" |
+| `:8080` from another PC | the database viewer is local to the server machine, on purpose |
+| `:8080` from this one | it needs its profile: `docker compose --profile db up -d dbviewer` |
+| `:3000` | CMED's page was not started: add `--cmed` |
+| `:5433` in a browser | that is PostgreSQL, not a web page. Use the viewer on `:8080` |
+| an `https://` address | nothing here speaks HTTPS. Type `http://` - browsers add the `s` on their own |
 
 `http://localhost:6060/api/v2/...` on its own will say `Not Found` or ask for a
 credential: those are the recorder's and CMED's doors, not pages to browse.

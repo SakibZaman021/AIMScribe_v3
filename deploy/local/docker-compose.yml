@@ -271,7 +271,11 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:8080"
+      # This machine only, by default: it reaches both databases with the
+      # administrator's credentials. Set AIMS_DBVIEWER_BIND=0.0.0.0 in .env to
+      # reach it from another PC - on a bench that is a convenience, on a
+      # clinic's server it is a way in that nobody asked for.
+      - "${AIMS_DBVIEWER_BIND:-127.0.0.1}:8080:8080"
 
 volumes:
   db:
