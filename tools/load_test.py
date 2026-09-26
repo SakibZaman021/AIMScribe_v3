@@ -377,6 +377,9 @@ class Room:
         return result
 
 
+import aiohttp                                   # noqa: E402
+
+
 class Client:
     def __init__(self, base: str, session):
         self.base = base.rstrip("/")
@@ -385,11 +388,22 @@ class Client:
     async def post(self, path: str, body: Dict[str, Any],
                    headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         url = path if path.startswith("http") else f"{self.base}{path}"
-        async with self.session.post(url, json=body, headers=headers or {}) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"{path} answered {response.status}: "
-                                   f"{(await response.text())[:200]}")
-            return await response.json()
+        # One retry on a dropped connection, because the recorder does the
+        # same: a keep-alive connection can be closed by the server at the
+        # moment it is reused, and treating that as a lost piece measures TCP
+        # rather than the server.
+        for attempt in (1, 2):
+            try:
+                async with self.session.post(url, json=body,
+                                             headers=headers or {}) as response:
+                    if response.status >= 300:
+                        raise RuntimeError(f"{path} answered {response.status}: "
+                                           f"{(await response.text())[:200]}")
+                    return await response.json()
+            except aiohttp.ClientConnectionError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.2)
 
     async def put(self, url: str, data: bytes) -> bool:
         async with self.session.put(url, data=data) as response:

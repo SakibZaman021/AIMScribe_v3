@@ -62,12 +62,22 @@ class Settings(BaseSettings):
     postgres_user: str = Field(default="aimscribe_user")
     postgres_password: str = Field(default="")
     postgres_sslmode: str = Field(default="prefer")
+    # How many copies of the server run. Each is a whole Python process with
+    # its own pool, so on a small machine this is the setting that decides
+    # whether it fits: four workers is roughly 1.2 GB, two is roughly 600 MB.
+    server_workers: int = Field(default=4, description="uvicorn worker processes")
+
     postgres_pool_min: int = Field(
-        default=2,
-        description="Minimum connections in pool"
+        default=10,
+        # Open before the clinic does. A pool that starts at two spends the
+        # first minute of the day making connections while every room asks
+        # for a grant at once: measured, the first burst of twenty-eight took
+        # 773 ms against a 300 ms promise, and the second took 48 ms. Ten
+        # costs a few megabytes and is warm when the doors open.
+        description="Connections opened at startup, before any request"
     )
     postgres_pool_max: int = Field(
-        default=10,
+        default=20,
         description="Maximum connections in pool"
     )
     

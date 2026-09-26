@@ -397,6 +397,9 @@ def server():
     repo.keys[clinical.key_digest(KEY)] = {"label": "cmed-prod", "revoked": False}
     grant_key = Ed25519PrivateKey.generate()
     receipt_key = Ed25519PrivateKey.generate()
+    # What one server remembers must not leak into the next test: the clinic
+    # mapping and the doctors already written are held in this process.
+    api_v2.forget_directory()
     api_v2.ctx.repo = repo
     api_v2.ctx.minio = FakeBucket()
     api_v2.ctx.grants = GrantIssuer(grant_key)
@@ -495,6 +498,11 @@ async def test_grant_verifies_on_the_recorder_and_names_the_pcs_clinic(server):
     assert (grant.patient_ref, grant.doctor_id, grant.hospital_id) == (
         "P0012345", "DR0042", "HOSP003")
     assert grant.jti == reply["jti"]
+
+    # The directory is written behind the reply, not before it: twenty-eight
+    # rooms opening together would otherwise queue on one another's row locks
+    # for a grant that is promised in 0.3 s. It still has to arrive.
+    await api_v2.directory_writes_done()
     assert ("DR0042", "HOSP003") in server.repo.doctors          # D4: directory, not gate
 
 

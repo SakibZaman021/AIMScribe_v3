@@ -766,7 +766,14 @@ def main():
         host="0.0.0.0",
         port=settings.server_port,
         reload=settings.debug,
-        workers=4  # Multiple workers for production
+        workers=settings.server_workers,
+        # A recorder keeps one connection and uses it every thirty seconds.
+        # uvicorn closes an idle connection after five, and when that lands on
+        # the moment the recorder reuses it the piece fails with "server
+        # disconnected" - the recorder retries and no audio is lost, but the
+        # retry is noise that looks like a fault. Longer than the gap between
+        # pieces, so the connection is still there when it is next needed.
+        timeout_keep_alive=75,
     )
 
 

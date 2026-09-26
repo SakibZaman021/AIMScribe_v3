@@ -216,6 +216,14 @@ services:
       - "${AIMS_HOST_NAME:-host.docker.internal}:host-gateway"
     tmpfs:
       - /tmp:size=4g
+    # A ceiling, so joining yesterday's recordings can never slow down today's.
+    # Merging a 150 MB consultation, encoding it to FLAC and encrypting it is
+    # heavy, and it runs on the same machine as the server: measured against
+    # 28 rooms, a grant went from 19 ms to nearly a second while the worker
+    # was busy. The work still gets done - a few seconds later per recording,
+    # which nobody is waiting on.
+    cpus: 1.5
+    cpu_shares: 512
 
   # CMED's test site. Started only with:  docker compose --profile cmed up -d
   cmed-web:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import time
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -1422,6 +1423,113 @@ def _coded(status: int, code: str, message: str, **extra) -> JSONResponse:
                                  **extra})
 
 
+# CMED's code for a clinic, and the doctors already in the register. Both are
+# read on the way to every grant, and neither changes during a clinic: the
+# mapping is set when a hospital is registered, and a doctor is added once.
+#
+# It matters because a grant is promised inside 0.3 s (SRS 9.1) and the path
+# does its work one query at a time: with 28 rooms opening together, every
+# extra query is 28 more waits for a free connection.
+_CLINIC_CACHE = {}
+_CLINIC_CACHE_SECONDS = 60.0
+_KNOWN_DOCTORS = set()
+_DIRECTORY_WRITES = set()
+
+
+async def directory_writes_done() -> None:
+    """Wait for everything started behind a reply. For tests."""
+    if _AUDIT_QUEUE is not None:
+        await _AUDIT_QUEUE.join()
+    pending = [t for t in _DIRECTORY_WRITES if not t.done()
+               and t.get_coro().__name__ != "_audit_writer"]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def forget_directory() -> None:
+    """Drop what this process remembers about clinics and doctors. For tests."""
+    _CLINIC_CACHE.clear()
+    _KNOWN_DOCTORS.clear()
+
+
+_AUDIT_QUEUE: "Optional[asyncio.Queue]" = None
+
+
+def _audit_behind(repo, **entry) -> None:
+    """
+    Write an audit entry after the reply has gone, through one writer.
+
+    Only for paths promised in milliseconds that already hold a durable record
+    of what happened - a grant has its authorisation row before this is called.
+
+    One writer, not one task each. The audit log is hash-chained and every
+    writer takes the same global lock to keep the chain straight, so handing
+    twenty-eight entries to twenty-eight tasks only moves the queue off the
+    request and into the pool. Queued here, they are written in order by a
+    single consumer, and each request pays nothing.
+    """
+    global _AUDIT_QUEUE
+    if _AUDIT_QUEUE is None:
+        _AUDIT_QUEUE = asyncio.Queue(maxsize=10000)
+        task = asyncio.create_task(_audit_writer(repo))
+        _DIRECTORY_WRITES.add(task)
+        task.add_done_callback(_DIRECTORY_WRITES.discard)
+    try:
+        _AUDIT_QUEUE.put_nowait(entry)
+    except asyncio.QueueFull:
+        # Ten thousand behind: something is very wrong with the database, and
+        # dropping a line of bookkeeping is better than holding up a clinic.
+        logger.error("Audit queue is full; %s was not recorded",
+                     entry.get("event_type"))
+
+
+async def _audit_writer(repo) -> None:
+    """Drain the queue, in order, for as long as the server runs."""
+    assert _AUDIT_QUEUE is not None
+    while True:
+        entry = await _AUDIT_QUEUE.get()
+        try:
+            await repo.audit(**entry)
+        except Exception as exc:
+            logger.warning("Audit entry %s could not be written: %s",
+                           entry.get("event_type"), exc)
+        finally:
+            _AUDIT_QUEUE.task_done()
+
+
+async def _remember_doctor(repo, clinic: str, doctor_id: str) -> None:
+    """
+    Add a doctor to the clinic's directory, once per doctor per server.
+
+    On the request, not behind it. Moving it behind the reply was tried and
+    measured worse: the background write still wants a connection, so a burst
+    of twenty-eight rooms asked the pool for fifty-six at once and every
+    foreground query queued - 43 ms became 585 ms. Guarded by the cache it
+    happens once per doctor, and once is cheap.
+    """
+    key = (clinic, doctor_id)
+    if key in _KNOWN_DOCTORS:
+        return
+    try:
+        await repo.upsert_doctor(doctor_id=doctor_id, hospital_id=clinic,
+                                 full_name=doctor_id, only_if_new=True)
+        _KNOWN_DOCTORS.add(key)
+    except Exception as exc:
+        logger.warning("Could not record doctor %s in the directory: %s",
+                       doctor_id, exc)
+
+
+async def _cmed_clinic(cmed_hospital_id):
+    """Which clinic CMED's code means, remembered for a minute."""
+    cached = _CLINIC_CACHE.get(cmed_hospital_id)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _CLINIC_CACHE_SECONDS:
+        return cached[1]
+    mapped = await _repo().hospital_for_cmed_id(cmed_hospital_id)
+    _CLINIC_CACHE[cmed_hospital_id] = (now, mapped)
+    return mapped
+
+
 async def _clinic_for(cmed_hospital_id: str, device: Dict[str, Any]) -> Optional[str]:
     """
     The clinic a grant is issued for: always the device's own (decision D1).
@@ -1433,7 +1541,7 @@ async def _clinic_for(cmed_hospital_id: str, device: Dict[str, Any]) -> Optional
     filed under either clinic would be labelled wrongly (SRS-GRT-10).
     """
     own = device["hospital_id"]
-    mapped = await _repo().hospital_for_cmed_id(cmed_hospital_id)
+    mapped = await _cmed_clinic(cmed_hospital_id)
     if mapped is not None:
         return own if mapped == own else None
     return own if cmed_hospital_id == own else None
@@ -1476,12 +1584,13 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
     # Decision D4: the doctor register is a directory, not a gate. CMED
     # authenticates its own doctors, and its API 2 now proves the consultation;
     # refusing a doctor new to this server stopped real consultations before.
-    try:
-        await repo.upsert_doctor(doctor_id=visit.doctor_id, hospital_id=clinic,
-                                 full_name=visit.doctor_id, only_if_new=True)
-    except Exception as exc:
-        logger.warning("Could not record doctor %s in the directory: %s",
-                       visit.doctor_id, exc)
+    # Not awaited. The directory is a convenience (decision D4), while the
+    # grant is promised inside 0.3 s - and when a clinic opens, every room
+    # asks at once. Twenty-eight rooms writing the same doctor's row together
+    # queue behind one another's locks: measured, 13 ms became 402 ms, and
+    # under upload load it broke the promise outright. Written behind the
+    # reply instead, once per doctor per server.
+    await _remember_doctor(repo, clinic, visit.doctor_id)
 
     now = datetime.now(timezone.utc)
     jti = new_jti()
@@ -1497,9 +1606,16 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         jti=jti, patient_ref=visit.patient_id, doctor_id=visit.doctor_id,
         hospital_id=clinic, cmed_hospital_id=visit.cmed_hospital_id,
         start_time=visit.start_time, visit_date=visit.visit_date, confirmation=state)
-    await repo.audit(event_type="grant.issued", actor_type="device",
-                     actor_id=visit.doctor_id, device_id=device["device_id"],
-                     detail={"hospital_id": clinic, "confirmation": state})
+    # Behind the reply, like the directory above. The audit log is hash-chained
+    # and every writer takes one global lock to keep the chain straight, so
+    # twenty-eight rooms opening together queue on it: measured, that lock alone
+    # took a grant from 43 ms to 587 ms and broke the 0.3 s promise (SRS 9.1).
+    # Nothing is lost by moving it: the grant's durable record is the
+    # authorisation row written above, and the audit entry follows it within
+    # milliseconds. Every other path still audits before answering.
+    _audit_behind(repo, event_type="grant.issued", actor_type="device",
+                  actor_id=visit.doctor_id, device_id=device["device_id"],
+                  detail={"hospital_id": clinic, "confirmation": state})
     return {"status": 200, "code": "GRANTED", "grant": token, "jti": jti,
             "confirmation": state, "hospital_id": clinic,
             "expires_in": ctx.grants.lifetime}
