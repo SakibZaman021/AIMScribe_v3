@@ -34,6 +34,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: aimscribe-v3-postgres
+    mem_limit: ${AIMS_PG_MEMORY:-1g}
     labels:
       com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
@@ -64,6 +65,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aimscribe-v3-redis
+    mem_limit: ${AIMS_REDIS_MEMORY:-256m}
     labels:
       com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
@@ -84,6 +86,13 @@ services:
   minio:
     image: minio/minio:latest
     container_name: aimscribe-v3-storage
+    # Measured: 768 MB is not enough. Under 28 rooms uploading 6 GB in a
+    # minute and a half, MinIO could not take the pieces - 'upload of
+    # piece failed', repeatedly - and the machine went down with it. It
+    # buffers and caches in proportion to what is arriving, so on a small
+    # server the honest answer is not to run it there at all: send pieces
+    # to Cloudflare R2 and keep the memory for the database.
+    mem_limit: ${AIMS_STORAGE_MEMORY:-2g}
     labels:
       com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
@@ -126,6 +135,8 @@ services:
       dockerfile: docker/Dockerfile
     image: aimscribe/api:3.3
     container_name: aimscribe-v3-server
+    # The shape a 4 GB server runs, so this bench measures that machine.
+    mem_limit: ${AIMS_API_MEMORY:-1g}
     labels:
       com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped
@@ -143,6 +154,7 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       SERVER_HOST: 0.0.0.0
+      SERVER_WORKERS: ${AIMS_SERVER_WORKERS:-2}
       # Not 6000. Browsers and Node's fetch both refuse that port - it is
       # X11's - so CMED's page could not deliver API 2 to it from inside
       # this network any more than Chrome could open the dashboard.
@@ -190,6 +202,7 @@ services:
     build: ../../backend/archive_worker
     image: aimscribe/archive-worker:3.3
     container_name: aimscribe-v3-archive-worker
+    mem_limit: ${AIMS_ARCHIVE_MEMORY:-768m}
     labels:
       com.aimslab.system: "aimscribe-v3"
     restart: unless-stopped

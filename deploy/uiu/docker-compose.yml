@@ -42,6 +42,7 @@ services:
   gateway:
     image: caddy:2.8-alpine
     container_name: aims-gateway
+    mem_limit: ${AIMS_GATEWAY_MEMORY:-256m}
     <<: *hardening
     ports:
       - "80:80"
@@ -65,6 +66,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: aims-postgres
+    mem_limit: ${AIMS_PG_MEMORY:-8g}
     <<: *hardening
     environment:
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-aims_admin}
@@ -84,11 +86,15 @@ services:
       - config_file=/etc/postgresql/postgresql.conf
     volumes:
       - ${AIMS_DB_PATH:?set AIMS_DB_PATH in .env}:/var/lib/postgresql/data
-      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      # AIMS_PG_CONF picks the profile: postgresql.conf for the recommended
+      # machine, postgresql.4gb.conf where AIMScribe has about 4 GB in all.
+      # The large one cannot start on a small machine - its shared_buffers
+      # alone is 16 GB - so this is the first thing to set on a small server.
+      - ${AIMS_PG_CONF:-./postgres/postgresql.conf}:/etc/postgresql/postgresql.conf:ro
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - ./postgres/schema:/aims/baseline:ro
       - ../../backend/scripts:/aims/scripts:ro
-    shm_size: 1gb
+    shm_size: ${AIMS_PG_SHM:-1gb}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
       interval: 10s
@@ -104,6 +110,7 @@ services:
     build: ./pgbouncer
     image: aimscribe/pgbouncer:3.3
     container_name: aims-pgbouncer
+    mem_limit: ${AIMS_PGBOUNCER_MEMORY:-128m}
     <<: *hardening
     environment:
       DB_HOST: postgres
@@ -132,6 +139,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aims-redis
+    mem_limit: ${AIMS_REDIS_MEMORY:-256m}
     <<: *hardening
     command:
       - redis-server
@@ -163,9 +171,14 @@ services:
       dockerfile: docker/Dockerfile
     image: aimscribe/api:3.3
     container_name: aims-api
+    mem_limit: ${AIMS_API_MEMORY:-2g}
     <<: *hardening
     env_file: [.env]
     environment:
+      # Each worker is a whole Python process with its own connection
+      # pool: four is about 1.2 GB, two about 600 MB. Two on a 4 GB
+      # machine, four on the recommended one.
+      SERVER_WORKERS: ${AIMS_SERVER_WORKERS:-4}
       # Through the pooler, in transaction mode - which is why the driver's
       # statement cache is turned off (AIMS_DB_POOLER).
       POSTGRES_HOST: pgbouncer
@@ -210,6 +223,7 @@ services:
       dockerfile: docker/Dockerfile.worker
     image: aimscribe/worker:3.3
     container_name: aims-worker
+    mem_limit: ${AIMS_TRANSCRIBE_MEMORY:-1g}
     <<: *hardening
     env_file: [.env]
     environment:
@@ -239,6 +253,12 @@ services:
     build: ../../backend/archive_worker
     image: aimscribe/archive-worker:3.3
     container_name: aims-archive-worker
+    # A ceiling and a share of the machine: merging a 150 MB
+    # consultation, encoding FLAC and encrypting it is heavy, and
+    # it runs beside the server. It must never be why today's
+    # grant is late.
+    mem_limit: ${AIMS_ARCHIVE_MEMORY:-1g}
+    cpus: ${AIMS_ARCHIVE_CPUS:-2}
     <<: *hardening
     environment:
       # Inside the machine, so it does not go out to the internet and back.
@@ -273,6 +293,7 @@ services:
   backup:
     image: postgres:16-alpine
     container_name: aims-backup
+    mem_limit: ${AIMS_BACKUP_MEMORY:-512m}
     <<: *hardening
     entrypoint: ["/bin/sh", "/opt/aims/backup.sh"]
     environment:
@@ -303,6 +324,7 @@ services:
     build: ./monitor
     image: aimscribe/monitor:3.3
     container_name: aims-monitor
+    mem_limit: ${AIMS_MONITOR_MEMORY:-256m}
     <<: *hardening
     environment:
       AIMS_MONITOR_DSN: postgresql://aims_monitor:${AIMS_MONITOR_PASSWORD}@postgres:5432/aims_recordings
