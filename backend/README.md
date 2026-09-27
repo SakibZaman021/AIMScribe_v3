@@ -1,5 +1,22 @@
 # AIMScribe Backend
 
+> **This file predates v3 and describes the Render deployment it was written for.**
+> It came in with the baseline commit and no phase has revised it. Where it and
+> the v3 deployment disagree, **v3 wins**:
+>
+> | This file says | v3 |
+> |---|---|
+> | `D:\AIMSLAB_AUDIO_STORAGE` on a Windows box | `AIMS_ARCHIVE_PATH`, `/srv/aims/archive` on Ubuntu, mounted at `/archive` |
+> | Hosted on Render, database on Neon | One Docker Compose stack on the UIU server |
+> | WAV plus a manifest | WAV, `.manifest.json` **and the clinical `.json`** beside it |
+> | One database | `aims_recordings` and `aims_clinical`, separate roles |
+>
+> For how the system is actually deployed, read
+> [`deploy/uiu/README.md`](../deploy/uiu/README.md),
+> [`deploy/uiu/SIZING_AND_DEPLOYMENT.md`](../deploy/uiu/SIZING_AND_DEPLOYMENT.md)
+> and [`DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md). This file is kept for the
+> v1 pipeline it still documents accurately.
+
 The server side of AIMScribe: clinical consultation recording for AIMS LAB.
 
 This service does **two separate jobs** that share a database and are otherwise

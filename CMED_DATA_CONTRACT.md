@@ -82,9 +82,55 @@ built. It is how the prescription finds its consultation.
 }
 ```
 
-**Required:** `demographics` must be an object. `previous_visit` must be
-present — **send `null` for a first visit**, do not omit the key. That
-distinction is how we tell "first visit" from "CMED forgot".
+**Required:** `demographics` must be an object, on **every** visit — first,
+second, tenth. `previous_visit` must be present as a key; **send `null` when
+there is no prior visit to give**, rather than omitting it. That distinction is
+how we tell "nothing to send" from "CMED forgot".
+
+### When to send `previous_visit` — the history rule
+
+`previous_visit` is a **backfill**, not a repeat. It exists so a prior
+consultation we never saw still reaches us.
+
+| Visit | What AIMS LAB already holds | What CMED sends |
+|---|---|---|
+| 1st | nothing | demographics + this visit. `previous_visit: null` |
+| 2nd, and we **do not** hold the 1st | nothing | demographics + this visit + **`previous_visit` = the 1st** |
+| 2nd, and we **do** hold the 1st | visit 1 | demographics + this visit. `previous_visit: null` |
+| 3rd onward | visits 1…n-1 | demographics + this visit. `previous_visit: null` |
+
+Demographics and the current prescription are sent every time regardless. Only
+the backfill is conditional.
+
+**Re-sending costs nothing, and this matters.** Three database constraints make
+a repeat harmless: `intake_once` keeps one row per body, `encounter_once` keeps
+one encounter per patient, doctor, clinic, time and visit date, and
+`prescription_version_once` keeps one prescription per version. A
+`previous_visit` delivered twice updates one row; it never duplicates a visit or
+a medicine.
+
+**So the conditional rule is an optimisation, and it carries one risk worth
+naming.** CMED decides from *its own* record of what it has sent. Ours can
+differ: a message that failed its schema check sits in quarantine, a
+consultation the patient refused is erased within five minutes, and a database
+restored from a backup loses whatever arrived after it. In each case CMED
+believes we hold visit n-1 and we do not — and because nothing asks, the gap is
+permanent and silent. That is the failure mode the unconditional version does
+not have.
+
+Two ways to keep the optimisation without the risk, and one of them has to be
+built:
+
+1. **CMED asks instead of remembering.** A read endpoint that answers which
+   visit dates we hold for a patient. CMED's decision then rests on our state,
+   not its memory. *This does not exist yet — it is the one piece the rule needs.*
+2. **The nightly reconciliation reports the gap.** `SRS-CRI-10` already compares
+   records against recordings each night; it should also flag a patient whose
+   history has a hole — visit n present, n-1 absent — so a missed backfill is
+   found the next morning rather than never.
+
+Until one of those is in place, **sending `previous_visit` on every returning
+patient is the safer default**, and it costs about two kilobytes.
 
 ### Accepted values
 

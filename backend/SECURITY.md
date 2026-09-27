@@ -56,7 +56,8 @@ Tracked and disclosed deliberately:
 
 - `/api/v1` routes are unauthenticated.
 - `AIMSCRIBE_WEBHOOK_SECRET` is hardcoded and needs rotating.
-- `D:\AIMSLAB_AUDIO_STORAGE` has no backup.
+- `D:\AIMSLAB_AUDIO_STORAGE` has no backup. (v3: `/srv/aims/archive`, RAID with a
+  nightly encrypted copy off the machine.)
 - Agent binaries are not yet Authenticode-signed.
 
 ## Handling secrets

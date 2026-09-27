@@ -186,7 +186,7 @@ Runs on the AIMS LAB server, not on Render. It listens on nothing.
 ```powershell
 $env:AIMS_BACKEND_URL  = "https://aimscribe-backend-render.onrender.com"
 $env:AIMS_WORKER_KEY   = "<worker key>"
-$env:AIMS_ARCHIVE_ROOT = "D:\AIMSLAB_AUDIO_STORAGE"
+$env:AIMS_ARCHIVE_ROOT = "D:\AIMSLAB_AUDIO_STORAGE"   # v3 on the UIU server: /srv/aims/archive
 python archive_worker\worker.py
 ```
 
