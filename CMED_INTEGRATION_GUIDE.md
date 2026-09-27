@@ -100,7 +100,7 @@ Only these two are accepted from the page:
   "trigger": {
     "patient_id":  "P0012345",
     "doctor_id":   "DR0042",
-    "hospital_id": "HOSP003",
+    "hospital_id": "AALO_DHOLPUR",
     "start_time":  "2026-09-13T10:14:32+06:00",   // with time zone
     "date":        "2026-09-13"
   }
@@ -168,7 +168,7 @@ retries are safe and produce one row, never two.
 | The **CMED Channel B key** | `POST /api/v2/admin/cmed-key` — shown **once** |
 | The recorder's port and path | `ws://127.0.0.1:5050/ws` — the same on every PC |
 | The **local API key** for the HTTP routes | Generated per install, in that PC's `.env` |
-| The clinic identifiers | `HOSP001`…`HOSP007` |
+| The clinic identifiers | `AALO_KARAIL`, `AALO_MIRPUR`, `AALO_DHOLPUR`, `AALO_SHYAMPUR`, `AALO_NARAYANGANJ`, `AALO_ERSHADNAGAR`, `AMADER_SUSASTHO` |
 | This guide and the data contract | |
 
 ### CMED gives AIMS LAB
@@ -176,7 +176,7 @@ retries are safe and produce one row, never two.
 | Item | Why |
 |---|---|
 | **The exact origin(s) of its page** | Goes into `AIMS_ALLOWED_ORIGINS`. Without it the socket refuses to open |
-| **Its own clinic identifiers** | Mapped to ours as `cmed_hospital_id`. **Until a clinic is mapped, recordings for it are refused** |
+| **Its own clinic identifiers** | Mapped to ours as `cmed_hospital_id`. An unmapped clinic is **not** refused — worse, it is silently accepted: the clinical record is stored, CMED gets `202 ACCEPTED`, but no confirmation is written and the **recording is erased after 24 hours** |
 | A server IP or range, if we are to allow-list it | Optional, for Channel B |
 
 ---
@@ -190,8 +190,8 @@ Bench values on the AIMS LAB laptop. The UIU server gets its own.
 | AIMS LAB server | `http://localhost:6060` (bench) → `https://aimscribe.uiu.ac.bd` |
 | Recorder socket | `ws://127.0.0.1:5050/ws` |
 | `AIMS_ALLOWED_ORIGINS` | must list CMED's exact origins — **currently only the bench page** |
-| Clinics registered | `HOSP001` Karail · `HOSP002` Mirpur · `HOSP003` Dholpur · `HOSP004` Shyampur · `HOSP005` Narayanganj · `HOSP006` Ershadnagar · `HOSP007` Amader Susastho |
-| `cmed_hospital_id` mapped | **HOSP003 only.** The other six are unmapped and will refuse recordings |
+| Clinics registered | `AALO_KARAIL` · `AALO_MIRPUR` · `AALO_DHOLPUR` · `AALO_SHYAMPUR` · `AALO_NARAYANGANJ` · `AALO_ERSHADNAGAR` · `AMADER_SUSASTHO` |
+| `cmed_hospital_id` | Each clinic is mapped to **its own code**, as a placeholder. If CMED uses different identifiers, send them and we remap |
 
 **Not port 6000.** Browsers and Node both refuse it. The server uses 6060
 internally and 443 at the edge.
