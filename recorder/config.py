@@ -155,17 +155,23 @@ class SegmentConfig:
     anyway, so nothing is lost by cutting often - and a great deal is gained. A
     clip is the unit of upload, retry and loss: at three minutes, a failure put
     three minutes of a consultation at risk and held the rest of the session
-    behind it. At a minute, the exposure is a minute, transcripts start arriving
-    while the doctor is still talking, and a poor connection recovers in smaller
-    steps.
+    behind it. At a minute and a half, the exposure is a minute and a half,
+    transcripts start arriving while the doctor is still talking, and a poor
+    connection recovers in smaller steps.
+
+    30 to 90 seconds, cutting on a one-second gap. The window is wide on purpose:
+    a longer window means more chances to find a real pause, and a cut inside a
+    pause is the only cut that cannot land inside a word. A narrow window with a
+    demanding gap does the opposite - it finds nothing and is forced at the
+    ceiling, which is the one cut that can split a word.
     """
     min_seconds: float = 30.0
-    max_seconds: float = 60.0
+    max_seconds: float = 90.0
     # Speech rarely stops on cue. Rather than cut a talker mid-sentence at the
     # maximum, keep listening this much longer for somewhere natural to cut.
-    grace_seconds: float = 15.0
+    grace_seconds: float = 30.0
     silence_rms: int = 320          # linear RMS, 0-32767; ~-40 dBFS
-    silence_hold_seconds: float = 3.0
+    silence_hold_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -309,10 +315,10 @@ class Config:
 
         segment = SegmentConfig(
             min_seconds=_float("AIMS_SEGMENT_MIN_SECONDS", 30.0),
-            max_seconds=_float("AIMS_SEGMENT_MAX_SECONDS", 60.0),
-            grace_seconds=_float("AIMS_SEGMENT_GRACE_SECONDS", 15.0),
+            max_seconds=_float("AIMS_SEGMENT_MAX_SECONDS", 90.0),
+            grace_seconds=_float("AIMS_SEGMENT_GRACE_SECONDS", 30.0),
             silence_rms=_int("AIMS_SILENCE_RMS", 320),
-            silence_hold_seconds=_float("AIMS_SILENCE_HOLD_SECONDS", 3.0),
+            silence_hold_seconds=_float("AIMS_SILENCE_HOLD_SECONDS", 1.0),
         )
 
         spool = SpoolConfig(

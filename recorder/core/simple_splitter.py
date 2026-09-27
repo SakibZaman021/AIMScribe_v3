@@ -80,6 +80,16 @@ class SealedSegment:
     captured_end_at: datetime
     rms_mean: float
     is_final: bool
+    # How this clip's end was chosen, and how much silence sat on each side of
+    # it. Recorded rather than trusted: "no word was split" is a claim that has
+    # to be measurable over a clinic day, not a belief about the algorithm.
+    #   gap      a full pause was found inside the window   - the good case
+    #   relaxed  past the maximum, half a pause accepted
+    #   quiet    no pause; cut at a verified non-speech dip
+    #   forced   nothing safe existed by the absolute ceiling
+    #   final    end of the consultation, or a pause boundary
+    cut_kind: str = "final"
+    cut_margin_ms: float = 0.0
 
 
 class _Command:
@@ -111,7 +121,7 @@ class Segmenter:
         silence_rms: int,
         silence_hold_seconds: float,
         on_segment: Callable[[SealedSegment], None],
-        queue_depth: int = 512,
+        queue_depth: int = 2048,
     ):
         self.bytes_per_second = sample_rate * channels * sample_width
         self.sample_width = sample_width
@@ -121,6 +131,12 @@ class Segmenter:
         # target length but still being given a chance to end on a quiet patch
         # rather than in the middle of a word.
         self.hard_bytes = int((max_seconds + grace_seconds) * self.bytes_per_second)
+        # Past the grace the clip is overdue, but a blind cut is the only thing
+        # that can split a word, so it is not what happens next: the clip runs
+        # on, looking for a dip that is verifiably not speech. This is where
+        # that search finally gives up. One more grace period, and no further -
+        # unbounded growth would be a memory leak wearing a safety jacket.
+        self.abs_bytes = self.hard_bytes + int(grace_seconds * self.bytes_per_second)
         # `silence_rms` is now a floor rather than the whole test. A fixed
         # threshold cannot work across a quiet consulting room and one with a
         # fan and a corridor outside: set low, the noisy room never cuts and
@@ -187,6 +203,8 @@ class Segmenter:
         self._frames: list = []
         self._framed_bytes = 0
         self._silence_started_at_offset: Optional[int] = None
+        # Says the 'holding the clip open' note once per clip, not per chunk.
+        self._overrun_logged = False
 
         self.segments_emitted = 0
         self.dropped_chunks = 0
@@ -300,22 +318,42 @@ class Segmenter:
                     else self.silence_hold_bytes)
         if (self._silence_bytes >= required
                 and self._silence_started_at_offset is not None):
+            # Cut in the middle of the pause, never at its edge. With a
+            # one-second hold that leaves half a second of silence on each side,
+            # and a word is not half a second long: inter-word pauses run
+            # 50-200 ms and between sentences 300-800 ms. The margin is what
+            # makes the guarantee, so it is measured and carried forward.
             middle = self._silence_started_at_offset + self._silence_bytes // 2
-            logger.debug("Pause at %.1f s; cutting inside it at %.1f s",
-                         size / self.bytes_per_second, middle / self.bytes_per_second)
-            self._seal(is_final=False, cut_at=middle)
+            margin = (self._silence_bytes // 2) / self.bytes_per_second * 1000.0
+            kind = "relaxed" if size >= self.max_bytes else "gap"
+            logger.debug("Pause at %.1f s; cutting inside it at %.1f s (%.0f ms clear)",
+                         size / self.bytes_per_second,
+                         middle / self.bytes_per_second, margin)
+            self._seal(is_final=False, cut_at=middle, cut_kind=kind,
+                       cut_margin_ms=margin)
             return
 
-        # Out of grace. The clip has to end, but not just anywhere: the quietest
-        # moment in the last couple of seconds is far more likely to be a gap
-        # between words than the arbitrary point the ceiling falls on.
+        # Out of grace, and no pause has come. Rather than cut at the ceiling
+        # wherever the words happen to be, look for a moment the frame analysis
+        # already judged to be silence - not merely the quietest speech - and
+        # keep running if there is not one.
         if size >= self.hard_bytes:
-            cut = self._quietest_offset_near_end()
-            logger.debug("Segment reached its ceiling at %.1f s; cutting at the "
-                         "quietest point, %.1f s",
+            last_resort = size >= self.abs_bytes
+            cut = self._quietest_offset_near_end(safe_only=not last_resort)
+            if cut is None and not last_resort:
+                # Nothing safe to cut on yet. Keep listening: the clip is long,
+                # which costs a little memory, and that is the cheaper mistake.
+                if not self._overrun_logged:
+                    self._overrun_logged = True
+                    logger.info("No safe cut by %.0f s; holding the clip open "
+                                "rather than cutting inside speech",
+                                size / self.bytes_per_second)
+                return
+            kind = "forced" if last_resort and cut is None else "quiet"
+            logger.debug("Segment reached %.1f s; cutting at %.1f s (%s)",
                          size / self.bytes_per_second,
-                         (cut or size) / self.bytes_per_second)
-            self._seal(is_final=False, cut_at=cut)
+                         (cut or size) / self.bytes_per_second, kind)
+            self._seal(is_final=False, cut_at=cut, cut_kind=kind)
 
     # ---- listening ----
 
@@ -389,7 +427,7 @@ class Segmenter:
                 self._silence_bytes = 0
                 self._silence_started_at_offset = None
 
-    def _quietest_offset_near_end(self) -> Optional[int]:
+    def _quietest_offset_near_end(self, *, safe_only: bool = False) -> Optional[int]:
         """
         The end of the quietest frame in the recent past, if there is a real dip.
 
@@ -399,12 +437,21 @@ class Segmenter:
         the "quietest" of those would just cut early for no benefit - and, with
         ties, as early as the window allows.
 
+        `safe_only` restricts the search to frames the analysis already judged to
+        be silence - which excludes the unvoiced consonants the zero-crossing
+        guard catches, because those are quiet and belong to the word beside
+        them. It returns None rather than offer a cut inside speech, and the
+        caller then lets the clip run on. Without it, "quietest" means only
+        "least loud", and the least loud moment of continuous speech is
+        somewhere in the middle of a word.
+
         Returns None when the recent audio is uniformly loud, and the caller
         then cuts at the ceiling as before.
         """
         earliest = len(self._buffer) - self.lookback_bytes
-        window = [(offset, rms) for offset, rms, _ in self._frames
-                  if offset >= earliest and offset >= self.min_bytes]
+        window = [(offset, rms) for offset, rms, speech in self._frames
+                  if offset >= earliest and offset >= self.min_bytes
+                  and not (safe_only and speech)]
         if len(window) < 3:
             return None
 
@@ -420,7 +467,8 @@ class Segmenter:
         ceiling = quietest * 1.2
         return max(offset for offset, rms in window if rms <= ceiling)
 
-    def _seal(self, *, is_final: bool, cut_at: Optional[int] = None) -> None:
+    def _seal(self, *, is_final: bool, cut_at: Optional[int] = None,
+              cut_kind: str = "final", cut_margin_ms: float = 0.0) -> None:
         """
         Emit the clip, optionally cutting at a chosen point.
 
@@ -454,6 +502,7 @@ class Segmenter:
         self._silence_started_at_offset = None
         self._frames = []
         self._framed_bytes = 0
+        self._overrun_logged = False
         self._rms_weighted_sum = 0.0
         self._rms_samples = 0
         self._segment_started_at = ended
@@ -465,6 +514,8 @@ class Segmenter:
                 captured_end_at=ended,
                 rms_mean=mean_rms,
                 is_final=is_final,
+                cut_kind=cut_kind,
+                cut_margin_ms=cut_margin_ms,
             ))
             self.segments_emitted += 1
         except Exception as exc:

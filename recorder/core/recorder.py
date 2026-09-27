@@ -72,9 +72,11 @@ class AudioRecorder:
     for exactly this and does a single queue put.
     """
 
-    # ~23 s of audio at 44.1 kHz with 2048-frame buffers. Deep enough that a brief
-    # disk or GC stall cannot cost frames, shallow enough to bound memory.
-    QUEUE_DEPTH = 512
+    # ~95 s of audio at 44.1 kHz with 2048-frame buffers, about 8 MB. Deep enough
+    # that a disk or GC stall cannot cost frames, shallow enough to bound memory.
+    # Not read anywhere: `Segmenter.queue_depth` is the value that applies. Kept
+    # in step with it so this does not document a depth the system does not use.
+    QUEUE_DEPTH = 2048
 
     def __init__(
         self,

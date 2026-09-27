@@ -487,3 +487,85 @@ def test_the_clips_reassemble_into_the_original_recording_byte_for_byte():
         f"{len(source) - len(rebuilt)} bytes of the recording went missing")
     assert hashlib.sha256(rebuilt).digest() == hashlib.sha256(source).digest(), \
         "the audio that came out is not the audio that went in"
+
+
+# ============================================================
+# The guarantee: a cut never lands inside a word
+# ============================================================
+
+def test_continuous_speech_is_held_open_rather_than_cut_inside_a_word():
+    """
+    The one cut that can split a word is the blind one at the ceiling.
+
+    Given speech with no pause in it, the clip must run past its ceiling looking
+    for a moment that is verifiably not speech, rather than cut wherever the
+    ceiling happens to fall. It gives up only at the absolute limit, one further
+    grace period later.
+    """
+    collected = []
+    segmenter = _segmenter(collected, min_seconds=1.0, max_seconds=2.0,
+                           grace_seconds=1.0, silence_hold_seconds=0.4)
+    # hard ceiling 3.0 s, absolute ceiling 4.0 s
+    segmenter.start(datetime.now(timezone.utc))
+    try:
+        segmenter.submit(_speech(3.4))         # past the ceiling, never quiet
+        time.sleep(0.8)
+        assert not collected, (
+            "cut inside continuous speech at the ceiling - that splits a word")
+
+        segmenter.submit(_speech(1.0))         # now past the absolute ceiling
+        _wait_for(collected)
+        assert collected, "the absolute ceiling must still end the clip"
+        assert collected[0].cut_kind in ("forced", "quiet")
+    finally:
+        segmenter.stop(seal_remaining=False)
+
+
+def test_a_gap_cut_records_the_silence_it_left_on_each_side():
+    """
+    'No word was split' has to be measurable over a clinic day, not asserted.
+
+    Every clip carries how its end was chosen and how much silence sat either
+    side of the cut, so the claim can be counted rather than believed.
+    """
+    collected = []
+    segmenter = _segmenter(collected, min_seconds=1.0, max_seconds=6.0,
+                           silence_hold_seconds=0.4)
+    segmenter.start(datetime.now(timezone.utc))
+    try:
+        segmenter.submit(_speech(1.5))
+        segmenter.submit(_room_tone(1.0))
+        segmenter.submit(_speech(1.0))
+        _wait_for(collected)
+
+        clip = collected[0]
+        assert clip.cut_kind == "gap", f"cut was {clip.cut_kind}, not a real pause"
+        # Cut at the middle of the pause, so at least half the required hold is
+        # clear on each side - comfortably more than the 50-200 ms between words.
+        assert clip.cut_margin_ms >= 200, f"only {clip.cut_margin_ms:.0f} ms clear"
+    finally:
+        segmenter.stop(seal_remaining=False)
+
+
+def test_a_quiet_consonant_is_never_offered_as_a_forced_cut_point():
+    """
+    A fricative is quiet and belongs to the word beside it. When the search for
+    a cut point is restricted to safe moments, it must not be chosen.
+    """
+    collected = []
+    segmenter = _segmenter(collected, min_seconds=0.5, max_seconds=1.0,
+                           grace_seconds=1.0, silence_hold_seconds=0.5)
+    segmenter.start(datetime.now(timezone.utc))
+    try:
+        segmenter.submit(_speech(0.8))
+        segmenter.submit(_fricative(0.5))
+        segmenter.submit(_speech(0.6))
+        time.sleep(0.5)
+        # The safe search must reject the fricative; anything sealed here would
+        # have been cut inside a word.
+        safe = segmenter._quietest_offset_near_end(safe_only=True)
+        loose = segmenter._quietest_offset_near_end(safe_only=False)
+        assert safe is None or safe != loose, (
+            "the safe search offered the same point as the loose one")
+    finally:
+        segmenter.stop(seal_remaining=False)
