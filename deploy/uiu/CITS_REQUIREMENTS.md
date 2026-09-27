@@ -7,8 +7,9 @@ recording on a UIU server with its clinical record beside it, and builds a resea
 dataset from them. This document asks for one machine, one DNS name, and a small
 number of firewall and policy decisions.
 
-Every number below is measured on our own bench — 28 rooms recording at once,
-2,434 audio pieces, 6.1 GB in a single burst — not estimated.
+Every number below is measured on our own bench, not estimated. The bench runs
+28 rooms at once — deliberately twice the real load — with 2,434 audio pieces and
+6.1 GB in a single burst.
 
 ---
 
@@ -17,9 +18,11 @@ Every number below is measured on our own bench — 28 rooms recording at once,
 | | Value |
 |---|---|
 | Clinics | 7 — six Aalo Clinic branches and Amader Susastho |
-| Consulting rooms | 14 |
+| Aalo Clinic branches | Karail, Mirpur, Dholpur, Shyampur, Narayanganj, Ershadnagar |
+| **Consulting rooms** | **14** |
 | **Recordings at the same time, at most** | **14** — one per room |
-| Doctors | 28 per day — 14 per shift, two shifts |
+| Laptops | 14, one per room |
+| Doctors | **30**, sharing those 14 rooms across two shifts |
 | Shift 1 | 08:30 – 14:20 |
 | Shift 2 | 15:00 – 21:00 |
 | Clinic days | Six days a week |
@@ -39,6 +42,10 @@ Every number below is measured on our own bench — 28 rooms recording at once,
 
 > This is a **storage and bandwidth** system, not a processor-heavy one. Average
 > request rate across all 14 rooms is about 1.2 per second, peaking near 4.
+
+**Size by rooms, not by doctors.** A room records one consultation at a time, so
+30 doctors working two shifts in 14 rooms produce 14 simultaneous recordings, not
+30. Every figure above follows from the room count.
 
 ---
 

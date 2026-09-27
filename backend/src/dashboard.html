@@ -84,6 +84,7 @@
 </header>
 
 <main>
+  <div class="empty" id="emptyNote" style="display:none"></div>
   <div class="cards" id="cards"></div>
 
   <section>
@@ -170,6 +171,14 @@ function drawCards(data) {
   const v = data.volume, c = data.confirmation.totals || {},
         i = data.integrity, r = data.recorders, x = data.reconciliation,
         p = data.copies;
+
+  // An empty range is a fact worth stating. Silent zeroes in every card look
+  // exactly like a dashboard that failed to load, and that is how it was read.
+  $("emptyNote").style.display = v.total_recordings ? "none" : "block";
+  $("emptyNote").textContent =
+    `No recordings between ${$("from").value} and ${$("to").value}` +
+    ($("clinic").value ? ` for ${$("clinic").selectedOptions[0].textContent}` : "") +
+    `. Widen the dates, or choose a different clinic — the page itself is fine.`;
 
   $("cards").innerHTML = [
     card("Recordings", figure(v.total_recordings, `${v.total_hours} hours`) +
@@ -338,8 +347,19 @@ async function refresh() {
   }
 }
 
+// Seven days back. The dashboard answers "is anything wrong today", and today
+// is still in the range - but a clinic that has not started yet, or a morning
+// before the first consultation, used to open on an entirely empty page. An
+// empty page reads as a broken one, and the week costs nothing to fetch.
+const daysAgo = (days) => {
+  const then = new Date();
+  then.setDate(then.getDate() - days);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${then.getFullYear()}-${pad(then.getMonth() + 1)}-${pad(then.getDate())}`;
+};
+
 async function start() {
-  $("from").value = today();
+  $("from").value = daysAgo(6);
   $("to").value = today();
   try {
     const { clinics } = await api("/clinics", {});
