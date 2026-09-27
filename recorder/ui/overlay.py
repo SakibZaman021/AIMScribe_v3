@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import sys
 import threading
 from typing import Any, Dict, Optional
 
@@ -56,6 +57,77 @@ WIDTH, HEIGHT = 258, 84        # grows by one line when there is something to sa
 NOTE_HEIGHT = 20
 STOP_SIZE = 50
 PAUSE_W, PAUSE_H = 74, 40
+
+
+SCALE = 1.0                    # display scale, set once by _enable_dpi_awareness()
+
+
+def _enable_dpi_awareness() -> float:
+    """
+    Tell Windows this process draws its own pixels, and return the display scale.
+
+    Without this, Windows bitmap-stretches the entire window at any scaling above
+    100%: every glyph and every curve is resampled by the compositor, which is
+    exactly the soft, smeared card seen at 125%. Nothing in the drawing code can
+    fix it, because the blurring happens after the drawing is finished.
+
+    Per-monitor v2 is asked for first, so the card stays sharp if it is moved to
+    a second screen at a different scaling. Each call is tried in turn because
+    the newer entry points do not exist on older Windows, and a recorder must
+    start on whatever the clinic has.
+    """
+    global SCALE
+    if sys.platform != "win32":
+        return 1.0
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    attempts = (
+        lambda: user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)),  # per-monitor v2
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),             # per-monitor
+        lambda: user32.SetProcessDPIAware(),                                # system-wide
+    )
+    for attempt in attempts:
+        try:
+            if attempt():
+                break
+        except Exception:
+            continue
+
+    dpi = 96
+    try:
+        dpi = user32.GetDpiForSystem() or 96
+    except Exception:
+        try:
+            dc = user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88) or 96   # LOGPIXELSX
+            user32.ReleaseDC(0, dc)
+        except Exception:
+            pass
+
+    SCALE = max(1.0, min(3.0, dpi / 96.0))
+    return SCALE
+
+
+def _apply_scale() -> None:
+    """
+    Grow the card to match the display scale.
+
+    Once the process is DPI-aware Windows stops scaling it, so the same pixel
+    figures that looked right at 100% would draw a card a fifth smaller at 125%.
+    These are the only place sizes are written down, so scaling them here is
+    enough; fonts are given in points and follow `tk scaling` instead.
+    """
+    global WIDTH, HEIGHT, NOTE_HEIGHT, STOP_SIZE, PAUSE_W, PAUSE_H
+    if SCALE == 1.0:
+        return
+    WIDTH = round(WIDTH * SCALE)
+    HEIGHT = round(HEIGHT * SCALE)
+    NOTE_HEIGHT = round(NOTE_HEIGHT * SCALE)
+    STOP_SIZE = round(STOP_SIZE * SCALE)
+    PAUSE_W = round(PAUSE_W * SCALE)
+    PAUSE_H = round(PAUSE_H * SCALE)
 
 
 class Overlay:
@@ -126,8 +198,17 @@ class Overlay:
     def build(self) -> None:
         import tkinter as tk
 
+        _enable_dpi_awareness()
+        _apply_scale()
+
         self.root = tk.Tk()
         self.root.withdraw()
+        # Font sizes are in points; this is what turns a point into the right
+        # number of physical pixels on a scaled display.
+        try:
+            self.root.tk.call("tk", "scaling", (96.0 * SCALE) / 72.0)
+        except Exception:
+            pass
 
         win = tk.Toplevel(self.root, bg=PAPER)
         win.overrideredirect(True)                  # fixed, not draggable (SRS-UIX-02)
@@ -224,25 +305,86 @@ class Overlay:
             ink = ring
             inside = self._tint(canvas.colour, 0.06) if canvas.hover else PAPER
 
-        thick = 4 if canvas.enabled else 3
-        if canvas.shape == "circle":
-            pad = thick / 2 + 1
-            canvas.create_oval(pad, pad, width - pad, height - pad,
-                               fill=inside, outline=ring, width=thick)
+        art = self._shape_image(canvas, width, height, fill=inside, edge=ring)
+        if art is not None:
+            # Held on the widget: a PhotoImage only referenced from the canvas is
+            # collected, and the button then draws as an empty rectangle.
+            canvas.art = art
+            canvas.create_image(0, 0, anchor="nw", image=art)
         else:
+            # No Pillow: the plain shapes, as before. Correct, just harder edged.
+            thick = round(4 * SCALE) if canvas.enabled else round(3 * SCALE)
             pad = thick / 2 + 1
-            self._round_rect(canvas, pad, pad, width - pad, height - pad, 9,
-                             fill=inside, outline=ring, width=thick)
+            if canvas.shape == "circle":
+                canvas.create_oval(pad, pad, width - pad, height - pad,
+                                   fill=inside, outline=ring, width=thick)
+            else:
+                self._round_rect(canvas, pad, pad, width - pad, height - pad,
+                                 round(9 * SCALE), fill=inside, outline=ring,
+                                 width=thick)
 
         if canvas.focused and canvas.enabled:
             if canvas.shape == "circle":
                 canvas.create_oval(1, 1, width - 1, height - 1, outline=ring, width=1)
             else:
-                self._round_rect(canvas, 1, 1, width - 1, height - 1, 11,
-                                 fill="", outline=ring, width=1)
+                self._round_rect(canvas, 1, 1, width - 1, height - 1,
+                                 round(11 * SCALE), fill="", outline=ring, width=1)
 
         canvas.create_text(width / 2, height / 2 + 0.5, text=canvas.label,
                            fill=ink, font=(FONT, 9, "bold"))
+
+    def _shape_image(self, canvas, width, height, *, fill, edge):
+        """
+        The button's shape as a supersampled image, or None if Pillow is absent.
+
+        tkinter's own `create_oval` and `create_polygon` have no antialiasing, so
+        a circle is drawn as a staircase and a 4 px ring turns that staircase
+        into the loudest thing on the card. Drawing at four times the size and
+        scaling down with a good filter is what makes the edge read as an edge.
+
+        The shape is filled rather than ringed, with a soft shadow beneath it and
+        a single hairline border. A solid shape at rest is calmer than a heavy
+        outline, and it leaves the one strong colour in the card for the label.
+        """
+        if width < 4 or height < 4:
+            return None
+        try:
+            from PIL import Image, ImageDraw, ImageFilter, ImageTk
+        except ImportError:
+            return None
+
+        ss = 4
+        big = (width * ss, height * ss)
+        pad = round(1.5 * SCALE) * ss
+        radius = (min(big) // 2 if canvas.shape == "circle"
+                  else round(10 * SCALE) * ss)
+
+        def box(offset=0):
+            return [pad, pad + offset, big[0] - pad - 1, big[1] - pad - 1 + offset]
+
+        layer = Image.new("RGBA", big, (0, 0, 0, 0))
+
+        # The shadow: the same shape, a little lower, blurred. Omitted while
+        # pressed, so the button reads as going down into the card.
+        if not canvas.pressed and canvas.enabled:
+            shadow = Image.new("RGBA", big, (0, 0, 0, 0))
+            ImageDraw.Draw(shadow).rounded_rectangle(
+                box(round(1.2 * SCALE) * ss), radius=radius, fill=(23, 28, 33, 64))
+            shadow = shadow.filter(ImageFilter.GaussianBlur(2.2 * ss))
+            layer = Image.alpha_composite(layer, shadow)
+
+        face = Image.new("RGBA", big, (0, 0, 0, 0))
+        ImageDraw.Draw(face).rounded_rectangle(
+            box(), radius=radius, fill=self._rgba(fill),
+            outline=self._rgba(edge), width=max(1, round(1.2 * SCALE) * ss))
+        layer = Image.alpha_composite(layer, face)
+
+        return ImageTk.PhotoImage(layer.resize((width, height), Image.LANCZOS))
+
+    @staticmethod
+    def _rgba(colour: str, alpha: int = 255):
+        red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+        return (red, green, blue, alpha)
 
     @staticmethod
     def _tint(colour: str, amount: float) -> str:
