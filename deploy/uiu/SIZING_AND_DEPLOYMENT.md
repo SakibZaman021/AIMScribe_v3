@@ -195,7 +195,15 @@ AIMS_SERVER_WORKERS=2
 AIMS_ARCHIVE_MEMORY=768m
 AIMS_ARCHIVE_CPUS=2
 AIMS_REDIS_MEMORY=256m
+AIMS_WORK_TMPFS=1g
 ```
+
+`AIMS_WORK_TMPFS=1g` matters more than it looks. The template's 6 GB is
+sized for two-hour consultations; tmpfs pages count against RAM, so on a
+4 GB machine that one setting can reserve more than every container ceiling
+combined. Measured against Aalo's 10-minute and Amader Susastho's 20-minute
+caps, joining, compressing and encrypting one consultation peaks near
+320 MB, so 1 GB is already generous.
 
 **3. Bring it up** — `docker compose up -d` — and wait for every container to
    report healthy. The databases, their roles and all eleven migrations are
