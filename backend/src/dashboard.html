@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-palette="#2a78d6,#eb6834,#1baf7a">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIMScribe — operations</title>
+<title>AIMScribe Operations</title>
 <!--
   The operational dashboard (SRS 3.3 §8.9).
 
@@ -13,125 +13,276 @@
   name and nothing clinical (SRS-DSH-06).
 
   Every count opens into the rows behind it (SRS-DSH-07) — click one.
+
+  Colour is the validated palette: categorical blue/orange/aqua for identity,
+  a reserved status set for state, each stepped separately for dark mode
+  rather than flipped. Charts are single-series, so they carry no legend and
+  never a second axis.
 -->
 <style>
-  :root {
-    --ink: #17202a; --muted: #5b6b7c; --line: #dfe5ec; --bg: #f5f7fa;
-    --card: #ffffff; --good: #1f7a4d; --warn: #9a6400; --bad: #a32020;
-    --accent: #1b4f8a;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
-  header { background: var(--card); border-bottom: 1px solid var(--line);
-           padding: 14px 20px; display: flex; gap: 16px; align-items: center;
-           flex-wrap: wrap; position: sticky; top: 0; z-index: 5; }
-  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
-  header .spacer { flex: 1; }
-  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
-  .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-          padding: 14px 16px; }
-  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
-             color: var(--muted); margin: 0 0 8px; font-weight: 600; }
-  .figure { font-size: 30px; font-weight: 650; line-height: 1.1; }
-  .figure small { font-size: 13px; font-weight: 400; color: var(--muted); }
-  .row { display: flex; justify-content: space-between; padding: 3px 0;
-         border-bottom: 1px dotted var(--line); }
-  .row:last-child { border-bottom: 0; }
-  .clickable { cursor: pointer; }
-  .clickable:hover { color: var(--accent); text-decoration: underline; }
-  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-  section { margin-top: 22px; }
-  section > h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted);
-                 text-transform: uppercase; letter-spacing: .06em; }
-  table { width: 100%; border-collapse: collapse; background: var(--card);
-          border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line);
-           font-size: 14px; white-space: nowrap; }
-  th { background: #eef2f7; font-weight: 600; font-size: 12px;
-       text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  tr:last-child td { border-bottom: 0; }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .bar { background: #e3e9f1; border-radius: 3px; height: 8px; min-width: 2px; }
-  .bar > div { background: var(--accent); height: 100%; border-radius: 3px; }
-  input, select, button { font: inherit; padding: 6px 10px; border-radius: 7px;
-                          border: 1px solid var(--line); background: var(--card); }
-  button { cursor: pointer; }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  dialog { border: 1px solid var(--line); border-radius: 12px; padding: 0;
-           max-width: 95vw; width: 1100px; }
-  dialog header { position: static; }
-  dialog .body { padding: 0 16px 16px; max-height: 70vh; overflow: auto; }
-  .empty { color: var(--muted); padding: 14px; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
-          font-size: 12px; background: #eef2f7; color: var(--muted); }
-  .pill.good { background: #e6f4ec; color: var(--good); }
-  .pill.warn { background: #fdf2dd; color: var(--warn); }
-  .pill.bad { background: #fbeaea; color: var(--bad); }
+:root {
+  --plane:   #f9f9f7;
+  --surface: #fcfcfb;
+  --raised:  #ffffff;
+  --ink:     #0b0b0b;
+  --ink-2:   #52514e;
+  --muted:   #898781;
+  --grid:    #e1e0d9;
+  --line:    #e6e5de;
+
+  --s1: #2a78d6;
+  --good: #0ca30c; --warn: #fab219; --critical: #d03b3b;
+  --good-ink: #006300; --warn-ink: #7a5200; --critical-ink: #97292a;
+  --good-bg: #e7f6e7; --warn-bg: #fdf3dc; --critical-bg: #fbe9e9;
+
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(16,24,32,.05), 0 6px 18px -10px rgba(16,24,32,.22);
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  --sans: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+}
+:root[data-theme="dark"] {
+  --plane: #0d0d0d; --surface: #1a1a19; --raised: #201f1e;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --line: #2f2e2b;
+  --s1: #3987e5;
+  --good-ink: #6fd06f; --warn-ink: #f0c25e; --critical-ink: #f08b8b;
+  --good-bg: #13260f; --warn-bg: #2a2110; --critical-bg: #2a1414;
+  --shadow: 0 1px 2px rgba(0,0,0,.5), 0 8px 24px -12px rgba(0,0,0,.7);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { background: var(--plane); color: var(--ink); font-family: var(--sans);
+       font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+h1, h2 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+button, input, select { font: inherit; color: inherit; }
+
+header {
+  position: sticky; top: 0; z-index: 30;
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  padding: 11px 20px; background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-right: 6px; }
+.mark { width: 26px; height: 26px; border-radius: 7px; flex: none;
+        background: linear-gradient(150deg, var(--s1), #17836f);
+        display: grid; place-items: center; }
+.mark i { width: 7px; height: 12px; border-radius: 3px; background: #fff; display: block; }
+.brand h1 { font-size: 15px; }
+.brand small { display: block; color: var(--muted); font-size: 11px; font-weight: 500; }
+.spacer { flex: 1 1 auto; }
+
+label.field { display: inline-flex; align-items: center; gap: 6px;
+              font-size: 12px; color: var(--muted); }
+input[type=date], select {
+  background: var(--raised); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 9px; font-size: 13px; color: var(--ink);
+}
+input:focus-visible, select:focus-visible, button:focus-visible,
+[role=button]:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
+button { background: var(--raised); border: 1px solid var(--line);
+         border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--s1); border-color: var(--s1); color: #fff; font-weight: 600; }
+.pill { font-size: 11.5px; color: var(--ink-2); background: var(--plane);
+        border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+        font-variant-numeric: tabular-nums; }
+.pill::before { content: ""; display: inline-block; width: 6px; height: 6px;
+  margin-right: 6px; border-radius: 50%; background: var(--good); vertical-align: middle; }
+
+main { padding: 18px 20px 48px; max-width: 1480px; margin: 0 auto; }
+
+.notice { display: none; margin-bottom: 16px; padding: 12px 14px;
+  border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-ink);
+  border: 1px solid #e3c98a; font-size: 13px; }
+
+.kpis { display: grid; gap: 12px; margin-bottom: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); }
+.kpi { background: var(--surface); border: 1px solid var(--line);
+       border-radius: var(--radius); padding: 13px 14px 12px; box-shadow: var(--shadow);
+       position: relative; overflow: hidden; }
+.kpi::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+              background: var(--line); }
+.kpi.t-good::after { background: var(--good); }
+.kpi.t-warn::after { background: var(--warn); }
+.kpi.t-bad::after  { background: var(--critical); }
+.kpi.t-info::after { background: var(--s1); }
+.kpi.actionable { cursor: pointer; }
+.kpi.actionable:hover { border-color: var(--muted); }
+.k-label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+           letter-spacing: .05em; font-weight: 650; }
+.k-value { font-size: 30px; font-weight: 680; letter-spacing: -0.025em;
+           font-variant-numeric: tabular-nums; margin-top: 3px; line-height: 1.05; }
+.k-value.t-good { color: var(--good-ink); }
+.k-value.t-warn { color: var(--warn-ink); }
+.k-value.t-bad  { color: var(--critical-ink); }
+.k-note { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+
+.grid { display: grid; gap: 14px; margin-bottom: 14px; }
+.cols-a { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+.cols-b { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+@media (max-width: 1080px) { .cols-a, .cols-b { grid-template-columns: 1fr; } }
+
+.panel { background: var(--surface); border: 1px solid var(--line);
+         border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+.panel > .head { padding: 11px 14px; border-bottom: 1px solid var(--line);
+                 display: flex; align-items: baseline; gap: 10px; }
+.panel > .head h2 { font-size: 13.5px; }
+.panel > .head .hint { font-size: 11.5px; color: var(--muted); margin-left: auto; }
+.panel .body { padding: 12px 14px; }
+
+.chart { width: 100%; display: block; }
+.chart text { font-family: var(--sans); fill: var(--muted); font-size: 10.5px; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .axis { stroke: var(--line); stroke-width: 1; }
+.chart .bar { transition: opacity .12s ease; }
+.chart g.col:hover .bar { opacity: .82; }
+.empty { color: var(--muted); font-size: 13px; padding: 26px 4px; text-align: center; }
+
+#tip { position: fixed; z-index: 60; pointer-events: none; opacity: 0;
+  transition: opacity .1s ease; background: var(--raised); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px;
+  box-shadow: var(--shadow); font-size: 12px; }
+
+.clinics { display: grid; gap: 7px; }
+.clinic { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px;
+  align-items: center; padding: 9px 11px; border-radius: 10px;
+  border: 1px solid transparent; cursor: pointer; background: var(--plane); }
+.clinic:hover { border-color: var(--muted); }
+.clinic[aria-current="true"] { border-color: var(--s1); }
+.clinic .name { font-weight: 600; font-size: 13px; }
+.clinic .code { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.clinic .n { font-variant-numeric: tabular-nums; font-weight: 650; font-size: 15px;
+             text-align: right; }
+.clinic .sub { font-size: 11.5px; color: var(--muted); text-align: right; }
+.meter { grid-column: 1 / -1; height: 4px; border-radius: 3px; background: var(--grid);
+         overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--s1); border-radius: 3px; }
+
+.att { display: grid; gap: 7px; }
+.att-row { display: grid; grid-template-columns: 22px 1fr auto; gap: 10px;
+  align-items: center; padding: 9px 11px; border-radius: 10px; background: var(--plane);
+  border: 1px solid transparent; font-size: 13px; }
+.att-row.clickable { cursor: pointer; }
+.att-row.clickable:hover { border-color: var(--muted); }
+.ic { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center;
+      font-size: 12px; font-weight: 700; color: #fff; }
+.ic.good { background: var(--good); }
+.ic.warn { background: var(--warn); color: #3a2a00; }
+.ic.bad { background: var(--critical); }
+.ic.quiet { background: var(--muted); }
+.what small { display: block; color: var(--muted); font-size: 11.5px; }
+.att-row .n { font-variant-numeric: tabular-nums; font-weight: 650; }
+
+.scroll { overflow: auto; max-height: 430px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+         white-space: nowrap; }
+th { position: sticky; top: 0; background: var(--surface); color: var(--muted);
+     font-size: 11px; text-transform: uppercase; letter-spacing: .04em; z-index: 1; }
+tbody tr:hover { background: var(--plane); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.path { font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+          max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 999px;
+       font-size: 11px; font-weight: 600; }
+.tag.good { background: var(--good-bg); color: var(--good-ink); }
+.tag.warn { background: var(--warn-bg); color: var(--warn-ink); }
+.tag.bad  { background: var(--critical-bg); color: var(--critical-ink); }
+.tag.quiet{ background: var(--plane); color: var(--muted); }
+.copy { border: 1px solid var(--line); background: var(--raised); border-radius: 6px;
+        padding: 1px 7px; font-size: 11px; cursor: pointer; }
+
+dialog { border: 1px solid var(--line); border-radius: 14px; padding: 0;
+  background: var(--surface); color: var(--ink); width: min(1180px, 94vw);
+  box-shadow: 0 20px 60px -20px rgba(0,0,0,.45); }
+dialog::backdrop { background: rgba(8,10,12,.46); }
+.foot { font-size: 11.5px; color: var(--muted); padding: 10px 14px 14px; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>AIMScribe — operations</h1>
-  <label>From <input type="date" id="from"></label>
-  <label>To <input type="date" id="to"></label>
-  <label>Clinic <select id="clinic"><option value="">all</option></select></label>
+  <div class="brand">
+    <div class="mark" aria-hidden="true"><i></i></div>
+    <div><h1>AIMScribe</h1><small>Operations</small></div>
+  </div>
+  <label class="field">From <input type="date" id="from"></label>
+  <label class="field">To <input type="date" id="to"></label>
+  <label class="field">Clinic <select id="clinic"><option value="">All clinics</option></select></label>
   <button class="primary" id="refresh">Refresh</button>
+  <button id="theme" title="Light or dark" aria-label="Light or dark">&#9680;</button>
   <span class="spacer"></span>
   <span id="when" class="pill"></span>
 </header>
 
 <main>
-  <div class="empty" id="emptyNote" style="display:none"></div>
-  <div class="cards" id="cards"></div>
+  <div class="notice" id="notice"></div>
+  <div class="kpis" id="kpis"></div>
 
-  <section>
-    <h2>Volume by doctor</h2>
-    <div id="byDoctor"></div>
-  </section>
+  <div class="grid cols-a">
+    <section class="panel">
+      <div class="head"><h2>Recordings each day</h2>
+        <span class="hint">hover a column</span></div>
+      <div class="body"><div id="byDay"></div></div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>Clinics</h2><span class="hint">click one to filter everything</span></div>
+      <div class="body"><div class="clinics" id="clinicBoard"></div></div>
+    </section>
+  </div>
 
-  <section>
-    <h2>Recorders</h2>
-    <div id="rooms"></div>
-  </section>
+  <div class="grid cols-b">
+    <section class="panel">
+      <div class="head"><h2>Needs attention</h2><span class="hint">click a row for the recordings behind it</span></div>
+      <div class="body"><div class="att" id="attention"></div></div>
+    </section>
+    <section class="panel">
+      <div class="head"><h2>Recorders</h2><span class="hint">one per consulting room</span></div>
+      <div class="scroll"><div id="rooms"></div></div>
+    </section>
+  </div>
 
-  <section>
-    <h2>Problems worth a look</h2>
-    <div id="problems"></div>
+  <section class="panel">
+    <div class="head"><h2 id="recTitle">Recordings</h2><span class="hint" id="recHint"></span></div>
+    <div class="scroll"><div id="recTable"></div></div>
+    <div class="foot">
+      <b>To remove a recording by hand on the server:</b> the folder column is relative to
+      <code>AIMS_ARCHIVE_PATH</code> — <code>/srv/aims/archive</code> on the UIU server.
+      Copy it and delete that consultation's folder: the <code>.wav</code>, its
+      <code>.manifest.json</code> and its clinical <code>.json</code> all live inside it.
+    </div>
   </section>
 </main>
 
 <dialog id="rows">
-  <header><strong id="rowsTitle">Recordings</strong><span class="spacer"></span>
-    <button id="closeRows">Close</button></header>
-  <div class="body"><div id="rowsBody"></div></div>
+  <div class="head"><h2 id="rowsTitle">Recordings</h2>
+    <span class="spacer"></span><button id="closeRows">Close</button></div>
+  <div class="scroll" id="rowsBody"></div>
 </dialog>
 
-<script>
-"use strict";
+<div id="tip" role="tooltip"></div>
 
-// The admin key is asked for once and kept in memory for this tab only.
-// Not in localStorage: every script on the machine can read that.
+<script>
 let ADMIN_KEY = "";
+let CLINICS = [];
 
 const $ = (id) => document.getElementById(id);
 // Local, not UTC. toISOString() converts first, so in Dhaka - six hours
 // ahead - everything recorded before 6am belonged to "yesterday" and the
 // page opened on an empty day while the clinic was working.
-const today = () => {
-  const now = new Date();
+const ymd = (d) => {
   const pad = (n) => String(n).padStart(2, "0");
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
-const esc = (value) => String(value ?? "").replace(/[&<>"]/g,
+const today = () => ymd(new Date());
+const daysAgo = (n) => { const d = new Date(); d.setDate(d.getDate() - n); return ymd(d); };
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const num = (n) => Number(n || 0).toLocaleString();
 
 async function api(path, params) {
-  if (!ADMIN_KEY) {
-    ADMIN_KEY = window.prompt("Administrator key") || "";
-  }
+  if (!ADMIN_KEY) ADMIN_KEY = window.prompt("Administrator key") || "";
   const query = new URLSearchParams(
     Object.entries(params || {}).filter(([, v]) => v !== "" && v != null));
   const response = await fetch(`/api/v2/dashboard${path}?${query}`,
@@ -144,239 +295,344 @@ async function api(path, params) {
   return response.json();
 }
 
-function card(title, body) {
-  return `<div class="card"><h2>${esc(title)}</h2>${body}</div>`;
+/* ---- tooltip: one element, moved ---- */
+const tip = $("tip");
+function showTip(event, html) {
+  tip.innerHTML = html;
+  tip.style.opacity = "1";
+  const box = tip.getBoundingClientRect();
+  let x = event.clientX + 14, y = event.clientY - box.height - 10;
+  if (x + box.width > innerWidth - 8) x = event.clientX - box.width - 14;
+  if (y < 8) y = event.clientY + 16;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
 }
+const hideTip = () => { tip.style.opacity = "0"; };
 
-function figure(value, note, tone) {
-  return `<div class="figure ${tone || ""}">${esc(value)}` +
-         (note ? ` <small>${esc(note)}</small>` : "") + `</div>`;
-}
+/* ============================================================
+   One chart, one series, no legend - the heading names it. The
+   hit target is the whole column, so a two-pixel bar is still
+   easy to hover.
+   ============================================================ */
+function barChart(host, rows, { label, value, unit }) {
+  if (!rows.length) { host.innerHTML = `<div class="empty">Nothing in this range.</div>`; return; }
+  const W = Math.max(320, host.clientWidth || 640), H = 232;
+  const padL = 36, padR = 10, padT = 12, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const max = Math.max(1, ...rows.map((r) => Number(value(r)) || 0));
+  const step = plotW / rows.length;
+  const bw = Math.max(3, Math.min(40, step - 6));
 
-function rowLine(label, value, state, tone) {
-  const attrs = state ? ` class="row clickable" data-state="${esc(state)}"`
-                      : ` class="row"`;
-  return `<div${attrs}><span>${esc(label)}</span>` +
-         `<strong class="${tone || ""}">${esc(value)}</strong></div>`;
-}
+  let g = "";
+  for (let i = 0; i <= 4; i++) {                 // four gridlines reads a magnitude
+    const v = (max / 4) * i, y = padT + plotH - (v / max) * plotH;
+    g += `<line class="gridline" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}"/>`
+       + `<text x="${padL - 7}" y="${y + 3.5}" text-anchor="end">${Math.round(v)}</text>`;
+  }
 
-function tone(count, warnAt) {
-  if (!count) return "good";
-  return count >= (warnAt || 1) * 3 ? "bad" : "warn";
-}
+  const every = Math.ceil(rows.length / 9);
+  let bars = "";
+  rows.forEach((r, i) => {
+    const v = Number(value(r)) || 0;
+    const h = v > 0 ? Math.max(2, (v / max) * plotH) : 0;
+    const x = padL + i * step + (step - bw) / 2;
+    bars += `<g class="col">`
+      + `<rect x="${padL + i * step}" y="${padT}" width="${step}" height="${plotH}"`
+      + ` fill="transparent" data-i="${i}"/>`
+      + `<rect class="bar" x="${x}" y="${padT + plotH - h}" width="${bw}" height="${h}"`
+      + ` rx="4" ry="4" fill="var(--s1)" pointer-events="none"/></g>`;
+    if (i % every === 0 || i === rows.length - 1) {
+      bars += `<text x="${padL + i * step + step / 2}" y="${H - 10}"`
+        + ` text-anchor="middle">${esc(label(r))}</text>`;
+    }
+  });
 
-// ---- drawing ----
+  host.innerHTML = `<svg class="chart" viewBox="0 0 ${W} ${H}" height="${H}" role="img"`
+    + ` aria-label="Recordings each day">${g}`
+    + `<line class="axis" x1="${padL}" x2="${W - padR}" y1="${padT + plotH}" y2="${padT + plotH}"/>`
+    + bars + `</svg>`;
 
-function drawCards(data) {
-  const v = data.volume, c = data.confirmation.totals || {},
-        i = data.integrity, r = data.recorders, x = data.reconciliation,
-        p = data.copies;
-
-  // An empty range is a fact worth stating. Silent zeroes in every card look
-  // exactly like a dashboard that failed to load, and that is how it was read.
-  $("emptyNote").style.display = v.total_recordings ? "none" : "block";
-  $("emptyNote").textContent =
-    `No recordings between ${$("from").value} and ${$("to").value}` +
-    ($("clinic").value ? ` for ${$("clinic").selectedOptions[0].textContent}` : "") +
-    `. Widen the dates, or choose a different clinic — the page itself is fine.`;
-
-  $("cards").innerHTML = [
-    card("Recordings", figure(v.total_recordings, `${v.total_hours} hours`) +
-      rowLine("Confirmed", c.confirmed || 0, "confirmed", "good") +
-      rowLine("Still confirming", c.pending || 0, "pending",
-              tone(c.pending, 2)) +
-      rowLine("Unconfirmed", c.unconfirmed || 0, "unconfirmed",
-              tone(c.unconfirmed, 1)) +
-      rowLine("From older recorders", c.legacy || 0, "legacy")),
-
-    card("Consent and refusals",
-      figure((c.refused || 0) + (c.expired || 0), "erased everywhere") +
-      rowLine("Patient did not consent", c.refused || 0, "refused") +
-      rowLine("Erased after 24 hours unconfirmed", c.expired || 0, "expired")),
-
-    card("Integrity",
-      figure(i.quarantined_total + i.stopped_early_total,
-             "quarantined or stopped early",
-             tone(i.quarantined_total + i.stopped_early_total, 1)) +
-      rowLine("Quarantined", i.quarantined_total, "quarantined",
-              tone(i.quarantined_total, 1)) +
-      rowLine("Stopped before the end", i.stopped_early_total, "stopped_early",
-              tone(i.stopped_early_total, 2)) +
-      rowLine("Alerts raised", i.alerts_total, null, tone(i.alerts_total, 3))),
-
-    card("Recorders",
-      figure(`${r.enrolled - r.silent}/${r.enrolled}`, "heard from",
-             r.silent ? "warn" : "good") +
-      rowLine("Silent", r.silent, null, tone(r.silent, 1)) +
-      rowLine("Holding audio", r.holding_audio, null, tone(r.holding_audio, 2))),
-
-    card("Matching with CMED",
-      figure(x.recordings_without_a_record + x.records_without_a_recording,
-             "unmatched",
-             tone(x.recordings_without_a_record + x.records_without_a_recording, 2)) +
-      rowLine("Recordings with no record", x.recordings_without_a_record, "pending") +
-      rowLine("Records with no recording", x.records_without_a_recording)),
-
-    card("Safe in two places",
-      figure(p.recordings_without_a_cloud_copy, "awaiting a cloud copy",
-             tone(p.recordings_without_a_cloud_copy, 5)) +
-      rowLine("Oldest waiting", p.oldest_uncopied_hours
-              ? `${p.oldest_uncopied_hours} h` : "—", "uncopied") +
-      rowLine("Pieces over 48 h old", p.pieces_older_than_48h, null,
-              tone(p.pieces_older_than_48h, 1)) +
-      rowLine("Last restore test", p.last_restore_test.at
-              ? p.last_restore_test.at.slice(0, 10) : "never",
-              null, p.last_restore_test.at ? "" : "warn")),
-  ].join("");
-
-  document.querySelectorAll("#cards .clickable").forEach((element) => {
-    element.addEventListener("click",
-      () => openRows(element.dataset.state, element.textContent.trim()));
+  host.querySelectorAll("g.col rect[data-i]").forEach((hit) => {
+    const r = rows[Number(hit.dataset.i)];
+    hit.addEventListener("mousemove", (e) => showTip(e,
+      `<b>${esc(label(r))}</b><br>${num(value(r))} ${esc(unit)} · ${num(r.hours)} h`));
+    hit.addEventListener("mouseleave", hideTip);
   });
 }
 
-function drawDoctors(data) {
-  const rows = data.volume.by_doctor;
-  if (!rows.length) { $("byDoctor").innerHTML = `<div class="empty">Nothing yet.</div>`; return; }
-  const most = Math.max(...rows.map((r) => r.recordings));
-  $("byDoctor").innerHTML = `<table><thead><tr>
-      <th>Clinic</th><th>Doctor</th><th class="num">Recordings</th>
-      <th class="num">Hours</th><th style="width:40%"></th></tr></thead><tbody>` +
-    rows.map((r) => `<tr>
-      <td>${esc(r.hospital_id)}</td><td>${esc(r.doctor_id)}</td>
-      <td class="num">${r.recordings}</td><td class="num">${r.hours}</td>
-      <td><div class="bar"><div style="width:${(100 * r.recordings / most).toFixed(1)}%"></div></div></td>
-    </tr>`).join("") + `</tbody></table>`;
+/* ---- KPI strip ---- */
+const toneFor = (n, warnAt = 1) => !n ? "good" : (n >= warnAt * 3 ? "bad" : "warn");
+
+function kpi({ label, value, note, tone, state }) {
+  return `<div class="kpi t-${tone || "info"}${state ? " actionable" : ""}"`
+    + (state ? ` data-state="${esc(state)}"` : "")
+    + `><div class="k-label">${esc(label)}</div>`
+    + `<div class="k-value${tone ? " t-" + tone : ""}">${esc(value)}</div>`
+    + `<div class="k-note">${esc(note || "")}</div></div>`;
 }
 
-function drawRooms(data) {
-  const rooms = data.recorders.rooms;
-  if (!rooms.length) { $("rooms").innerHTML = `<div class="empty">No recorders enrolled.</div>`; return; }
-  $("rooms").innerHTML = `<table><thead><tr>
-      <th>Clinic</th><th>PC</th><th>Version</th><th>Last heard from</th>
-      <th class="num">Waiting</th><th class="num">Buffer</th><th></th>
-    </tr></thead><tbody>` + rooms.map((room) => `<tr>
-      <td>${esc(room.hospital_id)}</td>
-      <td>${esc(room.machine_name || room.device_id.slice(0, 8))}</td>
-      <td>${esc(room.app_version || "—")}</td>
-      <td>${room.minutes_since_seen == null ? "never"
-            : room.minutes_since_seen < 60 ? `${room.minutes_since_seen} min ago`
-            : `${(room.minutes_since_seen / 60).toFixed(1)} h ago`}</td>
-      <td class="num">${room.pending_segments}</td>
-      <td class="num">${room.spool_mb} MB</td>
-      <td>${room.revoked ? `<span class="pill">revoked</span>`
-            : room.silent ? `<span class="pill bad">silent</span>`
-            : `<span class="pill good">recording</span>`}</td>
-    </tr>`).join("") + `</tbody></table>`;
+function drawKpis(d) {
+  const v = d.volume, c = d.confirmation.totals || {}, i = d.integrity,
+        p = d.copies, r = d.recorders;
+  const total = v.total_recordings || 0;
+  const confirmed = c.confirmed || 0;
+  const rate = total ? Math.round((confirmed / total) * 100) : 0;
+  const rooms = r.rooms || [];
+  const silent = rooms.filter((q) => q.silent && !q.revoked).length;
+  const uncopied = p.recordings_without_a_cloud_copy || 0;
+
+  $("kpis").innerHTML = [
+    kpi({ label: "Recordings", value: num(total),
+          note: `${num(v.total_hours)} hours of audio`, tone: "info" }),
+    kpi({ label: "Confirmed", value: total ? rate + "%" : "—",
+          note: `${num(confirmed)} matched to CMED`,
+          tone: !total ? null : rate >= 98 ? "good" : rate >= 90 ? "warn" : "bad" }),
+    kpi({ label: "Unconfirmed", value: num(c.unconfirmed || 0),
+          note: "erased after 24 hours", tone: toneFor(c.unconfirmed),
+          state: "unconfirmed" }),
+    kpi({ label: "Quarantined", value: num(i.quarantined_total || 0),
+          note: "held, never deleted", tone: toneFor(i.quarantined_total),
+          state: "quarantined" }),
+    kpi({ label: "No cloud copy", value: num(uncopied),
+          note: p.oldest_uncopied_hours != null
+            ? `oldest ${Math.round(p.oldest_uncopied_hours)} h`
+            : "safe in two places",
+          tone: toneFor(uncopied, 2), state: "uncopied" }),
+    kpi({ label: "Silent recorders", value: num(silent),
+          note: `${num(rooms.length)} enrolled`, tone: toneFor(silent) }),
+  ].join("");
+
+  $("notice").style.display = total ? "none" : "block";
+  $("notice").textContent =
+    `No recordings between ${$("from").value} and ${$("to").value}`
+    + ($("clinic").value ? ` for ${$("clinic").selectedOptions[0].textContent}` : "")
+    + `. Widen the dates or choose another clinic — the page itself is fine.`;
 }
 
-function drawProblems(data) {
-  const parts = [];
-  const i = data.integrity;
+/* ---- clinic board: the filter, as data ---- */
+function drawClinics(d) {
+  const byClinic = new Map((d.volume.by_clinic || []).map((c) => [c.hospital_id, c]));
+  const max = Math.max(1, ...[...byClinic.values()].map((c) => c.recordings || 0));
+  const current = $("clinic").value;
 
-  if (i.quarantined.length) {
-    parts.push(`<table><thead><tr><th>Clinic</th><th>Doctor</th>
-      <th>Why it was quarantined</th><th class="num">Count</th></tr></thead><tbody>` +
-      i.quarantined.map((q) => `<tr><td>${esc(q.hospital_id)}</td>
-        <td>${esc(q.doctor_id)}</td><td>${esc(q.quarantine_reason)}</td>
-        <td class="num">${q.n}</td></tr>`).join("") + `</tbody></table>`);
-  }
-  if (i.stopped_early.length) {
-    parts.push(`<table><thead><tr><th>Clinic</th><th>Doctor</th>
-      <th>Stopped because</th><th class="num">Count</th></tr></thead><tbody>` +
-      i.stopped_early.map((s) => `<tr><td>${esc(s.hospital_id)}</td>
-        <td>${esc(s.doctor_id)}</td><td>${esc(s.close_reason)}</td>
-        <td class="num">${s.n}</td></tr>`).join("") + `</tbody></table>`);
-  }
-  if (i.alerts.length) {
-    parts.push(`<table><thead><tr><th>Alert</th><th>Severity</th>
-      <th class="num">Count</th></tr></thead><tbody>` +
-      i.alerts.map((a) => `<tr><td>${esc(a.alert_type)}</td>
-        <td><span class="pill ${a.severity === "critical" ? "bad" : "warn"}">
-        ${esc(a.severity)}</span></td><td class="num">${a.n}</td></tr>`).join("") +
-      `</tbody></table>`);
-  }
-  $("problems").innerHTML = parts.length
-    ? parts.join('<div style="height:12px"></div>')
-    : `<div class="empty good">Nothing quarantined, nothing stopped early, no alerts.</div>`;
+  $("clinicBoard").innerHTML = CLINICS.length ? CLINICS.map((c) => {
+    const row = byClinic.get(c.hospital_id) || { recordings: 0, hours: 0 };
+    const pct = Math.round(((row.recordings || 0) / max) * 100);
+    return `<div class="clinic" data-id="${esc(c.hospital_id)}" tabindex="0" role="button"`
+      + ` aria-current="${current === c.hospital_id}">`
+      + `<div><div class="name">${esc(c.name || c.hospital_id)}</div>`
+      + `<div class="code">${esc(c.hospital_id)}</div></div>`
+      + `<div><div class="n">${num(row.recordings)}</div>`
+      + `<div class="sub">${num(row.hours)} h</div></div>`
+      + `<div class="meter"><i style="width:${pct}%"></i></div></div>`;
+  }).join("") : `<div class="empty">No clinics registered.</div>`;
+
+  $("clinicBoard").querySelectorAll(".clinic").forEach((el) => {
+    const pick = () => {
+      const id = el.dataset.id;
+      $("clinic").value = ($("clinic").value === id) ? "" : id;   // click again to clear
+      refresh();
+    };
+    el.addEventListener("click", pick);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+    });
+  });
 }
 
-// ---- the rows behind a number (SRS-DSH-07) ----
+/* ---- needs attention ---- */
+function drawAttention(d) {
+  const c = d.confirmation.totals || {}, i = d.integrity,
+        x = d.reconciliation, p = d.copies;
+  const items = [
+    { what: "Unconfirmed recordings", why: "CMED never described them — erased after 24 h",
+      n: c.unconfirmed || 0, state: "unconfirmed" },
+    { what: "Records with no recording", why: "CMED sent a visit we never recorded",
+      n: x.records_without_a_recording || 0, state: null },
+    { what: "Recordings with no record", why: "recorded, nothing from CMED yet",
+      n: x.recordings_without_a_record || 0, state: "pending" },
+    { what: "Quarantined", why: "a hash did not match — kept, never deleted",
+      n: i.quarantined_total || 0, state: "quarantined" },
+    { what: "Stopped early", why: "closed for a reason other than the prescription",
+      n: i.stopped_early_total || 0, state: "stopped_early" },
+    { what: "No cloud copy", why: "on the array, not yet safe in two places",
+      n: p.recordings_without_a_cloud_copy || 0, state: "uncopied" },
+    { what: "Pieces still in transit", why: "in the segment store over 48 hours",
+      n: p.pieces_older_than_48h || 0, state: null },
+    { what: "Open integrity alerts", why: "the operator queue",
+      n: i.alerts_total || 0, state: null },
+  ];
+  const row = (it) => {
+    const tone = !it.n ? "quiet" : it.n >= 3 ? "bad" : "warn";
+    return `<div class="att-row${it.n && it.state ? " clickable" : ""}"`
+      + (it.n && it.state ? ` data-state="${esc(it.state)}"` : "")
+      + `><span class="ic ${tone}" aria-hidden="true">${it.n ? "!" : "✓"}</span>`
+      + `<span class="what">${esc(it.what)}<small>${esc(it.why)}</small></span>`
+      + `<span class="n">${num(it.n)}</span></div>`;
+  };
+  const clean = items.every((it) => !it.n);
+  $("attention").innerHTML = clean
+    ? `<div class="att-row"><span class="ic good" aria-hidden="true">✓</span>`
+      + `<span class="what">Nothing needs attention`
+      + `<small>every check in this range is clear</small></span>`
+      + `<span class="n">0</span></div>`
+    : items.map(row).join("");
+}
 
-async function openRows(state, label) {
-  $("rowsTitle").textContent = `Recordings — ${label || state}`;
+/* ---- recorders ---- */
+function drawRooms(d) {
+  const rooms = d.recorders.rooms || [];
+  if (!rooms.length) {
+    $("rooms").innerHTML = `<div class="empty">No recorders enrolled yet.</div>`;
+    return;
+  }
+  $("rooms").innerHTML = `<table><thead><tr><th>Machine</th><th>Clinic</th>
+      <th>Version</th><th class="num">Holding</th><th>Last seen</th><th>State</th>
+      </tr></thead><tbody>`
+    + rooms.map((q) => {
+        const st = q.revoked ? ["bad", "revoked"]
+                 : q.silent ? ["warn", "silent"] : ["good", "reporting"];
+        const seen = q.minutes_since_seen == null ? "never"
+          : q.minutes_since_seen < 60 ? `${Math.round(q.minutes_since_seen)} min ago`
+          : `${Math.round(q.minutes_since_seen / 60)} h ago`;
+        return `<tr><td>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</td>`
+          + `<td>${esc(q.hospital_id)}</td><td>${esc(q.app_version || "—")}</td>`
+          + `<td class="num">${num(q.pending_segments)} · ${num(q.spool_mb)} MB</td>`
+          + `<td>${esc(seen)}</td>`
+          + `<td><span class="tag ${st[0]}">${st[1]}</span></td></tr>`;
+      }).join("") + `</tbody></table>`;
+}
+
+/* ---- recordings table, with the folder to delete by hand ---- */
+function confirmTag(v) {
+  const map = { confirmed: "good", pending: "warn", unconfirmed: "bad",
+                refused: "quiet", expired: "quiet", legacy: "quiet" };
+  return `<span class="tag ${map[v] || "quiet"}">${esc(v || "—")}</span>`;
+}
+
+function recordingsTable(list) {
+  if (!list.length) return `<div class="empty">No recordings match.</div>`;
+  return `<table><thead><tr><th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th>
+      <th class="num">Length</th><th>Confirmation</th><th>Archived</th>
+      <th>Folder on the server</th></tr></thead><tbody>`
+    + list.map((r) => {
+        const mins = Math.round((r.total_duration_seconds || 0) / 60);
+        const rel = r.archive_relpath || "";
+        const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
+        return `<tr><td>${esc(r.session_date || "")}</td>`
+          + `<td>${esc(r.hospital_id)}</td><td>${esc(r.doctor_id)}</td>`
+          + `<td>${esc(r.patient_id)}</td><td class="num">${mins} min</td>`
+          + `<td>${confirmTag(r.confirmation)}</td>`
+          + `<td>${r.archived_at ? `<span class="tag good">yes</span>`
+                                 : `<span class="tag warn">no</span>`}</td>`
+          + `<td class="path" title="${esc(folder)}">${esc(folder || "—")}`
+          + (folder ? ` <button class="copy" data-copy="${esc(folder)}">copy</button>` : "")
+          + `</td></tr>`;
+      }).join("") + `</tbody></table>`;
+}
+
+function wireCopy(root) {
+  root.querySelectorAll("button[data-copy]").forEach((b) => {
+    b.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(b.dataset.copy);
+        const was = b.textContent; b.textContent = "copied";
+        setTimeout(() => { b.textContent = was; }, 1200);
+      } catch { /* clipboard blocked: the title attribute still shows the path */ }
+    });
+  });
+}
+
+async function loadRecordings() {
+  const clinic = $("clinic").value;
+  $("recTitle").textContent = clinic
+    ? `Recordings — ${$("clinic").selectedOptions[0].textContent}`
+    : "Recordings — all clinics";
+  $("recTable").innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const d = await api("/recordings", { from: $("from").value, to: $("to").value,
+                                         hospital_id: clinic, limit: 200 });
+    const list = d.recordings || [];
+    $("recTable").innerHTML = recordingsTable(list);
+    $("recHint").textContent = `${num(list.length)} shown · newest first`;
+    wireCopy($("recTable"));
+  } catch (err) {
+    $("recTable").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
+}
+
+async function openRows(state) {
+  $("rowsTitle").textContent = "Recordings — " + state.replace(/_/g, " ");
   $("rowsBody").innerHTML = `<div class="empty">Loading…</div>`;
   $("rows").showModal();
   try {
-    const data = await api("/recordings", {
-      from: $("from").value, to: $("to").value,
-      hospital_id: $("clinic").value, state, limit: 300,
-    });
-    $("rowsBody").innerHTML = data.recordings.length ? `<table><thead><tr>
-        <th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th><th>File</th>
-        <th class="num">Minutes</th><th>State</th><th>Archived</th><th>Copied</th>
-      </tr></thead><tbody>` + data.recordings.map((r) => `<tr>
-        <td>${esc(r.date)}</td><td>${esc(r.hospital_id)}</td>
-        <td>${esc(r.doctor_id)}</td><td>${esc(r.patient_id)}</td>
-        <td>${esc(r.file_stem || "—")}</td><td class="num">${r.minutes}</td>
-        <td><span class="pill ${r.confirmation === "confirmed" ? "good"
-              : r.confirmation === "unconfirmed" ? "warn" : ""}">${esc(r.confirmation)}</span></td>
-        <td>${r.archived ? "yes" : "—"}</td><td>${r.copied ? "yes" : "—"}</td>
-      </tr>`).join("") + `</tbody></table>`
-      : `<div class="empty">Nothing here — which is usually the right answer.</div>`;
-  } catch (error) {
-    $("rowsBody").innerHTML = `<div class="empty bad">${esc(error.message)}</div>`;
+    const d = await api("/recordings", { from: $("from").value, to: $("to").value,
+      hospital_id: $("clinic").value, state, limit: 200 });
+    $("rowsBody").innerHTML = recordingsTable(d.recordings || []);
+    wireCopy($("rowsBody"));
+  } catch (err) {
+    $("rowsBody").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
 }
 
-// ---- loading ----
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-state]");
+  if (el) openRows(el.dataset.state);
+});
 
+/* ---- refresh ---- */
 async function refresh() {
-  $("when").textContent = "loading…";
   try {
-    const data = await api("/summary", {
-      from: $("from").value, to: $("to").value, hospital_id: $("clinic").value,
-    });
-    drawCards(data);
-    drawDoctors(data);
-    drawRooms(data);
-    drawProblems(data);
-    $("when").textContent = `as at ${new Date().toLocaleTimeString()}`;
-  } catch (error) {
-    $("when").textContent = error.message;
+    const d = await api("/summary", { from: $("from").value, to: $("to").value,
+                                      hospital_id: $("clinic").value });
+    drawKpis(d);
+    drawClinics(d);
+    drawAttention(d);
+    drawRooms(d);
+    barChart($("byDay"), d.volume.by_day || [],
+      { label: (r) => String(r.date || "").slice(5), value: (r) => r.recordings,
+        unit: "recordings" });
+    await loadRecordings();
+    $("when").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (err) {
+    $("notice").style.display = "block";
+    $("notice").textContent = err.message;
   }
 }
 
-// Seven days back. The dashboard answers "is anything wrong today", and today
-// is still in the range - but a clinic that has not started yet, or a morning
-// before the first consultation, used to open on an entirely empty page. An
-// empty page reads as a broken one, and the week costs nothing to fetch.
-const daysAgo = (days) => {
-  const then = new Date();
-  then.setDate(then.getDate() - days);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${then.getFullYear()}-${pad(then.getMonth() + 1)}-${pad(then.getDate())}`;
-};
+$("refresh").addEventListener("click", refresh);
+$("closeRows").addEventListener("click", () => $("rows").close());
+["from", "to", "clinic"].forEach((id) => $(id).addEventListener("change", refresh));
+addEventListener("resize", () => {
+  clearTimeout(window._rz);
+  window._rz = setTimeout(refresh, 300);
+});
+
+/* Dark mode is chosen, not flipped: its own steps from the same ramps. */
+$("theme").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("aims.theme", next); } catch {}
+  refresh();
+});
+try {
+  document.documentElement.dataset.theme = localStorage.getItem("aims.theme")
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+} catch { document.documentElement.dataset.theme = "light"; }
 
 async function start() {
   $("from").value = daysAgo(6);
   $("to").value = today();
   try {
     const { clinics } = await api("/clinics", {});
-    $("clinic").innerHTML = `<option value="">all</option>` +
-      clinics.map((c) => `<option value="${esc(c.hospital_id)}">` +
-        `${esc(c.name || c.hospital_id)}</option>`).join("");
-  } catch (error) {
-    $("when").textContent = error.message;
-  }
+    CLINICS = clinics || [];
+    $("clinic").innerHTML = `<option value="">All clinics</option>`
+      + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
+        + `${esc(c.name || c.hospital_id)}</option>`).join("");
+  } catch { /* refresh reports it */ }
   await refresh();
-  // Quiet enough to leave open on a wall screen all day.
-  setInterval(refresh, 60000);
 }
 
-$("refresh").addEventListener("click", refresh);
-$("closeRows").addEventListener("click", () => $("rows").close());
-["from", "to", "clinic"].forEach((id) => $(id).addEventListener("change", refresh));
 start();
 </script>
 </body>
