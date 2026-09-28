@@ -244,10 +244,13 @@ services:
       context: ../../cmed-web
       dockerfile: ../deploy/local/cmed-web.Dockerfile
       args:
-        # The browser bundle is built with these; CMED-LOCAL-01 is the clinic
-        # code bootstrap.py registers, and the page must send that one or the
-        # visit it describes belongs to a clinic the recorder is not in.
-        NEXT_PUBLIC_HOSPITAL_ID: CMED-LOCAL-01
+        # The browser bundle is built with these. The clinic code has to be
+        # the one this PC is enrolled to, or the visit the page describes
+        # belongs to a clinic the recorder is not in and the grant is refused
+        # with CLINIC_MISMATCH - which is the rule working, not a fault. It
+        # was written here twice, in two different values, and both went stale
+        # the day the clinics were renamed; it now comes from .env, once.
+        NEXT_PUBLIC_HOSPITAL_ID: ${AIMS_CLINIC:-AALO_DHOLPUR}
         NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6060}
         NEXT_PUBLIC_RECORDER_WS: ws://localhost:5050/ws
     image: aimscribe/cmed-web:3.3
@@ -262,7 +265,7 @@ services:
       AIMS_SERVER_URL: http://api:6060
       NEXT_PUBLIC_RECORDER_WS: ws://localhost:5050/ws
       NEXT_PUBLIC_BACKEND_URL: http://localhost:${AIMS_PORT:-6060}
-      NEXT_PUBLIC_HOSPITAL_ID: HOSP003
+      NEXT_PUBLIC_HOSPITAL_ID: ${AIMS_CLINIC:-AALO_DHOLPUR}
     depends_on:
       api:
         condition: service_healthy
