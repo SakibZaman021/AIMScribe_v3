@@ -324,7 +324,17 @@ class Segmenter:
             # 50-200 ms and between sentences 300-800 ms. The margin is what
             # makes the guarantee, so it is measured and carried forward.
             middle = self._silence_started_at_offset + self._silence_bytes // 2
-            margin = (self._silence_bytes // 2) / self.bytes_per_second * 1000.0
+            # Never seal less than the minimum. In a quiet room the silent run
+            # starts at the top of the buffer, so its middle is half the buffer
+            # - and the clip would close at half the minimum, again and again,
+            # which is exactly what a silent bench recording produced. The
+            # minimum is inside this silent run whenever the run began before
+            # it, so moving the cut there is still a cut inside the pause.
+            middle = max(middle, self.min_bytes)
+            margin = min(self._silence_bytes // 2,
+                         self._silence_started_at_offset + self._silence_bytes - middle,
+                         middle - self._silence_started_at_offset)
+            margin = max(0, margin) / self.bytes_per_second * 1000.0
             kind = "relaxed" if size >= self.max_bytes else "gap"
             logger.debug("Pause at %.1f s; cutting inside it at %.1f s (%.0f ms clear)",
                          size / self.bytes_per_second,

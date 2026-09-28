@@ -569,3 +569,32 @@ def test_a_quiet_consonant_is_never_offered_as_a_forced_cut_point():
             "the safe search offered the same point as the loose one")
     finally:
         segmenter.stop(seal_remaining=False)
+
+
+def test_a_quiet_room_does_not_halve_the_minimum():
+    """
+    Found on the bench: a silent consulting room produced a run of clips at
+    exactly half the minimum, over and over.
+
+    The cause is the rule that makes cuts safe. A cut lands in the middle of
+    the pause, and when the whole buffer is one pause - nobody has spoken yet -
+    its middle is half the buffer. The clip closed at half the minimum, the
+    remainder was silence again, and it repeated. The minimum still has to hold:
+    it is inside the silent run, so moving the cut there is still a cut inside
+    the pause.
+    """
+    collected = []
+    segmenter = _segmenter(collected, min_seconds=2.0, max_seconds=6.0,
+                           grace_seconds=2.0, silence_hold_seconds=0.4)
+    segmenter.start(datetime.now(timezone.utc))
+    try:
+        for _ in range(60):                       # 6 s of an empty room
+            segmenter.submit(_room_tone(0.1))
+        _wait_for(collected)
+        assert collected, "a quiet room should still produce clips"
+        shortest = min(len(s.pcm) / BYTES_PER_SECOND for s in collected)
+        assert shortest >= 1.95, (
+            f"clip of {shortest:.2f}s is under the 2s minimum - the cut point "
+            f"was taken from the middle of a buffer-long silence")
+    finally:
+        segmenter.stop(seal_remaining=False)
