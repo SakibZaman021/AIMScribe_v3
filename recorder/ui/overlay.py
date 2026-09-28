@@ -485,7 +485,10 @@ class Overlay:
             if self.window.state() == "withdrawn":
                 self._place()
                 self.window.deiconify()
-            self._keep_on_top()
+            # `active` covers paused as well as recording: a paused
+            # consultation is an open one, and its card is what Resume lives on.
+            self._keep_on_top(active=bool(status.get("is_recording")
+                                          or status.get("is_paused")))
         elif self.window.state() != "withdrawn":
             # Say why, every time. "The control disappeared" is otherwise a
             # report nobody can act on: this line distinguishes a card that
@@ -497,7 +500,7 @@ class Overlay:
                         status.get("session_id"), self.state.form_open)
             self.window.withdraw()
 
-    def _keep_on_top(self) -> None:
+    def _keep_on_top(self, *, active: bool = False) -> None:
         """
         Stay in front, for as long as the consultation lasts.
 
@@ -506,13 +509,47 @@ class Overlay:
         reason form and closing it again is one of them - and the card then
         sits behind CMED's browser. It has not gone, but it is gone as far as
         anyone can tell, and Stop is what they cannot find.
+
+        Testing the flag first is not enough either, and that is what was
+        wrong: `attributes("-topmost")` reports the flag tk last set, not the
+        real stacking order. Another top-most window - a browser going full
+        screen, a notification, the reason form closing - can sit in front
+        while tk still believes the card is on top, so the check said "already
+        there" and nothing was re-asserted. A paused consultation lost its
+        card that way, and a card that cannot be found cannot be resumed.
+
+        So while a consultation is open the flag and the lift are re-applied
+        every tick, unconditionally. It costs two calls four times a second
+        and it is the only thing that keeps Stop and Resume reachable.
         """
         try:
-            if not self.window.attributes("-topmost"):
+            if active:
+                self.window.attributes("-topmost", True)
+                self.window.lift()
+                self._recover_if_offscreen()
+            elif not self.window.attributes("-topmost"):
                 self.window.attributes("-topmost", True)
                 self.window.lift()
         except Exception as exc:                    # a window manager that will not
             logger.debug("Could not keep the control on top: %s", exc)
+
+    def _recover_if_offscreen(self) -> None:
+        """
+        Put the card back if it is no longer on a screen.
+
+        Unplugging a second monitor, or a resolution change, leaves the card at
+        coordinates that no longer exist. It is still "visible" as far as tk is
+        concerned, which is the same dead end as being behind something.
+        """
+        try:
+            x, y = self.window.winfo_rootx(), self.window.winfo_rooty()
+            width = self.window.winfo_screenwidth()
+            height = self.window.winfo_screenheight()
+            if x < -40 or y < -40 or x > width - 60 or y > height - 40:
+                logger.info("On-screen control was off-screen at %s,%s; replacing it", x, y)
+                self._place()
+        except Exception:
+            pass
 
     # ---- presses ----
 

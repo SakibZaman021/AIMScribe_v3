@@ -100,6 +100,10 @@ async def send(command: str, message: Dict[str, Any], *,
     return reply
 
 
+PAUSE_REASONS = ("patient_declined", "sensitive_personal_matter",
+                 "non_clinical_interruption", "other")
+
+
 def five_fields(args, start: Optional[datetime] = None) -> Dict[str, str]:
     start = start or datetime.now(timezone(timedelta(hours=6))).replace(microsecond=0)
     return {"patient_id": args.patient, "doctor_id": args.doctor,
@@ -247,7 +251,12 @@ def main(argv=None) -> int:
         "built": ("prescription_built",
                   {"session_id": args.session, "patient_id": args.patient}),
         "stop": ("stop", {"reason": args.reason}),
-        "pause": ("pause", {"reason": "clinical"}),
+        # The reason has to be one the agent accepts, or the pause is
+        # refused: "clinical" never was one, so this command could not
+        # work at all. --reason overrides it.
+        "pause": ("pause", {"reason": args.reason
+                            if args.reason in PAUSE_REASONS
+                            else "non_clinical_interruption"}),
         "resume": ("resume", {}),
     }
     command, message = commands[args.action]
