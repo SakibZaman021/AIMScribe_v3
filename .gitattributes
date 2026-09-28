@@ -3,3 +3,6 @@
 # ending conversion would change that hash on checkout and break both, so this
 # file is exempt from all normalisation.
 recorder/tests/wire_vectors.json -text
+
+# A PDF is bytes. Line-ending conversion on checkout would corrupt it.
+*.pdf binary
