@@ -69,6 +69,18 @@ if errorlevel 1 (
 )
 
 echo [5/7] Cleaning previous builds...
+REM An installed agent keeps its settings in .env beside the executable, and
+REM this next line deletes the whole folder. A rebuild therefore used to
+REM un-configure the machine it was built on: the agent came back with the
+REM compiled defaults, no allowed origins, and refused every connection from
+REM CMED's page with a 403 that looked like a browser fault. Keep it, and put
+REM it back afterwards.
+set "KEEPENV="
+if exist "dist\AIMScribe_Agent\.env" (
+    copy /y "dist\AIMScribe_Agent\.env" "%TEMP%\aimscribe_build_env.bak" >nul
+    set "KEEPENV=1"
+    echo       keeping the installed .env
+)
 if exist "dist"  rmdir /s /q dist
 if exist "build" rmdir /s /q build
 
@@ -107,6 +119,11 @@ if errorlevel 1 (
 )
 
 copy /y ".env.example" "dist\AIMScribe_Agent\.env.example" >nul
+if defined KEEPENV (
+    copy /y "%TEMP%\aimscribe_build_env.bak" "dist\AIMScribe_Agent\.env" >nul
+    del "%TEMP%\aimscribe_build_env.bak" >nul 2>&1
+    echo       restored the installed .env
+)
 
 echo [7/7] Signing...
 if "%SIGN_CERT_THUMBPRINT%"=="" (
