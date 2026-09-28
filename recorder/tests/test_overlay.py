@@ -315,3 +315,20 @@ def test_the_window_builds(tmp_path):
         assert "no sound from the microphone" not in drawn(overlay)
     finally:
         overlay.root.destroy()
+
+
+def test_a_paused_consultation_keeps_its_card():
+    """
+    Reported from the bench: after pausing, the control was gone and the
+    consultation could not be resumed.
+
+    A paused consultation is an open one. Its card carries Resume, and it is
+    the only thing that does - the tray can start nothing and the card has no
+    taskbar entry to click back. So `visible` must hold through a pause, for
+    every reason a doctor can choose.
+    """
+    for reason in ("patient_declined", "sensitive_personal_matter",
+                   "non_clinical_interruption", "other"):
+        view = OverlayState().view(paused(reason))
+        assert view.visible, f"the card hid while paused for {reason}"
+        assert view.stop_enabled, "Stop must stay reachable while paused"
