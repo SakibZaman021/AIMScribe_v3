@@ -99,22 +99,49 @@ format the SRS fixes, and the one the acoustic work needs).
 | 20 minutes | 2.0 TB | 1.2 TB | **3.2 TB** |
 | 30 minutes | 3.0 TB | 1.8 TB | **4.8 TB** |
 
-Your 5 TB figure matches the long end. Plan for it, because a study that
-fills its disk stops collecting.
+**That "Total" column is misleading and this section used to lean on it.** The
+two figures are two different places. The WAV lives on the UIU array; the
+lossless copy lives in cold storage at another provider. Adding them together
+sized the array for storage it never holds.
+
+Against the agreed caps — ten minutes at Aalo, fifteen to twenty at Amader
+Susastho, weighted twelve rooms to two — the average is **11.4 minutes**:
+
+| | On the UIU array | Off-site |
+|---|---|---|
+| **20,000 consultations** | **1.15 TB** | 0.7 TB |
 
 Everything else is small: both databases together measured **0.5 MB per
 recording**, so 20,000 consultations is about **10 GB** — call it 50 GB with
 indexes, audit trail and room to breathe. WAL and local backups, 100 GB.
 
-**So: 1 TB NVMe for the system, the databases and working files; 5 TB or more
-of separate array for the archive.** The 4×6 TB RAID recommendation stands —
-in RAID 10 it gives 12 TB usable, which is the study twice over plus the
-years of running afterwards.
+**So: 1 TB NVMe for the system, the databases and working files; 1.5 TB usable
+for the archive, and 2 TB is comfortable.** That is 1.15 TB of audio, the 20 GB
+the worker keeps free by refusing to write below it, and the free space no
+volume should run without.
+
+The 4×6 TB RAID 10 recommendation was room to keep running for years, not what
+the study needs, and this file did not separate the two. Any of 2 TB, 4 TB or
+12 TB runs the study; the difference is only how long you can carry on
+afterwards — roughly three weeks more at 2 TB, two to three months at 4 TB,
+about a year at 12 TB.
+
+**RAID is for uptime, not for safety.** Every archived recording also gets an
+encrypted lossless copy off-site, and the worker decodes that FLAC again and
+compares the samples against the archived audio before the copy counts. A
+single disk is therefore one of two copies, not the only one — provided the
+cloud copy is switched on and the monthly restore test actually happens.
+Without those two, no array size helps.
+
+**The real lever is retention, not capacity.** Even 12 TB is about a year at
+these hours. Once a recording has a verified off-site copy, removing the local
+WAV after an agreed period is safe, and that decision is worth more than any
+amount of disk.
 
 **Ask CITS what disks the 8 GB machine has.** Memory can be worked around;
-the archive cannot. If that box has a single 1 TB disk, it can run the
-system but it cannot hold the study, and the archive needs somewhere else
-from day one.
+storage cannot be conjured. If that box has a single 1 TB disk, it can run the
+system but it cannot hold the study, and something has to be added before
+collection starts.
 
 ---
 
@@ -240,8 +267,11 @@ python tools/preflight.py --server https://<host> --agent "<agent folder>"
 
 * **The dashboard**, `/api/v2/dashboard` — volume by clinic, anything
   unconfirmed, anything not yet copied.
-* **Disk on the array.** At 20 minutes average and 40 consultations a day,
-  the study grows about **4 GB a day**. A month is 120 GB.
+* **Disk on the array.** At the real deployment — 14 rooms across two shifts —
+  the archive grows **30 to 50 GB a day**, so a clinic month is around 1 TB and
+  the whole 20,000-consultation study is about **22 to 30 clinic days**. (An
+  earlier draft said 4 GB a day, from 40 consultations; that was a bench
+  figure, not this deployment.)
 * **`confirmation = unconfirmed`** in `sessions`. A recording CMED never
   describes is erased after 24 hours — correct, and it has already cost one
   real recording on the bench when Channel B was silently failing. If that
@@ -261,7 +291,7 @@ The recommendation has not changed, and the measurements support it:
 | Cores | 8 | 16 |
 | Memory | 8 GB **on Linux** (4 GB is Windows' share) | 32–64 GB |
 | System disk | 1 TB NVMe | 2 TB NVMe, mirrored |
-| Archive | 5 TB usable | 4 × 6 TB, RAID 10 |
+| Archive | 1.5 TB usable (2 TB comfortable) | 4 TB usable, mirrored |
 
 The 8-core, 8 GB machine will run this study if it runs Linux and has the
 array. On Windows it will still run it, with two workers and no local object
