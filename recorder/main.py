@@ -117,6 +117,31 @@ def load_log_salt() -> bytes:
 # Windows helpers
 # ============================================================
 
+def tell_the_person(title: str, message: str) -> None:
+    """
+    Put a startup failure in front of whoever just launched the agent.
+
+    This build is windowed: there is no console, so a print reaches nobody and
+    a log line reaches nobody in time. Every silent exit here has cost real
+    time - an agent that would not start because another copy held the mutex
+    looked exactly like one that started fine, and recordings went to the old
+    copy, against the old settings, for an hour before anyone noticed.
+
+    A native message box rather than tkinter: it works before any UI exists,
+    it needs nothing imported, and it cannot fail because a toolkit is missing,
+    which is one of the things reported through here.
+    """
+    logger.error("%s: %s", title, " ".join(message.split()))
+    if sys.platform != "win32":
+        print(title, message, sep="\n", file=sys.stderr)
+        return
+    try:
+        flags = 0x30 | 0x40000 | 0x10000    # warning icon, topmost, foreground
+        ctypes.windll.user32.MessageBoxW(None, message, "AIMScribe - " + title, flags)
+    except Exception:
+        print(title, message, sep="\n", file=sys.stderr)
+
+
 def acquire_single_instance() -> Optional[object]:
     """Return a mutex handle, or None if another agent already owns it."""
     if sys.platform != "win32":
@@ -553,7 +578,16 @@ def main() -> int:
 
     mutex = acquire_single_instance()
     if mutex is None:
-        logger.error("Another AIMScribe agent is already running; exiting")
+        tell_the_person(
+            "Already running",
+            "Another copy of AIMScribe is already running on this PC, so this "
+            "one has stopped.\n\n"
+            "That copy is the one recording, and it is using the settings it "
+            "started with - which may not be the settings you have just "
+            "installed.\n\n"
+            "If you are upgrading, or have changed the configuration, close the "
+            "running AIMScribe from the system tray first, then start this one "
+            "again.")
         return 2
 
     try:
@@ -563,8 +597,11 @@ def main() -> int:
         from PIL import Image  # noqa: F401
         import cryptography  # noqa: F401
     except ImportError as exc:
-        logger.critical("Missing dependency: %s", exc)
-        print(f"Missing dependency: {exc}\nInstall with: pip install -r requirements.txt")
+        tell_the_person(
+            "Cannot start",
+            f"AIMScribe is missing a component it needs: {exc}\n\n"
+            "This install is incomplete. Reinstall it, and tell AIMS LAB which "
+            "component was named above.")
         return 1
 
     import uvicorn
