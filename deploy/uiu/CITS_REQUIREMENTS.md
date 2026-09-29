@@ -103,18 +103,67 @@ never edited.
 | Cores | 8 | 16 |
 | Memory | **8 GB on Linux** | 32–64 GB ECC |
 | System / database disk | 1 TB NVMe | 2 TB NVMe, mirrored, power-loss protected |
-| Archive array | **2 TB usable** for the study | **4 × 6 TB, RAID 10 — 12 TB usable** |
+| Archive storage | **1.5 TB usable** | 4 TB usable, mirrored |
 | Internet | 50 Mbit/s symmetric | 100 Mbit/s symmetric |
 | Power | UPS | UPS with automatic clean shutdown |
 
-**The three storage areas must be separate.** Database on NVMe, archive on the
-array, working space on its own volume. A large merge must not slow a database
+**The three storage areas must be separate.** Database on NVMe, archive on its
+own volume, working space on its own. A large merge must not slow a database
 write that a recorder is waiting on.
 
-**Please tell us what disks the 8 GB machine has.** Memory can be worked around
-and we have measured exactly how. The archive cannot: if that box has a single
-1 TB disk, it can run the system but cannot hold the study, and the array is
-needed from day one.
+### How much archive storage, honestly
+
+The study is **1.15 TB**, and that is the number that matters. 20,000
+consultations at the agreed caps — ten minutes at Aalo, fifteen to twenty at
+Amader Susastho — average 11.4 minutes, and audio is a measured 5.02 MB per
+minute. Add the 20 GB the archive worker keeps free by refusing to write below
+it, and the free space no volume should run without, and the requirement is
+**1.5 TB usable. Two is comfortable.**
+
+A large array was previously recommended. That was room to keep running for
+years afterwards, not what the study needs, and the two were not separated
+clearly enough. They are separated here:
+
+| Option | Usable | Survives a disk failure | Holds |
+|---|---|---|---|
+| 1 × 2 TB | 2 TB | **No** — see below | The study, with room to spare |
+| 2 × 2 TB, RAID 1 | 2 TB | Yes | The study, and keeps working through a failure |
+| 2 × 4 TB, RAID 1 | 4 TB | Yes | The study **plus 2–3½ months** of continued recording |
+| 4 × 6 TB, RAID 10 | 12 TB | Yes | The study plus about a year |
+
+**Any of these can run the study.** The difference is what happens afterwards.
+
+**On running without RAID.** RAID protects *availability* — it keeps the
+system recording through a failed disk. It is not what protects the data, and
+this is the distinction that decides whether a single disk is acceptable:
+
+Every archived recording also gets a **lossless FLAC copy in cold storage at a
+second provider**, encrypted here first with a key that never leaves UIU. It is
+not assumed to be good: the worker decodes the FLAC again and compares the
+samples against the archived audio before the copy counts. So a single disk is
+**not** a single copy — it is one of two, and the second is off-site.
+
+If there is no RAID, then two things stop being optional:
+
+* the cloud copy must be **switched on and confirmed** — the dashboard shows
+  anything not yet safe in two places, and that count should be zero every
+  morning;
+* the **monthly restore test** must actually happen. A copy nobody has ever
+  read is not a backup, and a single disk makes that the only line of defence.
+
+With those two in place, a single 2 TB disk is a defensible way to run the
+study. Without them, it is not — and neither is RAID, because RAID has never
+protected anyone from a deletion or a corrupted write.
+
+**Please tell us what disks the machine has.** Memory can be worked around and
+we have measured exactly how. Storage cannot be conjured: if the box has a
+single 1 TB disk it can run the system but cannot hold the study, and something
+has to be added before collection starts.
+
+**The thing that actually decides long-term cost is retention, not array size.**
+Even 12 TB is about a year at these hours. Once a recording has a verified
+cloud copy, removing the local WAV after an agreed period is safe — and that
+decision (§2) is worth more than any amount of disk.
 
 **Why ECC is asked for.** The system's entire purpose is proving recordings were
 not altered. Uncorrected memory errors undermine that claim at the source.
@@ -270,7 +319,7 @@ In this order, all scripted:
 | We need | Detail |
 |---|---|
 | A machine | 8 cores, 8 GB **on Ubuntu Server 24.04**, 1 TB NVMe |
-| **An archive array** | **2 TB usable minimum; 12 TB strongly preferred** |
+| **Archive storage** | **1.5 TB usable minimum for the study; 2 TB comfortable.** RAID is for uptime, not for safety — the off-site copy is the second copy |
 | A DNS name | `aimscribe.uiu.ac.bd`, lower case, static address |
 | Inbound | 443 TCP+UDP, 80 TCP for certificates, SSH from named machines |
 | Outbound | 443 to two storage providers, NTP, container registries |
