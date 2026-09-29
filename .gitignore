@@ -75,3 +75,7 @@ backend/.env
 recorder/AIMScribe_Agent.spec
 recorder/build/
 recorder/dist/
+
+# The access sheet maps every address, login and variable in the system.
+# It carries no secret values, but it is a map, and both repositories are public.
+ACCESS_SHEET.pdf
