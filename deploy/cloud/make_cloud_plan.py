@@ -375,7 +375,127 @@ S.append(Paragraph("<b>The honest summary:</b> partial cloud is cheaper by about
                    "nobody specifically assigned to it, the rented server is worth the money.", BODY))
 
 # ================================================================ 10
-S.append(Paragraph("10 &middot; Everything side by side", H2))
+S.append(PageBreak())
+S.append(Paragraph("10 &middot; Partial cloud &mdash; the full specification", H2))
+S.append(Paragraph("Section 9 priced it. This is what UIU actually has to provide, to the same "
+                   "level of detail as the rented server in sections 5 and 6. Nothing about the "
+                   "clinics, the laptops or the storage changes &mdash; only where the computer "
+                   "sits.", BODY))
+
+S.append(H3 and Paragraph("10.1 &nbsp; The machine", H3))
+S.append(tbl([["", "Minimum", "Recommended", "What AIMS LAB offers", "Verdict"],
+              ["Staff (cores)", "4", "8", "<b>8</b>", "<b>enough</b>"],
+              ["Desk (memory)", "8 GB", "16 GB", "<b>8 GB</b>", "<b>enough</b>"],
+              ["<b>Filing cabinet (disk)</b>", "<b>160 GB SSD</b>", "<b>256 GB SSD</b>",
+               "<b>100 GB</b>", "<b>too small</b>"],
+              ["Network card", "1 Gbit/s", "1 Gbit/s", "assumed", "check"],
+              ["Power protection", "UPS", "UPS with clean shutdown", "unknown", "check"]],
+             [34 * mm, 24 * mm, 34 * mm, 32 * mm, 24 * mm], highlight=[3]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Only the disk is wrong, and only by 60 GB.</b> Section 6 works out why "
+                   "148 GB is needed even with all the audio in R2. A 256 GB SSD is a one-off "
+                   "purchase of roughly $30 and solves it with room for three years of database "
+                   "growth. Nothing else about the machine needs changing.", GOOD))
+
+S.append(H3 and Paragraph("10.2 &nbsp; Software on it", H3))
+S.append(tbl([["What", "Which", "Why"],
+              ["Operating system", "<b>Ubuntu Server 24.04 LTS</b>",
+               "Supported until 2029. On an 8 GB machine, Windows plus Docker Desktop would "
+               "consume about half the memory before AIMScribe started"],
+              ["Container engine", "Docker Engine with the Compose plugin",
+               "The whole system is eleven containers started by one command"],
+              ["Access", "root or sudo on the host", "To install and to run the stack"],
+              ["Everything else", "nothing to install by hand",
+               "Both databases, their roles and all eleven migrations are built on first start"]],
+             [34 * mm, 48 * mm, 74 * mm]))
+
+S.append(H3 and Paragraph("10.3 &nbsp; What UIU's network team must agree", H3))
+S.append(Paragraph("This is the part that takes longest, because it is other people's decision. "
+                   "A rented server needs none of it.", NOTE))
+S.append(Spacer(1, 3))
+S.append(tbl([["", "Requirement", "Why it cannot be skipped"],
+              ["1", "<b>Inbound port 443</b>, TCP <b>and</b> UDP",
+               "Every clinic laptop and CMED's server connect in on it. UDP carries HTTP/3"],
+              ["2", "<b>Inbound port 80</b>, TCP",
+               "Certificate renewal only. It serves nothing and redirects to 443"],
+              ["3", "SSH inbound from <b>named UIU machines only</b>", "Administration"],
+              ["4", "<b>Outbound 443 to Cloudflare, unfiltered</b>",
+               "This is how recordings reach R2. <b>No TLS interception and no transparent "
+               "proxy</b> &mdash; uploads are signed with the destination inside them, and a "
+               "middlebox breaks the signature"],
+              ["5", "<b>Outbound NTP (port 123)</b>",
+               "Recordings are filed under the clinic's local date, decided once. A drifting "
+               "clock misfiles consultations permanently"],
+              ["6", "<b>A DNS name, lower case, and a static address</b>",
+               "Certificates are issued for names. A changed DHCP lease silenced every recorder "
+               "once already on the bench"],
+              ["7", "No aggressive idle-connection timeout",
+               "Recorders reuse a connection every 30 seconds; the server holds them 75"],
+              ["8", "<b>No automatic reboots or patch windows 08:00&ndash;21:30</b>, six days a "
+                    "week", "A reboot mid-consultation is survivable but costs recordings that "
+                            "cannot be re-taken"],
+              ["9", "The data disk exempt from quota sweeps and automatic cleanup",
+               "It holds the databases and the upload buffer"]],
+             [7 * mm, 56 * mm, 93 * mm], bold_first=False))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>If CITS will not open an inbound port at all</b>, there is still a way: a "
+                   "Cloudflare Tunnel needs <b>no inbound rule whatsoever</b> &mdash; the server "
+                   "dials out and the tunnel carries traffic back. It is free, it fits the R2 "
+                   "policy, and it removes requirements 1, 2 and 6 from the list above.", GOOD))
+
+S.append(H3 and Paragraph("10.4 &nbsp; One-off costs, and who owns the machine", H3))
+S.append(tbl([["Item", "Cost", "Note"],
+              ["256 GB SSD", "~$30", "Required. 100 GB is not enough"],
+              ["UPS, if the room has none", "$80&ndash;150",
+               "A recording being written during an unclean power cut can be damaged"],
+              ["<b>One-off total</b>", "<b>$30&ndash;180</b>", ""],
+              ["<b>Then, per year</b>", "<b>$552</b>", "R2 storage and the domain only"]],
+             [48 * mm, 34 * mm, 74 * mm], highlight=[3, 4]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>The cost that does not appear on any invoice is a person.</b> With a "
+                   "rented server, backups are a checkbox, the hardware is somebody else's "
+                   "problem, and a failed disk is replaced without you knowing. On your own "
+                   "machine, all of that is a named person at AIMS LAB:", BAD))
+S.append(Spacer(1, 3))
+S.append(tbl([["Job", "How often", "What happens if nobody does it"],
+              ["Check the backup ran, and that the dashboard is clean", "every morning, 2 minutes",
+               "A silent failure runs for weeks"],
+              ["<b>Restore one recording and prove it opens</b>", "day one, then monthly",
+               "You discover the backups were unreadable on the day you need them"],
+              ["Operating system security updates", "monthly, 20 minutes",
+               "A public-facing machine drifts out of support"],
+              ["Watch free disk space", "weekly glance at the dashboard",
+               "The upload buffer fills and archiving stops"],
+              ["Be reachable if it stops", "whenever it happens",
+               "Clinics stop recording after the laptops fill, about 13 hours"]],
+             [52 * mm, 36 * mm, 68 * mm]))
+
+S.append(H3 and Paragraph("10.5 &nbsp; The two side by side", H3))
+S.append(tbl([["", "Partial &mdash; your own machine", "Full &mdash; DigitalOcean"],
+              ["Yearly cost", "<b>$552</b>", "$1,243"],
+              ["One-off cost", "$30&ndash;180", "$0"],
+              ["Time to running", "<b>weeks</b> &mdash; network approvals first", "<b>an afternoon</b>"],
+              ["Backups", "you build, you test", "a checkbox, then you test"],
+              ["Hardware failure", "your problem, your spare parts", "theirs; you rebuild from a snapshot"],
+              ["Someone on call", "a named person at AIMS LAB", "the provider, for the machine"],
+              ["Network rules", "nine agreements with CITS", "none"],
+              ["Patient data location", "<b>on a UIU machine</b>", "on a rented machine in Bangalore"],
+              ["Power cuts, cooling", "yours", "theirs"],
+              ["If the project grows", "buy and install hardware", "change a size in a menu"]],
+             [38 * mm, 58 * mm, 60 * mm], highlight=[1]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>The honest way to choose.</b> Partial cloud saves about $690 a year. That "
+                   "is roughly one week of a developer's time. If AIMS LAB has somebody who will "
+                   "genuinely own that machine &mdash; the morning check, the monthly restore, "
+                   "the 11pm phone call &mdash; take it, and keep patient data on a university "
+                   "machine into the bargain. <b>If that person does not exist and cannot be "
+                   "named today, rent the server</b>: $690 a year is cheap compared with "
+                   "discovering in month three that nothing has been backed up.", GOOD))
+
+S.append(PageBreak())
+
+# ================================================================ 11
+S.append(Paragraph("11 &middot; Everything side by side", H2))
 S.append(tbl([["Setup", "Server", "Storage", "Transfer", "Monthly", "Yearly"],
               ["<b>Partial &mdash; own server + R2</b>", "$0", "$45", "$0", "<b>$46</b>",
                "<b>$552</b>"],
@@ -394,8 +514,8 @@ S.append(Paragraph("<b>If the storage policy is Cloudflare R2, there are only tw
 
 S.append(PageBreak())
 
-# ================================================================ 11
-S.append(Paragraph("11 &middot; What runs where", H2))
+# ================================================================ 12
+S.append(Paragraph("12 &middot; What runs where", H2))
 S.append(tbl([["Layer", "What", "Lives on", "If it stops"],
               ["Clinic", "AIMScribe agent, one per room", "the doctor's laptop",
                "That room stops. The other thirteen continue"],
@@ -414,7 +534,7 @@ S.append(tbl([["Layer", "What", "Lives on", "If it stops"],
              [18 * mm, 48 * mm, 36 * mm, 54 * mm]))
 
 # ================================================================ 12
-S.append(Paragraph("12 &middot; Keeping it running", H2))
+S.append(Paragraph("13 &middot; Keeping it running", H2))
 S.append(tbl([["Risk", "What already protects you", "What you must still do"],
               ["Server down an hour", "Laptops hold ~13 hours each. Nothing is lost",
                "Nothing. This is designed for"],
@@ -442,7 +562,7 @@ S.append(Paragraph("<b>One server, not two.</b> What keeps clinics recording thr
                    "complexity. Spend the effort on alerting and on testing restores.", GOOD))
 
 # ================================================================ 13
-S.append(Paragraph("13 &middot; What must be built before any of this works", H2))
+S.append(Paragraph("14 &middot; What must be built before any of this works", H2))
 S.append(Paragraph("Today the system writes finished recordings to the server's own disk and "
                    "never removes them. That fills any disk, on any provider, in about a week.", BAD))
 S.append(Spacer(1, 4))
@@ -466,7 +586,7 @@ S.append(Paragraph("<b>About a week of work, and it must be finished and tested 
 S.append(PageBreak())
 
 # ================================================================ 14
-S.append(Paragraph("14 &middot; Setting it up, in order", H2))
+S.append(Paragraph("15 &middot; Setting it up, in order", H2))
 S.append(tbl([["", "Step", "Where"],
               ["1", "Open a Cloudflare account and create an R2 bucket. Turn on versioning",
                "Cloudflare"],
@@ -485,7 +605,7 @@ S.append(tbl([["", "Step", "Where"],
              [7 * mm, 112 * mm, 37 * mm], bold_first=False))
 
 # ================================================================ 15
-S.append(Paragraph("15 &middot; One page to remember", H2))
+S.append(Paragraph("16 &middot; One page to remember", H2))
 S.append(tbl([["Question", "Answer"],
               ["What does \"8 GB / 4 vCPU / 160 GB\" mean?",
                "One rented computer: four staff, a desk for them, a 160 GB filing cabinet"],
