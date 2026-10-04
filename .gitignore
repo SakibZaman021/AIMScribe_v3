@@ -79,3 +79,7 @@ recorder/dist/
 # The access sheet maps every address, login and variable in the system.
 # It carries no secret values, but it is a map, and both repositories are public.
 ACCESS_SHEET.pdf
+
+# Temporary build output when the real PDF is open in a viewer.
+deploy/cloud/*.new.pdf
+deploy/cloud/*.v2.pdf
