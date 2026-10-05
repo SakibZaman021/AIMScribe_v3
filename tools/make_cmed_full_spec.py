@@ -127,9 +127,9 @@ S.append(H3 and Paragraph("What is in here", H3))
 S.append(tbl([["Part", "Covers", "Who builds it", "Sections"],
               ["<b>A</b>", "How it all fits together, and the five fields that tie it together",
                "read this first", "1&ndash;2"],
-              ["<b>B</b>", "<b>The two browser signals</b> &mdash; API 1 and API 3a",
+              ["<b>B</b>", "<b>The two browser signals</b> &mdash; API 1 and API 3 on Channel A",
                "CMED's front-end developer", "3&ndash;9"],
-              ["<b>C</b>", "<b>The two server messages</b> &mdash; API 2 and API 3b",
+              ["<b>C</b>", "<b>The two server messages</b> &mdash; API 2 and API 3 on Channel B",
                "CMED's back-end developer", "10&ndash;15"],
               ["<b>D</b>", "Where the data lands, how to test, what each side hands over",
                "both, and the project leads", "16&ndash;21"]],
@@ -157,21 +157,36 @@ S.append(part("PART A", "How it all fits together",
               "The four messages, and the five fields that tie them to one consultation"))
 
 # ---------------------------------------------------------- 1
-S.append(Paragraph("1 &middot; The four things CMED builds", H2))
+S.append(Paragraph("1 &middot; Three APIs &mdash; and why they are four messages", H2))
 S.append(tbl([["", "What", "From where", "When", "Carries", "Part"],
               ["<b>API 1</b>", "Start recording", "the browser", "the doctor opens a patient",
                "the five fields", "B"],
               ["<b>API 2</b>", "<b>Patient information</b>", "<b>CMED's server</b>",
                "the same moment", "demographics, paramedic readings, previous visit", "C"],
-              ["<b>API 3a</b>", "Prescription built", "the browser",
+              ["<b>API 3</b><br/>Channel A", "Prescription built", "the browser",
                "the doctor presses Build Prescription", "the patient and session id", "B"],
-              ["<b>API 3b</b>", "<b>The prescription</b>", "<b>CMED's server</b>",
+              ["<b>API 3</b><br/>Channel B", "<b>The prescription</b>", "<b>CMED's server</b>",
                "the same moment", "medicines, diagnoses, investigations", "C"]],
              [15 * mm, 29 * mm, 25 * mm, 34 * mm, 42 * mm, 11 * mm], highlight=[2, 4]))
 S.append(Spacer(1, 4))
+S.append(Spacer(1, 4))
+S.append(tbl([["On the naming &mdash; there are three APIs, not four"],
+              ["CMED's existing integration guide numbers these <b>API 1, API 2 and API 3</b>, "
+               "and that numbering is correct and unchanged. <b>API 3 is one event</b> &mdash; "
+               "the prescription has been built &mdash; but it has to be told to <b>two "
+               "different places</b>: the recorder on the doctor's PC, so it knows the "
+               "consultation has reached its end, and the AIMS LAB server, so we receive the "
+               "prescription itself.<br/><br/>"
+               "This document therefore writes <b>\"API 3, Channel A\"</b> for the signal to the "
+               "PC and <b>\"API 3, Channel B\"</b> for the message to our server. They are the "
+               "two halves of API 3, matching sections 6a and 6b of the earlier guide. "
+               "<b>An earlier draft of this document called them API 3a and API 3b; those labels "
+               "are withdrawn.</b> Three APIs, four messages."]],
+             [156 * mm], bold_first=False))
+S.append(Spacer(1, 4))
 S.append(Paragraph("<b>They go in pairs.</b> When the doctor opens a patient, the browser sends "
                    "API 1 and your server sends API 2 at the same moment. When the doctor presses "
-                   "Build Prescription, the browser sends API 3a and your server sends API 3b. "
+                   "Build Prescription, the browser sends API 3 on Channel A and your server sends API 3 on Channel B. "
                    "Four messages, two moments.", GOOD))
 S.append(Spacer(1, 4))
 S.append(tbl([["Why two channels instead of one?"],
@@ -210,7 +225,7 @@ S.append(tbl([["Field", "Type", "Rule", "Example"],
              [26 * mm, 16 * mm, 72 * mm, 42 * mm], mono=(3,)))
 S.append(Spacer(1, 4))
 S.append(tbl([["Three mistakes that break the match"],
-              ["<b>1. Sending the prescription's own time as start_time.</b> API 3a and API 3b "
+              ["<b>1. Sending the prescription's own time as start_time.</b> API 3 on Channel A and API 3 on Channel B "
                "must repeat the <b>original</b> start_time from when the patient was opened "
                "&mdash; not the time the prescription was built. This is the single most common "
                "integration mistake, and it is silent: both messages succeed, and the "
@@ -232,7 +247,7 @@ S.append(PageBreak())
 
 # ============================================================ PART B
 S.append(part("PART B", "The two browser signals",
-              "API 1 and API 3a &middot; built by CMED's front-end developer"))
+              "API 1 and API 3 on Channel A &middot; built by CMED's front-end developer"))
 
 # ---------------------------------------------------------- 3
 S.append(Paragraph("3 &middot; How the page connects", H2))
@@ -396,9 +411,9 @@ S.append(Paragraph("<b>But a provisional start can still fail afterwards.</b> If
 S.append(PageBreak())
 
 # ---------------------------------------------------------- 6
-S.append(Paragraph("6 &middot; API 3a &mdash; the prescription has been built", H2))
+S.append(Paragraph("6 &middot; API 3, Channel A &mdash; the prescription has been built", H2))
 S.append(Paragraph("Send this the moment <b>Build Prescription</b> succeeds, at the same time as "
-                   "your server sends API 3b.", BODY))
+                   "your server sends API 3 on Channel B.", BODY))
 S.append(Spacer(1, 3))
 S.append(Preformatted(
     '{\n'
@@ -442,7 +457,7 @@ S.append(Spacer(1, 4))
 S.append(tbl([["What the doctor does", "What CMED sends", "What the recorder does"],
               ["Opens patient A", "API 1 (A) + API 2 (A)", "Starts recording A"],
               ["Consults", "&mdash;", "Recording"],
-              ["Presses Build Prescription", "<b>API 3a (A) + API 3b (A)</b>",
+              ["Presses Build Prescription", "<b>API 3 on Channel A (A) + API 3 on Channel B (A)</b>",
                "<b>Keeps recording.</b> Arms the gate"],
               ["Prints it, hands it over, counsels", "&mdash;", "<b>Still recording</b> &mdash; "
                                                                 "this is the valuable part"],
@@ -514,14 +529,14 @@ S.append(PageBreak())
 
 # ============================================================ PART C
 S.append(part("PART C", "The two server messages",
-              "API 2 and API 3b &middot; built by CMED's back-end developer"))
+              "API 2 and API 3 on Channel B &middot; built by CMED's back-end developer"))
 
 # ---------------------------------------------------------- 10
 S.append(Paragraph("10 &middot; How CMED's server connects", H2))
 S.append(tbl([["", "Address"],
               ["<b>API 2</b> &mdash; patient information",
                "POST https://&lt;aims-lab-server&gt;/api/v2/clinical/patient-information"],
-              ["<b>API 3b</b> &mdash; prescription",
+              ["<b>API 3, Channel B</b> &mdash; prescription",
                "POST https://&lt;aims-lab-server&gt;/api/v2/clinical/prescription"],
               ["Header on both", "X-CMED-Key: &lt;the key AIMS LAB gives you&gt;"],
               ["Body", "JSON, UTF-8, under 1 MB"],
@@ -652,7 +667,7 @@ S.append(tbl([["Field", "Rule"],
               ["<b>date</b>", "<b>Required</b> if you send previous_visit at all. YYYY-MM-DD. "
                               "The date of that earlier consultation. Without it the whole "
                               "previous visit is ignored"],
-              ["prescription", "Same shape as API 3b, section 13. Only "
+              ["prescription", "Same shape as API 3 on Channel B, section 13. Only "
                                "<font face='Courier'>items</font> really matters"],
               ["diagnoses, notes", "May sit inside <font face='Courier'>prescription</font> or "
                                    "beside it &mdash; both work"]],
@@ -673,9 +688,9 @@ S.append(Paragraph("<b>Recommendation for the first release: send it every time 
 S.append(PageBreak())
 
 # ---------------------------------------------------------- 13
-S.append(Paragraph("13 &middot; API 3b &mdash; the prescription", H2))
+S.append(Paragraph("13 &middot; API 3, Channel B &mdash; the prescription", H2))
 S.append(Paragraph("Sent the moment the doctor presses <b>Build Prescription</b>, at the same "
-                   "time as the browser's API 3a. Remember that this does <b>not</b> stop the "
+                   "time as the browser's API 3 on Channel A. Remember that this does <b>not</b> stop the "
                    "recording &mdash; see section 7.", BODY))
 S.append(Spacer(1, 3))
 S.append(Preformatted(
@@ -735,7 +750,7 @@ S.append(PageBreak())
 S.append(Paragraph("14 &middot; Corrections, repeats and retries", H2))
 S.append(tbl([["Situation", "What to do", "What happens"],
               ["The doctor edits the prescription after it was sent",
-               "Send API 3b again with the <b>same five fields</b>",
+               "Send API 3 on Channel B again with the <b>same five fields</b>",
                "We store it as a new version. Both are kept; the newest is the current one"],
               ["Your network failed, you are not sure it arrived", "Send it again, unchanged",
                "<b>Completely safe.</b> You get <font face='Courier'>202 ALREADY_RECEIVED</font> "
@@ -822,7 +837,7 @@ S.append(H3 and Paragraph("The five fields, and the pairing", H3))
 S.append(tbl([["", "Rule", "Why"],
               ["1", "<b>The five fields must be identical in all four messages</b>",
                "They are the only link between the recording and the clinical record"],
-              ["2", "<b>start_time in API 3a and 3b is the original</b>, from when the patient "
+              ["2", "<b>start_time in API 3 on Channel A and 3b is the original</b>, from when the patient "
                     "was opened", "It is how the prescription finds its recording"],
               ["3", "<b>Every timestamp carries its offset</b> (+06:00)",
                "A time without a zone is stored as empty"],
@@ -832,7 +847,7 @@ S.append(tbl([["", "Rule", "Why"],
 S.append(H3 and Paragraph("The browser side", H3))
 S.append(tbl([["", "Rule", "Why"],
               ["5", "<b>Keep the session_id</b> that API 1 returns",
-               "API 3a needs it. Without it you cannot arm the gate"],
+               "API 3 on Channel A needs it. Without it you cannot arm the gate"],
               ["6", "<b>Treat RECORDING_PROVISIONAL as success</b>",
                "The microphone is already live. It is not a warning"],
               ["7", "<b>But keep listening</b> &mdash; a provisional start can be refused a "
@@ -887,7 +902,7 @@ S.append(Preformatted(
     '\n'
     '    if (m.command === "start") {\n'
     '      if (m.code === "RECORDING_STARTED" || m.code === "RECORDING_PROVISIONAL") {\n'
-    '        sessionId = m.data.session_id;      // keep it - API 3a needs it\n'
+    '        sessionId = m.data.session_id;      // keep it - API 3 on Channel A needs it\n'
     '        showRecording(true);\n'
     '      } else {\n'
     '        showProblem(m.code);                // act on the code, not the message\n'
@@ -909,7 +924,7 @@ S.append(Preformatted(
     '    start_time:  new Date().toISOString(),   // with offset\n'
     '    date:        localDateString()           // the clinic\'s local day\n'
     '  };\n'
-    '  currentVisit = visit;                 // keep for API 3a and 3b\n'
+    '  currentVisit = visit;                 // keep for API 3 on Channel A and 3b\n'
     '\n'
     '  socket.send(JSON.stringify({\n'
     '    command: "start",\n'
@@ -929,7 +944,7 @@ S.append(Preformatted(
     '    session_id: sessionId\n'
     '  }));\n'
     '\n'
-    '  // API 3b - note it reuses currentVisit, so start_time is the ORIGINAL.\n'
+    '  // API 3 on Channel B - note it reuses currentVisit, so start_time is the ORIGINAL.\n'
     '  sendPrescriptionFromYourServer(currentVisit, prescription);\n'
     '}\n'
     '\n'
@@ -989,7 +1004,7 @@ S.append(tbl([["Question", "Answer"],
                "<font face='Courier'>ws://127.0.0.1:5050/ws</font> &mdash; the same PC, every time"],
               ["Do I need a password there?", "<b>No.</b> You need your page's web address on our "
                                               "allow-list instead"],
-              ["What do I keep from the reply?", "<b>session_id</b> &mdash; API 3a needs it"],
+              ["What do I keep from the reply?", "<b>session_id</b> &mdash; API 3 on Channel A needs it"],
               ["Is RECORDING_PROVISIONAL bad?", "<b>No.</b> It means recording. But keep "
                                                 "listening &mdash; it can still be refused"],
               ["Does prescription_built stop it?", "<b>No.</b> It arms the gate. The next patient "
@@ -1007,7 +1022,7 @@ S.append(tbl([["Question", "Answer"],
               ["What is required in API 2?", "<font face='Courier'>demographics</font>, and "
                                              "<font face='Courier'>previous_visit</font> present "
                                              "(null is fine)"],
-              ["What is required in API 3b?", "<font face='Courier'>issued_at</font>, "
+              ["What is required in API 3 on Channel B?", "<font face='Courier'>issued_at</font>, "
                                               "<font face='Courier'>items</font>, "
                                               "<font face='Courier'>diagnoses</font>, "
                                               "<font face='Courier'>investigations</font> "
@@ -1046,7 +1061,11 @@ def footer(canvas, doc):
     canvas.restoreState()
 
 
-OUT = Path(__file__).resolve().parent.parent / "CMED_INTEGRATION_SPECIFICATION.pdf"
+import argparse
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--out", default="CMED_INTEGRATION_SPECIFICATION.pdf",
+                 help="output file name, for when the real one is open in a viewer")
+OUT = Path(__file__).resolve().parent.parent / _ap.parse_args().out
 SimpleDocTemplate(str(OUT), pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
                   topMargin=16 * mm, bottomMargin=20 * mm,
                   title="The CMED Integration Specification - AIMScribe v3",

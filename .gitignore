@@ -83,3 +83,6 @@ ACCESS_SHEET.pdf
 # Temporary build output when the real PDF is open in a viewer.
 deploy/cloud/*.new.pdf
 deploy/cloud/*.v2.pdf
+
+deploy/cloud/*.staged.pdf
+*.staged.pdf
