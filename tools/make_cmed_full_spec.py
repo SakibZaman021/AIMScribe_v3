@@ -543,6 +543,25 @@ S.append(tbl([["", "Address"],
               ["Success", "HTTP 202 &mdash; the message is stored before you get this reply"]],
              [50 * mm, 106 * mm], mono=(1,)))
 S.append(Spacer(1, 4))
+S.append(Spacer(1, 4))
+S.append(tbl([["Also on the same server", "Address", "Key needed?"],
+              ["<b>Is the system running?</b>", "<font face='Courier'>GET /health</font>",
+               "<b>No</b> &mdash; poll it freely"],
+              ["Which system is this?", "<font face='Courier'>GET /</font>", "No"]],
+             [50 * mm, 62 * mm, 44 * mm], highlight=[1]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>The hostname is configuration, not a constant.</b> AIMS LAB sends the "
+                   "staging and production hostnames with the key, and they differ. The server "
+                   "runs on <b>DigitalOcean in Bangalore</b>, the lowest-latency region available "
+                   "to Dhaka at roughly 45&ndash;70 ms. <b>That latency never affects "
+                   "recording</b> &mdash; the microphone is driven by the program on the clinic "
+                   "PC over loopback, so it starts instantly whether or not our server is "
+                   "reachable.", GOOD))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Operational detail &mdash; endpoints, limits, monitoring, the test "
+                   "commands and the go-live checklist &mdash; is in the companion "
+                   "\"Integration &amp; Test Guide for CMED DevOps\".</b> This document stays "
+                   "with the messages themselves.", NOTE))
 S.append(Paragraph("<b>The key is a server credential. It must never appear in a browser</b>, in "
                    "page source, or in anything a user can view. Both messages go server to "
                    "server.", BAD))
@@ -965,7 +984,9 @@ S.append(tbl([["", "What", "How"],
               ["3", "See every message and reply side by side",
                "open <font face='Courier'>/protocol-test</font> on the test site"],
               ["4", "Test the browser signals against a real recorder",
-               "install the recorder on one PC, then open your page and watch the replies"]],
+               "install the recorder on one PC, then open your page and watch the replies"],
+              ["5", "<b>Confirm the server is up at any time</b>",
+               "<font face='Courier'>curl https://&lt;host&gt;/health</font> &mdash; no key needed"]],
              [7 * mm, 62 * mm, 87 * mm], bold_first=False))
 S.append(Spacer(1, 3))
 S.append(Paragraph("Step 2 runs every case that matters &mdash; a good message, the same message "
