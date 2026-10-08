@@ -281,7 +281,7 @@ S.append(Paragraph("<b>Why this droplet:</b> 8 vCPU on DigitalOcean's Basic line
                    "16 GB and 320 GB as a fixed bundle, so asking for 8 cores and 200 GB lands "
                    "here and the extra memory and disk come at no additional cost. The 6 TB of "
                    "included transfer matters more than it looks: the server pushes roughly "
-                   "520 GB a month up to Cloudflare R2, and on this provider that is free.", GOOD))
+                   "840 GB a month up to Cloudflare R2, and on this provider that is free.", GOOD))
 
 S.append(Paragraph("2.2 &nbsp; Storage &mdash; the 320 GB disk is not where audio lives", H2))
 S.append(Paragraph("The droplet's 320 GB is <b>working space</b>. It is not the audio archive, and "
@@ -291,11 +291,11 @@ S.append(Spacer(1, 4))
 S.append(tbl([["", "<b>Server disk &mdash; 320 GB</b>", "<b>Cloudflare R2 &mdash; 3 TB</b>"],
               ["Holds", "Operating system, the eight programs, both databases, logs, and "
                         "recordings <b>in transit</b>",
-               "<b>Every recording, permanently</b>, as encrypted FLAC"],
+               "<b>Every recording, permanently, as the original WAV</b>"],
               ["How long", "Hours. A file is removed once the cloud copy is verified",
                "<b>Permanently.</b> This is the research dataset"],
               ["Capacity", "about a day and a half of recording as a buffer",
-               "<b>41,600 consultations</b> &mdash; the 18,000-patient study uses 1.3 TB"],
+               "<b>26,200 consultations</b> &mdash; the 18,000-patient study uses 2.06 TB"],
               ["Cost", "included in the $96 droplet", "<b>$45/month, $540/year</b>"],
               ["If it fills", "archiving stops; clinics keep recording locally",
                "buy more &mdash; $15 per TB per month, no limit"]],
@@ -305,7 +305,7 @@ S.append(tbl([["Total cost of the cloud deployment", "Monthly", "Yearly"],
               ["Droplet &mdash; 8 vCPU / 16 GB / 320 GB, Bangalore", "$96", "$1,152"],
               ["Droplet backups", "$19", "$230"],
               ["<b>Cloudflare R2 &mdash; 3 TB of audio</b>", "<b>$45</b>", "<b>$540</b>"],
-              ["Transfer to R2 (519 GB/mo, inside the included 6 TB)", "$0", "$0"],
+              ["Transfer to R2 (844 GB/mo, inside the included 6 TB)", "$0", "$0"],
               ["<b>Total</b>", "<b>$160</b>", "<b>$1,922</b>"]],
              [100 * mm, 28 * mm, 28 * mm], highlight=[3, 5]))
 S.append(Spacer(1, 3))
@@ -327,7 +327,7 @@ S.append(Preformatted(
     '                                                <stem>.manifest.json\n'
     '\n'
     'IN CLOUDFLARE R2\n'
-    '  copies/AALO_DHOLPUR/DR0042/2026-10-05/<stem>.v1.flac.enc\n'
+    '  copies/AALO_DHOLPUR/DR0042/2026-10-05/<stem>.v1.wav.enc\n'
     '  copies/AALO_DHOLPUR/DR0042/2026-10-05/<stem>.v1.json.enc\n'
     '\n'
     '  where <stem> = P0012345_DR0042_AALO_DHOLPUR_101432_102755_20261005', CODE))
@@ -336,9 +336,9 @@ S.append(tbl([["Same", "Different", "Why"],
               ["<b>clinic / doctor / date</b>, in that order",
                "a <font face='Courier'>copies/</font> prefix",
                "lets other things share the bucket later"],
-              ["the file name, character for character",
-               "<font face='Courier'>.flac</font> not <font face='Courier'>.wav</font>",
-               "lossless, 40% smaller &mdash; verified by decoding and comparing"],
+              ["<b>the file itself &mdash; the same WAV, bit for bit</b>",
+               "nothing",
+               "<b>No conversion at all.</b> On a full-cloud deployment the raw recording is what is kept, so there is no second format and nothing to decode or verify"],
               ["", "<font face='Courier'>.enc</font> on the end",
                "<b>encrypted before it leaves UIU</b> &mdash; see below"],
               ["", "<font face='Courier'>.v1</font> version number",
@@ -654,6 +654,154 @@ S.append(tbl([["<b>CMED gives AIMS LAB &mdash; both are blocking</b>", "Why it b
              [62 * mm, 94 * mm], req=[1, 2]))
 
 S.append(PageBreak())
+S.append(part("PART E", "How integration actually happens",
+              "What can be tested today, what cannot, and how the gateway gets proved"))
+
+S.append(Paragraph("11A &middot; The honest starting position", H2))
+S.append(Paragraph("<b>Today the system runs on a single PC on a private network.</b> Its address "
+                   "is a local one of the form <font face='Courier'>192.168.x.x</font>. That is "
+                   "correct for development, and it is where all the testing so far has happened.",
+                   BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["<b>So CMED's backend cannot send us anything yet, and no setting changes that</b>"],
+              ["A private address is not reachable from the internet. There is no public IP, no "
+               "DNS name and no TLS certificate, so <b>a POST from CMED's server to API 2 or "
+               "API 3 Channel B cannot arrive</b>. It is not a firewall rule and not a key "
+               "problem &mdash; there is simply nothing for CMED to connect to.<br/><br/>"
+               "<b>This is ours to solve, before CMED's backend work can be tested at all.</b> "
+               "Section 11C is how."]],
+             [156 * mm], bold_first=False))
+
+S.append(Paragraph("11B &middot; What CMED can test today, with no change at all", H2))
+S.append(Paragraph("The split matters, because <b>one half of the integration is completely "
+                   "unblocked right now</b> and the other is not.", BODY))
+S.append(Spacer(1, 4))
+S.append(tbl([["", "Channel", "Testable today?", "Why"],
+              ["<b>API 1</b><br/><b>API 3, Channel A</b><br/>plus "
+               "<font face='Courier'>doctors</font> and <font face='Courier'>status</font>",
+               "browser &rarr; recorder, on the clinic PC",
+               "<b>YES &mdash; fully, today</b>",
+               "<b>It never touches the internet.</b> The page and the recorder are on the same "
+               "machine, over loopback. Install the recorder on one PC and CMED's front-end work "
+               "can be finished and tested end to end"],
+              ["<b>API 2</b><br/><b>API 3, Channel B</b>",
+               "CMED's server &rarr; our server",
+               "<b>NO &mdash; not until we publish an address</b>",
+               "Needs a public hostname and a certificate. This is the gap"]],
+             [36 * mm, 34 * mm, 34 * mm, 52 * mm], highlight=[1], req=[2]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>So CMED should start on the browser side immediately.</b> It is the half "
+                   "with the awkward details &mdash; the gate, the session id, the provisional "
+                   "reply, reading the clinic code off the laptop &mdash; and none of it needs our "
+                   "server to exist. The backend half is the simpler of the two and can follow a "
+                   "few days later.", GOOD))
+
+S.append(Paragraph("11C &middot; Three ways to give CMED a gateway to test against", H2))
+S.append(tbl([["", "Option", "Ready in", "Public HTTPS?", "Good for"],
+              ["<b>1</b>", "<b>Deploy the DigitalOcean droplet</b> (section 2) and use it as "
+                           "staging", "<b>one afternoon</b>", "<b>Yes</b>",
+               "<b>The real answer.</b> It is the production machine anyway"],
+              ["<b>2</b>", "<b>A Cloudflare Tunnel from the PC running it now</b>",
+               "<b>~15 minutes</b>", "<b>Yes</b>",
+               "<b>Unblocking CMED this week</b>, without waiting for the droplet"],
+              ["<b>3</b>", "CMED builds against the written spec and a stub of their own",
+               "immediate", "n/a",
+               "Weak. Proves their code compiles, not that it interoperates"]],
+             [8 * mm, 54 * mm, 26 * mm, 24 * mm, 42 * mm], highlight=[1, 2]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Recommendation: option 2 now, option 1 this month.</b> A Cloudflare Tunnel "
+                   "gives a real public HTTPS hostname pointing at the stack already running on "
+                   "the PC, <b>needs no inbound firewall rule and no port forwarding</b> &mdash; "
+                   "the machine dials out &mdash; and costs nothing. CMED can begin backend "
+                   "testing against it within the hour, and when the droplet is live they change "
+                   "one hostname. Which is exactly why section 0.1 asks them to hold the hostname "
+                   "as configuration rather than compile it in.", GOOD))
+S.append(Spacer(1, 4))
+S.append(tbl([["What the tunnel changes, and what it does not"],
+              ["<b>Unchanged:</b> every endpoint, every reply code, the key, the limits, the "
+               "folder layout. CMED's code is identical against the tunnel and against the "
+               "droplet.<br/>"
+               "<b>Changed:</b> the hostname, and nothing else.<br/>"
+               "<b>Not for live clinics:</b> it depends on that PC staying switched on. It is a "
+               "test gateway, not a deployment."]],
+             [156 * mm], bold_first=False))
+
+S.append(PageBreak())
+S.append(Paragraph("11D &middot; The integration plan, in phases", H2))
+S.append(tbl([["Phase", "What happens", "Who", "Waiting on"],
+              ["<b>0</b>", "<b>AIMS LAB publishes a staging gateway</b> (tunnel, then droplet) and "
+                           "issues the hostname and key", "<b>AIMS LAB</b>",
+               "<b>nothing &mdash; ours to do</b>"],
+              ["<b>1</b>", "<b>CMED builds and tests the browser half</b> on a PC with the recorder "
+                           "installed: connect, <font face='Courier'>doctors</font>, API 1, the "
+                           "gate, API 3 Channel A", "CMED front-end",
+               "<b>nothing &mdash; can start today</b>"],
+              ["<b>2</b>", "CMED builds the backend half and tests it against staging &mdash; the "
+                           "four commands in section 7, then from their own code",
+               "CMED backend", "phase 0"],
+              ["<b>3</b>", "<b>Joint end-to-end on one clinic PC</b>: a real consultation, both "
+                           "channels, and <b>we confirm it matched and archived</b>",
+               "both", "phases 1 and 2"],
+              ["<b>4</b>", "Production droplet, production key, seven clinics enrolled, alerting on",
+               "AIMS LAB", "phase 3"]],
+             [12 * mm, 68 * mm, 28 * mm, 44 * mm], highlight=[1, 2], req=[4]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Phases 0 and 1 run in parallel and neither waits on the other.</b> That is "
+                   "the point of the split: CMED's front-end developer can start the day they read "
+                   "this, while we stand up the gateway.", GOOD))
+
+S.append(Paragraph("11E &middot; Proving the gateway works &mdash; the test matrix", H2))
+S.append(Paragraph("Run these against the staging hostname, in order. Each row proves one thing, "
+                   "and the last three are the ones that matter.", BODY))
+S.append(Spacer(1, 4))
+S.append(tbl([["", "Test", "Expected", "What it proves"],
+              ["<b>1</b>", "<font face='Courier'>GET /health</font>",
+               "<b>200</b>, <font face='Courier'>status: healthy</font>",
+               "<b>The gateway is reachable from CMED's network</b> &mdash; DNS, routing, TLS, and "
+               "the server is alive"],
+              ["<b>2</b>", "the same, reading the <font face='Courier'>system</font> field",
+               "<font face='Courier'>AIMScribe v3</font>",
+               "You reached <b>this</b> system, not the older v1 backend"],
+              ["<b>3</b>", "<font face='Courier'>POST</font> API 2 with <b>no key</b>",
+               "<b>401</b> INVALID_KEY", "Authentication is actually enforced"],
+              ["<b>4</b>", "<font face='Courier'>POST</font> API 2 with the key", "<b>202</b>",
+               "<b>The key works and the record is stored</b>"],
+              ["<b>5</b>", "<font face='Courier'>POST</font> the identical body again",
+               "<b>202</b> ALREADY_RECEIVED",
+               "<b>Retries are safe</b> &mdash; CMED can queue without risking duplicates"],
+              ["<b>6</b>", "<font face='Courier'>POST</font> API 2 with "
+                           "<font face='Courier'>sex: \"F\"</font> and no "
+                           "<font face='Courier'>previous_visit</font>",
+               "<b>422</b>, naming both fields",
+               "Validation works, and a bad record is quarantined rather than lost"],
+              ["<b>7</b>", "<font face='Courier'>POST</font> a body over 1 MB", "<b>413</b>",
+               "The size limit is real"],
+              ["<b>8</b>", "<font face='Courier'>POST</font> API 3 Channel B, same five fields",
+               "<b>202</b>", "The prescription endpoint works"],
+              ["<b>9</b>", "<b>From a clinic PC: connect to "
+                           "<font face='Courier'>ws://127.0.0.1:5050/ws</font>, send "
+                           "<font face='Courier'>doctors</font></b>",
+               "the clinic code",
+               "<b>CMED's page is on our allow-list</b> and can read the enrolment"],
+              ["<b>10</b>", "<b>A real consultation &mdash; all four messages, in order</b>",
+               "<b>recording, then archived</b>", "<b>The integration works</b>"],
+              ["<b>11</b>", "<b>AIMS LAB confirms that consultation matched and archived</b>",
+               "<b>written confirmation from us</b>",
+               "<b>The only test that proves the five fields line up. Nothing above it does</b>"]],
+             [8 * mm, 52 * mm, 36 * mm, 58 * mm], highlight=[9, 10], req=[11]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Tests 1 to 8 are CMED's to run unattended, as often as they like.</b> Tests "
+                   "9 and 10 need a PC with the recorder on it. <b>Test 11 is ours, and must be "
+                   "asked for explicitly</b> &mdash; every test above it can pass while the five "
+                   "fields silently fail to match, in which case the recording is deleted a day "
+                   "later and nobody notices.", BAD))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Our script runs tests 1 to 8 in a single command</b> &mdash; "
+                   "<font face='Courier'>channel_b_test.py</font>, section 10. Please run it and "
+                   "send us the output: it is the fastest way for both sides to agree the gateway "
+                   "is good.", GOOD))
+
+S.append(PageBreak())
 S.append(Paragraph("12 &middot; Go-live checklist", H2))
 S.append(tbl([["", "Item", "Owner"],
               ["&#9744;", "Production hostname and key issued and stored in CMED's secret store",
@@ -705,7 +853,7 @@ S.append(tbl([["Question", "Answer"],
                                                                "loopback-only"],
               ["Where is the server?", "<b>DigitalOcean Bangalore (BLR1)</b>, 8 vCPU / 16 GB / "
                                        "320 GB, ~45&ndash;70 ms from Dhaka"],
-              ["<b>Where does the audio live?</b>", "<b>Cloudflare R2, 3 TB</b>, as encrypted FLAC. "
+              ["<b>Where does the audio live?</b>", "<b>Cloudflare R2, 3 TB</b>, as the original WAV, encrypted. "
                                                    "<b>Not on the 320 GB server disk</b>, which is working space"],
               ["Same folders as the server?", "<b>Yes</b> &mdash; "
                                              "<font face='Courier'>copies/clinic/doctor/date/</font>"],
@@ -713,7 +861,13 @@ S.append(tbl([["Question", "Answer"],
               ["<b>Does a 202 mean it worked?</b>", "<b>No. It means stored, not matched.</b> See "
                                                     "section 9 step 8"],
               ["What must I send AIMS LAB?", "<b>Your page's exact addresses, and your clinic "
-                                             "codes.</b> Both blocking"]],
+                                             "codes.</b> Both blocking"],
+              ["<b>Can I test the backend today?</b>", "<b>Not yet</b> &mdash; our server is on a "
+                                                      "private network. AIMS LAB publishes a "
+                                                      "staging hostname first. Section 11C"],
+              ["<b>Can I test the browser half today?</b>", "<b>Yes, completely.</b> Loopback "
+                                                           "on the clinic PC, no internet needed. "
+                                                           "Start there"]],
              [54 * mm, 102 * mm], highlight=[2, 15]))
 S.append(Spacer(1, 6))
 S.append(Paragraph("Prepared by AIMS LAB, United International University. Companion to the CMED "

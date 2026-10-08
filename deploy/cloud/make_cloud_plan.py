@@ -118,24 +118,30 @@ S.append(PageBreak())
 
 # ================================================================ 2
 S.append(Paragraph("2 &middot; What goes into the 3 TB, and how long it lasts", H2))
-S.append(Paragraph("The format decides everything else, so it comes first. <b>FLAC is not a "
-                   "backup and not a different recording. It is the same audio stored smaller</b> "
-                   "&mdash; lossless, every sample identical when unpacked. The system already "
-                   "proves it on every file: it decodes the FLAC again and compares it to the "
-                   "original before accepting the copy. Any audio tool opens it directly.", BODY))
+S.append(Paragraph("The format decides everything else, so it comes first. <b>On a full-cloud deployment "
+                   "we keep the original WAV and convert nothing.</b> There is no FLAC step and no "
+                   "cold archive tier: the recording that comes off the microphone is the "
+                   "recording that is stored, permanently, in Cloudflare R2.", BODY))
 S.append(Spacer(1, 4))
 S.append(tbl([["What you store", "Per recording", "The 18,000 study", "What 3 TB holds",
-               "Months of recording"],
-              ["Raw WAV only", "120 MB", "2,160 GB", "25,000 recordings", "about 3.5"],
-              ["<b>FLAC only</b>", "<b>72 MB</b>", "<b>1,296 GB</b>", "<b>41,600 recordings</b>",
-               "<b>about 6</b>"],
-              ["Both (the old plan)", "192 MB", "3,456 GB", "15,600 recordings", "about 2"]],
-             [30 * mm, 24 * mm, 30 * mm, 36 * mm, 36 * mm], highlight=[2]))
+               "Clinic days of recording"],
+              ["<b>Raw WAV &mdash; what we do</b>", "<b>120 MB</b>", "<b>2.06 TB</b>",
+               "<b>26,200 recordings</b>", "<b>95 days, about 3.6 months</b>"],
+              ["FLAC, if we compressed", "72 MB", "1.24 TB", "43,700 recordings", "158 days"]],
+             [38 * mm, 24 * mm, 28 * mm, 34 * mm, 32 * mm], highlight=[1]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>Store FLAC only.</b> Identical quality, and your 3 TB lasts nearly twice "
-                   "as long. The whole 18,000-patient study fits in 1.3 TB, leaving 1.7 TB of "
-                   "room &mdash; about four more months of recording before any decision is "
-                   "needed.", GOOD))
+S.append(Paragraph("<b>Store the raw WAV.</b> 3 TB holds 26,200 consultations and the whole "
+                   "18,000-patient study needs 2.06 TB, which leaves about 0.94 TB spare &mdash; "
+                   "roughly another month of recording. Compressing to FLAC would roughly double "
+                   "that headroom, but it buys capacity we do not need and costs a conversion step, "
+                   "a verification step and a second format to keep track of.", GOOD))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>This is the decision that follows from going fully cloud.</b> FLAC earned "
+                   "its place when the plan was a 100 GB server at UIU feeding a cold archive, "
+                   "because every gigabyte on that disk was scarce. With storage rented by the "
+                   "gigabyte and no archive tier, the saving is $21 a month and the cost is a more "
+                   "complicated pipeline on the one part of the system that must never lose "
+                   "anything.", GOOD))
 S.append(Spacer(1, 4))
 S.append(Paragraph("<b>No Glacier, no deep archive.</b> Deep archive is cheap because reading "
                    "from it takes 12 to 48 hours. Your researchers will read this dataset "
@@ -177,11 +183,11 @@ S.append(PageBreak())
 # ================================================================ 4
 S.append(Paragraph("4 &middot; The trap that decides which server to rent", H2))
 S.append(Paragraph("R2 never charges you to take data <b>out</b>. But something has to put data "
-                   "<b>in</b> &mdash; and that is your server, sending about <b>519 GB every "
+                   "<b>in</b> &mdash; and that is your server, sending about <b>844 GB every "
                    "month</b> up to Cloudflare. Whether that is free depends entirely on who you "
                    "rent the server from.", BODY))
 S.append(Spacer(1, 4))
-S.append(tbl([["Your server is at", "What it charges to send 519 GB/month out", "Monthly", "Yearly"],
+S.append(tbl([["Your server is at", "What it charges to send 844 GB/month out", "Monthly", "Yearly"],
               ["<b>DigitalOcean</b>", "The droplet includes <b>5,000 GB</b> of transfer a month. "
                                       "519 is well inside it", "<b>$0</b>", "<b>$0</b>"],
               ["<b>Amazon EC2</b>", "First 100 GB free, then <b>$0.1093 per GB</b> to leave AWS. "
@@ -203,9 +209,8 @@ S.append(Paragraph("This is the single most important sentence in this document,
 S.append(Paragraph("5 &middot; The server, number by number", H2))
 S.append(H3 and Paragraph("Staff (vCPU): the work needs 1.5, so buy 4", H3))
 S.append(tbl([["Job", "How much work it really is", "Staff needed"],
-              ["Compressing audio to FLAC",
-               "The only heavy job. About 2 minutes of one worker per consultation. 277 a day is "
-               "roughly 9 hours of one worker, spread across 24 hours", "under 1"],
+              ["Uploading the finished recording",
+               "Reading one file and sending it. No conversion, so almost no processor time at all", "under 1"],
               ["The website, the API, CMED's messages",
                "About 1.2 requests a second across all 14 rooms, measured. That is very light",
                "well under 1"],
@@ -317,7 +322,7 @@ S.append(tbl([["What to buy", "Exactly what to pick", "Monthly", "Yearly"],
                "$0<br/><i>(RDS ~$25)</i>", "$0<br/><i>($300)</i>"],
               ["Audio storage &mdash; <b>option 1</b>", "<b>Cloudflare R2</b>, 3 TB, per your policy",
                "$45", "$540"],
-              ["<b>&hellip; plus transfer out</b>", "<b>519 GB/month leaving AWS at $0.1093/GB</b>",
+              ["<b>&hellip; plus transfer out</b>", "<b>844 GB/month leaving AWS at $0.1093/GB</b>",
                "<b>$46</b>", "<b>$549</b>"],
               ["<b>TOTAL with R2</b>", "", "<b>$168</b>", "<b>$2,013</b>"],
               ["Audio storage &mdash; <b>option 2</b>", "Amazon S3 Standard, 3 TB, same region",
@@ -529,7 +534,7 @@ S.append(tbl([["Layer", "What", "Lives on", "If it stops"],
                "Recording continues but goes unconfirmed"],
               ["Server", "Archive worker &mdash; joins, compresses, uploads", "the server",
                "Recordings queue in the 30 GB buffer"],
-              ["Storage", "The FLAC recordings", "Cloudflare R2",
+              ["Storage", "The recordings, as WAV", "Cloudflare R2",
                "Finished recordings wait in the buffer; clinics unaffected for ~1.5 days"]],
              [18 * mm, 48 * mm, 36 * mm, 54 * mm]))
 
@@ -570,8 +575,8 @@ S.append(tbl([["", "Work", "Why", "Effort"],
               ["1", "<b>Upload the finished recording to R2, verify it arrived, then delete it "
                     "from the server</b>",
                "Without this nothing else in this plan is possible", "a few days"],
-              ["2", "Keep the FLAC, drop the WAV",
-               "Same audio, 40% less storage, your 3 TB lasts twice as long", "half a day"],
+              ["2", "<b>No conversion step</b> &mdash; upload the WAV as it is",
+               "Simpler, and 3 TB already holds more than the study needs", "none"],
               ["3", "Point the dashboard and the restore tool at R2",
                "So a recording can still be found and fetched", "a day"],
               ["4", "Alert when the upload buffer passes half full",
@@ -616,8 +621,8 @@ S.append(tbl([["Question", "Answer"],
                "with the droplet"],
               ["Where do we buy storage?", "<b>Cloudflare R2</b>, 3 TB &mdash; $45/month, "
                                            "$540/year, and nothing to read it back"],
-              ["Do we keep WAV or FLAC?", "<b>FLAC only.</b> Identical audio, 3 TB lasts twice "
-                                          "as long"],
+              ["Do we keep WAV or FLAC?", "<b>Raw WAV.</b> No conversion. 3 TB holds 26,200 "
+                                          "consultations; the study needs 2.06 TB"],
               ["Do we need Glacier?", "<b>No.</b> Everything stays instantly readable"],
               ["<b>Cheapest overall</b>", "<b>Partial cloud &mdash; $46/month, $552/year</b>, if "
                                           "somebody at AIMS LAB owns the machine"],
