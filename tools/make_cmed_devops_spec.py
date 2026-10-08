@@ -127,6 +127,88 @@ S.append(tbl([["Nothing CMED runs needs to change for the clinic PCs"],
              [156 * mm], bold_first=False))
 
 S.append(PageBreak())
+S.append(part("THE ENDPOINTS", "Exact addresses, method by method",
+              "Copy these. Everything else in this document explains them"))
+
+S.append(Paragraph("0.1 &nbsp; The gateway", H2))
+S.append(Paragraph("One hostname serves everything on the server side. AIMS LAB issues it with "
+                   "the key; it differs between staging and production, so hold it in "
+                   "configuration.", BODY))
+S.append(Spacer(1, 2))
+S.append(Preformatted(
+    'BASE_URL = https://<aims-host>          <-- AIMS LAB sends this with the key\n'
+    '\n'
+    'Transport  HTTPS only, TLS 1.2 or 1.3. Port 443. HTTP redirects to HTTPS\n'
+    'Encoding   JSON, UTF-8\n'
+    'Auth       X-CMED-Key: <key>            on the two clinical endpoints only', CODE))
+
+S.append(Paragraph("0.2 &nbsp; The four addresses CMED calls", H2))
+S.append(tbl([["#", "Method", "Full address", "Auth", "Body", "Success"],
+              ["<b>1</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;/health"
+                                        "</font>", "<b>none</b>", "none", "<b>200</b>"],
+              ["<b>2</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;/</font>",
+               "none", "none", "200"],
+              ["<b>3</b>", "<b>POST</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
+                                          "/api/v2/clinical/patient-information</font>",
+               "<b>X-CMED-Key</b>", "JSON<br/>&le;1 MB", "<b>202</b>"],
+              ["<b>4</b>", "<b>POST</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
+                                          "/api/v2/clinical/prescription</font>",
+               "<b>X-CMED-Key</b>", "JSON<br/>&le;1 MB", "<b>202</b>"]],
+             [8 * mm, 16 * mm, 76 * mm, 22 * mm, 17 * mm, 17 * mm], highlight=[1], req=[3, 4]))
+S.append(Spacer(1, 3))
+S.append(tbl([["", "Which API it is", "Sent when"],
+              ["<b>3</b>", "<b>API 2</b> &mdash; patient information",
+               "the doctor opens a patient"],
+              ["<b>4</b>", "<b>API 3, Channel B</b> &mdash; the prescription",
+               "the doctor presses Build Prescription"]],
+             [8 * mm, 72 * mm, 76 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>There is no GET for clinical data and there is no DELETE.</b> CMED writes "
+                   "to us and never reads back: nothing clinical and no audio is ever served to "
+                   "CMED. Both clinical calls are POST, and a repeat of the same POST is safe "
+                   "&mdash; it returns 202 <font face='Courier'>ALREADY_RECEIVED</font> and "
+                   "stores one row.", GOOD))
+
+S.append(Paragraph("0.3 &nbsp; The local address on each clinic PC", H2))
+S.append(tbl([["Protocol", "Full address", "Auth", "Who"],
+              ["<b>WebSocket</b>", "<font face='Courier'>ws://127.0.0.1:5050/ws</font>",
+               "page address allow-list", "CMED's page, in the doctor's browser"]],
+             [24 * mm, 56 * mm, 40 * mm, 36 * mm]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("Not HTTP and not a REST call &mdash; one WebSocket held open for the whole "
+                   "clinic session, carrying short JSON messages each way. "
+                   "<b>ws://</b> and not <b>wss://</b> because it never leaves the machine; "
+                   "loopback needs no certificate and a browser permits it.", BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["Message CMED sends", "Which API", "Sent when"],
+              ["<font face='Courier'>{\"command\": \"start\", \"trigger\": {&hellip;}}</font>",
+               "<b>API 1</b>", "the doctor opens a patient"],
+              ["<font face='Courier'>{\"command\": \"prescription_built\", &hellip;}</font>",
+               "<b>API 3, Channel A</b>", "the doctor presses Build Prescription"],
+              ["<font face='Courier'>{\"command\": \"doctors\"}</font>", "&mdash;",
+               "<b>on page load</b> &mdash; returns this PC's clinic code"],
+              ["<font face='Courier'>{\"command\": \"status\"}</font>", "&mdash;",
+               "optional; the recorder also pushes status unprompted"]],
+             [62 * mm, 32 * mm, 62 * mm], highlight=[3]))
+S.append(Spacer(1, 4))
+S.append(tbl([["All six, on one line each"],
+              ["<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/health</font><br/>"
+               "<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/</font><br/>"
+               "<font face='Courier'>POST https://&lt;aims-host&gt;/api/v2/clinical/"
+               "patient-information</font><br/>"
+               "<font face='Courier'>POST https://&lt;aims-host&gt;/api/v2/clinical/prescription"
+               "</font><br/>"
+               "<font face='Courier'>WS &nbsp;&nbsp;ws://127.0.0.1:5050/ws &nbsp;&rarr; command "
+               "\"start\"</font><br/>"
+               "<font face='Courier'>WS &nbsp;&nbsp;ws://127.0.0.1:5050/ws &nbsp;&rarr; command "
+               "\"prescription_built\"</font>"]],
+             [156 * mm], bold_first=False))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Everything else under <font face='Courier'>/api/v2/</font> is closed to "
+                   "CMED's key</b> &mdash; those endpoints belong to the recorders and use client "
+                   "certificates. There is nothing there CMED needs.", NOTE))
+
+S.append(PageBreak())
 
 # ============================================================ PART A
 S.append(part("PART A", "The server",
@@ -200,6 +282,89 @@ S.append(Paragraph("<b>Why this droplet:</b> 8 vCPU on DigitalOcean's Basic line
                    "here and the extra memory and disk come at no additional cost. The 6 TB of "
                    "included transfer matters more than it looks: the server pushes roughly "
                    "520 GB a month up to Cloudflare R2, and on this provider that is free.", GOOD))
+
+S.append(Paragraph("2.2 &nbsp; Storage &mdash; the 320 GB disk is not where audio lives", H2))
+S.append(Paragraph("The droplet's 320 GB is <b>working space</b>. It is not the audio archive, and "
+                   "it is nowhere near enough to be one. Every recording is copied to "
+                   "<b>Cloudflare R2 object storage</b> and then removed from the server.", BAD))
+S.append(Spacer(1, 4))
+S.append(tbl([["", "<b>Server disk &mdash; 320 GB</b>", "<b>Cloudflare R2 &mdash; 3 TB</b>"],
+              ["Holds", "Operating system, the eight programs, both databases, logs, and "
+                        "recordings <b>in transit</b>",
+               "<b>Every recording, permanently</b>, as encrypted FLAC"],
+              ["How long", "Hours. A file is removed once the cloud copy is verified",
+               "<b>Permanently.</b> This is the research dataset"],
+              ["Capacity", "about a day and a half of recording as a buffer",
+               "<b>41,600 consultations</b> &mdash; the 18,000-patient study uses 1.3 TB"],
+              ["Cost", "included in the $96 droplet", "<b>$45/month, $540/year</b>"],
+              ["If it fills", "archiving stops; clinics keep recording locally",
+               "buy more &mdash; $15 per TB per month, no limit"]],
+             [24 * mm, 64 * mm, 68 * mm], highlight=[1]))
+S.append(Spacer(1, 4))
+S.append(tbl([["Total cost of the cloud deployment", "Monthly", "Yearly"],
+              ["Droplet &mdash; 8 vCPU / 16 GB / 320 GB, Bangalore", "$96", "$1,152"],
+              ["Droplet backups", "$19", "$230"],
+              ["<b>Cloudflare R2 &mdash; 3 TB of audio</b>", "<b>$45</b>", "<b>$540</b>"],
+              ["Transfer to R2 (519 GB/mo, inside the included 6 TB)", "$0", "$0"],
+              ["<b>Total</b>", "<b>$160</b>", "<b>$1,922</b>"]],
+             [100 * mm, 28 * mm, 28 * mm], highlight=[3, 5]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>R2 charges nothing to read data back</b>, which is why it was chosen: a "
+                   "research dataset gets downloaded many times, and on Amazon S3 each full read "
+                   "of 3 TB would cost about $250.", GOOD))
+
+S.append(H3 and Paragraph("2.3 &nbsp; The cloud copy keeps the same folder structure as the local archive", H3))
+S.append(Paragraph("Object storage has no real folders &mdash; a key is just a long name &mdash; "
+                   "but a key may contain <font face='Courier'>/</font>, and every tool from "
+                   "Cloudflare's own browser to <font face='Courier'>rclone</font> displays those "
+                   "as folders. <b>So the layout is entirely ours to choose, and it already "
+                   "mirrors the local archive:</b>", BODY))
+S.append(Spacer(1, 2))
+S.append(Preformatted(
+    'ON THE SERVER\n'
+    '  archive/AALO_DHOLPUR/DR0042/2026-10-05/<stem>/<stem>.wav\n'
+    '                                                <stem>.json\n'
+    '                                                <stem>.manifest.json\n'
+    '\n'
+    'IN CLOUDFLARE R2\n'
+    '  copies/AALO_DHOLPUR/DR0042/2026-10-05/<stem>.v1.flac.enc\n'
+    '  copies/AALO_DHOLPUR/DR0042/2026-10-05/<stem>.v1.json.enc\n'
+    '\n'
+    '  where <stem> = P0012345_DR0042_AALO_DHOLPUR_101432_102755_20261005', CODE))
+S.append(Spacer(1, 3))
+S.append(tbl([["Same", "Different", "Why"],
+              ["<b>clinic / doctor / date</b>, in that order",
+               "a <font face='Courier'>copies/</font> prefix",
+               "lets other things share the bucket later"],
+              ["the file name, character for character",
+               "<font face='Courier'>.flac</font> not <font face='Courier'>.wav</font>",
+               "lossless, 40% smaller &mdash; verified by decoding and comparing"],
+              ["", "<font face='Courier'>.enc</font> on the end",
+               "<b>encrypted before it leaves UIU</b> &mdash; see below"],
+              ["", "<font face='Courier'>.v1</font> version number",
+               "a corrected copy never overwrites the first"],
+              ["", "no per-consultation sub-folder",
+               "the stem is already unique, so the extra level earns nothing in a bucket"]],
+             [52 * mm, 48 * mm, 56 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>So you can browse R2 exactly as you browse the server</b> &mdash; open a "
+                   "clinic, then a doctor, then a day, and the consultations are there. A restore "
+                   "can walk one clinic or one date without consulting any database, which is the "
+                   "reason the structure was chosen.", GOOD))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>It is also ours to change.</b> One function builds these keys "
+                   "(<font face='Courier'>copy_object_key</font>), so if a different arrangement "
+                   "suits the research better &mdash; year and month above clinic, say, or the "
+                   "patient above the date &mdash; it is a small change, not a migration. Worth "
+                   "settling before 18,000 recordings are in place rather than after.", NOTE))
+S.append(Spacer(1, 4))
+S.append(tbl([["One thing Cloudflare cannot do"],
+              ["<b>Every file is encrypted on our server before it is uploaded</b> (AES-GCM), and "
+               "the key never leaves UIU. The folder names and file names are visible to "
+               "Cloudflare; <b>the audio and the clinical record are not</b>. Cloudflare stores "
+               "bytes it cannot read, and so could any future provider &mdash; which is what makes "
+               "putting patient recordings on commodity storage acceptable at all."]],
+             [156 * mm], bold_first=False))
 
 S.append(PageBreak())
 
@@ -540,6 +705,10 @@ S.append(tbl([["Question", "Answer"],
                                                                "loopback-only"],
               ["Where is the server?", "<b>DigitalOcean Bangalore (BLR1)</b>, 8 vCPU / 16 GB / "
                                        "320 GB, ~45&ndash;70 ms from Dhaka"],
+              ["<b>Where does the audio live?</b>", "<b>Cloudflare R2, 3 TB</b>, as encrypted FLAC. "
+                                                   "<b>Not on the 320 GB server disk</b>, which is working space"],
+              ["Same folders as the server?", "<b>Yes</b> &mdash; "
+                                             "<font face='Courier'>copies/clinic/doctor/date/</font>"],
               ["Does latency affect recording?", "<b>No.</b> The microphone is driven locally"],
               ["<b>Does a 202 mean it worked?</b>", "<b>No. It means stored, not matched.</b> See "
                                                     "section 9 step 8"],
