@@ -260,7 +260,7 @@ S.append(tbl([["", "Where", "What is there", "For how long"],
                "<b>One finished file per consultation</b>, with its clinical record beside it",
                "Until it is copied to cloud storage and verified"],
               ["<b>3</b>", "<b>Cloud storage</b><br/>Cloudflare R2",
-               "The permanent copy, as FLAC &mdash; same audio, 40% smaller",
+               "<b>The permanent copy &mdash; the original WAV, encrypted</b>",
                "<b>Permanently.</b> This is the research dataset"]],
              [8 * mm, 36 * mm, 54 * mm, 58 * mm]))
 S.append(Spacer(1, 4))
