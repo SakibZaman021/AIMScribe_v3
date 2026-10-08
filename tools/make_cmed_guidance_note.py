@@ -275,18 +275,25 @@ S.append(Paragraph("Four levels, in this order &mdash; clinic, then doctor, then
                    "local date, then one file per consultation:", BODY))
 S.append(Spacer(1, 2))
 S.append(Preformatted(
-    '<archive root>/<hospital_id>/<doctor_id>/<YYYY-MM-DD>/<name>.wav\n'
-    '                                                     /<name>.json', CODE))
+    '<archive root>/<hospital_id>/<doctor_id>/<YYYY-MM-DD>/<name>/\n'
+    '                                                        <name>.wav\n'
+    '                                                        <name>.json\n'
+    '                                                        <name>.manifest.json\n'
+    '                                                        _index.json', CODE))
 S.append(Paragraph("A real example:", BODY))
 S.append(Preformatted(
     '/srv/aimscribe/archive/\n'
+    '  catalogue.sqlite3                  <-- an index of everything below\n'
     '  AALO_DHOLPUR/\n'
     '    DR0042/\n'
     '      2026-10-05/\n'
-    '        P0012345_DR0042_AALO_DHOLPUR_101432_102755_20261005.wav\n'
-    '        P0012345_DR0042_AALO_DHOLPUR_101432_102755_20261005.json\n'
-    '        P0012387_DR0042_AALO_DHOLPUR_103010_104402_20261005.wav\n'
-    '        P0012387_DR0042_AALO_DHOLPUR_103010_104402_20261005.json\n'
+    '        P0012345_DR0042_AALO_DHOLPUR_101432_102755_20261005/\n'
+    '          P0012345_..._20261005.wav            7.6 MB  the audio\n'
+    '          P0012345_..._20261005.json           1.8 KB  the clinical record\n'
+    '          P0012345_..._20261005.manifest.json  6.8 KB  proof it is intact\n'
+    '          _index.json                          0.5 KB  what is in this folder\n'
+    '        P0012387_DR0042_AALO_DHOLPUR_103010_104402_20261005/\n'
+    '          ...\n'
     '    DR0051/\n'
     '      2026-10-05/\n'
     '        ...', CODE))
@@ -312,17 +319,34 @@ S.append(Paragraph("<b>Why this matters to CMED: you can locate any recording fr
                    "the file name.", GOOD))
 
 S.append(PageBreak())
-S.append(H3 and Paragraph("6.2 &nbsp; The JSON file beside the audio", H3))
-S.append(Paragraph("Every recording has a file with <b>the same name</b> and a "
-                   "<font face='Courier'>.json</font> ending. It holds the clinical record CMED "
-                   "sent &mdash; the demographics, the paramedic readings, the prescription, the "
-                   "previous visit &mdash; together with the recording's own details and its "
-                   "signature chain.", BODY))
+S.append(H3 and Paragraph("6.2 &nbsp; The four files in each consultation folder", H3))
+S.append(tbl([["File", "Size", "What it is", "Why it is there"],
+              ["<b>&lt;name&gt;.wav</b>", "~7&ndash;120 MB", "<b>The audio</b>, one file for the "
+                                                             "whole consultation",
+               "The recording itself, joined from its 30&ndash;90 second pieces"],
+              ["<b>&lt;name&gt;.json</b>", "~2 KB", "<b>The clinical record CMED sent</b> &mdash; "
+                                                    "patient, visit, paramedic, previous_visit, "
+                                                    "prescription, recording",
+               "So the consultation can be read without our database"],
+              ["<b>&lt;name&gt;.manifest.json</b>", "~7 KB",
+               "<b>Proof the audio is intact</b> &mdash; session id, times, timezone, and a "
+               "signed entry for every piece",
+               "Anyone can re-check the audio has not been altered or truncated"],
+              ["<b>_index.json</b>", "~0.5 KB", "What is in this folder", "Lets a folder be "
+                                                                         "understood on its own"]],
+             [40 * mm, 22 * mm, 48 * mm, 46 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>Note the extra level: each consultation gets its own folder</b>, named the "
+                   "same as the files inside it. So a day's work is a list of folders, one per "
+                   "patient, not a heap of loose files.", NOTE))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>So each consultation is self-contained.</b> One folder, two files, and "
-                   "everything needed to understand that consultation is in them. The database is "
-                   "an index into this, not the only copy &mdash; if the database were lost "
-                   "entirely, the dataset would still be readable.", GOOD))
+S.append(Paragraph("<b>So each consultation is self-contained.</b> One folder, four files, and "
+                   "everything needed to understand <i>and verify</i> that consultation is in "
+                   "them. The database is an index into this, not the only copy &mdash; if the "
+                   "database were lost entirely, the dataset would still be readable. There is "
+                   "also a <font face='Courier'>catalogue.sqlite3</font> at the top of the "
+                   "archive listing every session, clip and pause, which is how a recording is "
+                   "found quickly without walking the folders.", GOOD))
 
 S.append(Paragraph("7 &middot; What CMED can and cannot see", H2))
 S.append(tbl([["", "Can CMED see it?", "Why"],
