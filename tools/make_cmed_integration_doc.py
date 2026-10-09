@@ -26,6 +26,7 @@ from reportlab.platypus import Spacer, Paragraph, HRFlowable, PageBreak, Preform
 
 from cmed_doc_style import (H1, SUB, H2, H3, BODY, NOTE, BAD, GOOD, CODE,
                             tbl, part, build)
+from cmed_diagrams import architecture, sequence, gate, five_fields
 
 S = []
 
@@ -56,6 +57,9 @@ S.append(tbl([["What this integration is, in one paragraph"],
                "<b>Audio never goes to CMED, and nothing clinical is ever served back to CMED.</b>"]],
              [156 * mm], bold_first=False))
 S.append(Spacer(1, 5))
+S.append(Spacer(1, 8))
+S.append(architecture())
+S.append(Spacer(1, 8))
 S.append(Paragraph("Every rule here is taken from the program that validates these messages on "
                    "arrival. <b>If this document and the software disagree, the software is right "
                    "and this is a bug</b> &mdash; please tell us.", BODY))
@@ -198,6 +202,20 @@ S.append(Paragraph("<b>They go in pairs.</b> Two moments, four messages. <b>API 
                    "integration guide calls these 6a and 6b; this document says Channel A and "
                    "Channel B. Three APIs, four messages.", GOOD))
 
+S.append(PageBreak())
+S.append(Paragraph("4.1 &middot; One whole consultation, start to finish", H2))
+S.append(Paragraph("Read this once and the rest of the document is detail. Time runs down the "
+                   "page; each column is one party.", BODY))
+S.append(Spacer(1, 6))
+S.append(sequence())
+S.append(Spacer(1, 6))
+S.append(Paragraph("<b>Three things to take from it.</b> The four messages happen at only "
+                   "<b>two moments</b>, in pairs. <b>The match</b> &mdash; the step CMED cannot "
+                   "see &mdash; is what decides whether a recording is kept. And the recorder "
+                   "<b>keeps recording through the prescription</b>, closing only when the next "
+                   "patient is opened.", GOOD))
+
+S.append(PageBreak())
 S.append(Paragraph("5 &middot; The five fields", H2))
 S.append(Paragraph("All four messages about one consultation carry these same five fields, with "
                    "<b>exactly the same values, character for character</b>.", BODY))
@@ -233,6 +251,10 @@ S.append(tbl([["Three mistakes that break the match"],
                "on disk."]],
              [156 * mm], bold_first=False))
 S.append(Spacer(1, 4))
+S.append(PageBreak())
+S.append(H3 and Paragraph("5.1 &nbsp; One object, four messages", H3))
+S.append(five_fields())
+S.append(Spacer(1, 6))
 S.append(Paragraph("<b>Build the five fields once, into one object, when the doctor opens the "
                    "patient. Keep it for the whole consultation and pass the same object to all "
                    "four messages.</b> Never rebuild them and never recompute the time. Do that "
@@ -410,6 +432,10 @@ S.append(tbl([["<b>Building the prescription does NOT stop the recording</b>"],
                "next API 1, typically twenty to thirty seconds later."]],
              [156 * mm], bold_first=False))
 S.append(Spacer(1, 4))
+S.append(Spacer(1, 6))
+S.append(H3 and Paragraph("11.1 &nbsp; What the recorder is doing, state by state", H3))
+S.append(gate())
+S.append(Spacer(1, 8))
 S.append(tbl([["The doctor does", "CMED sends", "The recorder does"],
               ["Opens patient A", "API 1 + API 2", "starts recording A"],
               ["Consults", "&mdash;", "recording"],
