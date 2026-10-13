@@ -369,6 +369,39 @@ async def test_hard_refusal_within_the_wait(monkeypatch, spool, device_key):
     assert [d for d in spool.root.iterdir() if d.is_dir()] == []
 
 
+async def test_microphone_unavailable_leaves_nothing_behind(monkeypatch, spool, device_key):
+    """
+    A microphone that will not open leaves no session in the spool.
+
+    The session directory is created before the device is opened. Left behind,
+    it was recovered at the next start as an interrupted consultation: a false
+    "agent stopped unexpectedly" alert, and an empty recording uploaded to show
+    up as a discrepancy. A page retrying AGENT_NOT_READY - which it should -
+    made one of those per retry.
+    """
+    import core.session_controller as sc
+    from core.recorder import AudioCaptureError
+
+    class DeadMicrophone:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            raise AudioCaptureError("device in use by another application")
+
+    ctl = make_controller(monkeypatch, spool, device_key, ScriptedUploader([CONFIRMED]))
+    monkeypatch.setattr(sc, "AudioRecorder", DeadMicrophone)
+
+    for _ in range(3):                                  # the page retries
+        with pytest.raises(SessionError) as err:
+            await ctl.open_session(trigger())
+        assert err.value.code == "AGENT_NOT_READY"
+
+    assert ctl.state == "idle"
+    assert [d for d in spool.root.iterdir() if d.is_dir()] == []
+    assert spool.recover(device_key) == []              # nothing to resurrect
+
+
 async def test_hard_refusal_after_the_wait(monkeypatch, spool, device_key):
     ctl = make_controller(monkeypatch, spool, device_key,
                           ScriptedUploader([MISMATCH], delay=0.05),

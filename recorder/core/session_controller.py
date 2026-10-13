@@ -357,6 +357,11 @@ class SessionController:
                     "alert_type": "microphone_unavailable",
                     "detail": str(exc),
                 })
+                # Nothing was captured and nothing was sent, so there is no
+                # consultation to keep. Left on disk, the directory came back at
+                # the next start as an interrupted session - a false alert and an
+                # empty upload - once for every retry of AGENT_NOT_READY.
+                self._spool.remove(spool_session, reason="microphone unavailable at start")
                 raise SessionError(
                     "The microphone is unavailable. Check that it is connected and "
                     "not in use by another application.", code="AGENT_NOT_READY") from exc
