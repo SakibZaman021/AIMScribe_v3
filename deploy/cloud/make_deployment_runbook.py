@@ -444,7 +444,8 @@ S.append(Preformatted(
     '#   "status":   "healthy"\n'
     '#   "database": "connected"\n'
     '#   "redis":    "connected"\n'
-    '#   "system":   "AIMScribe v3"      <-- check this one', CODE))
+    '#   "system":   "AIMScribe v3 - AIMS LAB server"\n'
+    '#                 ^ check it STARTS WITH "AIMScribe v3"', CODE))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Run it from somewhere else, not from the droplet.</b> Testing from the "
                    "server proves the program is running; it does not prove DNS, the firewall, the "
@@ -581,11 +582,12 @@ S.append(tbl([["", "Check", "Command or action", "Pass"],
                "<font face='Courier'>curl -s https://&lt;host&gt;/health</font>",
                "<b><font face='Courier'>status: healthy</font></b>"],
               ["<b>4</b>", "It is the right system", "the same reply",
-               "<b><font face='Courier'>system: AIMScribe v3</font></b>"],
+               "<b><font face='Courier'>system</font> starts with "
+               "<font face='Courier'>AIMScribe v3</font></b>"],
               ["<b>5</b>", "The key is enforced", "POST API 2 with no key", "<b>401</b>"],
               ["<b>6</b>", "<b>API 2 accepts</b>", "POST API 2 with the key", "<b>202</b>"],
               ["<b>7</b>", "Retries are safe", "POST the identical body again",
-               "<b>202</b> ALREADY_RECEIVED"],
+               "<b>200</b> ALREADY_RECEIVED"],
               ["<b>8</b>", "<b>API 3 Channel B accepts</b>", "POST the prescription", "<b>202</b>"]],
              [8 * mm, 42 * mm, 60 * mm, 46 * mm], highlight=[3, 6, 8]))
 S.append(Spacer(1, 4))

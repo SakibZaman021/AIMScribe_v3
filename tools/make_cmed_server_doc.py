@@ -429,7 +429,8 @@ S.append(Preformatted(
     '      "database": "connected",\n'
     '      "redis":    "connected",\n'
     '      "minio":    "connected",\n'
-    '      "system":   "AIMScribe v3",      <-- ASSERT ON THIS\n'
+    '      "system":   "AIMScribe v3 - AIMS LAB server",\n'
+    '                    ^ assert this STARTS WITH "AIMScribe v3"\n'
     '      "srs":      "3.x",\n'
     '      "version":  "3.x.x",\n'
     '      "mode":     "FastAPI Async"\n'
@@ -443,7 +444,7 @@ S.append(tbl([["Field", "Watch for", "Meaning"],
                "if disconnected, nothing can be stored. <b>Alert on this</b>"],
               ["redis", "<font face='Courier'>connected</font>",
                "the queue. If disconnected, archiving stalls"],
-              ["<b>system</b>", "<b><font face='Courier'>AIMScribe v3</font></b>",
+              ["<b>system</b>", "<b>starts with <font face='Courier'>AIMScribe v3</font></b>",
                "<b>see the warning below</b>"],
               ["version", "changes after a deploy", "useful to confirm a release landed"]],
              [26 * mm, 46 * mm, 84 * mm], highlight=[1], req=[4]))
@@ -475,11 +476,12 @@ S.append(tbl([["", "Check", "Expected", "Proves"],
               ["<b>3</b>", "<b><font face='Courier'>GET /health</font></b>",
                "<b><font face='Courier'>status: healthy</font></b>",
                "<b>reachable from CMED's network</b>"],
-              ["<b>4</b>", "the same reply", "<font face='Courier'>system: AIMScribe v3</font>",
+              ["<b>4</b>", "the same reply", "<font face='Courier'>system</font> starts with "
+               "<font face='Courier'>AIMScribe v3</font>",
                "the right system"],
               ["<b>5</b>", "POST API 2 with no key", "<b>401</b>", "auth is enforced"],
               ["<b>6</b>", "POST API 2 with the key", "<b>202</b>", "<b>the key works</b>"],
-              ["<b>7</b>", "POST the identical body again", "<b>202</b> ALREADY_RECEIVED",
+              ["<b>7</b>", "POST the identical body again", "<b>200</b> ALREADY_RECEIVED",
                "<b>retries are safe</b>"],
               ["<b>8</b>", "POST a deliberately invalid body", "<b>422</b>, naming the bad fields",
                "validation works, and a bad record is <b>quarantined, not lost</b>"],
@@ -604,9 +606,10 @@ S.append(tbl([["Question", "Answer"],
               ["How do I know it is up?", "<b><font face='Courier'>GET /health</font></b> &mdash; "
                                           "no key. Expect "
                                           "<font face='Courier'>status: healthy</font>"],
-              ["<b>What else must I assert on?</b>", "<b><font face='Courier'>system == "
-                                                     "\"AIMScribe v3\"</font></b> &mdash; an older "
-                                                     "v1 backend has a similar health path"],
+              ["<b>What else must I assert on?</b>", "<b><font face='Courier'>system</font> starts with "
+                                                     "<font face='Courier'>AIMScribe v3</font></b> &mdash; "
+                                                     "an older v1 backend has a similar health path. "
+                                                     "Do not test for equality"],
               ["Which ports are open?", "<b>443 TCP and UDP, and 80 TCP</b> for certificates. "
                                         "Nothing else"],
               ["Who issues the certificate?", "<b>Let's Encrypt, automatically.</b> No manual "
