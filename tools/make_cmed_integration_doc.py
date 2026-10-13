@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reportlab.lib.units import mm
-from reportlab.platypus import Spacer, Paragraph, HRFlowable, PageBreak, Preformatted
+from reportlab.platypus import Spacer, Paragraph, HRFlowable, PageBreak, Preformatted, KeepTogether
 
 from cmed_doc_style import (H1, SUB, H2, H3, BODY, NOTE, BAD, GOOD, CODE,
                             tbl, part, build)
@@ -478,6 +478,127 @@ S.append(Paragraph("<b>Show <font face='Courier'>level</font> as a small meter.<
                    GOOD))
 
 S.append(PageBreak())
+S.append(Paragraph("11A &middot; When the recording does not start &mdash; recovering without "
+                   "the doctor", H2))
+S.append(Paragraph("The doctor opens a patient and the page sends API 1 &mdash; but the recorder "
+                   "was not running yet, or the socket had dropped a second earlier, or the "
+                   "microphone was briefly busy. <b>The doctor must never have to notice, and must "
+                   "never have to re-open the patient.</b> This section is how the page makes "
+                   "that true.", BODY))
+S.append(Spacer(1, 4))
+S.append(tbl([["<b>The rule: the page does not fire and forget. It reconciles.</b>"],
+              ["The page always knows what <b>should</b> be happening &mdash; which visit is open, "
+               "and whether its prescription has been built. The recorder always says what "
+               "<b>is</b> happening &mdash; in the <font face='Courier'>status</font> message it "
+               "pushes unprompted, and again the moment a socket reconnects.<br/><br/>"
+               "<b>Whenever the two disagree, the page resends the missing message, with the same "
+               "five fields.</b> That is safe because the recorder treats a repeat as a repeat: "
+               "a second <font face='Courier'>start</font> for the same consultation is "
+               "<font face='Courier'>SESSION_ALREADY_ACTIVE</font>, and a second "
+               "<font face='Courier'>prescription_built</font> is "
+               "<font face='Courier'>GATE_ALREADY_ARMED</font>. Both were verified against a "
+               "running recorder &mdash; section 22, <font face='Courier'>channel_a_test.py</font>."]],
+             [156 * mm], bold_first=False))
+S.append(Spacer(1, 5))
+S.append(tbl([["What went wrong", "How the page notices", "What the page does, on its own",
+               "Doctor sees"],
+              ["<b>Recorder not running</b> when the patient was opened",
+               "the socket will not connect", "<b>keeps trying every 2 s; on connect, sends "
+                                              "start for the open visit</b>",
+               "a small \"connecting\" dot"],
+              ["<b>Socket dropped</b> at the moment of the click",
+               "no reply within 5 s, or the socket closed",
+               "<b>resends start on reconnect</b>", "nothing"],
+              ["<b>Microphone busy</b>, or the recorder still starting",
+               "<font face='Courier'>AGENT_NOT_READY</font>",
+               "<b>retries after 2, 4, 8, 16 s</b>, then keeps trying every 30 s",
+               "nothing, then a small notice"],
+              ["<b>API 3a was lost</b>",
+               "status says <font face='Courier'>armed: false</font> but the page built the "
+               "prescription", "<b>resends prescription_built</b>", "nothing"],
+              ["<b>Next patient refused</b> with "
+               "<font face='Courier'>GATE_NOT_ARMED</font>, and the page <b>did</b> build the "
+               "previous prescription", "the reply code, plus the page's own record",
+               "<b>re-arms the previous consultation, then resends start</b>", "nothing"],
+              ["Next patient refused with <font face='Courier'>GATE_NOT_ARMED</font>, and the "
+               "page did <b>not</b> build the previous prescription",
+               "the reply code", "<b>nothing &mdash; this is the gate working</b>. The doctor is "
+                                 "glancing at another patient",
+               "nothing"],
+              ["<b>Refused by the server</b>, for a configuration reason",
+               "<font face='Courier'>AUTHORISATION_<br/>FAILED</font>, "
+               "<font face='Courier'>CLINIC_<br/>MISMATCH</font>, "
+               "<font face='Courier'>DEVICE_NOT_<br/>ENROLLED</font>",
+               "<b>stops retrying</b> &mdash; a retry cannot fix configuration. "
+                                 "Logs it for AIMS LAB",
+               "a small banner that does not block work"],
+              ["<b>Recording, but the microphone has gone silent</b>",
+               "<font face='Courier'>level</font> at exactly 0 for 30 s",
+               "shows a small warning", "\"microphone?\""]],
+             [38 * mm, 36 * mm, 50 * mm, 32 * mm], highlight=[1, 2, 3, 4, 5], req=[7]))
+S.append(Spacer(1, 5))
+S.append(tbl([["<b>Why a late start still counts: start_time is always the original</b>"],
+              ["When the page resends API 1 two minutes after the doctor opened the patient, it "
+               "sends the <b>same five fields, including the original start_time</b> &mdash; not "
+               "a new one. The recorder begins capturing from the moment the resend arrives, but "
+               "the consultation is still identified by the moment it really began, so <b>it "
+               "still matches API 2</b> and is still kept.<br/><br/>"
+               "<b>What is lost is only the audio between the click and the recovery</b> &mdash; "
+               "typically two to five seconds. The consultation is not lost, and nobody had to "
+               "do anything.<br/><br/>"
+               "<b>Measured, not assumed:</b> API 2 sent first, then the recorder told 60 seconds "
+               "later with the original start_time &mdash; the recording was <b>confirmed</b>."]],
+             [156 * mm], bold_first=False))
+S.append(Spacer(1, 4))
+S.append(KeepTogether(tbl([["<b>Today there is a five-minute limit, and the page should know it</b>"],
+              ["The server matches a late recording to its API 2 only if the recording starts "
+               "<b>within five minutes</b> of API 2 arriving. We measured it: the same test with a "
+               "330-second gap left the recording <b>unconfirmed</b>, with its API 2 sitting "
+               "unclaimed beside it, and nothing retries the match afterwards &mdash; that "
+               "recording would be deleted after 24 hours.<br/><br/>"
+               "<b>So reconcile fast.</b> Reconnecting every two seconds keeps nearly every "
+               "recovery inside the limit; the case that falls outside it is a recorder that was "
+               "not running at all for more than five minutes, such as a PC booting slowly at the "
+               "start of a clinic. It is a known limitation on the AIMS LAB side (the box below). "
+               "<b>A late API 2 is unaffected</b> &mdash; that direction is matched for 24 hours."]],
+             [156 * mm], bold_first=False)))
+S.append(Spacer(1, 5))
+S.append(tbl([["", "Four rules that keep reconciliation safe"],
+              ["<b>1</b>", "<b>Never invent a prescription_built.</b> Resend only one the page "
+                           "actually sent. Otherwise the page would override the gate, which "
+                           "exists to stop a glance at another patient from closing the real "
+                           "consultation"],
+              ["<b>2</b>", "<b>Only reconcile the visit that is open now.</b> Once the doctor has "
+                           "moved to the next patient, the previous one is finished &mdash; do not "
+                           "resend its start"],
+              ["<b>3</b>", "<b>Stop on configuration errors.</b> "
+                           "<font face='Courier'>AUTHORISATION_FAILED</font>, "
+                           "<font face='Courier'>CLINIC_MISMATCH</font>, "
+                           "<font face='Courier'>DEVICE_NOT_ENROLLED</font> and "
+                           "<font face='Courier'>ORIGIN_NOT_ALLOWED</font> will fail every time"],
+              ["<b>4</b>", "<b>Never block the doctor.</b> Every retry runs in the background; "
+                           "nothing modal, nothing that has to be dismissed"]],
+             [8 * mm, 148 * mm], bold_first=False))
+S.append(Spacer(1, 5))
+S.append(tbl([["Known limitations on the AIMS LAB side"],
+              ["Testing found three cases the page cannot fully solve. All three are on our side, and in each the page's behaviour described above is already correct:"
+               "<br/><br/>"
+               "<b>A recording that starts more than five minutes after its API 2</b> is not "
+               "matched today, as the box above describes. Because the match already requires "
+               "all five fields to be identical to the second, a longer window could not "
+               "confirm an unrelated recording.<br/><br/>"
+               "<b>A microphone that dies mid-consultation</b> &mdash; a headset unplugged, a "
+               "driver crash &mdash; currently stops capture without reopening the device, and "
+               "status still reports <font face='Courier'>is_recording: true</font>. The "
+               "<font face='Courier'>level</font> rule in the table above is the signal to "
+               "watch for.<br/>"
+               "<br/><b>A recorder that crashes mid-consultation</b> loses the second half today: "
+               "the resent start creates a second recording for the same five fields, and the "
+               "server confirms only one. <b>The page should still resend</b> &mdash; it is never "
+               "worse than not resending."]],
+             [156 * mm], bold_first=False))
+
+S.append(PageBreak())
 
 # ============================================================ PART D
 S.append(part("PART D", "The two server messages",
@@ -613,7 +734,7 @@ S.append(tbl([["Situation", "What to do", "What happens"],
                "Send API 3 Channel B again with the <b>same five fields</b>",
                "Stored as a new version. Both kept; the newest is current"],
               ["Your network failed and you are unsure", "Send it again, unchanged",
-               "<b>Completely safe.</b> <font face='Courier'>202 ALREADY_RECEIVED</font> and one "
+               "<b>Completely safe.</b> <font face='Courier'>200 ALREADY_RECEIVED</font> and one "
                "row, not two"],
               ["You sent something wrong", "Send the corrected version, same five fields",
                "Same as an edit"],
@@ -629,7 +750,7 @@ S.append(Paragraph("<b>Every message is stored word for word, exactly as sent, b
 S.append(Paragraph("15 &middot; Every reply from the server", H2))
 S.append(tbl([["Code", "Means", "What CMED should do"],
               ["<b>202 ACCEPTED</b>", "Stored safely", "Nothing. Mark it sent"],
-              ["<b>202 ALREADY_RECEIVED</b>", "This exact message was already stored",
+              ["<b>200 ALREADY_RECEIVED</b>", "This exact message was already stored",
                "Nothing. <b>Retrying is safe</b>"],
               ["400 MALFORMED_JSON", "Not valid JSON", "Fix and resend. Do not retry unchanged"],
               ["400 MISSING_FIELD", "One of the five is missing or malformed", "Fix and resend"],
@@ -915,10 +1036,12 @@ S.append(Paragraph("22 &middot; Testing, in the order that makes sense", H2))
 S.append(tbl([["", "What", "Needs", "How"],
               ["<b>1</b>", "<b>The browser half &mdash; all of it</b>", "<b>a PC with the recorder "
                                                                         "installed. No internet</b>",
-               "<b>Available today.</b> Connect, <font face='Courier'>doctors</font>, API 1, the "
-               "gate, API 3 Channel A"],
+               "<b>Available today.</b> <font face='Courier'>python tools/channel_a_test.py "
+               "--origin https://&lt;your page&gt;</font> &mdash; 22 checks, including both "
+               "recovery cases in section 11A"],
               ["<b>2</b>", "Check a server message against the rules", "nothing at all",
-               "<font face='Courier'>python tools/channel_b_test.py --local</font>"],
+               "<font face='Courier'>python tools/channel_b_test.py --validate my.json "
+               "--kind patient_information</font>"],
               ["<b>3</b>", "<b>The server half against a live host</b>", "<b>a staging hostname "
                                                                          "from us</b>",
                "<font face='Courier'>channel_b_test.py --server https://&lt;host&gt; --key &lt;key&gt;"
@@ -948,7 +1071,9 @@ S.append(Spacer(1, 3))
 S.append(H3 and Paragraph("Is it up?", H3))
 S.append(Preformatted(
     'curl -s https://<aims-host>/health | jq .\n'
-    '# expect: "status": "healthy"  AND  "system": "AIMScribe v3"', CODE))
+    '# expect: "status": "healthy"\n'
+    '#   and   "system" STARTS WITH "AIMScribe v3"\n'
+    '#         (today it reads "AIMScribe v3 - AIMS LAB server")', CODE))
 S.append(H3 and Paragraph("Is my key accepted? Send a patient", H3))
 S.append(Preformatted(
     'curl -s -o /dev/null -w "%{http_code}\\n" \\\n'
@@ -967,7 +1092,8 @@ S.append(Preformatted(
     '      }\'\n'
     '# expect: 202', CODE))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Send that exact command twice.</b> Both times you get <b>202</b> &mdash; "
+S.append(Paragraph("<b>Send that exact command twice.</b> The first gets <b>202</b>, the "
+                   "second <b>200</b> &mdash; "
                    "the second is <font face='Courier'>ALREADY_RECEIVED</font>. That proves "
                    "retries are safe, which is the most useful thing to know before writing your "
                    "queue.", GOOD))
@@ -1016,82 +1142,126 @@ S.append(tbl([["The one thing these four commands cannot prove"],
              [156 * mm], bold_first=False))
 
 S.append(PageBreak())
-S.append(Paragraph("23 &middot; A complete worked example", H2))
+S.append(Paragraph("23 &middot; A complete worked example, with recovery built in", H2))
+S.append(Paragraph("The browser half of the integration as it should actually be written: the five "
+                   "fields built once, and <b>a reconcile step that resends whatever the recorder "
+                   "is missing</b> &mdash; so a recorder that was not running, a dropped socket or "
+                   "a busy microphone heal themselves without the doctor knowing. Section 11A is "
+                   "the reasoning; this is the code.", BODY))
+S.append(Spacer(1, 3))
 S.append(Preformatted(
-    'let socket, sessionId = null, currentVisit = null, CLINIC = null;\n'
+    "// ---- what SHOULD be happening: the page's own record --------------------\n"
+    'let visit = null;          // the open consultation: the five fields, built once\n'
+    'let built = false;         // has the doctor built ITS prescription?\n'
+    'let CLINIC = null;         // read from the recorder, never hardcoded\n'
+    'let socket = null, sessionId = null, stopRetrying = false, retryMs = 2000;\n'
+    '\n'
+    'const CONFIG_ERRORS = ["AUTHORISATION_FAILED", "CLINIC_MISMATCH",\n'
+    '                       "DEVICE_NOT_ENROLLED", "ORIGIN_NOT_ALLOWED"];\n'
+    '\n'
+    'function send(command, extra) {\n'
+    '  if (!socket || socket.readyState !== WebSocket.OPEN) return false;\n'
+    '  socket.send(JSON.stringify({ command, request_id: command + "-" + Date.now(),\n'
+    '                               ...extra }));\n'
+    '  return true;\n'
+    '}\n'
+    '\n'
+    '// ---- the heart of it: compare SHOULD with IS, resend whatever is missing --\n'
+    'function reconcile(status) {\n'
+    '  if (!visit || stopRetrying) return;\n'
+    '  const recordingThis = status.is_recording &&\n'
+    '                        status.patient_ref === visit.patient_id;\n'
+    '\n'
+    '  if (!recordingThis) {\n'
+    '    send("start", { trigger: visit });            // SAME five fields - safe\n'
+    '    return;                                       // SESSION_ALREADY_ACTIVE if dup\n'
+    '  }\n'
+    '  sessionId = status.session_id;\n'
+    '  if (built && !status.armed) {                   // our 3a was lost\n'
+    '    send("prescription_built", { patient_id: visit.patient_id,\n'
+    '                                 session_id: sessionId });   // safe if dup\n'
+    '  }\n'
+    '}\n'
     '\n'
     'function connect() {\n'
     '  socket = new WebSocket("ws://127.0.0.1:5050/ws");\n'
     '\n'
-    '  socket.onopen = () => {\n'
-    '    // Read the clinic code off THIS laptop. Never hardcode it.\n'
-    '    socket.send(JSON.stringify({ command: "doctors" }));\n'
-    '  };\n'
+    '  socket.onopen = () => { retryMs = 2000; showConnected(true);\n'
+    '                          send("doctors"); };     // clinic code first\n'
     '\n'
     '  socket.onmessage = (e) => {\n'
     '    const m = JSON.parse(e.data);\n'
     '\n'
-    '    if (m.event === "status") { showRecordingState(m); return; }\n'
-    '\n'
-    '    if (m.command === "doctors") {\n'
-    '      CLINIC = m.data.hospital_id;            // may be null = not enrolled\n'
-    '      if (!CLINIC) return showProblem("This PC is not registered");\n'
-    '      showClinicName(CLINIC);                 // so a wrong PC is obvious\n'
-    '      fillDoctorSelector(m.data.doctors);     // [] is normal - do not block\n'
+    '    // Status reaches us two ways: pushed unprompted (event "status"), and as\n'
+    '    // the reply to our own poll (command "status", the fields under data).\n'
+    '    const status = m.event === "status" ? m\n'
+    '                 : m.command === "status" ? m.data : null;\n'
+    '    if (status) {\n'
+    '      showRecordingState(status);                 // incl. a level meter\n'
+    '      reconcile(status);                          // <-- self-healing\n'
     '      return;\n'
     '    }\n'
-    '\n'
+    '    if (m.command === "doctors") {\n'
+    '      CLINIC = m.data.hospital_id;\n'
+    '      if (!CLINIC) { stopRetrying = true; return banner("PC not registered"); }\n'
+    '      showClinicName(CLINIC);\n'
+    '      fillDoctorSelector(m.data.doctors);         // [] is normal\n'
+    '      return;\n'
+    '    }\n'
     '    if (m.command === "start") {\n'
-    '      if (m.code === "RECORDING_STARTED" ||\n'
-    '          m.code === "RECORDING_PROVISIONAL") {\n'
-    '        sessionId = m.data.session_id;        // keep it - API 3a needs it\n'
-    '        showRecording(true);\n'
-    '      } else {\n'
-    '        showProblem(m.code);                  // act on code, not message\n'
+    '      if (m.code === "RECORDING_STARTED" || m.code === "RECORDING_PROVISIONAL" ||\n'
+    '          m.code === "SESSION_ALREADY_ACTIVE") {  // all three mean: recording\n'
+    '        sessionId = m.data && m.data.session_id || sessionId;\n'
+    '      } else if (m.code === "GATE_NOT_ARMED" && previousWasBuilt()) {\n'
+    '        rearmPrevious();                          // then reconcile() resends start\n'
+    '      } else if (CONFIG_ERRORS.includes(m.code)) {\n'
+    '        stopRetrying = true; banner(m.code);      // a retry cannot fix this\n'
+    '      } else if (m.code === "AGENT_NOT_READY") {\n'
+    '        setTimeout(() => send("start", { trigger: visit }), retryMs);\n'
+    '        retryMs = Math.min(retryMs * 2, 30000);   // 2, 4, 8, 16, 30, 30...\n'
     '      }\n'
     '    }\n'
     '  };\n'
     '\n'
-    '  socket.onclose = () => { showRecording(false); setTimeout(connect, 2000); };\n'
-    '  socket.onerror = () => showProblem("AIMScribe is not running on this PC");\n'
+    '  socket.onclose = () => { showConnected(false);\n'
+    '                           setTimeout(connect, 2000); };  // quietly, forever\n'
     '}\n'
     '\n'
-    '// The doctor opens a patient.\n'
-    '// Build the five fields ONCE, here, and reuse this object everywhere.\n'
+    '// ---- the doctor opens a patient --------------------------------------------\n'
     'function openPatient(patient, doctor) {\n'
-    '  currentVisit = {\n'
+    '  visit = {                                       // built ONCE, here\n'
     '    patient_id:  patient.id,\n'
     '    doctor_id:   doctor.id,\n'
-    '    hospital_id: CLINIC,                 // from the recorder, not settings\n'
-    '    start_time:  new Date().toISOString(),\n'
-    '    date:        localDateString()       // the clinic\'s local day\n'
+    '    hospital_id: CLINIC,\n'
+    '    start_time:  new Date().toISOString(),        // the ORIGINAL, forever\n'
+    '    date:        localDateString()\n'
     '  };\n'
-    '\n'
-    '  socket.send(JSON.stringify({\n'
-    '    command: "start",\n'
-    '    request_id: "open-" + currentVisit.patient_id,\n'
-    '    trigger: currentVisit                // the SAME object\n'
-    '  }));\n'
-    '\n'
-    '  queueToOurBackend("API2", currentVisit, demographics, paramedic,\n'
-    '                    previousVisit);      // never inline - always queued\n'
+    '  built = false; stopRetrying = false; retryMs = 2000;\n'
+    '  send("start", { trigger: visit });              // if the socket is down,\n'
+    '                                                  // reconcile() sends it later\n'
+    '  queueToOurBackend("API2", visit, demographics, paramedic, previousVisit);\n'
     '}\n'
     '\n'
-    '// The doctor presses Build Prescription. This does NOT stop recording.\n'
+    '// ---- the doctor builds the prescription - this does NOT stop recording -----\n'
     'function prescriptionBuilt(prescription) {\n'
-    '  socket.send(JSON.stringify({\n'
-    '    command: "prescription_built",\n'
-    '    request_id: "built-" + currentVisit.patient_id,\n'
-    '    patient_id: currentVisit.patient_id,\n'
-    '    session_id: sessionId\n'
-    '  }));\n'
-    '\n'
-    '  // currentVisit is reused, so start_time is the ORIGINAL. This is the\n'
-    '  // single most important line in the integration.\n'
-    '  queueToOurBackend("API3B", currentVisit, prescription);\n'
+    '  built = true;                                   // remembered, so it can be\n'
+    '  send("prescription_built", {                    // resent if it gets lost\n'
+    '    patient_id: visit.patient_id, session_id: sessionId });\n'
+    '  queueToOurBackend("API3B", visit, prescription);   // same visit object\n'
     '}\n'
+    '\n'
+    '// A safety net for the one path with no status event: an idle recorder\n'
+    '// whose socket is open but which never received the start.\n'
+    'setInterval(() => send("status"), 10000);\n'
     '\n'
     'connect();', CODE))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>The single most important function is <font face='Courier'>reconcile()"
+                   "</font></b>. It runs on every status message &mdash; including the one the "
+                   "recorder sends the instant a socket reconnects &mdash; and it is the reason "
+                   "the doctor never has to re-open a patient. Note that it resends the "
+                   "<b>same</b> <font face='Courier'>visit</font> object, so start_time is still "
+                   "the original and the late recording still matches API 2.", GOOD))
 
 S.append(PageBreak())
 S.append(Paragraph("24 &middot; What each side must hand over", H2))
