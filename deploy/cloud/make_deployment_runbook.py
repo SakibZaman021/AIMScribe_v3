@@ -1195,6 +1195,8 @@ S.append(tbl([["", "Check", "Command or action", "Pass"],
                c("HTTP/1.1 200") + ", no TLS error"],
               ["<b>3</b>", "<b>Health, from outside</b>", c("curl.exe -s https://&lt;host&gt;/health"),
                "<b>" + c('"status":"healthy"') + "</b>"],
+              ["<b>3b</b>", "Every migration is applied", "the same reply",
+               "<b>" + c('"schema":"ok"') + "</b>, not " + c('"missing ..."')],
               ["<b>4</b>", "It is the right system", "the same reply",
                "<b>" + c("system") + " starts with " + c("AIMScribe v3") + "</b>"],
               ["<b>5</b>", "The key is enforced", "POST API 2 with no key", "<b>401</b>"],
@@ -1363,7 +1365,10 @@ S.append(code(
     '   from pg_constraint where conname = \'chain_entries_entry_type_check\'"'))
 S.append(expect(c("device_health_log") + ", " + c("consultation_parts") + " and a CHECK that "
                 "lists " + c("'reassign'") + " and " + c("'marker'")
-                + ". Run the scripts again and nothing changes: all three are safe to repeat."))
+                + ". Run the scripts again and nothing changes: all three are safe to repeat. "
+                "Within a minute " + c("https://" + HOST + "/health") + " shows "
+                + c('"schema":"ok"') + "; until then it names the file still missing, and the "
+                "monitor alerts."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Order: the server first, then the recorders.</b> A new recorder sends "
                    "each patient click and prescription signal to " + c("/session/marker")

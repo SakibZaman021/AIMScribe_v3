@@ -23,6 +23,7 @@ from message_queue.redis_async import AsyncRedisClient, push_transcription_job_a
 
 # Protocol 2: device identity, integrity chain, purge receipts, archive handshake.
 import api_v2
+import schema_check
 from api_v2 import router as v2_router
 from clinical import router as clinical_router
 from dashboard import router as dashboard_router
@@ -267,6 +268,11 @@ async def lifespan(app: FastAPI):
     """Manage application startup and shutdown."""
     # Startup
     await ctx.initialize()
+    # Every migration this code needs, present? Said loudly at start, shown in
+    # /health, and fatal only if AIMS_SCHEMA_STRICT asks for it.
+    pools = _schema_pools()
+    if pools[0] is not None:
+        await schema_check.at_startup(*pools, repo=api_v2.ctx.repo)
     yield
     # Shutdown
     await ctx.close()
@@ -424,21 +430,40 @@ async def _storage_states() -> dict:
         return answer
 
 
+def _schema_pools():
+    """The recordings pool, and the clinical one when it is a separate database."""
+    recordings = getattr(getattr(ctx, "db", None), "pool", None)
+    clinical = getattr(getattr(api_v2.ctx, "clinical", None), "_pool", None)
+    return recordings, clinical
+
+
+async def _schema_state() -> str:
+    recordings, clinical = _schema_pools()
+    if recordings is None:
+        return "not checked"
+    await schema_check.STATE.check(recordings, clinical)
+    return schema_check.STATE.summary()
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     db_healthy = await ctx.db.healthcheck() if ctx.db else False
     redis_healthy = await ctx.redis.healthcheck() if ctx.redis else False
     storage = await _storage_states()
+    schema = await _schema_state() if db_healthy else "not checked"
     # The segment bucket is where every recording lands, so it counts. The
     # copy bucket counts only if it is configured: unset is a choice, but set
     # and failing means copies are silently not being made.
     storage_healthy = storage["minio"] == "connected" and         storage["copy_bucket"] in ("connected", "not configured")
 
     return {
-        "status": "healthy" if (db_healthy and redis_healthy and storage_healthy)
-        else "degraded",
+        "status": "healthy" if (db_healthy and redis_healthy and storage_healthy
+                                and schema == "ok") else "degraded",
         "database": "connected" if db_healthy else "disconnected",
+        # "ok", or the migration files still to apply (e.g. "missing
+        # 015_v3_consultation_parts.sql"). Read by the monitor.
+        "schema": schema,
         "redis": "connected" if redis_healthy else "disconnected",
         "minio": storage["minio"],
         "copy_bucket": storage["copy_bucket"],

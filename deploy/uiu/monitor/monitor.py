@@ -105,6 +105,16 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
     ]
 
 
+def schema_finding(url: str) -> Finding:
+    """Ask the API's /health, the way Docker does, and read its schema answer."""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return checks.schema(json.loads(response.read()))
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", url, exc)
+        return checks.schema(None)
+
+
 def certificate_finding(host: str, now: datetime) -> Finding:
     """
     Asked from outside, the way a recorder asks: the answer that matters is
@@ -174,6 +184,7 @@ async def one_pass(dsn: str, host: str, webhook: str) -> str:
         findings.append(Finding("database:reachable", checks.CRITICAL,
                                 f"the recordings database cannot be read: {exc}", {}))
     findings.append(certificate_finding(host, now))
+    findings.append(schema_finding(os.getenv("AIMS_API_HEALTH_URL", "http://api:6000/health")))
 
     state = load_state()
     for finding in findings:
