@@ -139,15 +139,18 @@ ROWS = [
      "tests/test_labelling_server.py", H, "-", "-", "-"),
 
     # ---------------------------------------------------------------- recorder <-> server
-    ("Recorder to server", "U1", "Laptop clock behind the server by more than 5 s",
-     "Grants are verified with 5 s leeway (core/crypto.py verify_grant); PyJWT rejects an "
-     "<i>iat</i> in the future. Every grant fails, so every recording is held and never "
-     "uploads. A clock more than 65 s ahead fails the same way (expired).",
-     "Experiment: laptop 6 s behind -> ImmatureSignatureError; 300 s ahead -> "
-     "ExpiredSignatureError", G,
-     "Nothing from that PC reaches the server; audio piles up on the laptop",
-     "Verify iat/exp against the server's Date header offset (or leeway 10 min), report clock "
-     "skew in the heartbeat, and have the installer enable Windows time sync", "half a day"),
+    ("Recorder to server", "U1", "Laptop clock wrong (behind or ahead of the server)",
+     "The recorder measures the server's time from the Date header on every reply and checks "
+     "each grant against it (core/uploader.py note_server_date, server_now; core/crypto.py "
+     "verify_grant now=). Used grants are remembered by when this PC saw them, not by their "
+     "expiry, so a fast clock cannot accept one twice. The offset goes in the heartbeat; the "
+     "server raises <i>clock_skew</i> once per 6 h when it is 2 minutes or more. The installer "
+     "turns on Windows time sync.",
+     "tests/test_clock_skew.py (6 s, 5 min and 1 h either way), "
+     "backend tests/test_clock_skew_server.py; Channel A 24/24 on the new build. "
+     "Not tried on a laptop with its clock actually set wrong", H,
+     "Times stamped by the PC (and so file names) follow its own clock until time sync "
+     "corrects it", "-", "-"),
     ("Recorder to server", "U2", "Internet down for hours",
      "Recording never waits; spool holds 13.5 h; authorisation retried; uploads and matching "
      "resume on reconnect.",
@@ -306,10 +309,9 @@ ROWS = [
 ]
 
 # Ranked by consequence: lost or misfiled audio first, then silent stalls.
-TOP = ["U1", "D1", "A3", "B3", "S9", "S4", "S10", "C2", "D4", "U3"]
+TOP = ["D1", "A3", "B3", "S9", "S4", "S10", "C2", "D4", "U3", "S5"]
 
 NEXT = [
-    ("U1", "Clock skew: verify grants against the server's time, report skew, enable time sync"),
     ("D1", "Schema version check at server start (013, 014, 015)"),
     ("B3", "Run tools/cmed_build_session.py with CMED's finished build"),
     ("A3", "Nightly encrypted database backup to R2"),
@@ -319,6 +321,7 @@ NEXT = [
     ("D4", "One unconfirmed alert per clinic outage, not per recording"),
     ("C2", "Segmenter survives a failed write; check free disk space"),
     ("U3", "Dashboard list of held sessions per PC"),
+    ("S5", "Keep the recorder running (restart task in place); nothing more without CMED"),
 ]
 
 COLOUR = {H: GOODC, P: WARNC, G: CRIT}
@@ -350,10 +353,9 @@ def main():
     s.append(tbl(top, [14 * mm, 46 * mm, 50 * mm, 64 * mm]))
     s.append(Spacer(1, 4 * mm))
     s.append(Paragraph(
-        "<b>Most urgent: U1.</b> A laptop clock only six seconds behind the server makes every "
-        "grant fail, so nothing from that PC is ever uploaded. Since today's change those "
-        "recordings are held rather than deleted, so nothing is lost - but nothing arrives "
-        "either. Clinic laptops drift; this will happen.", BAD))
+        "<b>Most urgent: D1.</b> Nothing checks at start-up that migrations 013, 014 and 015 "
+        "are applied. Without 015 every click marker fails and that recording stops "
+        "uploading - nothing is lost, but nothing arrives until someone notices.", BAD))
 
     s.append(PageBreak())
     s.append(part("PART 1", "Every failure mode, by component",

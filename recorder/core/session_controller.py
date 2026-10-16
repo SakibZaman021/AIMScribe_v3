@@ -1323,6 +1323,10 @@ class SessionController:
             "mic_level": self._live_level(active),
             "silent": bool(active is not None and active.consecutive_silent >= 2),
             "authorisation": active.authorisation if active is not None else None,
+            # Server time minus this PC's time, as measured from the server's
+            # replies; the server raises clock_skew when it is large.
+            "clock_offset_seconds": (round(offset, 1) if (offset := getattr(
+                self._uploader, "clock_offset", None)) is not None else None),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 

@@ -27,9 +27,11 @@ grounds for deleting the only other copy of it.
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import logging
 import ssl
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -41,6 +43,10 @@ from core.crypto import ReceiptError
 from core.spool import COMMITTED, PENDING, RECEIPTED, SessionSpool, Spool
 
 logger = logging.getLogger(__name__)
+
+# A clock this far from the server's is reported: in the log, in the
+# heartbeat, and by the server as a clock_skew alert. Recording is unaffected.
+CLOCK_WARN_SECONDS = 60
 
 # Returned by a grant lookup that must be tried again later.
 _RETRY = object()
@@ -115,6 +121,10 @@ class UploadManager:
         # offers no client certificates, so this is the transport identity.
         self._device_token: Optional[str] = None
         self._doctors_cache: Optional[List[Dict[str, Any]]] = None
+        # How far this PC's clock is from the server's: a few recent readings,
+        # so one slow reply cannot swing it.
+        self._clock_samples: deque = deque(maxlen=7)
+        self._clock_warned = False
         # Sessions already reported as unable to complete, so the
         # warning is raised once rather than on every tick.
         self._reported_quarantines: set = set()
@@ -833,6 +843,7 @@ class UploadManager:
             body.get("grant"), self._grant_key,
             issuer=self.cfg.security.grant_issuer,
             audience=self.cfg.security.grant_audience,
+            now=self.server_now(),
         )
         if grant.patient_ref != trigger.get("patient_id"):
             raise crypto.GrantError("grant is for another patient")
@@ -965,6 +976,43 @@ class UploadManager:
 
     # ---- HTTP ----
 
+    # ---- the server's clock ----
+
+    def note_server_date(self, header: Optional[str], sent: float, received: float) -> None:
+        """
+        One measurement of how far this PC's clock is from the server's, from
+        the Date header every reply carries. Taken against the middle of the
+        round trip; the header counts whole seconds, hence the half second.
+        """
+        if not header:
+            return
+        try:
+            server = email.utils.parsedate_to_datetime(header).timestamp() + 0.5
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return
+        self._clock_samples.append(server - (sent + received) / 2)
+        offset = self.clock_offset
+        if offset is not None and abs(offset) >= CLOCK_WARN_SECONDS and not self._clock_warned:
+            self._clock_warned = True
+            logger.warning("This PC's clock is %.0f s %s the server's. Permissions are "
+                           "checked against the server's time, so recording is not "
+                           "affected; Windows time sync should be fixed.", abs(offset),
+                           "behind" if offset > 0 else "ahead of")
+        elif offset is not None and abs(offset) < CLOCK_WARN_SECONDS:
+            self._clock_warned = False
+
+    @property
+    def clock_offset(self) -> Optional[float]:
+        """Server time minus this PC's time, in seconds; None until measured."""
+        if not self._clock_samples:
+            return None
+        ordered = sorted(self._clock_samples)
+        return ordered[len(ordered) // 2]
+
+    def server_now(self) -> float:
+        """The server's time now, as best this PC knows it."""
+        return time.time() + (self.clock_offset or 0.0)
+
     async def _post(
         self, endpoint: str, payload: Dict[str, Any], *, attempts: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
@@ -1003,9 +1051,11 @@ class UploadManager:
 
         for attempt in range(total):
             try:
+                sent = time.time()
                 async with self._http.request(
                     method, url, json=json_body, headers=headers, timeout=timeout
                 ) as response:
+                    self.note_server_date(response.headers.get("Date"), sent, time.time())
                     if response.status < 300:
                         if response.content_type == "application/json":
                             return await response.json()
