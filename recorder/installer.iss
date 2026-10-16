@@ -461,6 +461,25 @@ begin
   PowerCfg('/SETACTIVE SCHEME_CURRENT');
 end;
 
+{ Windows time sync, on and running. The recorder checks the server's
+  permission against the server's own clock, so a wrong PC clock no longer
+  stops uploads - but the times it stamps, and so the file names, follow the
+  PC's clock. Kept right here. Domain PCs keep their domain time source as
+  well (ALL = the domain hierarchy plus these servers). Failures are ignored:
+  a hospital network may block time servers, and recording does not depend
+  on it. }
+procedure ConfigureTime();
+var
+  ResultCode: Integer;
+begin
+  Exec('sc.exe', 'config w32time start= auto', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('net.exe', 'start w32time', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('w32tm.exe', '/config /syncfromflags:ALL ' +
+       '"/manualpeerlist:time.windows.com,0x9 time.google.com,0x9 pool.ntp.org,0x9" /update',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('w32tm.exe', '/resync /force', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -469,6 +488,7 @@ begin
     StageEnrollmentToken();
     RegisterLogonTask();
     ConfigurePower();
+    ConfigureTime();
   end;
 end;
 

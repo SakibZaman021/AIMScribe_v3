@@ -618,17 +618,23 @@ class GrantGuard:
     open sessions until it expired. Entries are pruned lazily.
     """
 
+    # Long past any grant's life, on any clock: a used grant is remembered by
+    # when THIS PC saw it, never by its expiry, which is the server's time. A
+    # laptop running fast forgot a grant before it expired, and took it twice.
+    REMEMBER_SECONDS = 3600
+
     def __init__(self) -> None:
         self._seen: Dict[str, float] = {}
 
     def consume(self, grant: "Grant") -> None:
         import time as _time
-        now = _time.time()
+        now = _time.monotonic()
         if len(self._seen) > 512:
-            self._seen = {jti: exp for jti, exp in self._seen.items() if exp > now}
-        if self._seen.get(grant.jti, 0) > now:
+            self._seen = {jti: at for jti, at in self._seen.items()
+                          if now - at < self.REMEMBER_SECONDS}
+        if grant.jti in self._seen:
             raise GrantError("grant has already been used")
-        self._seen[grant.jti] = float(grant.expires_at)
+        self._seen[grant.jti] = now
 
 
 def verify_grant(
@@ -638,12 +644,19 @@ def verify_grant(
     issuer: str,
     audience: str,
     leeway_seconds: int = 5,
+    now: Optional[float] = None,
 ) -> Grant:
     """
     Verify a CMED grant and return its claims.
 
     Only EdDSA is accepted. Passing an explicit algorithm list is what prevents
     the classic "alg: none" and HMAC-confusion attacks against JWT verifiers.
+
+    `now` is the SERVER's time as this PC last measured it. The grant's iat and
+    exp are the server's clock; checked against a laptop clock only six seconds
+    slow, every grant looked issued in the future and nothing from that PC was
+    ever uploaded. PyJWT can only compare against the local clock, so the two
+    time claims are checked here instead.
     """
     import jwt  # imported lazily to keep tray startup fast
 
@@ -660,7 +673,9 @@ def verify_grant(
             leeway=leeway_seconds,
             options={
                 "require": ["exp", "iat", "jti", "aud", "iss", "sub"],
-                "verify_exp": True,
+                "verify_exp": False,
+                "verify_iat": False,
+                "verify_nbf": False,
                 "verify_aud": True,
                 "verify_iss": True,
                 "verify_signature": True,
@@ -668,6 +683,18 @@ def verify_grant(
         )
     except Exception as exc:  # PyJWT raises a family of subclasses
         raise GrantError(f"grant rejected: {type(exc).__name__}") from exc
+
+    import time as _time
+    moment = _time.time() if now is None else float(now)
+    try:
+        issued, expires = float(claims["iat"]), float(claims["exp"])
+        not_before = float(claims.get("nbf", issued))
+    except (TypeError, ValueError) as exc:
+        raise GrantError("grant rejected: DecodeError") from exc
+    if issued > moment + leeway_seconds or not_before > moment + leeway_seconds:
+        raise GrantError("grant rejected: ImmatureSignatureError")
+    if expires < moment - leeway_seconds:
+        raise GrantError("grant rejected: ExpiredSignatureError")
 
     # Consent is not a grant claim any more. Reception takes consent before the
     # consultation, and a refusal is recorded on the recorder's own Stop button

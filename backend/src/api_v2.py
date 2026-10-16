@@ -255,6 +255,8 @@ class HeartbeatRequest(BaseModel):
     spool_pressure: str = ""
     pending_segments: int = 0
     sent_at: Optional[str] = None
+    # Server time minus the PC's time, measured by the recorder from our replies.
+    clock_offset_seconds: Optional[float] = None
 
 
 class ArchivedPart(BaseModel):
@@ -1204,7 +1206,37 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
             device_id=device["device_id"], session_id=body.session_id,
             detail={"spool_bytes": body.spool_bytes,
                     "pending_segments": body.pending_segments})
+    await _check_clock(device, body)
     return {"status": "ok"}
+
+
+# A PC clock this far off is reported. Recording and uploads still work - the
+# recorder checks grants against the server's time - but the times it stamps
+# (and so file names) follow its own clock, so someone should fix time sync.
+CLOCK_SKEW_ALERT_SECONDS = 120
+CLOCK_SKEW_REPEAT = timedelta(hours=6)
+_CLOCK_ALERTED: Dict[str, datetime] = {}
+
+
+async def _check_clock(device, body: HeartbeatRequest) -> None:
+    offset = body.clock_offset_seconds
+    if offset is None and body.sent_at:
+        sent = _parse_time(body.sent_at)
+        if sent.tzinfo is not None:
+            offset = (datetime.now(timezone.utc) - sent).total_seconds()
+    if offset is None or abs(offset) < CLOCK_SKEW_ALERT_SECONDS:
+        return
+    key, now = str(device["device_id"]), datetime.now(timezone.utc)
+    last = _CLOCK_ALERTED.get(key)
+    if last is not None and now - last < CLOCK_SKEW_REPEAT:
+        return
+    _CLOCK_ALERTED[key] = now
+    await _repo().raise_alert(
+        alert_type="clock_skew", severity="warning", device_id=device["device_id"],
+        session_id=body.session_id,
+        detail={"offset_seconds": round(offset, 1),
+                "pc_clock": "behind" if offset > 0 else "ahead",
+                "detail": "Turn on Windows time sync on this PC"})
 
 
 # ============================================================
