@@ -181,12 +181,15 @@ ROWS = [
 
     # ---------------------------------------------------------------- server & database
     ("Server and database", "D1", "A migration not applied on a deployed database",
-     "Nothing checks the schema at start-up. With 013 missing every reassign got 500 (seen "
-     "live); with 015 missing every click marker fails and that recording stops uploading.",
-     "Live: chain_entries_entry_type_check violation until 013 was applied", G,
-     "Uploads stall until someone notices; recorders retry for ever",
-     "A schema_version table written by each migration and checked at start (refuse to start "
-     "or report degraded in /health)", "half a day"),
+     "At start-up the server checks for what each migration 002-015 and the clinical schema "
+     "leave behind - tables, columns, the entry types the chain accepts - so a skipped or "
+     "half-applied migration is named (backend/src/schema_check.py). It is logged as critical, "
+     "raised as <i>schema_missing</i>, shown in /health (\"schema\": \"missing 015_...\", "
+     "status degraded) and alerted by the monitor. It clears by itself within a minute of "
+     "applying the file. AIMS_SCHEMA_STRICT=true refuses to start instead.",
+     "tests/test_schema_check.py (9, real PostgreSQL, each migration removed in turn); "
+     "deploy/uiu tests (monitor); live: local server reports schema ok", H,
+     "-", "-", "-"),
     ("Server and database", "D2", "Database restarts mid-request",
      "The request fails; the recorder and worker retry; commits are idempotent.",
      "Duplicate-detection tests; not re-run against a restarting database", H,
@@ -309,10 +312,9 @@ ROWS = [
 ]
 
 # Ranked by consequence: lost or misfiled audio first, then silent stalls.
-TOP = ["D1", "A3", "B3", "S9", "S4", "S10", "C2", "D4", "U3", "S5"]
+TOP = ["A3", "B3", "S9", "S4", "S10", "C2", "D4", "U3", "S5", "A1"]
 
 NEXT = [
-    ("D1", "Schema version check at server start (013, 014, 015)"),
     ("B3", "Run tools/cmed_build_session.py with CMED's finished build"),
     ("A3", "Nightly encrypted database backup to R2"),
     ("S4", "Tie a resumed recording to the one it continues"),
@@ -322,6 +324,7 @@ NEXT = [
     ("C2", "Segmenter survives a failed write; check free disk space"),
     ("U3", "Dashboard list of held sessions per PC"),
     ("S5", "Keep the recorder running (restart task in place); nothing more without CMED"),
+    ("A1", "Release-on-pressure and an alert when cloud copies are overdue"),
 ]
 
 COLOUR = {H: GOODC, P: WARNC, G: CRIT}
@@ -353,9 +356,9 @@ def main():
     s.append(tbl(top, [14 * mm, 46 * mm, 50 * mm, 64 * mm]))
     s.append(Spacer(1, 4 * mm))
     s.append(Paragraph(
-        "<b>Most urgent: D1.</b> Nothing checks at start-up that migrations 013, 014 and 015 "
-        "are applied. Without 015 every click marker fails and that recording stops "
-        "uploading - nothing is lost, but nothing arrives until someone notices.", BAD))
+        "<b>Most urgent: A3.</b> The nightly database backups are kept on the droplet "
+        "itself. Audio is safe in R2, but if the droplet is lost, so are up to a week of "
+        "clinical records and the catalogue.", BAD))
 
     s.append(PageBreak())
     s.append(part("PART 1", "Every failure mode, by component",

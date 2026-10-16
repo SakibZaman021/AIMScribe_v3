@@ -217,3 +217,16 @@ def test_the_summary_carries_the_worst_of_what_was_found():
     assert report["status"] == CRITICAL
     assert [f["check"] for f in report["findings"]] == ["a", "b", "c"]
     assert checks.worst([Finding("a", OK, "fine")]) == OK
+
+
+# ---------------------------------------------------------------- schema
+
+def test_a_missing_migration_is_critical():
+    f = checks.schema({"status": "degraded", "schema": "missing 015_v3_consultation_parts.sql"})
+    assert f.status == CRITICAL and "015_v3_consultation_parts.sql" in f.message
+
+
+def test_an_up_to_date_schema_is_ok_and_silence_is_a_warning():
+    assert checks.schema({"status": "healthy", "schema": "ok"}).status == OK
+    assert checks.schema(None).status == WARNING
+    assert checks.schema({"status": "healthy"}).status == WARNING   # an older server

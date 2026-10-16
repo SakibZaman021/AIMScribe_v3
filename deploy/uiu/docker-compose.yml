@@ -340,6 +340,8 @@ services:
       AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST}
       AIMS_ALERT_WEBHOOK: ${AIMS_ALERT_WEBHOOK:-}
       AIMS_MONITOR_EVERY: ${AIMS_MONITOR_EVERY:-300}
+      # The API's own health, for the schema check (migrations applied?).
+      AIMS_API_HEALTH_URL: ${AIMS_API_HEALTH_URL:-http://api:6000/health}
       AIMS_CLINIC_HOURS: ${AIMS_CLINIC_HOURS:-08:00-22:00}
       # Free space each volume must keep, in GB. Left empty, each is its
       # default (500 / 100 / 50) capped at 15% of that volume, which suits

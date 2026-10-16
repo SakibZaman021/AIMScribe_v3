@@ -252,6 +252,30 @@ def certificate(not_after: Optional[datetime], now: datetime) -> Finding:
 
 
 # ============================================================
+# The database schema
+# ============================================================
+
+def schema(health: Optional[Dict[str, Any]]) -> Finding:
+    """
+    The server checks that every migration its code needs is applied and says
+    so in /health. A missing one does not stop the server - recorders keep
+    their audio and retry - so without this nobody would know uploads had
+    stalled until a doctor asked where yesterday's clinic went.
+    """
+    if health is None:
+        return Finding("api:schema", WARNING,
+                       "the API did not answer /health, so the schema is unknown", {})
+    state = str(health.get("schema", "not reported"))
+    if state == "ok":
+        return Finding("api:schema", OK, "database schema up to date", {})
+    if state.startswith("missing"):
+        return Finding("api:schema", CRITICAL,
+                       f"the database is {state} - apply it from backend/scripts; "
+                       f"uploads that need it are waiting on the PCs", {"schema": state})
+    return Finding("api:schema", WARNING, f"schema check: {state}", {"schema": state})
+
+
+# ============================================================
 # Saying it once
 # ============================================================
 
@@ -281,5 +305,6 @@ def summary(findings: Sequence[Finding]) -> Dict[str, Any]:
 
 
 __all__ = ["CRITICAL", "Finding", "OK", "WARNING", "archive_backlog", "certificate",
+           "schema",
            "copies_behind", "disk_space", "failed_jobs", "in_clinic_hours",
            "should_send", "silent_recorders", "summary", "worst"]
