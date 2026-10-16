@@ -122,6 +122,8 @@ class Segmenter:
         silence_hold_seconds: float,
         on_segment: Callable[[SealedSegment], None],
         queue_depth: int = 2048,
+        on_partial: Optional[Callable[[str, bytes, datetime], None]] = None,
+        partial_every_seconds: float = 0.0,
     ):
         self.bytes_per_second = sample_rate * channels * sample_width
         self.sample_width = sample_width
@@ -153,6 +155,14 @@ class Segmenter:
         # one forced at the ceiling wherever the words happen to be.
         self.relaxed_hold_bytes = max(1, self.silence_hold_bytes // 2)
         self._on_segment = on_segment
+        # The clip being assembled, handed out every few seconds so the caller
+        # can keep it on disk: ("append", new bytes, clip start) as it grows,
+        # ("reset", what remains after a cut, next clip start) once a clip is
+        # sealed. Runs on this thread, never the capture thread.
+        self._on_partial = on_partial
+        self._partial_bytes = (int(partial_every_seconds * self.bytes_per_second)
+                               if on_partial and partial_every_seconds > 0 else 0)
+        self._persisted = 0
 
         # 20 ms is short enough to place a cut precisely inside a gap, long
         # enough for the loudness and zero-crossing figures to mean something.
@@ -208,6 +218,9 @@ class Segmenter:
 
         self.segments_emitted = 0
         self.dropped_chunks = 0
+        # Every byte accepted into this recording, sealed or not: where the
+        # joined audio has reached. Written only by the capture thread.
+        self.received_bytes = 0
 
     # ---- lifecycle ----
 
@@ -234,6 +247,7 @@ class Segmenter:
         PortAudio and lose the same audio with worse timing.
         """
         self._queue.put_nowait(chunk)
+        self.received_bytes += len(chunk)
 
     def flush(self, *, is_final: bool = False, timeout: float = 30.0) -> bool:
         """
@@ -290,6 +304,9 @@ class Segmenter:
 
     def _consume(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
+        if self._partial_bytes and len(self._buffer) - self._persisted >= self._partial_bytes:
+            self._hand_partial("append", bytes(self._buffer[self._persisted:]))
+            self._persisted = len(self._buffer)
 
         level = _rms(chunk, self.sample_width)
         # Rises at once, falls slowly: a meter following the raw value would
@@ -532,6 +549,20 @@ class Segmenter:
             # Losing a segment here means losing audio, so this is loud.
             logger.critical("Failed to seal segment: %s", exc, exc_info=True)
             raise
+        # Only once the clip is safely sealed: until then the copy on disk is
+        # still the only other copy of it.
+        if self._partial_bytes:
+            self._hand_partial("reset", bytes(self._buffer))
+            self._persisted = len(self._buffer)
+
+    def _hand_partial(self, kind: str, data: bytes) -> None:
+        started = self._segment_started_at or datetime.now(timezone.utc)
+        try:
+            self._on_partial(kind, data, started)
+        except Exception as exc:
+            # Never at the cost of the recording itself: this copy only bounds
+            # what a power cut can take.
+            logger.error("Could not keep the clip in progress on disk: %s", exc)
 
     # ---- metrics ----
 

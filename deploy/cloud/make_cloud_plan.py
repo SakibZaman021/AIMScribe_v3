@@ -110,9 +110,10 @@ S.append(tbl([["Word", "What it really means", "Think of it as"],
                "<b>A toll on the road out.</b> Free at some gates, expensive at others"]],
              [30 * mm, 74 * mm, 52 * mm]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("So <b>\"8 GB / 4 vCPU / 160 GB\"</b> is one rented computer: four staff, a "
-                   "desk big enough for them, and a 160 GB filing cabinet. Section 5 justifies "
-                   "each of those three numbers.", GOOD))
+S.append(Paragraph("So <b>\"8 vCPU / 16 GB / 320 GB\"</b> &mdash; DigitalOcean's "
+                   "<b>s-8vcpu-16gb</b> &mdash; is one rented computer: eight staff, a desk big "
+                   "enough for them, and a 320 GB filing cabinet. Section 5 explains each of "
+                   "those three numbers.", GOOD))
 
 S.append(PageBreak())
 
@@ -207,7 +208,7 @@ S.append(Paragraph("This is the single most important sentence in this document,
 
 # ================================================================ 5
 S.append(Paragraph("5 &middot; The server, number by number", H2))
-S.append(H3 and Paragraph("Staff (vCPU): the work needs 1.5, so buy 4", H3))
+S.append(H3 and Paragraph("Staff (vCPU): the work needs 1.5; the droplet has 8", H3))
 S.append(tbl([["Job", "How much work it really is", "Staff needed"],
               ["Uploading the finished recording",
                "Reading one file and sending it. No conversion, so almost no processor time at all", "under 1"],
@@ -219,32 +220,42 @@ S.append(tbl([["Job", "How much work it really is", "Staff needed"],
               ["<b>Total</b>", "", "<b>about 1.5</b>"]],
              [44 * mm, 82 * mm, 30 * mm], highlight=[5]))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Two would work. Four is what to buy</b> &mdash; the extra is for the busy "
-                   "hour when fourteen rooms finish at once and fourteen recordings want "
-                   "compressing together. Eight would be paying for staff who sit idle; an "
-                   "earlier draft of this plan said eight, and that was wrong.", NOTE))
+S.append(Paragraph("<b>The measured work needs about 1.5; eight is AIMS LAB's requirement</b> "
+                   "(at least 8 cores, 8 GB and 200 GB), and on DigitalOcean the only regular "
+                   "droplet that meets all three is " + "<b>s-8vcpu-16gb</b>. The 4-vCPU size "
+                   "has a 160 GB disk, below the 200 GB asked for. The spare staff are not "
+                   "wasted: they absorb the busy hour, when fourteen rooms finish at once and "
+                   "fourteen recordings are joined, encrypted and uploaded together, and they "
+                   "leave room to switch transcription on.", NOTE))
 S.append(Spacer(1, 4))
-S.append(H3 and Paragraph("Desk (memory): 8 GB", H3))
-S.append(tbl([["Part", "Normal use", "Its cap"],
-              ["The API server", "320 MB", "1 GB"],
-              ["PostgreSQL, both databases", "240 MB", "1 GB"],
-              ["Archive worker", "250 MB", "768 MB"],
-              ["Queue (Redis)", "23 MB", "256 MB"],
-              ["Gateway (HTTPS)", "40 MB", "256 MB"],
-              ["<b>Everything together</b>", "<b>about 1 GB</b>", "<b>3.4 GB</b>"]],
-             [56 * mm, 50 * mm, 50 * mm], highlight=[6]))
+S.append(H3 and Paragraph("Desk (memory): 16 GB, and how it is shared", H3))
+S.append(tbl([["Part", "Normal use", "Its cap on the droplet"],
+              ["PostgreSQL, both databases", "240 MB + its 4 GB cache", "6 GB"],
+              ["The API server", "320 MB", "2 GB"],
+              ["Archive worker", "250 MB", "2 GB &mdash; joins one long consultation"],
+              ["Transcription, if switched on", "&mdash;", "1 GB"],
+              ["Backup job", "a few minutes a night", "512 MB"],
+              ["Queue, gateway, monitor, pooler", "about 150 MB", "about 900 MB"],
+              ["<b>Everything together</b>", "<b>about 1 GB, plus the cache</b>",
+               "<b>about 12.4 GB</b>, leaving 3.6 GB for the system"]],
+             [56 * mm, 46 * mm, 54 * mm], highlight=[7]))
 S.append(Spacer(1, 3))
-S.append(Paragraph("Measured under a test twice as heavy as the real clinics. <b>4 GB is too "
-                   "tight</b> &mdash; the caps alone come to 3.4 GB and leave nothing for the "
-                   "operating system. <b>8 GB is right.</b> <b>16 GB is waste</b> on a 10 GB "
-                   "database.", BODY))
-
-S.append(PageBreak())
+S.append(Paragraph("Normal use was measured under a test twice as heavy as the real clinics, "
+                   "and is about 1 GB. The caps are ceilings, not reservations: each one "
+                   "stops a single part from taking the machine down. The database's cache "
+                   "is set to 4 GB (" + "<font face='Courier'>postgresql.16gb.conf</font>), "
+                   "a quarter of the droplet, which keeps the whole database in memory for "
+                   "years. 8 GB would run the measured load; 16 GB is what the required "
+                   "8-core droplet comes with, and it is used.", BODY))
 
 # ================================================================ 6
-S.append(Paragraph("6 &middot; Filing cabinet (disk): 160 GB, and no extra disk", H2))
-S.append(Paragraph("The audio does not stay on the server. It is uploaded to R2 and deleted "
-                   "locally. So the disk only holds what must physically live on the machine:", BODY))
+S.append(Paragraph("6 &middot; Filing cabinet (disk): 320 GB, and no extra disk", H2))
+S.append(Paragraph("The audio does not stay on the server for long. Each recording is "
+                   "encrypted and uploaded to R2 as the raw WAV; once R2 has confirmed it holds "
+                   "exactly what was sent, the WAV is kept on the server for "
+                   "<b>2 days</b> for quick re-reading and then removed. Its clinical JSON, "
+                   "manifest and index entry stay. So the disk holds what must physically "
+                   "live on the machine, plus two days of recordings:", BODY))
 S.append(Spacer(1, 4))
 S.append(tbl([["What", "Size", "Why it has to be there"],
               ["Operating system", "20 GB", "Linux, packages, updates"],
@@ -257,7 +268,7 @@ S.append(tbl([["What", "Size", "Why it has to be there"],
               ["Database safety log", "10 GB", "Every change written down before it is applied, "
                                                "so a power cut cannot corrupt anything"],
               ["Backup staging", "10 GB", "Last night's backup, before and after upload"],
-              ["Working space", "3 GB", "One consultation being joined and compressed"],
+              ["Working space", "3 GB", "One consultation being joined and encrypted"],
               ["<b>Upload buffer</b>", "<b>30 GB</b>",
                "<b>If R2 is unreachable, finished recordings wait here instead of being lost.</b> "
                "30 GB is about a day and a half of recording"],
@@ -265,27 +276,34 @@ S.append(tbl([["What", "Size", "Why it has to be there"],
               ["Kept free deliberately", "20 GB", "The worker refuses to write below this, so a "
                                                   "full disk can never damage a recording"],
               ["Never-full headroom", "25 GB", "No disk should run above 80% full"],
-              ["<b>Total needed</b>", "<b>148 GB</b>", ""]],
-             [38 * mm, 20 * mm, 98 * mm], highlight=[11]))
+              ["<b>Recent recordings</b>", "<b>66 GB</b>",
+               "<b>Two clinic days at 33 GB a day</b> (277 consultations &times; 120 MB). "
+               "Set by " + "<font face='Courier'>AIMS_ARCHIVE_LOCAL_RETENTION_DAYS=2</font>. "
+               "Nothing is removed until R2 has confirmed its copy"],
+              ["<b>Total needed</b>", "<b>214 GB</b>", "67% of the 320 GB disk"]],
+             [38 * mm, 20 * mm, 98 * mm], highlight=[12]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>A DigitalOcean droplet of this size includes 160 GB. 148 fits inside 160, "
-                   "so no extra disk is needed and none is budgeted.</b> On Amazon the disk is "
-                   "billed separately and must be ordered at 200 GB &mdash; that is a real "
-                   "difference between the two, not a preference.", GOOD))
+S.append(Paragraph("<b>The s-8vcpu-16gb droplet includes 320 GB. 214 fits inside it with a "
+                   "third to spare, so no extra disk is needed and none is budgeted.</b> On "
+                   "Amazon the disk is billed separately &mdash; a real difference between the "
+                   "two, not a preference.", GOOD))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>The one line to watch over the years</b> is the databases, at "
-                   "20&ndash;40 GB a year. On 160 GB that is comfortable for roughly three "
-                   "years. The decision to grow belongs to 2029, not today.", NOTE))
+S.append(Paragraph("<b>Two lines to watch over the years.</b> The databases grow 20&ndash;40 GB "
+                   "a year, which the spare 100 GB covers for about three years. And if R2 "
+                   "stops confirming copies, recordings stay on the server and the disk "
+                   "rises: the server raises <font face='Courier'>cloud_copy_overdue</font> "
+                   "for any recording without a copy after a day.", NOTE))
 
 # ================================================================ 7
 S.append(Paragraph("7 &middot; Full cloud &mdash; DigitalOcean", H2))
 S.append(Paragraph("Everything rented. Nothing at UIU except the laptops in the clinics.", BODY))
 S.append(Spacer(1, 4))
 S.append(tbl([["What to buy", "Exactly what to pick", "Monthly", "Yearly"],
-              ["The server", "Droplet &rarr; Basic &rarr; Regular. <b>8 GB / 4 vCPU / 160 GB "
-                             "SSD</b>. Region: <b>Bangalore (BLR1)</b>", "$48", "$576"],
+              ["The server", "Droplet &rarr; Basic &rarr; Regular. <b>s-8vcpu-16gb: 8 vCPU / "
+                             "16 GB / 320 GB SSD</b>. Region: <b>Bangalore (BLR1)</b>",
+               "$96", "$1,152"],
               ["Server backups", "Tick \"Enable backups\" when creating it &mdash; 20% of the "
-                                 "droplet price", "$9.60", "$115"],
+                                 "droplet price", "$19.20", "$230"],
               ["Audio storage", "<b>Cloudflare R2</b>, 3 TB, bought from Cloudflare separately",
                "$45", "$540"],
               ["Domain name", "e.g. aimscribe.uiu.ac.bd &mdash; or use a UIU subdomain for free",
@@ -293,10 +311,10 @@ S.append(tbl([["What to buy", "Exactly what to pick", "Monthly", "Yearly"],
               ["HTTPS certificate", "Free, renews itself", "$0", "$0"],
               ["Database", "<b>Nothing to buy.</b> PostgreSQL runs on the server itself", "$0", "$0"],
               ["Sending data to R2", "Included in the droplet's 5 TB transfer", "<b>$0</b>", "<b>$0</b>"],
-              ["<b>TOTAL</b>", "", "<b>$104</b>", "<b>$1,243</b>"]],
+              ["<b>TOTAL</b>", "", "<b>$161</b>", "<b>$1,934</b>"]],
              [32 * mm, 78 * mm, 22 * mm, 24 * mm], highlight=[8]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>For the 2.5-month collection phase: about $200</b>, because storage is "
+S.append(Paragraph("<b>For the 2.5-month collection phase: about $350</b>, because storage is "
                    "only half full on average while it fills.", BODY))
 
 S.append(PageBreak())
@@ -362,7 +380,7 @@ S.append(tbl([["What", "Detail", "Monthly", "Yearly"],
              [32 * mm, 78 * mm, 22 * mm, 24 * mm], highlight=[5]))
 S.append(Spacer(1, 4))
 S.append(tbl([["What you gain", "What you take on"],
-              ["<b>Saves about $700 a year</b> against full cloud",
+              ["<b>Saves about $1,380 a year</b> against full cloud",
                "UIU's network rules must allow it: a fixed name, one port open, no filtering of "
                "the connection to Cloudflare"],
               ["Patient data stays on a university machine, which simplifies the ethics question",
@@ -373,7 +391,7 @@ S.append(tbl([["What you gain", "What you take on"],
                "Backups, patching and disk monitoring are all yours to do"]],
              [78 * mm, 78 * mm], bold_first=False))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>The honest summary:</b> partial cloud is cheaper by about $58 a month, "
+S.append(Paragraph("<b>The honest summary:</b> partial cloud is cheaper by about $115 a month, "
                    "and the saving is real. What you pay instead is in attention and "
                    "availability &mdash; somebody has to own that machine. For a 2.5-month "
                    "study with staff on hand, that is a fair trade. For permanent running with "
@@ -398,7 +416,9 @@ S.append(tbl([["", "Minimum", "Recommended", "What AIMS LAB offers", "Verdict"],
              [34 * mm, 24 * mm, 34 * mm, 32 * mm, 24 * mm], highlight=[3]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Only the disk is wrong, and only by 60 GB.</b> Section 6 works out why "
-                   "148 GB is needed even with all the audio in R2. A 256 GB SSD is a one-off "
+                   "148 GB is needed even with all the audio in R2 (set "
+                   "<font face='Courier'>AIMS_ARCHIVE_LOCAL_RETENTION_DAYS=0</font> there, so "
+                   "each WAV leaves as soon as its copy is confirmed). A 256 GB SSD is a one-off "
                    "purchase of roughly $30 and solves it with room for three years of database "
                    "growth. Nothing else about the machine needs changing.", GOOD))
 
@@ -408,10 +428,11 @@ S.append(tbl([["What", "Which", "Why"],
                "Supported until 2029. On an 8 GB machine, Windows plus Docker Desktop would "
                "consume about half the memory before AIMScribe started"],
               ["Container engine", "Docker Engine with the Compose plugin",
-               "The whole system is eleven containers started by one command"],
+               "The whole system is nine services started by one command"],
               ["Access", "root or sudo on the host", "To install and to run the stack"],
               ["Everything else", "nothing to install by hand",
-               "Both databases, their roles and all eleven migrations are built on first start"]],
+               "Both databases, their roles and all fifteen schema scripts are built on first "
+               "start"]],
              [34 * mm, 48 * mm, 74 * mm]))
 
 S.append(H3 and Paragraph("10.3 &nbsp; What UIU's network team must agree", H3))
@@ -477,7 +498,7 @@ S.append(tbl([["Job", "How often", "What happens if nobody does it"],
 
 S.append(H3 and Paragraph("10.5 &nbsp; The two side by side", H3))
 S.append(tbl([["", "Partial &mdash; your own machine", "Full &mdash; DigitalOcean"],
-              ["Yearly cost", "<b>$552</b>", "$1,243"],
+              ["Yearly cost", "<b>$552</b>", "$1,934"],
               ["One-off cost", "$30&ndash;180", "$0"],
               ["Time to running", "<b>weeks</b> &mdash; network approvals first", "<b>an afternoon</b>"],
               ["Backups", "you build, you test", "a checkbox, then you test"],
@@ -489,12 +510,12 @@ S.append(tbl([["", "Partial &mdash; your own machine", "Full &mdash; DigitalOcea
               ["If the project grows", "buy and install hardware", "change a size in a menu"]],
              [38 * mm, 58 * mm, 60 * mm], highlight=[1]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>The honest way to choose.</b> Partial cloud saves about $690 a year. That "
+S.append(Paragraph("<b>The honest way to choose.</b> Partial cloud saves about $1,380 a year. That "
                    "is roughly one week of a developer's time. If AIMS LAB has somebody who will "
                    "genuinely own that machine &mdash; the morning check, the monthly restore, "
                    "the 11pm phone call &mdash; take it, and keep patient data on a university "
                    "machine into the bargain. <b>If that person does not exist and cannot be "
-                   "named today, rent the server</b>: $690 a year is cheap compared with "
+                   "named today, rent the server</b>: $1,380 a year is cheap compared with "
                    "discovering in month three that nothing has been backed up.", GOOD))
 
 S.append(PageBreak())
@@ -504,16 +525,18 @@ S.append(Paragraph("11 &middot; Everything side by side", H2))
 S.append(tbl([["Setup", "Server", "Storage", "Transfer", "Monthly", "Yearly"],
               ["<b>Partial &mdash; own server + R2</b>", "$0", "$45", "$0", "<b>$46</b>",
                "<b>$552</b>"],
-              ["<b>Full &mdash; DigitalOcean + R2</b>", "$58", "$45", "$0", "<b>$104</b>",
-               "<b>$1,243</b>"],
-              ["Full &mdash; DigitalOcean + Spaces", "$58", "$60", "$0", "$119", "$1,423"],
+              ["<b>Full &mdash; DigitalOcean + R2</b>", "$115", "$45", "$0", "<b>$161</b>",
+               "<b>$1,934</b>"],
+              ["Full &mdash; DigitalOcean + Spaces", "$115", "$60", "$0", "$176", "$2,112"],
               ["Full &mdash; Amazon + S3", "$77", "$75", "$0", "$152", "$1,824"],
               ["Full &mdash; Amazon + R2", "$77", "$45", "<b>$46</b>", "$168", "$2,013"]],
              [48 * mm, 20 * mm, 20 * mm, 22 * mm, 22 * mm, 24 * mm], highlight=[1, 2]))
 S.append(Spacer(1, 5))
 S.append(Paragraph("<b>If the storage policy is Cloudflare R2, there are only two sensible "
                    "answers:</b> your own server (cheapest, if somebody owns it), or "
-                   "DigitalOcean (nobody owns it, and it still costs less than Amazon). "
+                   "DigitalOcean (nobody owns it). The Amazon rows are priced at a smaller "
+                   "server (2 vCPU, 8 GB); at the required 8 cores Amazon costs more than "
+                   "DigitalOcean, not less. "
                    "<b>Amazon with R2 is the worst of all five</b> &mdash; you pay Amazon $549 a "
                    "year for the privilege of sending your data to Cloudflare.", GOOD))
 
@@ -531,8 +554,8 @@ S.append(tbl([["Layer", "What", "Lives on", "If it stops"],
               ["Server", "<b>aims_recordings</b> &mdash; audio tracking", "the server's disk",
                "Nothing can be confirmed or archived"],
               ["Server", "<b>aims_clinical</b> &mdash; patients, prescriptions", "the server's disk",
-               "Recording continues but goes unconfirmed"],
-              ["Server", "Archive worker &mdash; joins, compresses, uploads", "the server",
+               "Recording continues and is archived; CMED's records attach when it is back"],
+              ["Server", "Archive worker &mdash; joins, encrypts, uploads", "the server",
                "Recordings queue in the 30 GB buffer"],
               ["Storage", "The recordings, as WAV", "Cloudflare R2",
                "Finished recordings wait in the buffer; clinics unaffected for ~1.5 days"]],
@@ -549,14 +572,17 @@ S.append(tbl([["Risk", "What already protects you", "What you must still do"],
                "An alert when the buffer passes half full"],
               ["Disk fills", "The worker refuses to write rather than corrupt anything",
                "Watch the dashboard; it reports this"],
-              ["A recording CMED never describes", "Erased after 24 hours &mdash; correct, but "
+              ["A recording CMED never describes", "Kept and archived, with no clinical record "
+                                                   "&mdash; never deleted, but "
                                                    "silent",
-               "Check the unconfirmed count every morning. It should be zero"],
+               "Check the unconfirmed count every morning. Once any outage is over it should "
+               "be zero; ask CMED to check its outbox for any left"],
               ["The databases are lost", "Nightly encrypted backup to R2",
                "<b>Restore one on day one, then monthly.</b> A backup nobody has read is not a "
                "backup"],
               ["Someone deletes audio by mistake", "Nothing, by default",
-               "Turn on R2 object versioning"],
+               "Turn on a bucket lock (retention rule) on the archive bucket, if Cloudflare "
+               "offers it"],
               ["The bill surprises you", "R2 is a fixed rate with no egress",
                "On Amazon only: set a billing alarm"]],
              [34 * mm, 60 * mm, 62 * mm]))
@@ -567,39 +593,45 @@ S.append(Paragraph("<b>One server, not two.</b> What keeps clinics recording thr
                    "complexity. Spend the effort on alerting and on testing restores.", GOOD))
 
 # ================================================================ 13
-S.append(Paragraph("14 &middot; What must be built before any of this works", H2))
-S.append(Paragraph("Today the system writes finished recordings to the server's own disk and "
-                   "never removes them. That fills any disk, on any provider, in about a week.", BAD))
+S.append(PageBreak())
+S.append(Paragraph("14 &middot; What had to be built, and is", H2))
+S.append(Paragraph("The system used to write finished recordings to the server's own disk and "
+                   "never remove them, which fills any disk in about a week. That is fixed; the "
+                   "order is the one this plan asked for.", GOOD))
 S.append(Spacer(1, 4))
-S.append(tbl([["", "Work", "Why", "Effort"],
-              ["1", "<b>Upload the finished recording to R2, verify it arrived, then delete it "
+S.append(tbl([["", "Work", "Now"],
+              ["1", "<b>Upload the finished recording to R2, verify it arrived, then remove it "
                     "from the server</b>",
-               "Without this nothing else in this plan is possible", "a few days"],
+               "Done. R2's own fingerprint of the object must match what was sent before the "
+               "copy counts; the WAV leaves after "
+               "<font face='Courier'>AIMS_ARCHIVE_LOCAL_RETENTION_DAYS</font>, and only then"],
               ["2", "<b>No conversion step</b> &mdash; upload the WAV as it is",
-               "Simpler, and 3 TB already holds more than the study needs", "none"],
-              ["3", "Point the dashboard and the restore tool at R2",
-               "So a recording can still be found and fetched", "a day"],
-              ["4", "Alert when the upload buffer passes half full",
-               "The buffer only helps if somebody is warned before it fills", "a day"]],
-             [7 * mm, 56 * mm, 64 * mm, 29 * mm], bold_first=False))
+               "Done. The copy is the raw WAV, encrypted, decrypted again and hashed before "
+               "upload"],
+              ["3", "Fetch a recording back from R2",
+               "<font face='Courier'>restore.py</font> turns a downloaded copy back into the "
+               "WAV, byte for byte; the manifest beside it names the object"],
+              ["4", "Alert when copies stop arriving",
+               "<font face='Courier'>cloud_copy_overdue</font> after a day without a copy"]],
+             [7 * mm, 62 * mm, 87 * mm], bold_first=False))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>About a week of work, and it must be finished and tested before "
-                   "collection starts, not during it.</b> The order matters: upload, verify, "
-                   "<i>then</i> delete. Never delete on the strength of an upload that was "
-                   "merely accepted.", NOTE))
+S.append(Paragraph("<b>The order is the safety:</b> upload, verify, <i>then</i> remove. Nothing "
+                   "is removed on the strength of an upload that was merely accepted, and "
+                   "nothing at all while no copy key is set.", NOTE))
 
 S.append(PageBreak())
 
 # ================================================================ 14
 S.append(Paragraph("15 &middot; Setting it up, in order", H2))
 S.append(tbl([["", "Step", "Where"],
-              ["1", "Open a Cloudflare account and create an R2 bucket. Turn on versioning",
+              ["1", "Open a Cloudflare account and create the two R2 buckets",
                "Cloudflare"],
-              ["2", "Create the server: 8 GB / 4 vCPU / 160 GB, Bangalore, backups ticked",
+              ["2", "Create the server: s-8vcpu-16gb (8 vCPU / 16 GB / 320 GB), Bangalore, "
+                    "backups ticked",
                "DigitalOcean"],
               ["3", "Point a domain name at it, and let the certificate issue itself", "DNS"],
               ["4", "Install Docker, copy the project, fill in the settings file", "the server"],
-              ["5", "Start everything with one command; eleven database migrations run themselves",
+              ["5", "Start everything with one command; all fifteen schema scripts run themselves",
                "the server"],
               ["6", "Register the seven clinics and issue CMED's key", "the server"],
               ["7", "Run the load test: 28 rooms at once. It must lose nothing", "your laptop"],
@@ -612,13 +644,14 @@ S.append(tbl([["", "Step", "Where"],
 # ================================================================ 15
 S.append(Paragraph("16 &middot; One page to remember", H2))
 S.append(tbl([["Question", "Answer"],
-              ["What does \"8 GB / 4 vCPU / 160 GB\" mean?",
-               "One rented computer: four staff, a desk for them, a 160 GB filing cabinet"],
-              ["Why 4 staff?", "The measured work needs 1.5. Four covers the busy hour. "
-                               "Eight would be waste"],
-              ["Why 160 GB and no extra disk?",
-               "Audio lives in R2, so the server needs 148 GB &mdash; and 160 comes included "
-               "with the droplet"],
+              ["What does \"8 vCPU / 16 GB / 320 GB\" mean?",
+               "One rented computer, DigitalOcean's s-8vcpu-16gb: eight staff, a desk for "
+               "them, a 320 GB filing cabinet"],
+              ["Why 8 staff?", "AIMS LAB's requirement. The measured work needs 1.5; the rest "
+                               "covers the busy hour and transcription"],
+              ["Why 320 GB and no extra disk?",
+               "Audio lives in R2 and stays here only 2 days after its copy is confirmed, so "
+               "the server needs 214 GB &mdash; and 320 comes included"],
               ["Where do we buy storage?", "<b>Cloudflare R2</b>, 3 TB &mdash; $45/month, "
                                            "$540/year, and nothing to read it back"],
               ["Do we keep WAV or FLAC?", "<b>Raw WAV.</b> No conversion. 3 TB holds 26,200 "
@@ -626,13 +659,14 @@ S.append(tbl([["Question", "Answer"],
               ["Do we need Glacier?", "<b>No.</b> Everything stays instantly readable"],
               ["<b>Cheapest overall</b>", "<b>Partial cloud &mdash; $46/month, $552/year</b>, if "
                                           "somebody at AIMS LAB owns the machine"],
-              ["<b>Best rented option</b>", "<b>DigitalOcean + R2 &mdash; $104/month, "
-                                            "$1,243/year</b>"],
+              ["<b>Best rented option</b>", "<b>DigitalOcean + R2 &mdash; $161/month, "
+                                            "$1,934/year</b>"],
               ["Amazon?", "$152/month with S3. <b>$168 with R2 &mdash; avoid</b>, Amazon charges "
                           "$549/year to send data to Cloudflare"],
-              ["How long does 3 TB last?", "The whole 18,000 study uses 1.3 TB. 3 TB is about "
-                                           "six months of recording"],
-              ["What must be built first?", "Upload to R2 and delete locally. About a week"],
+              ["How long does 3 TB last?", "The whole 18,000 study uses 2.06 TB. 3 TB is about "
+                                           "95 clinic days of recording"],
+              ["What had to be built first?", "Upload to R2, verify, then remove locally. "
+                                              "Done"],
               ["The one step never to skip", "<b>Restore a recording on day one and prove it "
                                              "opens</b>"]],
              [56 * mm, 100 * mm], highlight=[7, 8]))

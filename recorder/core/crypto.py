@@ -233,6 +233,51 @@ def resume_payload(*, at: datetime, paused_seconds: float) -> Dict[str, Any]:
     }
 
 
+def reassign_payload(
+    *, from_fields: Dict[str, str], to_fields: Dict[str, str],
+    patient_opened_at: datetime, at: datetime,
+) -> Dict[str, Any]:
+    """
+    The prescription named another patient the doctor opened during this
+    recording: the whole recording is that patient's.
+
+    A wrong profile picked at the start is the common case. Signed into the
+    chain, so the move is evidence rather than a silent edit, and
+    `patient_opened_at` lets a reviewer see when the right patient was opened.
+    """
+    return {
+        "type": "reassign",
+        "from": dict(from_fields),
+        "to": dict(to_fields),
+        "patient_opened_at": iso_utc(patient_opened_at),
+        "at": iso_utc(at),
+    }
+
+
+MARKER_EVENTS = ("patient_opened", "prescription_built")
+_FIVE_FIELDS = ("patient_id", "doctor_id", "hospital_id", "start_time", "date")
+
+
+def marker_payload(
+    *, event: str, patient: Dict[str, str], audio_seconds: float, at: datetime,
+) -> Dict[str, Any]:
+    """
+    Something CMED said during an unarmed recording, at an exact second of its
+    audio: a patient opened, or a prescription built. Nothing is decided on the
+    PC; the server reads these markers, in order, to work out whose
+    consultation each part of the recording was, and the archive cuts there.
+    """
+    if event not in MARKER_EVENTS:
+        raise ValueError(f"unknown marker event {event!r}")
+    return {
+        "type": "marker",
+        "event": event,
+        "patient": {name: str(patient.get(name, "")) for name in _FIVE_FIELDS},
+        "audio_seconds": round(float(audio_seconds), 3),
+        "at": iso_utc(at),
+    }
+
+
 def close_payload(
     *, closed_at: datetime, segment_count: int, duration_seconds: float,
     paused_seconds: float, reason: str = "",

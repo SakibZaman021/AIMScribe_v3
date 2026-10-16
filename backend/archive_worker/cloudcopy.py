@@ -1,18 +1,25 @@
 """
-The lossless cloud copy (SRS 3.2 §7.10, `SRS-ARC-08`-`SRS-ARC-13`).
+The cloud copy (SRS 3.2 §7.10, `SRS-ARC-08`-`SRS-ARC-13`).
 
 Pieces in the cloud are not deleted when a recording is archived. Each finished
-consultation is first kept in the cloud as one merged, losslessly compressed
-copy, so that a lost archive volume can be rebuilt exactly:
+consultation is first kept in the cloud as one merged copy of the raw WAV,
+byte for byte the file in the archive, so that a lost archive volume can be
+rebuilt exactly:
 
-    WAV (archived) -> FLAC -> decoded and compared -> encrypted -> copy bucket
+    WAV (archived) -> encrypted -> decrypted again and hashed -> copy bucket
+
+The audio is not compressed. The dataset is raw WAV by decision, and a copy
+that is the archived file itself needs no codec to restore and cannot differ
+from it in any way a sample comparison might miss. Copies made earlier as FLAC
+can still be read (`restore.py`); none are made any more.
 
 Two rules shape this module:
 
-**Lossless, and proven so.** The FLAC is decoded again and its samples compared
-with the archived WAV before anything is uploaded (`SRS-ARC-09`, step 3). A
-compressor that silently resampled, or a half-written file, is caught here
-rather than in five years when someone needs the audio.
+**The same bytes, and proven so.** The plaintext is hashed as it is encrypted,
+and the sealed file is decrypted again and hashed before anything is uploaded
+(`SRS-ARC-09`, step 3). Both must equal the archive's own SHA-256, so a
+half-written file or a bad key is caught here rather than in five years when
+someone needs the audio.
 
 **Encrypted before it leaves.** The key lives at UIU and never reaches the
 server or the bucket (`SRS-DAT-08`), so the copy is unreadable to the storage
@@ -42,7 +49,7 @@ class CopyError(RuntimeError):
 
 
 # ============================================================
-# FLAC
+# FLAC - reading older copies only
 # ============================================================
 
 def _soundfile():
@@ -50,44 +57,17 @@ def _soundfile():
         import soundfile                                    # noqa: WPS433
     except Exception as exc:                                # pragma: no cover
         raise CopyError(
-            "the soundfile package is needed for the lossless cloud copy "
+            "the soundfile package is needed to restore an older FLAC copy "
             "(pip install soundfile)") from exc
     return soundfile
-
-
-def to_flac(wav_path: Path, flac_path: Path) -> Path:
-    """
-    Compress the archived WAV to FLAC, written beside it and renamed only once
-    complete, so a crash never leaves a short file that looks finished.
-    """
-    sf = _soundfile()
-    partial = flac_path.with_suffix(flac_path.suffix + ".partial")
-    try:
-        with sf.SoundFile(str(wav_path)) as source:
-            if source.subtype not in ("PCM_16", "PCM_24", "PCM_S8", "PCM_32"):
-                raise CopyError(f"{wav_path.name} is {source.subtype}, not integer PCM; "
-                                "FLAC would not be lossless")
-            with sf.SoundFile(str(partial), mode="w", samplerate=source.samplerate,
-                              channels=source.channels, format="FLAC",
-                              subtype=source.subtype) as target:
-                for block in source.blocks(blocksize=1 << 18, dtype="int32",
-                                           always_2d=True):
-                    target.write(block)
-        os.replace(partial, flac_path)
-    except CopyError:
-        partial.unlink(missing_ok=True)
-        raise
-    except Exception as exc:
-        partial.unlink(missing_ok=True)
-        raise CopyError(f"could not compress {wav_path.name}: {exc}") from exc
-    return flac_path
 
 
 def audio_fingerprint(path: Path) -> str:
     """
     A fingerprint of the audio itself - the samples, the rate and the channel
     count - not of the file. Two files with the same fingerprint hold the same
-    recording however they are encoded.
+    recording however they are encoded. Used only to check an older FLAC copy
+    against the WAV restored from it.
     """
     sf = _soundfile()
     digest = hashlib.sha256()
@@ -102,10 +82,7 @@ def audio_fingerprint(path: Path) -> str:
 
 
 def flac_matches_wav(flac_path: Path, wav_path: Path) -> bool:
-    """
-    `SRS-ARC-09`, step 3: decode the FLAC and confirm it holds exactly the
-    samples of the archived WAV. Nothing is uploaded until this is true.
-    """
+    """An older FLAC copy and the WAV decoded from it hold the same samples."""
     return audio_fingerprint(flac_path) == audio_fingerprint(wav_path)
 
 
@@ -150,7 +127,7 @@ class Encrypted:
     path: Path
     bytes: int
     sha256: str            # the object as it is uploaded
-    plain_sha256: str      # the FLAC or JSON before encryption
+    plain_sha256: str      # the WAV or JSON before encryption
     md5: str               # what the store returns as the object's ETag
 
 
@@ -201,41 +178,49 @@ def encrypt_file(source: Path, target: Path, key: bytes) -> Encrypted:
                      md5=etag.hexdigest())
 
 
+def _plain_chunks(source: Path, key: bytes) -> Iterator[bytes]:
+    """The plaintext of one sealed file, chunk by chunk, each one authenticated."""
+    aes = _cipher(key)
+    with open(source, "rb") as reader:
+        magic, _ = _HEADER.unpack(reader.read(_HEADER.size))
+        if magic != MAGIC:
+            raise CopyError(f"{source.name} is not an AIMScribe copy")
+        index, done = 0, False
+        while not done:
+            nonce = reader.read(NONCE_BYTES)
+            header = reader.read(_FRAME.size)
+            if len(nonce) != NONCE_BYTES or len(header) != _FRAME.size:
+                raise CopyError(f"{source.name} ends in the middle of a chunk")
+            (length,) = _FRAME.unpack(header)
+            sealed = reader.read(length)
+            if len(sealed) != length:
+                raise CopyError(f"{source.name} is truncated")
+            # Whether this was the last chunk is sealed into it, so a file
+            # cut short fails here instead of decrypting to less audio.
+            for last in (False, True):
+                try:
+                    plain = aes.decrypt(nonce, sealed, _aad(index, last))
+                    done = last
+                    break
+                except Exception:
+                    if last:
+                        raise CopyError(
+                            f"{source.name} does not decrypt: wrong key, or the "
+                            f"file has been changed (chunk {index})")
+            yield plain
+            index += 1
+
+
 def decrypt_file(source: Path, target: Path, key: bytes) -> Path:
     """
     Turn one copy-bucket object back into the file it was made from - the
     restore path (`AT-74`), and the only way the copy is of any use.
     """
-    aes = _cipher(key)
     partial = target.with_suffix(target.suffix + ".partial")
     try:
-        with open(source, "rb") as reader, open(partial, "wb") as writer:
-            magic, chunk_size = _HEADER.unpack(reader.read(_HEADER.size))
-            if magic != MAGIC:
-                raise CopyError(f"{source.name} is not an AIMScribe copy")
-            index, done = 0, False
-            while not done:
-                nonce = reader.read(NONCE_BYTES)
-                header = reader.read(_FRAME.size)
-                if len(nonce) != NONCE_BYTES or len(header) != _FRAME.size:
-                    raise CopyError(f"{source.name} ends in the middle of a chunk")
-                (length,) = _FRAME.unpack(header)
-                sealed = reader.read(length)
-                if len(sealed) != length:
-                    raise CopyError(f"{source.name} is truncated")
-                # Whether this was the last chunk is sealed into it, so a file
-                # cut short fails here instead of decrypting to less audio.
-                for last in (False, True):
-                    try:
-                        writer.write(aes.decrypt(nonce, sealed, _aad(index, last)))
-                        done = last
-                        break
-                    except Exception:
-                        if last:
-                            raise CopyError(
-                                f"{source.name} does not decrypt: wrong key, or the "
-                                f"file has been changed (chunk {index})")
-                index += 1
+        with open(partial, "wb") as writer:
+            for plain in _plain_chunks(source, key):
+                writer.write(plain)
         os.replace(partial, target)
     except CopyError:
         partial.unlink(missing_ok=True)
@@ -244,6 +229,24 @@ def decrypt_file(source: Path, target: Path, key: bytes) -> Path:
         partial.unlink(missing_ok=True)
         raise CopyError(f"could not decrypt {source.name}: {exc}") from exc
     return target
+
+
+def sealed_sha256(source: Path, key: bytes) -> str:
+    """
+    Decrypt a sealed file in memory and hash what comes out, writing nothing.
+
+    The proof, before upload, that the object about to leave decrypts to the
+    archived file with the key UIU holds (`SRS-ARC-09`, step 3).
+    """
+    digest = hashlib.sha256()
+    try:
+        for plain in _plain_chunks(source, key):
+            digest.update(plain)
+    except CopyError:
+        raise
+    except Exception as exc:
+        raise CopyError(f"could not read {source.name} back: {exc}") from exc
+    return digest.hexdigest()
 
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -255,4 +258,4 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
 
 
 __all__ = ["CopyError", "Encrypted", "audio_fingerprint", "decrypt_file",
-           "encrypt_file", "flac_matches_wav", "load_key", "sha256_file", "to_flac"]
+           "encrypt_file", "flac_matches_wav", "load_key", "sealed_sha256", "sha256_file"]

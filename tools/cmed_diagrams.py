@@ -256,8 +256,8 @@ def sequence():
     g.add(text(7, y - 13, "THE MATCH   we compare the five fields the recorder "
                           "reported with the five CMED's server sent.", size=7.4,
                font=FB, fill=GOOD))
-    g.add(text(7, y - 24, "Identical: the recording is CONFIRMED and joins the "
-                          "dataset.   Different: it is deleted after 24 hours.",
+    g.add(text(7, y - 24, "Identical: the clinical record is ATTACHED to the recording.  "
+                          "Late or missing: the recording is still kept.",
                size=7.2, fill=GOOD))
     y -= MATCH + GAP
 
@@ -387,9 +387,9 @@ def gate():
     g.add(text(13, 22, "which means \"this consultation may now be closed by the next "
                        "one\". Audio keeps being written throughout.", size=7.4,
                fill=CRIT))
-    g.add(text(13, 12, "If the next API 1 arrives without the gate being armed, it is "
-                       "refused with GATE_NOT_ARMED.", size=7.4, font=FB,
-               fill=CRIT))
+    g.add(text(13, 12, "An API 1 before that is accepted into the same recording; "
+                       "the server files each part under the right patient.", size=7.4,
+               font=FB, fill=CRIT))
 
     d.add(g)
     return d

@@ -87,7 +87,9 @@ services:
     volumes:
       - ${AIMS_DB_PATH:?set AIMS_DB_PATH in .env}:/var/lib/postgresql/data
       # AIMS_PG_CONF picks the profile: postgresql.conf for the recommended
-      # machine, postgresql.4gb.conf where AIMScribe has about 4 GB in all.
+      # machine, postgresql.16gb.conf for the DigitalOcean droplet
+      # (s-8vcpu-16gb, with AIMS_PG_MEMORY=6g), postgresql.4gb.conf where
+      # AIMScribe has about 4 GB in all.
       # The large one cannot start on a small machine - its shared_buffers
       # alone is 16 GB - so this is the first thing to set on a small server.
       - ${AIMS_PG_CONF:-./postgres/postgresql.conf}:/etc/postgresql/postgresql.conf:ro
@@ -254,9 +256,8 @@ services:
     image: aimscribe/archive-worker:3.3
     container_name: aims-archive-worker
     # A ceiling and a share of the machine: merging a 150 MB
-    # consultation, encoding FLAC and encrypting it is heavy, and
-    # it runs beside the server. It must never be why today's
-    # grant is late.
+    # consultation and encrypting it is heavy, and it runs beside
+    # the server. It must never be why today's grant is late.
     mem_limit: ${AIMS_ARCHIVE_MEMORY:-1g}
     cpus: ${AIMS_ARCHIVE_CPUS:-2}
     <<: *hardening
@@ -272,6 +273,10 @@ services:
       AIMS_POLL_SECONDS: ${AIMS_POLL_SECONDS:-30}
       AIMS_BATCH_SIZE: ${AIMS_BATCH_SIZE:-5}
       AIMS_DISK_HEADROOM_BYTES: ${AIMS_DISK_HEADROOM_BYTES:-21474836480}
+      # Days a WAV stays on this disk once its cloud copy is proven. Without
+      # this the disk fills at the full day's audio, every day. Negative keeps
+      # everything here. Nothing is ever released without a proven copy.
+      AIMS_ARCHIVE_LOCAL_RETENTION_DAYS: ${AIMS_ARCHIVE_LOCAL_RETENTION_DAYS:-7}
       TZ: ${TZ:-Asia/Dhaka}
     volumes:
       - ${AIMS_ARCHIVE_PATH:?set AIMS_ARCHIVE_PATH in .env}:/archive
@@ -280,10 +285,11 @@ services:
         condition: service_healthy
     read_only: true
     tmpfs:
-      # The working disks: pieces are downloaded and joined here, and the
-      # copy is compressed and encrypted here, before anything is written to
-      # the archive array (SRS-SRV-03). About 320 MB per recorded hour, twice
-      # over for the join, plus the FLAC and its encrypted form.
+      # The working disk for the join: pieces are downloaded and joined
+      # here before anything is written to the archive array (SRS-SRV-03).
+      # About 320 MB per recorded hour, twice over. The sealed cloud copy is
+      # as large as the WAV, so it is written on the archive disk instead
+      # (/archive/.copywork), not here.
       - /tmp:size=${AIMS_WORK_TMPFS:-6g}
     networks: [internal]
 
@@ -291,7 +297,10 @@ services:
   # Nightly backups of both databases (SRS-STO-06, SRS-DAT-16)
   # ------------------------------------------------------------
   backup:
-    image: postgres:16-alpine
+    # postgres:16-alpine plus openssl and tzdata (backup/Dockerfile): the
+    # plain image could not encrypt a backup or restore one.
+    build: ./backup
+    image: aimscribe/backup:3.3
     container_name: aims-backup
     mem_limit: ${AIMS_BACKUP_MEMORY:-512m}
     <<: *hardening
@@ -332,7 +341,12 @@ services:
       AIMS_ALERT_WEBHOOK: ${AIMS_ALERT_WEBHOOK:-}
       AIMS_MONITOR_EVERY: ${AIMS_MONITOR_EVERY:-300}
       AIMS_CLINIC_HOURS: ${AIMS_CLINIC_HOURS:-08:00-22:00}
-      AIMS_DISK_FLOOR_GB: ${AIMS_DISK_FLOOR_GB:-500}
+      # Free space each volume must keep, in GB. Left empty, each is its
+      # default (500 / 100 / 50) capped at 15% of that volume, which suits
+      # both the UIU array and the 320 GB droplet.
+      AIMS_DISK_FLOOR_GB: ${AIMS_DISK_FLOOR_GB:-}
+      AIMS_DB_FLOOR_GB: ${AIMS_DB_FLOOR_GB:-}
+      AIMS_BACKUP_FLOOR_GB: ${AIMS_BACKUP_FLOOR_GB:-}
       TZ: ${TZ:-Asia/Dhaka}
     volumes:
       # Read-only: it looks at how full they are, never at what is in them.

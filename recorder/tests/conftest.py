@@ -1,6 +1,7 @@
 """Shared fixtures. Everything runs against a temp directory; nothing touches %PROGRAMDATA%."""
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.crypto import DeviceKey  # noqa: E402
 from core.spool import Spool  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _collect_on_the_main_thread():
+    """
+    Finalise each test's leftovers here, on the main thread, before the next
+    test starts its segmenter thread.
+
+    Async tests can leave their event loop in a reference cycle with tasks still
+    pending. Collected later, the collection can run on whichever thread happens
+    to allocate - a segmenter worker - and finalising a Windows proactor loop
+    off its own thread crashed the interpreter (0x80000003) about one run in
+    ten. The recorder itself has one loop for its whole life; this is a test
+    artefact, so it is settled in the tests.
+    """
+    yield
+    gc.collect()
 
 
 @pytest.fixture

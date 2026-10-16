@@ -1,10 +1,13 @@
 """
 The worker's copy pass, end to end against a stand-in server and bucket.
 
-The order in `SRS-ARC-09` is the whole point of these tests: compress, prove
-the compression lossless, encrypt, upload, have the store confirm what it
-holds, record - and only then may the pieces go. Each test here breaks one
-step and checks that the pieces survive it.
+The order in `SRS-ARC-09` is the whole point of these tests: encrypt the raw
+WAV, prove the sealed file decrypts to exactly the archived bytes, upload, have
+the store confirm what it holds, record - and only then may the pieces go. Each
+test here breaks one step and checks that the pieces survive it.
+
+The last section is the release of the local WAV: only once the copy is proven
+and the recording has aged past the retention period.
 
     cd archive_worker && python -m pytest -q test_worker_copy.py
 """
@@ -15,14 +18,15 @@ import hashlib
 import json
 import math
 import wave
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pytest
 
-pytest.importorskip("soundfile")
-
+import archive
 import cloudcopy
+import restore
 import worker as worker_module
 from worker import ArchiveWorker, Settings
 
@@ -105,7 +109,7 @@ class FakeBackend:
             self.versions[kind] = version
             bucket = self.AUDIO if kind == "audio" else self.JSON
             key = f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v{version}." + \
-                  ("flac.enc" if kind == "audio" else "json.enc")
+                  ("wav.enc" if kind == "audio" else "json.enc")
             return Response({"object_key": key, "version": version, "bucket": bucket,
                              "upload_url": f"https://{bucket}.example/put/{key}"})
         if url.endswith("/archive/copy/complete"):
@@ -134,7 +138,7 @@ class FakeBackend:
 
     def stored(self, kind: str) -> Optional[bytes]:
         keys = [k for k in self.objects if k.endswith(
-            "flac.enc" if kind == "audio" else "json.enc")]
+            "wav.enc" if kind == "audio" else "json.enc")]
         return self.objects[sorted(keys)[-1]] if keys else None
 
 
@@ -184,7 +188,7 @@ def setup(tmp_path, monkeypatch):
 # ============================================================
 
 def test_the_copy_is_made_and_only_then_are_the_pieces_released(setup, tmp_path):
-    """AT-64: the FLAC and the JSON reach the copy bucket; the pieces follow."""
+    """AT-64: the raw WAV and the JSON reach the copy bucket; the pieces follow."""
     worker, backend, audio = setup
     assert worker.copy_pass() == 1
 
@@ -195,15 +199,15 @@ def test_the_copy_is_made_and_only_then_are_the_pieces_released(setup, tmp_path)
     assert backend.failures == []
 
     # What is in the bucket is the recording, and nothing else would do: decrypt
-    # it, decode it, and compare the samples with the archived WAV (AT-74).
-    sealed = tmp_path / "from_bucket.flac.enc"
+    # it and it is the archived WAV, byte for byte (AT-74).
+    sealed = tmp_path / "from_bucket.wav.enc"
     sealed.write_bytes(backend.stored("audio"))
-    flac = cloudcopy.decrypt_file(sealed, tmp_path / "from_bucket.flac", KEY)
-    assert cloudcopy.flac_matches_wav(flac, audio)
+    back = cloudcopy.decrypt_file(sealed, tmp_path / "from_bucket.wav", KEY)
+    assert back.read_bytes() == audio.read_bytes()
 
     audio_copy = next(c for c in recorded["copies"] if c["kind"] == "audio")
     assert audio_copy["sha256"] == cloudcopy.sha256_file(sealed)
-    assert audio_copy["plain_sha256"] == cloudcopy.sha256_file(flac)
+    assert audio_copy["plain_sha256"] == cloudcopy.sha256_file(audio)
     # The fingerprint the store can be asked for, without sending the file back.
     assert audio_copy["md5"] == hashlib.md5(sealed.read_bytes()).hexdigest()
 
@@ -242,10 +246,11 @@ def test_a_missing_json_is_fetched_before_the_copy(setup):
 # Nothing is released on a doubt
 # ============================================================
 
-def test_a_flac_that_does_not_decode_to_the_audio_stops_everything(setup, monkeypatch):
+def test_a_sealed_copy_that_does_not_decrypt_to_the_audio_stops_everything(
+        setup, monkeypatch):
     """AT-66: mismatch detected, pieces kept, alert raised."""
     worker, backend, _ = setup
-    monkeypatch.setattr(cloudcopy, "flac_matches_wav", lambda flac, wav: False)
+    monkeypatch.setattr(cloudcopy, "sealed_sha256", lambda path, key: "0" * 64)
 
     assert worker.copy_pass() == 0
     assert backend.objects == {}                    # nothing was uploaded
@@ -323,3 +328,130 @@ def test_the_json_is_written_again_and_uploaded_as_a_new_object(setup, tmp_path)
     assert rewrite["copies"][0]["version"] == 2
     assert backend.stored("json") != first_json
     assert len([k for k in backend.objects if k.endswith("json.enc")]) == 2
+
+
+def test_no_flac_is_ever_made(setup):
+    """The dataset is raw WAV by decision; the copy is the WAV itself."""
+    worker, backend, _ = setup
+    worker.copy_pass()
+    assert not [k for k in backend.objects if "flac" in k]
+
+
+# ============================================================
+# Releasing the local WAV (the archive disk would fill in days)
+# ============================================================
+
+def catalogued(worker, audio: Path) -> None:
+    """The row the worker writes when it archives, and the manifest beside it."""
+    worker.catalogue.record(
+        session={"session_id": SESSION, "patient_ref": "P0012345",
+                 "doctor_id": "DR0042", "hospital_id": "HOSP003"},
+        archive_relpath=RELPATH, filename=audio.name,
+        sha256_hex=cloudcopy.sha256_file(audio), byte_length=audio.stat().st_size,
+        segments=[], session_date="2026-09-13")
+    audio.with_suffix(".manifest.json").write_text(json.dumps({
+        "session_id": SESSION, "patient_ref": "P0012345",
+        "archive": {"filename": audio.name, "sha256": cloudcopy.sha256_file(audio)}}),
+        encoding="utf-8")
+
+
+def later(days: float) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
+def test_without_a_copy_the_wav_is_never_released(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)                       # archived, never copied
+    assert worker.release_pass(now=later(365)) == 0
+    assert audio.exists()
+
+
+def test_without_a_copy_key_nothing_is_released_even_if_marked_copied(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    worker.catalogue.mark_copied(SESSION, "copies/x.v1.wav.enc")
+    worker.settings.copy_key = None
+    assert worker.release_pass(now=later(365)) == 0
+    assert audio.exists()
+
+
+def test_a_refused_copy_never_releases_the_wav(setup):
+    """The store did not confirm it, so the catalogue never calls it copied."""
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    backend.truncate_uploads = True
+    worker.copy_pass()
+    assert worker.release_pass(now=later(365)) == 0
+    assert audio.exists()
+
+
+def test_a_proven_copy_younger_than_the_retention_period_is_kept(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    assert worker.copy_pass() == 1
+    assert worker.release_pass(now=later(6.9)) == 0
+    assert audio.exists()
+
+
+def test_a_proven_old_copy_releases_the_wav_and_keeps_everything_else(setup, tmp_path):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    original = audio.read_bytes()
+    assert worker.copy_pass() == 1
+
+    assert worker.release_pass(now=later(7.1)) == 1
+    assert not audio.exists()
+    assert audio.with_suffix(".json").exists()
+
+    manifest = json.loads(audio.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+    assert manifest["local_audio"]["status"] == "released"
+    assert manifest["local_audio"]["cloud_copy"].endswith(".v1.wav.enc")
+    row = worker.catalogue.find(patient_id="P0012345")[0]
+    assert row["local_released_at"] and row["copy_object_key"].endswith(".wav.enc")
+    index = json.loads((audio.parent / "_index.json").read_text(encoding="utf-8"))
+    assert index["sessions"][0]["local_audio"] == "released"
+
+    # Released twice is still released once.
+    assert worker.release_pass(now=later(8)) == 0
+
+    # And the recording comes back from the copy bucket, byte for byte.
+    sealed = tmp_path / f"{STEM}.v1.wav.enc"
+    sealed.write_bytes(backend.stored("audio"))
+    restored = restore.restore_one(sealed, tmp_path / "restored", KEY)
+    assert restored.read_bytes() == original
+    assert cloudcopy.sha256_file(restored) == row["sha256"]
+
+
+def test_a_wav_that_changed_after_its_copy_is_kept(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    worker.copy_pass()
+    with open(audio, "r+b") as handle:
+        handle.seek(1000)
+        handle.write(b"\x01\x02")
+    assert worker.release_pass(now=later(30)) == 0
+    assert audio.exists()
+
+
+def test_a_late_prescription_after_release_still_rewrites_the_json(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    worker.copy_pass()
+    worker.release_pass(now=later(8))
+
+    backend.document = {"file_stem": STEM, "prescription": {"version": 2}}
+    backend.pending_json.append({"session_id": SESSION, "file_stem": STEM,
+                                 "archive_relpath": RELPATH})
+    assert worker.copy_pass() == 1
+    beside = json.loads(audio.with_suffix(".json").read_text(encoding="utf-8"))
+    assert beside["prescription"]["version"] == 2
+    assert not audio.exists()
+
+
+def test_a_negative_retention_keeps_every_wav(setup):
+    worker, backend, audio = setup
+    catalogued(worker, audio)
+    worker.copy_pass()
+    worker.settings.local_retention_days = -1
+    assert worker.release_pass(now=later(365)) == 0
+    assert audio.exists()

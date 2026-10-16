@@ -24,15 +24,31 @@ Sequence per session:
 
 Then, for each archived recording, the cloud copy (SRS-ARC-08-13):
 
-  7. compress the WAV to FLAC          decode it again and compare the samples
-  8. encrypt the FLAC and the JSON     with a key that never leaves this machine
+  7. encrypt the raw WAV and the JSON  with a key that never leaves this machine
+  8. decrypt again and hash            must equal the archive's own SHA-256
   9. upload them                       the audio to cold storage, the JSON hot
  10. POST /api/v2/archive/copy/complete   the server checks what the store holds
                                           against what was sent, records the
                                           copy, and only then deletes the pieces
 
+And, once a recording's copy is proven and it has aged past the retention
+period, the WAV on this disk is released (11). Its JSON, manifest and catalogue
+row stay; the manifest says where the copy is. Without this the archive disk
+fills in days.
+
 A session is only reported complete after step 4 succeeds. Any failure leaves the
 session pending, the agent keeps its local audio, and the next pass retries.
+
+One recording, several consultations. When the server finds that a recording
+held more than one patient (a follow-up with no prescription, then the next
+patient), the pending session carries "parts": where each consultation begins,
+in seconds of the joined audio. The worker joins as always, then cuts the
+joined audio at exact frames into one WAV per patient, each in its own folder
+with its own manifest and JSON. The parts are contiguous - joined again they
+are the joined WAV byte for byte - so the completion report still carries the
+whole recording's fingerprint, the one the chain vouches for. If the server
+later changes its mind (a prescription arrived late), the recut pass joins the
+existing parts, proves they are still that audio, and cuts again.
 """
 from __future__ import annotations
 
@@ -42,6 +58,7 @@ import signal
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +97,16 @@ class Settings:
         # the storage provider never see it (SRS-DAT-08).
         self.copy_key = cloudcopy.load_key(os.getenv("AIMS_COPY_KEY"))
         self.copy_batch = int(os.getenv("AIMS_COPY_BATCH", "2"))
+        # Days an archived WAV stays on this disk after its cloud copy is
+        # proven. Negative keeps every WAV here for ever; the disk then fills.
+        self.local_retention_days = float(
+            os.getenv("AIMS_ARCHIVE_LOCAL_RETENTION_DAYS", "7"))
+        self.retention_interval = int(os.getenv("AIMS_RETENTION_INTERVAL_SECONDS", "600"))
+        # Where the sealed copy is written before upload. It is as large as the
+        # recording, so it goes on the archive disk: a tmpfs counts against the
+        # container's memory, and an hour-long consultation would not fit.
+        self.copy_work_dir = Path(os.getenv("AIMS_COPY_WORK_DIR",
+                                            str(self.archive_root / ".copywork")))
 
     def problems(self) -> List[str]:
         issues = []
@@ -104,6 +131,14 @@ class Settings:
         return host in ("localhost", "127.0.0.1", "::1") or "." not in host
 
 
+def safe_stem(part: Dict[str, Any]) -> str:
+    """A part's file name, refused unless it is one the archive can hold."""
+    stem = part.get("file_stem")
+    if not isinstance(stem, str) or not archive.FOLDER_PATTERN.match(stem):
+        raise ArchiveError(f"part {part.get('part_no')} has an unsafe file_stem: {stem!r}")
+    return stem
+
+
 class ArchiveWorker:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -117,7 +152,9 @@ class ArchiveWorker:
         self.running = True
         self.archived = 0
         self.copied = 0
+        self.released = 0
         self.failed = 0
+        self._next_retention = 0.0
 
     # ---- lifecycle ----
 
@@ -138,6 +175,11 @@ class ArchiveWorker:
         logger.info("Copies  : %s", "on, encrypted at UIU"
                     if self.settings.copy_key else
                     "OFF - AIMS_COPY_KEY is not set, so no cloud copy is kept")
+        logger.info("Release : %s", "never - no cloud copy, so every WAV stays here"
+                    if self.settings.copy_key is None
+                    or self.settings.local_retention_days < 0 else
+                    f"WAV removed from this disk {self.settings.local_retention_days:g} "
+                    f"day(s) after its cloud copy is proven")
         logger.info("=" * 64)
 
         while self.running:
@@ -154,8 +196,9 @@ class ArchiveWorker:
                 logger.error("Poll failed: %s", exc, exc_info=True)
                 self._sleep(self.settings.poll_seconds)
 
-        logger.info("Stopped. Archived %s session(s), copied %s, %s failure(s)",
-                    self.archived, self.copied, self.failed)
+        logger.info("Stopped. Archived %s session(s), copied %s, released %s, "
+                    "%s failure(s)", self.archived, self.copied, self.released,
+                    self.failed)
         return 0
 
     def _sleep(self, seconds: int) -> None:
@@ -168,9 +211,10 @@ class ArchiveWorker:
 
     def drain_once(self) -> int:
         self.sweep()
+        self.maybe_release()
         sessions = self.fetch_pending()
         if not sessions:
-            return self.copy_pass()
+            return self.recut_pass() + self.copy_pass()
 
         logger.info("%s session(s) pending", len(sessions))
         processed = 0
@@ -191,8 +235,9 @@ class ArchiveWorker:
                 logger.error("Session %s failed unexpectedly: %s",
                              session.get("session_id"), exc, exc_info=True)
 
-        # The cloud copy runs after the archiving, on what is already on disk.
-        return processed + self.copy_pass()
+        # Recuts and the cloud copy run after the archiving, on what is already
+        # on disk.
+        return processed + self.recut_pass() + self.copy_pass()
 
     def sweep(self) -> None:
         """
@@ -236,6 +281,11 @@ class ArchiveWorker:
             session.get("timezone") or "UTC")
 
         session_date = session.get("session_date") or opened_local.date().isoformat()
+
+        parts = session.get("parts") or []
+        if len(parts) > 1:
+            self.archive_parts(session, segments, parts, session_date)
+            return
 
         # The filename comes first: the folder is named after it, so that one
         # directory is one consultation. A patient seen twice in a day gets two
@@ -324,8 +374,291 @@ class ArchiveWorker:
             except Exception as exc:
                 logger.warning("Catalogue not marked reported for %s: %s", session_id, exc)
 
+    # ---- one recording, several consultations ----
+
+    def archive_parts(self, session: Dict[str, Any], segments: List[Dict[str, Any]],
+                      parts: List[Dict[str, Any]], session_date: str) -> None:
+        """
+        Join, then cut into one file per consultation, then report once.
+
+        Everything is proven before anything is reported: the joined audio is
+        hashed from disk, every part is hashed from the archive volume, and the
+        parts' frames add up to the joined audio's. A failure anywhere leaves
+        the session pending, exactly as for a single file.
+        """
+        session_id = session["session_id"]
+        parts = sorted(parts, key=lambda q: int(q["part_no"]))
+        for part in parts:
+            safe_stem(part)                       # refuses an unsafe name now
+
+        total_bytes = sum(int(seg["bytes"]) for seg in segments)
+        # The joined audio in scratch, and the parts beside it on the volume.
+        archive.ensure_space(self.settings.archive_root, total_bytes * 2,
+                             headroom=self.settings.disk_headroom)
+
+        with tempfile.TemporaryDirectory(prefix=f"aims_{session_id}_") as scratch:
+            paths = self.download_segments(segments, Path(scratch))
+            logger.info("Joining %s segment(s) for %s, to cut into %s consultations",
+                        len(paths), session_id, len(parts))
+            joined = archive.join_wav(paths, Path(scratch) / "joined.wav")
+            if archive.sha256_file(joined.path) != joined.sha256:
+                raise ArchiveError("joined audio failed verification after write")
+            written = self.write_parts(session, parts, joined, session_date)
+
+        self.finish_parts(session, written, joined, session_date, segments)
+
+    def write_parts(self, session: Dict[str, Any], parts: List[Dict[str, Any]],
+                    joined: "archive.JoinResult", session_date: str,
+                    own: Optional[set] = None) -> List[Dict[str, Any]]:
+        """
+        Cut `joined` into the parts and write each to its own folder.
+
+        `own` is the set of paths this session already holds (a recut): a file
+        there is overwritten, because it is ours, rather than stepped around.
+        """
+        own = own or set()
+        session_id = session["session_id"]
+        fmt = archive.wav_format(joined.path)
+        bounds = archive.part_frames([q.get("start_seconds") for q in parts],
+                                     fmt.rate, fmt.frames)
+        written: List[Dict[str, Any]] = []
+        for part, (start, end) in zip(parts, bounds):
+            stem = part["file_stem"]
+            doctor = part.get("doctor_id") or session["doctor_id"]
+            directory = archive.session_directory(
+                self.settings.archive_root, session["hospital_id"], doctor,
+                session_date, stem)
+            filename = f"{stem}.wav"
+            if (directory / filename).resolve() in own:
+                destination = directory / filename
+            else:
+                destination, _ = archive.free_destination(
+                    directory, filename, archive.part_bytes(end - start, fmt))
+            directory.mkdir(parents=True, exist_ok=True)
+            result = archive.cut_wav(joined.path, start, end, destination)
+            if archive.sha256_file(destination) != result.sha256:
+                destination.unlink(missing_ok=True)
+                raise ArchiveError(f"part {part['part_no']} failed verification after write")
+            written.append({
+                "part": part, "path": destination, "result": result,
+                "start_frame": start, "end_frame": end,
+                "relpath": archive.relative_path(session["hospital_id"], doctor,
+                                                 session_date, stem, destination.name),
+                "derived_from": {
+                    "session_id": session_id,
+                    "part_no": int(part["part_no"]),
+                    "parts_count": len(parts),
+                    "start_seconds": round(start / fmt.rate, 3),
+                    "end_seconds": round(end / fmt.rate, 3),
+                    "start_frame": start, "end_frame": end,
+                    "rule": part.get("rule"),
+                    "needs_review": bool(part.get("needs_review")),
+                    "recording_sha256": joined.sha256.hex(),
+                    "recording_bytes": joined.bytes,
+                },
+            })
+        if sum(w["end_frame"] - w["start_frame"] for w in written) != fmt.frames:
+            raise ArchiveError("the parts do not add up to the recording")
+        return written
+
+    def finish_parts(self, session: Dict[str, Any], written: List[Dict[str, Any]],
+                     joined: "archive.JoinResult", session_date: str,
+                     segments: List[Dict[str, Any]]) -> bool:
+        """Manifest, JSON, indexes and catalogue for each part; then one report."""
+        session_id = session["session_id"]
+        for w in written:
+            part = w["part"]
+            as_part = {**session, "patient_ref": part.get("patient_id")
+                       or session.get("patient_ref"),
+                       "doctor_id": part.get("doctor_id") or session.get("doctor_id")}
+            archive.write_manifest(w["path"], as_part, w["result"],
+                                   derived_from=w["derived_from"])
+            self.write_clinical_json(session_id, w["path"], recording={
+                "audio_sha256": w["result"].sha256.hex(),
+                "audio_bytes": w["result"].bytes,
+                "duration_seconds": round(w["result"].duration_seconds, 3),
+                "archive_relpath": w["relpath"],
+            }, part_no=int(part["part_no"]), derived_from=w["derived_from"])
+            archive.update_day_index(w["path"].parent)
+
+        try:
+            first = written[0]
+            self.catalogue.record(
+                session=session, archive_relpath=first["relpath"],
+                filename=first["path"].name, sha256_hex=joined.sha256.hex(),
+                byte_length=joined.bytes, segments=segments, session_date=session_date,
+                pauses=session.get("pauses") or [], parts_count=len(written))
+            for w in written:
+                part = w["part"]
+                self.catalogue.record_part(session_id, {
+                    "part_no": int(part["part_no"]),
+                    "patient_id": part.get("patient_id") or session.get("patient_ref"),
+                    "doctor_id": part.get("doctor_id") or session.get("doctor_id"),
+                    "archive_relpath": w["relpath"], "filename": w["path"].name,
+                    "sha256": w["result"].sha256.hex(), "bytes": w["result"].bytes,
+                    "start_seconds": w["derived_from"]["start_seconds"],
+                    "end_seconds": w["derived_from"]["end_seconds"],
+                    "start_frame": w["start_frame"], "end_frame": w["end_frame"],
+                    "rule": part.get("rule"), "needs_review": part.get("needs_review"),
+                })
+            self.catalogue.drop_parts_after(session_id, len(written))
+        except Exception as exc:
+            logger.error("Could not write the local catalogue for %s: %s",
+                         session_id, exc, exc_info=True)
+
+        logger.info("Archived %s as %s consultation(s): %s", session_id, len(written),
+                    ", ".join(w["relpath"] for w in written))
+        reported = self.report_complete(
+            session_id, written[0]["relpath"], joined.sha256, joined.bytes,
+            parts=[{"part_no": int(w["part"]["part_no"]),
+                    "archive_relpath": w["relpath"],
+                    "sha256": w["result"].sha256.hex(), "bytes": w["result"].bytes,
+                    "start_seconds": w["derived_from"]["start_seconds"],
+                    "end_seconds": w["derived_from"]["end_seconds"]} for w in written])
+        if reported:
+            try:
+                self.catalogue.mark_reported(session_id)
+            except Exception as exc:
+                logger.warning("Catalogue not marked reported for %s: %s", session_id, exc)
+        return reported
+
+    # ---- recut: the server changed where the consultations begin ----
+
+    def recut_pass(self) -> int:
+        """Cut again every archived recording whose parts the server changed."""
+        try:
+            sessions = self.fetch("archive/recut/pending", self.settings.batch_size)
+        except Exception as exc:
+            # An older server has no recut endpoint; nothing to do then.
+            logger.debug("No recut list: %s", exc)
+            return 0
+        done = 0
+        for session in sessions:
+            if not self.running:
+                break
+            try:
+                if self.recut_session(session):
+                    done += 1
+            except (ArchiveError, CopyError) as exc:
+                self.failed += 1
+                logger.error("Recut of %s refused: %s", session.get("session_id"), exc)
+                self.report_copy_failure(session.get("session_id"), "recut", str(exc))
+            except Exception as exc:
+                self.failed += 1
+                logger.error("Recut of %s failed unexpectedly: %s",
+                             session.get("session_id"), exc, exc_info=True)
+                self.report_copy_failure(session.get("session_id"), "recut", str(exc))
+        return done
+
+    def _existing_files(self, session: Dict[str, Any]) -> List[Path]:
+        """
+        The files this recording is archived as now, in order. Taken from the
+        server when it lists them, else from this machine's catalogue, else the
+        single file the session was archived as.
+        """
+        listed = (session.get("existing_parts") or session.get("archived_parts")
+                  or [q for q in (session.get("parts") or []) if q.get("archive_relpath")])
+        relpaths = [q["archive_relpath"] for q in
+                    sorted(listed, key=lambda q: int(q.get("part_no") or 0))]
+        if not relpaths:
+            relpaths = [r["archive_relpath"] for r in
+                        self.catalogue.parts_for(session["session_id"])]
+        if not relpaths and session.get("archive_relpath"):
+            relpaths = [session["archive_relpath"]]
+        return [self._inside(rel) for rel in relpaths]
+
+    def _inside(self, relpath: str) -> Path:
+        path = (self.settings.archive_root / relpath).resolve()
+        if self.settings.archive_root.resolve() not in path.parents:
+            raise ArchiveError(f"archived file outside the archive: {relpath}")
+        return path
+
+    def _expected_sha(self, session: Dict[str, Any]) -> str:
+        expected = session.get("archive_sha256")
+        if not expected:
+            row = self.catalogue.session_row(session["session_id"])
+            expected = row["sha256"] if row else None
+        if not expected:
+            raise ArchiveError("no fingerprint for the recording to check the cut against")
+        return str(expected).lower()
+
+    def recut_session(self, session: Dict[str, Any]) -> bool:
+        """
+        Join the existing parts, prove that is still the recording the chain
+        vouches for, cut at the new starts, report, then tidy the old files.
+
+        Safe to interrupt anywhere. If the run stopped after writing some new
+        parts over old ones, the old set no longer joins to the recording - so
+        the new set is tried as well; whichever proves itself is the source.
+        """
+        session_id = session["session_id"]
+        parts = sorted(session.get("parts") or [], key=lambda q: int(q["part_no"]))
+        if not parts:
+            raise ArchiveError("recut requested with no parts")
+        for part in parts:
+            safe_stem(part)
+        expected = self._expected_sha(session)
+        session_date = session.get("session_date") or str(session.get("opened_at", ""))[:10]
+
+        new_paths = []
+        for part in parts:
+            doctor = part.get("doctor_id") or session["doctor_id"]
+            directory = archive.session_directory(
+                self.settings.archive_root, session["hospital_id"], doctor,
+                session_date, part["file_stem"])
+            new_paths.append((directory / f"{part['file_stem']}.wav").resolve())
+        old_paths = self._existing_files(session)
+
+        with tempfile.TemporaryDirectory(prefix=f"aims_recut_{session_id}_") as scratch:
+            joined = None
+            for candidate in (old_paths, new_paths):
+                if not candidate or not all(path.is_file() for path in candidate):
+                    continue
+                attempt = archive.join_wav(candidate, Path(scratch) / "joined.wav")
+                if attempt.sha256.hex() == expected:
+                    joined = attempt
+                    break
+            if joined is None:
+                missing = [path.name for path in old_paths if not path.is_file()]
+                if missing:
+                    raise ArchiveError(
+                        f"{', '.join(missing)} not on this disk (released to the "
+                        f"cloud copy?); restore it before the recording can be recut")
+                raise ArchiveError("the archived parts no longer join to the recording "
+                                   "the chain describes; not cutting them")
+
+            own = set(old_paths) | set(new_paths)
+            written = self.write_parts(session, parts, joined, session_date, own=own)
+            segments = session.get("segments") or []
+            reported = self.finish_parts(session, written, joined, session_date, segments)
+
+        if not reported:
+            return False
+        kept = {w["path"].resolve() for w in written}
+        for old in old_paths:
+            if old.resolve() not in kept:
+                self._remove_archived(old)
+        try:
+            self.catalogue.mark_uncopied(session_id)
+        except Exception as exc:
+            logger.warning("Catalogue copy state not reset for %s: %s", session_id, exc)
+        logger.info("Recut %s into %s consultation(s)", session_id, len(written))
+        return True
+
+    def _remove_archived(self, audio: Path) -> None:
+        """An old part no longer named by the server: its files, then its folder."""
+        for path in (audio, audio.with_suffix(".manifest.json"),
+                     archive.clinical_json_path(audio), audio.parent / "_index.json"):
+            path.unlink(missing_ok=True)
+        try:
+            audio.parent.rmdir()
+        except OSError:
+            archive.update_day_index(audio.parent)    # something else lives there
+
     def write_clinical_json(self, session_id: str, audio_path: Path,
-                            recording: Optional[Dict[str, Any]] = None) -> Path:
+                            recording: Optional[Dict[str, Any]] = None,
+                            part_no: Optional[int] = None,
+                            derived_from: Optional[Dict[str, Any]] = None) -> Path:
         """
         Fetch what CMED holds about this visit and write it beside the audio.
 
@@ -342,15 +675,23 @@ class ArchiveWorker:
         ties the file to the chain was missing from the copy that would be
         used to rebuild it.
         """
+        extra = {"params": {"part": part_no}} if part_no is not None else {}
         response = self.session.get(
             f"{self.settings.backend_url}/api/v2/archive/clinical/{session_id}",
-            timeout=self.settings.request_timeout, verify=self.settings.verify_tls)
+            timeout=self.settings.request_timeout, verify=self.settings.verify_tls,
+            **extra)
         if response.status_code >= 300:
             raise ArchiveError(f"clinical record unavailable "
                                f"({response.status_code}); will retry")
         document = response.json()
-        if recording:
-            document["recording"] = {**(document.get("recording") or {}), **recording}
+        if recording or derived_from:
+            merged = {**(document.get("recording") or {}), **(recording or {})}
+            if derived_from:
+                # The server says which part this is; the frames and the whole
+                # recording's fingerprint are only known here.
+                merged["derived_from"] = {**derived_from,
+                                          **(merged.get("derived_from") or {})}
+            document["recording"] = merged
         return archive.write_clinical_json(audio_path, document)
 
     def download_segments(self, segments: List[Dict[str, Any]], scratch: Path) -> List[Path]:
@@ -391,7 +732,8 @@ class ArchiveWorker:
         return paths
 
     def report_complete(self, session_id: str, relpath: str,
-                        sha256: bytes, byte_length: int) -> bool:
+                        sha256: bytes, byte_length: int,
+                        parts: Optional[List[Dict[str, Any]]] = None) -> bool:
         """
         Tell the backend the archive copy exists and hashes correctly.
 
@@ -402,14 +744,17 @@ class ArchiveWorker:
         disk but unacknowledged - the catalogue keeps it in `unreported()` and the
         agent rightly keeps its local copy.
         """
+        body: Dict[str, Any] = {
+            "session_id": session_id,
+            "archive_relpath": relpath,
+            "sha256": sha256.hex(),
+            "bytes": byte_length,
+        }
+        if parts:
+            body["parts"] = parts
         response = self.session.post(
             f"{self.settings.backend_url}/api/v2/archive/complete",
-            json={
-                "session_id": session_id,
-                "archive_relpath": relpath,
-                "sha256": sha256.hex(),
-                "bytes": byte_length,
-            },
+            json=body,
             timeout=self.settings.request_timeout,
             verify=self.settings.verify_tls,
         )
@@ -471,9 +816,94 @@ class ArchiveWorker:
                 self.report_copy_failure(session["session_id"], "json", str(exc))
         return done
 
+    def parts_of(self, session: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        The files a multi-consultation recording is archived as, in order, each
+        with its fingerprint: from the server's listing when it gives one, else
+        from this machine's catalogue. Empty for a single-file recording.
+        """
+        listed = [q for q in (session.get("parts") or []) if q.get("archive_relpath")]
+        if len(listed) > 1:
+            return [{"part_no": int(q["part_no"]), "archive_relpath": q["archive_relpath"],
+                     "sha256": q.get("archive_sha256") or q.get("sha256"),
+                     "copied": bool(q.get("copied_at"))}
+                    for q in sorted(listed, key=lambda q: int(q["part_no"]))]
+        rows = self.catalogue.parts_for(session["session_id"])
+        if len(rows) > 1:
+            return [{"part_no": r["part_no"], "archive_relpath": r["archive_relpath"],
+                     "sha256": r["sha256"], "copied": bool(r["copied_at"])} for r in rows]
+        return []
+
+    def copy_parts(self, session: Dict[str, Any], parts: List[Dict[str, Any]]) -> None:
+        """
+        The copy of each consultation's file, part by part. The pieces in the
+        segment bucket may go only once every part is copied, so "final" goes
+        with the last one and with no other.
+        """
+        session_id = session["session_id"]
+        todo = [q for q in parts if not q["copied"]]
+        for index, part in enumerate(todo):
+            audio = self.archive_file({"archive_relpath": part["archive_relpath"]})
+            if part.get("sha256") and archive.sha256_file(audio).hex() != part["sha256"]:
+                raise CopyError(f"{audio.name} on disk no longer matches what was "
+                                f"archived; not copying it")
+            if not archive.clinical_json_path(audio).exists():
+                self.write_clinical_json(session_id, audio, part_no=part["part_no"])
+            audio_copy, json_copy = self.seal_and_upload(
+                session_id, audio, part.get("sha256"), part_no=part["part_no"])
+            result = self.post("archive/copy/complete", {
+                "session_id": session_id, "part_no": part["part_no"],
+                "final": index == len(todo) - 1,
+                "copies": [audio_copy, json_copy],
+            })
+            try:
+                self.catalogue.mark_part_copied(session_id, part["part_no"],
+                                                audio_copy["object_key"])
+            except Exception as exc:
+                logger.warning("Catalogue not marked copied for %s part %s: %s",
+                               session_id, part["part_no"], exc)
+            logger.info("Cloud copy of %s part %s stored; %s piece(s) deleted",
+                        session_id, part["part_no"], result.get("objects_deleted", 0))
+        try:
+            rows = self.catalogue.parts_for(session_id)
+            first = next((r for r in rows if r["copy_object_key"]), None)
+            if first is not None and all(r["copied_at"] for r in rows):
+                self.catalogue.mark_copied(session_id, first["copy_object_key"])
+        except Exception as exc:
+            logger.warning("Catalogue not marked copied for %s: %s", session_id, exc)
+
+    def seal_and_upload(self, session_id: str, audio: Path, expected: Optional[str],
+                        part_no: Optional[int] = None):
+        """Encrypt the WAV and its JSON, prove the seal, upload both."""
+        json_path = archive.clinical_json_path(audio)
+        self.settings.copy_work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"aimscopy_{session_id}_",
+                                         dir=self.settings.copy_work_dir) as scratch:
+            work = Path(scratch)
+            stem = audio.stem
+            expected = expected or archive.sha256_file(audio).hex()
+            sealed = cloudcopy.encrypt_file(audio, work / f"{stem}.wav.enc",
+                                            self.settings.copy_key)
+            if sealed.plain_sha256 != expected:
+                raise CopyError(f"{audio.name} changed while it was encrypted; "
+                                f"the pieces stay where they are")
+            if cloudcopy.sealed_sha256(sealed.path, self.settings.copy_key) != expected:
+                raise CopyError("the sealed copy does not decrypt to the archived audio; "
+                                "the pieces stay where they are")
+            audio_copy = self.upload_copy(session_id, "audio", sealed, part_no=part_no)
+            json_copy = self.upload_copy(
+                session_id, "json",
+                cloudcopy.encrypt_file(json_path, work / f"{stem}.json.enc",
+                                       self.settings.copy_key), part_no=part_no)
+        return audio_copy, json_copy
+
     def copy_session(self, session: Dict[str, Any]) -> None:
         """The steps of SRS-ARC-09, in order, each proven before the next."""
         session_id = session["session_id"]
+        parts = self.parts_of(session)
+        if parts:
+            self.copy_parts(session, parts)
+            return
         audio = self.archive_file(session)
 
         # 1. The archived WAV, still exactly what was reported.
@@ -487,21 +917,27 @@ class ArchiveWorker:
         if not json_path.exists():
             self.write_clinical_json(session_id, audio)
 
-        with tempfile.TemporaryDirectory(prefix=f"aimscopy_{session_id}_") as scratch:
+        self.settings.copy_work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f"aimscopy_{session_id}_",
+                                         dir=self.settings.copy_work_dir) as scratch:
             work = Path(scratch)
             stem = audio.stem
 
-            # 2 and 3. Compress, then decode again and compare the samples.
-            flac = cloudcopy.to_flac(audio, work / f"{stem}.flac")
-            if not cloudcopy.flac_matches_wav(flac, audio):
-                raise CopyError("the FLAC does not decode to the archived audio; "
+            # 2 and 3. Encrypt the WAV itself, then decrypt it again and hash.
+            # Both hashes must be the archive's: the bytes that went in, and
+            # the bytes the sealed file gives back with the key UIU holds.
+            expected = session.get("archive_sha256") or archive.sha256_file(audio).hex()
+            sealed = cloudcopy.encrypt_file(audio, work / f"{stem}.wav.enc",
+                                            self.settings.copy_key)
+            if sealed.plain_sha256 != expected:
+                raise CopyError(f"{audio.name} changed while it was encrypted; "
+                                f"the pieces stay where they are")
+            if cloudcopy.sealed_sha256(sealed.path, self.settings.copy_key) != expected:
+                raise CopyError("the sealed copy does not decrypt to the archived audio; "
                                 "the pieces stay where they are")
 
-            # 4 and 5. Encrypt here, upload, read back, compare.
-            audio_copy = self.upload_copy(
-                session_id, "audio",
-                cloudcopy.encrypt_file(flac, work / f"{stem}.flac.enc",
-                                       self.settings.copy_key))
+            # 4 and 5. Upload; the server then asks the store for its fingerprint.
+            audio_copy = self.upload_copy(session_id, "audio", sealed)
             json_copy = self.upload_copy(
                 session_id, "json",
                 cloudcopy.encrypt_file(json_path, work / f"{stem}.json.enc",
@@ -517,7 +953,7 @@ class ArchiveWorker:
             self.catalogue.mark_copied(session_id, audio_copy["object_key"])
         except Exception as exc:
             logger.warning("Catalogue not marked copied for %s: %s", session_id, exc)
-        logger.info("Cloud copy of %s stored (%.1f MB FLAC); %s piece(s) deleted",
+        logger.info("Cloud copy of %s stored (%.1f MB WAV); %s piece(s) deleted",
                     session_id, audio_copy["bytes"] / 1024 ** 2,
                     result.get("objects_deleted", 0))
 
@@ -527,7 +963,30 @@ class ArchiveWorker:
         it as a new object. The earlier ones are kept (SRS-ARC-13).
         """
         session_id = session["session_id"]
-        audio = self.archive_file(session)
+        parts = self.parts_of(session)
+        if parts:
+            for part in parts:
+                audio = self.archive_file({"archive_relpath": part["archive_relpath"]},
+                                          need_audio=False)
+                json_path = self.write_clinical_json(session_id, audio,
+                                                     part_no=part["part_no"])
+                copies = []
+                if self.settings.copy_key is not None:
+                    with tempfile.TemporaryDirectory(
+                            prefix=f"aimsjson_{session_id}_") as scratch:
+                        copies.append(self.upload_copy(
+                            session_id, "json",
+                            cloudcopy.encrypt_file(
+                                json_path, Path(scratch) / f"{audio.stem}.json.enc",
+                                self.settings.copy_key), part_no=part["part_no"]))
+                self.post("archive/copy/complete",
+                          {"session_id": session_id, "part_no": part["part_no"],
+                           "final": False, "copies": copies})
+            logger.info("Wrote the JSON of %s part(s) of %s again", len(parts), session_id)
+            return
+        # The WAV may already have been released from this disk; the JSON
+        # beside where it was is still written, and still copied.
+        audio = self.archive_file(session, need_audio=False)
         json_path = self.write_clinical_json(session_id, audio)
 
         copies = []
@@ -542,15 +1001,137 @@ class ArchiveWorker:
                   {"session_id": session_id, "final": False, "copies": copies})
         logger.info("Wrote the JSON for %s again after a late prescription", session_id)
 
-    def archive_file(self, session: Dict[str, Any]) -> Path:
+    def archive_file(self, session: Dict[str, Any], need_audio: bool = True) -> Path:
         relpath = session.get("archive_relpath") or ""
         audio = (self.settings.archive_root / relpath).resolve()
-        if not audio.is_file() or self.settings.archive_root.resolve() not in audio.parents:
-            raise CopyError(f"archived file missing or outside the archive: {relpath}")
+        if self.settings.archive_root.resolve() not in audio.parents:
+            raise CopyError(f"archived file outside the archive: {relpath}")
+        if need_audio and not audio.is_file():
+            raise CopyError(f"archived file missing: {relpath}")
+        if not need_audio and not audio.parent.is_dir():
+            raise CopyError(f"archive folder missing: {relpath}")
         return audio
 
+    # ============================================================
+    # Releasing the local WAV once the cloud copy is proven
+    # ============================================================
+
+    def maybe_release(self) -> int:
+        """At most every few minutes: hashing a day's audio is not free."""
+        if time.time() < self._next_retention:
+            return 0
+        self._next_retention = time.time() + self.settings.retention_interval
+        try:
+            return self.release_pass()
+        except Exception as exc:
+            logger.error("Release pass failed: %s", exc, exc_info=True)
+            return 0
+
+    def release_pass(self, now: Optional[datetime] = None) -> int:
+        """
+        Remove archived WAVs from this disk that are safe elsewhere.
+
+        Safe means three things, all checked here and none assumed: the server
+        proved the cloud copy against the store's own fingerprint (only then
+        does the catalogue record it as copied), the recording is older than
+        the retention period, and the file on disk is still the one that was
+        copied. With no copy key there are no copies, so nothing is released,
+        ever. The JSON, the manifest and the catalogue row stay, and the
+        manifest records where the copy is.
+        """
+        if self.settings.copy_key is None or self.settings.local_retention_days < 0:
+            return 0
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=self.settings.local_retention_days)
+
+        released = 0
+        for row in self.catalogue.releasable(cutoff.isoformat()):
+            if not self.running:
+                break
+            try:
+                if self.release_one(row, now):
+                    released += 1
+            except Exception as exc:
+                self.failed += 1
+                logger.error("Could not release the local WAV of %s: %s",
+                             row["session_id"], exc)
+        if released:
+            self.released += released
+            logger.info("Released %s archived WAV(s) from this disk; their cloud "
+                        "copies are proven", released)
+        return released
+
+    def release_one(self, row: Dict[str, Any], now: datetime) -> bool:
+        if int(row.get("parts_count") or 1) > 1:
+            return self.release_parts(row, now)
+        audio = (self.settings.archive_root / row["archive_relpath"]).resolve()
+        if self.settings.archive_root.resolve() not in audio.parents:
+            raise CopyError(f"outside the archive: {row['archive_relpath']}")
+        manifest = audio.with_suffix(".manifest.json")
+
+        if not audio.exists():
+            # Released before, and the run stopped before the catalogue knew.
+            if archive.local_audio_released(manifest):
+                self.catalogue.mark_released(row["session_id"], now.isoformat())
+                return False
+            raise CopyError(f"{audio.name} is missing and was never released - "
+                            f"restore it from {row['copy_object_key']}")
+
+        # The copy was made of a file with this hash. One that differs now has
+        # been changed or damaged since; keep it for a person to look at.
+        if archive.sha256_file(audio).hex() != row["sha256"]:
+            raise CopyError(f"{audio.name} no longer matches the copied audio; kept")
+
+        # Record first, delete second: a crash in between leaves a manifest
+        # that says released beside a WAV still present, which the next pass
+        # simply finishes.
+        archive.record_local_release(
+            manifest, released_at=now.isoformat(timespec="seconds"),
+            copy_object_key=row["copy_object_key"], sha256=row["sha256"])
+        audio.unlink()
+        self.catalogue.mark_released(row["session_id"], now.isoformat())
+        archive.update_day_index(audio.parent)
+        logger.info("Released %s from this disk; the copy is %s",
+                    audio.name, row["copy_object_key"])
+        return True
+
+    def release_parts(self, row: Dict[str, Any], now: datetime) -> bool:
+        """
+        Every consultation's file of one recording, or none of them: each must
+        have a proven copy and still match it. One that does not keeps the
+        whole recording here for a person to look at.
+        """
+        session_id = row["session_id"]
+        parts = self.catalogue.parts_for(session_id)
+        if len(parts) < 2 or not all(q["copied_at"] and q["copy_object_key"] for q in parts):
+            return False
+        pending = []
+        for part in parts:
+            audio = self._inside(part["archive_relpath"])
+            manifest = audio.with_suffix(".manifest.json")
+            if not audio.exists():
+                if archive.local_audio_released(manifest):
+                    continue
+                raise CopyError(f"{audio.name} is missing and was never released - "
+                                f"restore it from {part['copy_object_key']}")
+            if archive.sha256_file(audio).hex() != part["sha256"]:
+                raise CopyError(f"{audio.name} no longer matches the copied audio; kept")
+            pending.append((part, audio, manifest))
+        for part, audio, manifest in pending:
+            archive.record_local_release(
+                manifest, released_at=now.isoformat(timespec="seconds"),
+                copy_object_key=part["copy_object_key"], sha256=part["sha256"])
+            audio.unlink()
+            self.catalogue.mark_part_released(session_id, part["part_no"], now.isoformat())
+            archive.update_day_index(audio.parent)
+        self.catalogue.mark_released(session_id, now.isoformat())
+        logger.info("Released %s consultation file(s) of %s from this disk",
+                    len(pending), session_id)
+        return bool(pending)
+
     def upload_copy(self, session_id: str, kind: str,
-                    encrypted: "cloudcopy.Encrypted") -> Dict[str, Any]:
+                    encrypted: "cloudcopy.Encrypted",
+                    part_no: Optional[int] = None) -> Dict[str, Any]:
         """
         Put one encrypted object in the copy bucket.
 
@@ -561,8 +1142,10 @@ class ArchiveWorker:
         the object, which the server asks for after this returns - so the size
         and the fingerprint go with the report.
         """
-        place = self.post("archive/copy/authorize",
-                          {"session_id": session_id, "kind": kind})
+        request: Dict[str, Any] = {"session_id": session_id, "kind": kind}
+        if part_no is not None:
+            request["part_no"] = part_no
+        place = self.post("archive/copy/authorize", request)
         with open(encrypted.path, "rb") as handle:
             response = self.session.put(
                 place["upload_url"], data=handle,

@@ -23,9 +23,16 @@
 #define AppPublisher   "AIMS LAB"
 #define AppExe         "AIMScribe_Agent.exe"
 
-; Defaults offered on the configuration page. Override per site.
-#define DefaultBackend "https://aimscribe-backend-render.onrender.com"
-#define DefaultOrigin  "https://aim-scribe-exe.vercel.app"
+; Defaults offered on the configuration page on a NEW PC. Set them once when
+; building, so nobody types the server address twenty times:
+;   ISCC /DDefaultBackend=https://<server> /DDefaultOrigin=https://<cmed page> installer.iss
+; An upgrade ignores these and keeps what that PC already has.
+#ifndef DefaultBackend
+  #define DefaultBackend "https://aimscribe-backend-render.onrender.com"
+#endif
+#ifndef DefaultOrigin
+  #define DefaultOrigin  "https://aim-scribe-exe.vercel.app"
+#endif
 
 [Setup]
 SetupIconFile={#AppIcon}
@@ -97,6 +104,41 @@ Filename: "taskkill.exe"; Parameters: "/IM {#AppExe} /F"; \
 [Code]
 var
   ConfigPage: TInputQueryWizardPage;
+  KeptApiKey: String;
+
+{ The settings file of the version being upgraded, if there is one. }
+function PreviousEnv(): String;
+begin
+  if WizardForm.PrevAppDir <> '' then
+    Result := AddBackslash(WizardForm.PrevAppDir) + '.env'
+  else
+    Result := ExpandConstant('{autopf}\AIMScribe\.env');
+end;
+
+{ One value from that file, or '' when it has none. }
+function EnvValue(const Key: String): String;
+var
+  Lines: TArrayOfString;
+  I: Integer;
+begin
+  Result := '';
+  if not LoadStringsFromFile(PreviousEnv(), Lines) then Exit;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+    if Pos(Key + '=', Lines[I]) = 1 then
+    begin
+      Result := Trim(Copy(Lines[I], Length(Key) + 2, MaxInt));
+      Exit;
+    end;
+end;
+
+{ An upgrade keeps the PC's own settings. It used to offer the build's defaults,
+  so pressing Next on an upgrade quietly moved a PC to another server - one
+  enrolled somewhere it no longer talked to - and gave it a new local key. }
+function Kept(const Key, Default: String): String;
+begin
+  Result := EnvValue(Key);
+  if Result = '' then Result := Default;
+end;
 
 { An upgrade, not a first install. Enrolment lives under ProgramData and is
   never touched by Setup, so a machine that has already been enrolled keeps its
@@ -118,9 +160,9 @@ begin
   else
     ConfigPage := CreateInputQueryPage(wpSelectDir,
       'AIMScribe Configuration',
-      'Which backend, and which doctor is this PC for?',
-      'The enrolment token names the doctor and hospital this machine records for.' + #13#10 +
-      'Obtain one per PC from the AIMScribe administrator.');
+      'Which server, and which clinic is this PC for?',
+      'The enrolment token names the clinic this machine records for. Doctors' + #13#10 +
+      'need nothing: CMED names the doctor with every patient. One token per PC.');
 
   ConfigPage.Add('Backend URL:', False);
   ConfigPage.Add('CMED web address:', False);
@@ -129,9 +171,10 @@ begin
   else
     ConfigPage.Add('Enrolment token:', False);
 
-  ConfigPage.Values[0] := '{#DefaultBackend}';
-  ConfigPage.Values[1] := '{#DefaultOrigin}';
+  ConfigPage.Values[0] := Kept('AIMS_BACKEND_URL', '{#DefaultBackend}');
+  ConfigPage.Values[1] := Kept('AIMS_ALLOWED_ORIGINS', '{#DefaultOrigin}');
   ConfigPage.Values[2] := '';
+  KeptApiKey := EnvValue('AIMS_LOCAL_API_KEY');
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -217,6 +260,9 @@ begin
     Env.Add('AIMS_CHANNELS=1');
     Env.Add('AIMS_SAMPLE_WIDTH=2');
     Env.Add('AIMS_FRAMES_PER_BUFFER=2048');
+    Env.Add('# The clinic speakerphone, opened by name and kept at 100%, whatever');
+    Env.Add('# Windows has as its default. Without it, the PC''s own microphone records.');
+    Env.Add('AIMS_PREFERRED_MICROPHONE=Jabra');
     Env.Add('');
     Env.Add('# A clip is the unit of upload, retry and loss. Short clips mean');
     Env.Add('# a failure risks a minute, not three, and transcripts arrive while');
@@ -243,7 +289,10 @@ begin
     Env.Add('# anything else, which is what stops a random page recording.');
     Env.Add('AIMS_ALLOWED_ORIGINS=' + Trim(ConfigPage.Values[1]));
     Env.Add('AIMS_ALLOWED_HOSTS=localhost:5050,127.0.0.1:5050,[::1]:5050');
-    Env.Add('AIMS_LOCAL_API_KEY=' + NewApiKey());
+    if KeptApiKey <> '' then
+      Env.Add('AIMS_LOCAL_API_KEY=' + KeptApiKey)
+    else
+      Env.Add('AIMS_LOCAL_API_KEY=' + NewApiKey());
     Env.Add('AIMS_REQUIRE_GRANT=true');
     Env.Add('AIMS_ENABLE_DOCS=false');
     Env.Add('');
@@ -314,7 +363,13 @@ begin
   Append(Xml, '  <RegistrationInfo>');
   Append(Xml, '    <Description>Starts the AIMScribe recording agent at logon.</Description>');
   Append(Xml, '  </RegistrationInfo>');
-  Append(Xml, '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>');
+    { At logon, and again every minute after it. While the agent runs the extra
+      starts are ignored (IgnoreNew below); if it has stopped for any reason, it
+      is running again within a minute, with nobody touching the PC. }
+  Append(Xml, '  <Triggers><LogonTrigger>');
+  Append(Xml, '    <Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
+  Append(Xml, '    <Enabled>true</Enabled>');
+  Append(Xml, '  </LogonTrigger></Triggers>');
   Append(Xml, '  <Principals><Principal id="Author">');
   Append(Xml, '    <GroupId>S-1-5-32-545</GroupId>');
   Append(Xml, '    <RunLevel>HighestAvailable</RunLevel>');
@@ -334,6 +389,7 @@ begin
       to run all day. }
   Append(Xml, '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
   Append(Xml, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+  Append(Xml, '    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>');
   Append(Xml, '  </Settings>');
   Append(Xml, '  <Actions Context="Author"><Exec>');
   Append(Xml, '    <Command>"' + ExpandConstant('{app}\{#AppExe}') + '"</Command>');
@@ -383,6 +439,28 @@ begin
   Sleep(2000);
 end;
 
+procedure PowerCfg(const Args: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('powercfg.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+{ A consultation PC, used for nothing else. Two Windows power habits end a
+  recording without anyone deciding to:
+    closing the lid sleeps the laptop;
+    USB selective suspend can switch the speakerphone off to save power.
+  Both are turned off for the active power plan. Idle sleep is not touched:
+  the agent itself keeps Windows awake while a recording is open. }
+procedure ConfigurePower();
+begin
+  PowerCfg('/SETACVALUEINDEX SCHEME_CURRENT SUB_BUTTONS LIDACTION 0');
+  PowerCfg('/SETDCVALUEINDEX SCHEME_CURRENT SUB_BUTTONS LIDACTION 0');
+  PowerCfg('/SETACVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0');
+  PowerCfg('/SETDCVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0');
+  PowerCfg('/SETACTIVE SCHEME_CURRENT');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -390,6 +468,7 @@ begin
     WriteEnvFile();
     StageEnrollmentToken();
     RegisterLogonTask();
+    ConfigurePower();
   end;
 end;
 

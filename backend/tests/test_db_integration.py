@@ -263,10 +263,10 @@ async def test_confirmation_deadlines_and_sweep(dbs):
         for sid in (slow, old):
             await repo.set_session_confirmation(sid, "pending", grant_jti=None)
         result = await api_v2.maintenance_sweep()
-        assert (result["erased"], result["marked_unconfirmed"]) == (1, 1)
+        assert (result["erased"], result["marked_unconfirmed"]) == (0, 2)
         assert (await repo.session_confirmation(slow))["confirmation"] == "unconfirmed"
-        erased = await repo.get_session(old)
-        assert (erased["confirmation"], erased["patient_id"]) == ("expired", "REDACTED")
+        kept = await repo.get_session(old)
+        assert (kept["confirmation"], kept["patient_id"]) != ("expired", "REDACTED")
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.minio = None
 
@@ -594,13 +594,13 @@ async def test_an_archived_recording_waits_for_its_copy(dbs):
     assert sid in [w["session_id"] for w in waiting]
     assert next(w for w in waiting if w["session_id"] == sid)["file_stem"] == stem
 
-    key = f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.flac.enc"
+    key = f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.wav.enc"
     assert await dbs.repo.next_copy_version(sid, "audio") == 1
     await dbs.repo.record_cloud_copy(
         session_id=sid, kind="audio", object_key=key, version=1,
         byte_length=900_000, sha256=b"\x22" * 32, plain_sha256=b"\x33" * 32)
     await dbs.repo.record_cloud_copy(
-        session_id=sid, kind="json", object_key=key.replace("flac", "json"), version=1,
+        session_id=sid, kind="json", object_key=key.replace("wav.enc", "json.enc"), version=1,
         byte_length=2048, sha256=b"\x44" * 32, plain_sha256=b"\x55" * 32)
     await dbs.repo.mark_copied(sid)
     await dbs.repo.mark_segments_deleted(sid)
@@ -620,7 +620,7 @@ async def test_the_same_object_recorded_twice_is_one_row(dbs):
     v = visit(patient_id="PCOPY2")
     stem = "PCOPY2_DR0042_HOSP003_101432_102847_20260913"
     sid = await _archived(dbs, device, v, stem=stem)
-    key = f"copies/{stem}.v1.flac.enc"
+    key = f"copies/{stem}.v1.wav.enc"
 
     first = await dbs.repo.record_cloud_copy(
         session_id=sid, kind="audio", object_key=key, version=1, byte_length=900_000,
@@ -772,7 +772,7 @@ async def test_the_sweep_notices_a_copy_that_never_happened(dbs):
 
     # Once copied, it stops being reported.
     await dbs.repo.record_cloud_copy(
-        session_id=sid, kind="audio", object_key=f"copies/{stem}.v9.flac.enc", version=9,
+        session_id=sid, kind="audio", object_key=f"copies/{stem}.v9.wav.enc", version=9,
         byte_length=1, sha256=bytes.fromhex("77") * 32, plain_sha256=None)
     await dbs.repo.mark_copied(sid)
     assert sid not in [r["session_id"] for r in await dbs.repo.copies_overdue(hours=24)]
@@ -802,7 +802,7 @@ async def test_the_copy_endpoints_run_on_postgres(dbs):
     try:
         place = await api_v2.archive_copy_authorize(
             api_v2.CopyAuthorizeRequest(session_id=sid, kind="audio"))
-        assert place["object_key"].endswith(f"{stem}.v1.flac.enc")
+        assert place["object_key"].endswith(f"{stem}.v1.wav.enc")
         result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
             session_id=sid, copies=[{
                 "kind": "audio", "object_key": place["object_key"], "version": 1,

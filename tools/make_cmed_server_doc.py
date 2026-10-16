@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reportlab.lib.units import mm
-from reportlab.platypus import Spacer, Paragraph, HRFlowable, PageBreak, Preformatted
+from reportlab.platypus import KeepTogether, Spacer, Paragraph, HRFlowable, PageBreak, Preformatted
 
 import cmed_doc_style as st
 from cmed_doc_style import (H1, SUB, H2, H3, BODY, NOTE, BAD, GOOD, CODE,
@@ -34,7 +34,7 @@ S = []
 S.append(Paragraph("AIMScribe v3 &mdash; Server Deployment", H1))
 S.append(Paragraph("<b>Document 2 of 2 &mdash; for CMED's server and infrastructure team</b> "
                    "&middot; The machine, the gateway, the storage and the monitoring &middot; "
-                   "AIMS LAB, United International University &middot; 9 October 2026", SUB))
+                   "AIMS LAB, United International University &middot; 16 October 2026", SUB))
 S.append(HRFlowable(width="100%", thickness=1, color=st.RULE, spaceAfter=8))
 S.append(tbl([["", "The two documents"],
               ["1. The other", "<b>Software integration</b> &mdash; the four APIs, the key, the "
@@ -107,21 +107,38 @@ S.append(tbl([["", "Endpoint", "Today", "After", "Why"],
                "unaffected"],
               ["<b>8</b>", "<font face='Courier'>ws://&hellip;</font> &rarr; "
                            "<font face='Courier'>status</font>", "<b>YES</b>", "<b>YES</b>",
-               "unaffected"]],
-             [8 * mm, 56 * mm, 16 * mm, 16 * mm, 60 * mm], highlight=[5, 6, 7, 8], req=[1, 2, 3, 4]))
+               "unaffected"],
+              ["<b>9</b>", "<font face='Courier'>GET &hellip;/api/v2/clinical/patient/{id}/visits"
+                           "</font><br/><i>ask what we hold &mdash; new</i>", "<b>NO</b>",
+               "<b>YES</b>", "same as 3. Without the key: <b>401</b>"],
+              ["<b>10</b>", "<font face='Courier'>POST &hellip;/api/v2/session/reassign</font>"
+                            "<br/><i>recorders only &mdash; new</i>", "&mdash;", "<b>YES</b>",
+               "<b>Not CMED's.</b> Kept for older recorders. Without a device credential: "
+               "<b>401</b>"],
+              ["<b>12</b>", "<font face='Courier'>POST &hellip;/api/v2/session/marker</font>"
+                            "<br/><i>recorders only &mdash; new</i>", "&mdash;", "<b>YES</b>",
+               "<b>Not CMED's.</b> Which patient was opened, or had a prescription built, at "
+               "which second of a recording. Without a device credential: <b>401</b>"],
+              ["<b>11</b>", "<font face='Courier'>POST &hellip;/api/v2/device/health</font>"
+                            "<br/><i>recorders only &mdash; new</i>", "&mdash;", "<b>YES</b>",
+               "<b>Not CMED's.</b> What a laptop saw while offline. Without a device credential: "
+               "<b>401</b>"]],
+             [8 * mm, 56 * mm, 16 * mm, 16 * mm, 60 * mm], highlight=[5, 6, 7, 8],
+             req=[1, 2, 3, 4, 9]))
 S.append(Spacer(1, 4))
 S.append(Paragraph("<b>Read the shape of that table.</b> The four local ones already work and the "
-                   "deployment does not touch them. The four server ones are blocked by <b>one "
-                   "cause</b> &mdash; no public address &mdash; and unblocked by <b>one act</b>. "
-                   "There is no code to write on either side.", GOOD))
+                   "deployment does not touch them. The five server ones CMED calls are blocked "
+                   "by <b>one cause</b> &mdash; no public address &mdash; and unblocked by <b>one "
+                   "act</b>. Rows 10 to 12 are our recorders talking to our server; they need "
+                   "nothing from CMED.", GOOD))
 
 S.append(Paragraph("2 &middot; So what should each CMED team do now?", H2))
 S.append(tbl([["Team", "Can start", "Blocked until"],
               ["<b>Front-end</b> (the page)", "<b>today, on everything</b> &mdash; endpoints "
                                               "5&ndash;8 are live on any PC with the recorder "
                                               "installed", "<b>nothing</b>"],
-              ["<b>Back-end</b> (the two POSTs)", "<b>today, writing against document 1</b>",
-               "<b>testing</b> needs a hostname from us"],
+              ["<b>Back-end</b> (the POSTs, the visits GET, <b>the outbox</b>)",
+               "<b>today, writing against document 1</b>", "<b>testing</b> needs a hostname from us"],
               ["<b>Infrastructure</b>", "reading this document, and preparing the one config line "
                                         "in section 12", "nothing"]],
              [40 * mm, 72 * mm, 44 * mm], highlight=[1]))
@@ -303,16 +320,19 @@ S.append(part("PART D", "Where the recordings live",
 
 S.append(Paragraph("10 &middot; Two storages, both needed", H2))
 S.append(Paragraph("<b>The droplet's 320 GB is not the audio archive and is nowhere near enough to "
-                   "be one.</b> Every recording is uploaded to Cloudflare R2 and then removed from "
-                   "the server.", BAD))
+                   "be one.</b> Every recording is uploaded to Cloudflare R2 as the raw WAV, "
+                   "encrypted, and removed from the server two days after that copy is "
+                   "verified.", BAD))
 S.append(Spacer(1, 4))
 S.append(tbl([["", "<b>Droplet disk &mdash; 320 GB</b>", "<b>Cloudflare R2 &mdash; 3 TB</b>"],
               ["Holds", "the OS, the nine services, both databases, logs, and recordings <b>in "
                         "transit</b>",
                "<b>every recording, permanently, as the original WAV</b>"],
-              ["How long", "hours &mdash; a file is removed once the cloud copy is verified",
-               "<b>permanently.</b> This is the research dataset"],
-              ["Capacity", "about a day and a half of recording, as a buffer",
+              ["How long", "two days after its cloud copy is verified "
+                           "(<font face='Courier'>AIMS_ARCHIVE_LOCAL_RETENTION_DAYS=2</font>); "
+                           "never before", "<b>permanently.</b> This is the research dataset"],
+              ["Capacity", "two days of recordings, the databases and the rest: a 214 GB budget "
+                           "on the 320 GB disk",
                "<b>26,200 consultations.</b> The 18,000-patient study uses 2.06 TB"],
               ["Cost", "included in the droplet", "<b>$45/month</b>"],
               ["If it fills", "archiving stalls; <b>clinics keep recording locally</b>",
@@ -321,11 +341,12 @@ S.append(tbl([["", "<b>Droplet disk &mdash; 320 GB</b>", "<b>Cloudflare R2 &mdas
 S.append(Spacer(1, 4))
 S.append(tbl([["Total monthly cost of the deployment", "Monthly", "Yearly"],
               ["Droplet &mdash; 8 vCPU / 16 GB / 320 GB, Bangalore", "$96", "$1,152"],
-              ["Droplet backups", "$19", "$230"],
+              ["Droplet backups", "$19.20", "$230"],
               ["<b>Cloudflare R2 &mdash; 3 TB</b>", "<b>$45</b>", "<b>$540</b>"],
               ["Transfer to R2 (844 GB/mo, inside the 6 TB allowance)", "$0", "$0"],
-              ["<b>Total</b>", "<b>$160</b>", "<b>$1,922</b>"]],
-             [100 * mm, 28 * mm, 28 * mm], highlight=[3, 5]))
+              ["Domain name", "~$1", "~$12"],
+              ["<b>Total</b>", "<b>$161</b>", "<b>$1,934</b>"]],
+             [100 * mm, 28 * mm, 28 * mm], highlight=[3, 6]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>R2 charges nothing to read data back</b>, which is why it was chosen over "
                    "S3 or Spaces: a research dataset is downloaded many times, and on Amazon each "
@@ -411,6 +432,30 @@ S.append(Paragraph("<b>Messages sent before step 2 are not lost on your side if 
                    "<font face='Courier'>AIMS_SERVER_URL</font> unset or pointed at your own stub "
                    "until we send you the hostname.", NOTE))
 
+S.append(KeepTogether([Paragraph("13A &middot; The outbox lives on your servers", H2),
+                      Paragraph("Each Aalo branch keeps working on its local CMED server through an internet or "
+                   "power cut. <b>API 2 and API 3 Channel B cannot reach us while the internet is "
+                   "down</b>, so CMED's software team builds an outbox (document 1, section 16): "
+                   "messages wait in it and go when the connection returns. Late is fine &mdash; "
+                   "nothing on our side has a deadline. <b>Running that outbox reliably is the "
+                   "server team's part.</b>", BODY),
+                      Spacer(1, 3),
+                      tbl([["", "What the server team makes sure of"],
+              ["<b>1</b>", "<b>The outbox is a table on the branch server's own disk</b>, in the "
+                           "database that survives a power cut, and it is in that server's "
+                           "backups"],
+              ["<b>2</b>", "<b>Whichever server sends to us can reach it outbound</b>: HTTPS 443 "
+                           "to our hostname, and the key in its secret store. If each branch "
+                           "server sends directly, every branch needs both; if branches sync to "
+                           "a central CMED server that sends, only that one does"],
+              ["<b>3</b>", "<b>It is watched</b>: the number waiting and the age of the oldest. "
+                           "Alert if the oldest is more than an hour old while the internet is "
+                           "up &mdash; that is a stuck outbox, not an outage"],
+              ["<b>4</b>", "<b>A 401 stops it</b> and pages someone: the key is wrong or revoked"],
+              ["<b>5</b>", "<b>Nothing is purged unsent.</b> A message is removed only on our "
+                           "202 or 200"]],
+             [8 * mm, 148 * mm], bold_first=False, highlight=[1])]))
+
 S.append(PageBreak())
 
 # ============================================================ PART F
@@ -428,7 +473,8 @@ S.append(Preformatted(
     '      "status":   "healthy",\n'
     '      "database": "connected",\n'
     '      "redis":    "connected",\n'
-    '      "minio":    "connected",\n'
+    '      "minio":    "connected",         <-- the segment bucket, checked\n'
+    '      "copy_bucket": "connected",      <-- the 3 TB archive bucket, checked\n'
     '      "system":   "AIMScribe v3 - AIMS LAB server",\n'
     '                    ^ assert this STARTS WITH "AIMScribe v3"\n'
     '      "srs":      "3.x",\n'
@@ -444,6 +490,10 @@ S.append(tbl([["Field", "Watch for", "Meaning"],
                "if disconnected, nothing can be stored. <b>Alert on this</b>"],
               ["redis", "<font face='Courier'>connected</font>",
                "the queue. If disconnected, archiving stalls"],
+              ["minio, copy_bucket", "<font face='Courier'>connected</font>",
+               "really asked, every 30 s. <font face='Courier'>refused</font>, "
+               "<font face='Courier'>bucket missing</font> or "
+               "<font face='Courier'>unreachable</font> mean archiving stops"],
               ["<b>system</b>", "<b>starts with <font face='Courier'>AIMScribe v3</font></b>",
                "<b>see the warning below</b>"],
               ["version", "changes after a deploy", "useful to confirm a release landed"]],
@@ -467,6 +517,7 @@ S.append(tbl([["Monitoring guidance", "Recommendation"],
                                 "recording continues regardless"]],
              [40 * mm, 116 * mm], req=[4]))
 
+S.append(PageBreak())
 S.append(Paragraph("15 &middot; Proving the gateway, once it is up", H2))
 S.append(tbl([["", "Check", "Expected", "Proves"],
               ["<b>1</b>", "<font face='Courier'>nslookup &lt;host&gt;</font>", "the droplet's IP",
@@ -485,7 +536,9 @@ S.append(tbl([["", "Check", "Expected", "Proves"],
                "<b>retries are safe</b>"],
               ["<b>8</b>", "POST a deliberately invalid body", "<b>422</b>, naming the bad fields",
                "validation works, and a bad record is <b>quarantined, not lost</b>"],
-              ["<b>9</b>", "POST a body over 1 MB", "<b>413</b>", "the limit is real"]],
+              ["<b>9</b>", "POST a body over 1 MB", "<b>413</b>", "the limit is real"],
+              ["<b>10</b>", "GET the visits list for a test patient, with and without the key",
+               "<b>200</b>, then <b>401</b>", "the read is authenticated too"]],
              [8 * mm, 54 * mm, 46 * mm, 44 * mm], highlight=[3, 6, 7]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Our script does checks 3 to 8 in one command</b> &mdash; "
@@ -498,31 +551,40 @@ S.append(Paragraph("<b>And then the one check that actually matters.</b> Checks 
                    "gateway works; <b>they do not prove the integration works</b>. A 202 means "
                    "stored, not matched. Record one real consultation with all four messages, then "
                    "<b>ask us to confirm it was matched and archived</b>.", BAD))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Our side, for completeness:</b> an existing database is not migrated by "
+                   "itself. When we deploy this version we apply the two new schema scripts "
+                   "(013 and 014) by hand before the recorders are updated; a new server builds "
+                   "them on first start. Nothing for CMED to do.", NOTE))
 
 S.append(PageBreak())
 S.append(Paragraph("16 &middot; When it is down", H2))
 S.append(tbl([["How long", "What happens in the clinics", "What CMED should do"],
               ["minutes", "<b>Nothing.</b> Recording continues; laptops hold their pieces and "
-                          "retry", "<b>Nothing.</b> Your queue retries"],
-              ["an hour", "<b>Still nothing.</b> Each laptop holds about thirteen hours",
-               "Nothing. Keep queueing"],
-              ["most of a day", "Laptops begin to fill; clinics eventually stop",
-               "Keep queueing. <b>Do not drop messages</b>"],
-              ["<b>a message is never sent</b>", "<b>The recording is uploaded but unconfirmed, "
-                                                 "and deleted after 24 hours</b>",
-               "<b>This is the only real failure.</b> Queue durably and retry with backoff"]],
+                          "retry", "<b>Nothing.</b> Your outbox retries"],
+              ["an hour", "<b>Still nothing.</b> Each laptop holds about thirteen hours, and "
+                          "logs what it saw for our dashboard", "Nothing. Keep them in the outbox"],
+              ["most of a day", "Laptops begin to fill; new recordings eventually stop",
+               "Keep them in the outbox. <b>Do not drop messages</b>"],
+              ["<b>a message is never sent</b>", "<b>The recording is kept and archived, with no "
+                                                 "clinical record attached</b>",
+               "<b>This is the only real failure.</b> A durable outbox prevents it"]],
              [30 * mm, 66 * mm, 60 * mm], req=[4]))
 S.append(Spacer(1, 4))
 S.append(Paragraph("<b>Notice what never happens: our server being down does not stop a doctor and "
                    "does not cut a recording.</b> The system is built so the clinic keeps working "
-                   "whatever we are doing. A message that arrives an hour late is completely fine.",
+                   "whatever we are doing. A message that arrives a day late is completely fine "
+                   "&mdash; it attaches to its recording whenever it lands.",
                    GOOD))
 S.append(Spacer(1, 4))
 S.append(tbl([["What AIMS LAB watches, so you know what we will notice"],
               ["<b>Every minute:</b> <font face='Courier'>/health</font>, from outside the droplet."
                "<br/>"
                "<b>Every morning:</b> the count of unconfirmed recordings &mdash; <b>it should be "
-               "zero</b>; anything above it means a message did not match.<br/>"
+               "zero</b> once outages are over; anything left means a message did not arrive or "
+               "did not match, and we will ask you to check the outbox.<br/>"
+               "<b>After any outage:</b> each laptop's offline period, sent when it reconnects "
+               "&mdash; how long, how many consultations, whether the microphone was fine.<br/>"
                "<b>Continuously:</b> free disk, queue depth, and the upload buffer.<br/>"
                "<b>Nightly:</b> an encrypted database backup, with a restore drill monthly."]],
              [156 * mm], bold_first=False))
@@ -539,7 +601,7 @@ S.append(tbl([["", "What", "Who", "How long", "Blocks CMED?"],
                "no"],
               ["<b>2</b>", "Machine hardened, Docker installed, stack started", "AIMS LAB",
                "1 hour", "no"],
-              ["<b>3</b>", "R2 bucket created, settings filled in, services verified", "AIMS LAB",
+              ["<b>3</b>", "R2 buckets created, settings filled in, services verified", "AIMS LAB",
                "1 hour", "no"],
               ["<b>4</b>", "<b>Clinics and doctors registered, CMED key issued</b>", "AIMS LAB",
                "30 min", "<b>needs CMED's clinic codes</b>"],
@@ -570,8 +632,9 @@ S.append(tbl([["", "Item", "Owner"],
               ["&#9744;", "<font face='Courier'>/health</font> in CMED's monitoring, asserting on "
                           "<font face='Courier'>system</font> <b>and</b> "
                           "<font face='Courier'>status</font>", "CMED"],
-              ["&#9744;", "Both POSTs sent from a <b>durable queue with retry</b>, never inline in "
-                          "the request serving the doctor", "CMED"],
+              ["&#9744;", "Both POSTs sent from a <b>durable outbox on the branch server</b>, "
+                          "retried with backoff, never inline in the request serving the doctor; "
+                          "its depth and oldest age monitored", "CMED"],
               ["&#9744;", "<b>The five fields built once per consultation and reused by all four "
                           "messages</b>", "CMED"],
               ["&#9744;", "Clinic code read from the <font face='Courier'>doctors</font> command, "
@@ -581,8 +644,10 @@ S.append(tbl([["", "Item", "Owner"],
                           "LAB", "CMED"],
               ["&#9744;", "<b>End-to-end test done, and the recording confirmed matched and "
                           "archived by AIMS LAB</b>", "both"],
-              ["&#9744;", "Droplet live in BLR1, backups enabled, R2 bucket created with "
-                          "versioning", "AIMS LAB"],
+              ["&#9744;", "Droplet live in BLR1, backups enabled, both R2 buckets created",
+               "AIMS LAB"],
+              ["&#9744;", "Schema scripts 013 and 014 applied, if the database already existed",
+               "AIMS LAB"],
               ["&#9744;", "Database backup <b>restored once</b> and row counts checked",
                "AIMS LAB"],
               ["&#9744;", "Alerting on unconfirmed recordings and on disk above 80%", "AIMS LAB"],
@@ -629,15 +694,19 @@ S.append(tbl([["Question", "Answer"],
                                           "AIMS LAB"],
               ["Does CMED ever receive audio?", "<b>No. Never</b>"],
               ["What if your server goes down?", "<b>Clinics keep recording.</b> Each laptop holds "
-                                                 "~13 hours. Keep queueing"],
+                                                 "~13 hours. Keep the outbox"],
+              ["What if a branch loses internet?", "<b>Recording carries on.</b> API 2 and 3B "
+                                                   "wait in the outbox on the branch server and "
+                                                   "go when it is back. Late is fine"],
               ["<b>The only real failure?</b>", "<b>A message never sent.</b> The recording is "
-                                                "erased after 24 hours"],
+                                                "kept, but with no clinical record"],
               ["<b>Does a 202 mean success?</b>", "<b>No &mdash; stored, not matched.</b> Ask us to "
                                                   "confirm a test recording archived"],
-              ["Total cost?", "<b>$160/month</b> &mdash; $96 droplet, $19 backups, $45 storage"],
+              ["Total cost?", "<b>$161/month</b> &mdash; $96 droplet, $19.20 backups, $45 "
+                              "storage, ~$1 domain"],
               ["What do you need from us?", "<b>Your clinic codes</b> (step 4) and <b>your page's "
                                             "exact web addresses</b>"]],
-             [54 * mm, 102 * mm], highlight=[5, 12, 17, 18]))
+             [54 * mm, 102 * mm], highlight=[5, 12, 18, 19]))
 S.append(Spacer(1, 6))
 S.append(Paragraph("Prepared by AIMS LAB, United International University. <b>Document 2 of 2</b>; "
                    "the companion is \"Software Integration\", for the team writing the code. Every "

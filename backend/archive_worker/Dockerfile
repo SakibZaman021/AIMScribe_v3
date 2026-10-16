@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # cloud copy back, so it ships in the image that made them.
 COPY worker.py archive.py catalogue.py cloudcopy.py restore.py ./
 
-# Fail the build, not the night shift, if the FLAC codec is not usable.
+# Copies are raw WAV now; the codec is kept only so restore.py can still read
+# a FLAC copy made before that. Fail the build if it is not usable.
 RUN python -c "import soundfile; print(soundfile.__libsndfile_version__)"
 
 # The archive volume is mounted here and must be writable by this user.

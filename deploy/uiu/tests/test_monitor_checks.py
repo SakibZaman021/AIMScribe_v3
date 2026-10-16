@@ -52,6 +52,34 @@ def test_a_healthy_volume_says_how_much_is_left():
     assert (finding.status, finding.detail["free_gb"]) == (OK, 20000.0)
 
 
+def test_the_uiu_floor_does_not_alarm_for_ever_on_the_droplet():
+    """500 GB free cannot exist on a 320 GB disk; the default is capped."""
+    floor = checks.effective_floor_gb(None, 500, 320 * GB)
+    assert floor == 48                                     # 15% of 320 GB
+    healthy = checks.disk_space("archive", free_bytes=250 * GB, total_bytes=320 * GB,
+                                floor_gb=floor)
+    assert healthy.status == OK
+
+
+def test_the_uiu_array_keeps_its_absolute_floor():
+    assert checks.effective_floor_gb(None, 500, 96000 * GB) == 500
+    assert checks.effective_floor_gb("", 500, 96000 * GB) == 500
+
+
+def test_an_explicit_floor_is_used_unless_it_is_impossible():
+    assert checks.effective_floor_gb("40", 500, 320 * GB) == 40
+    assert checks.effective_floor_gb("500", 500, 320 * GB) == 48   # copied from UIU
+    assert checks.effective_floor_gb("not a number", 100, 320 * GB) == 48
+
+
+def test_a_droplet_filling_up_still_alarms():
+    floor = checks.effective_floor_gb(None, 500, 320 * GB)
+    assert checks.disk_space("archive", free_bytes=30 * GB, total_bytes=320 * GB,
+                             floor_gb=floor).status == WARNING
+    assert checks.disk_space("archive", free_bytes=20 * GB, total_bytes=320 * GB,
+                             floor_gb=floor).status == CRITICAL
+
+
 # ============================================================
 # Work that stopped
 # ============================================================

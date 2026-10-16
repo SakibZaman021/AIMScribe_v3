@@ -102,14 +102,19 @@ def test_a_warning_appears_once_per_consultation():
 def test_why_a_recording_ended_stays_on_screen_briefly():
     clock = Clock()
     state = OverlayState(clock)
-    state.on_event("recording_stopped", {"reason": "authorisation_refused"})
+    state.on_event("session_refused", {"session_id": "S1"})
     view = state.view({})
-    assert view.visible and "did not authorise" in view.headline
+    assert view.visible and "deleted" in view.headline
     clock.now += MESSAGE_SECONDS + 1
     assert state.view({}).visible is False
 
-    state.on_event("session_refused", {"session_id": "S1"})
-    assert "deleted" in state.view({}).headline
+
+def test_a_held_recording_says_it_is_kept_not_deleted():
+    state = OverlayState(Clock())
+    state.on_event("recording_started", {"session_id": "S1"})
+    state.on_event("session_held", {"session_id": "S1",
+                                    "message": "Recording. Kept on this PC."})
+    assert state.note == "Recording. Kept on this PC."
 
 
 def test_an_open_form_keeps_the_control_visible():

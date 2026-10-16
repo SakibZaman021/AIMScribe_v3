@@ -119,19 +119,41 @@ Only these two are accepted from the page:
 prescription, hands it over, then counsels the patient for another minute or
 two — and that counselling is exactly the part worth recording. The signal
 *arms the gate*: it allows the **next** patient's `start` to close this session.
-Recording ends when the next patient is opened.
+Recording ends when the next patient is opened, or by itself two minutes after
+the prescription if no one else is opened (it waits up to ten seconds more for a
+pause, so a sentence is not cut).
+
+**Every patient opened before the prescription is built is accepted.** The
+reply is `RECORDING_STARTED` (or `RECORDING_PROVISIONAL`) with the `session_id`
+of the recording already running and `data.continued: true` — the same success
+reply your code already handles, so carry on exactly as for any start: send API 2
+for that patient as usual. The recording does not stop; the recorder writes down
+which patient was opened and at which second. It may be a glance at another file,
+a correction of a wrong profile picked at the start, or the next patient after a
+follow-up that needed no prescription — the AIMS LAB server tells these apart
+afterwards from what followed (a prescription, or a return to the first patient)
+and files each part of the audio under the right patient. **Nothing new is asked
+of CMED.**
+
+Send `prescription_built` with the patient the prescription is for and the
+`session_id` the recorder gave you. Any patient opened during the recording is
+accepted.
+
+A recording also ends by itself after 15 minutes with no patient opened and no
+prescription, and closes cleanly when Windows shuts down or restarts.
 
 Every reply carries `request_id`, `status` and `code`. **Act on the code, never
 the message** — the wording changes without notice.
 
 | Code | Meaning |
 |---|---|
-| `RECORDING_STARTED` | Recording, and the server has authorised it |
-| `RECORDING_PROVISIONAL` | Recording. Permission still being checked — this is normal |
+| `RECORDING_STARTED` | Recording, and the server has authorised it. With `data.continued: true`: the recording already running carries on, and this patient is written down — treat it as any start |
+| `RECORDING_PROVISIONAL` | Recording. Permission still being checked — this is normal. Our server never stops it afterwards; a "no" keeps the audio on the PC until it is fixed |
+| `SESSION_ALREADY_ACTIVE` | This patient is already being recorded and the prescription was built; a resend is harmless |
+| `AGENT_NOT_READY` | Starting up, or the microphone is busy. The recorder keeps trying by itself |
 | `GATE_ARMED` | The prescription signal was accepted |
 | `GATE_ALREADY_ARMED` | Sent twice; harmless |
-| `PATIENT_MISMATCH` | The signal names a different patient than the open session |
-| `CLINIC_MISMATCH` | `hospital_id` is not this laptop's clinic. **Refused** |
+| `PATIENT_MISMATCH` | The signal names a patient not opened during this recording, or another session |
 | `MISSING_FIELD` | A field is absent or malformed |
 
 `stop`, `pause` and `resume` exist on the socket but are **not CMED's to send** —
@@ -153,8 +175,16 @@ Every field, every accepted range and every reply code is in
 
 **The key is a server credential and must never reach a browser.**
 
-**Neither message may delay the doctor.** Send them from a queue and retry;
+**Neither message may delay the doctor.** Send them from an outbox and retry;
 retries are safe and produce one row, never two.
+
+**While a branch has no internet, its local CMED server cannot reach us.** Keep
+both messages in a durable outbox on that server — a database table that
+survives a power cut — and send them, in order, when the connection returns.
+Late is fine: they attach to their recording whenever they arrive, hours or
+days later, and nothing on our side deletes a recording because a message was
+late or missing. The reply rules are in
+[`CMED_DATA_CONTRACT.md`](CMED_DATA_CONTRACT.md) §6.
 
 ---
 
@@ -176,7 +206,7 @@ retries are safe and produce one row, never two.
 | Item | Why |
 |---|---|
 | **The exact origin(s) of its page** | Goes into `AIMS_ALLOWED_ORIGINS`. Without it the socket refuses to open |
-| **Its own clinic identifiers** | Mapped to ours as `cmed_hospital_id`. An unmapped clinic is **not** refused — worse, it is silently accepted: the clinical record is stored, CMED gets `202 ACCEPTED`, but no confirmation is written and the **recording is erased after 24 hours** |
+| **Its own clinic identifiers** | Mapped to ours as `cmed_hospital_id`. An unmapped clinic is **not** refused — worse, it is silently accepted: the clinical record is stored and CMED gets `202 ACCEPTED`, but it is **never attached to its recording**. The recording is kept; it simply has no clinical record |
 | A server IP or range, if we are to allow-list it | Optional, for Channel B |
 
 ---

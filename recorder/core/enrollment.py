@@ -54,6 +54,12 @@ DEVICE_TOKEN_FILE = "device.token"
 class EnrollmentError(RuntimeError):
     """Enrollment failed. The agent stays unenrolled and refuses to record."""
 
+    def __init__(self, message: str, *, rejected: bool = False):
+        super().__init__(message)
+        # The server said no - a mistyped, used or expired token. Trying the
+        # same token again cannot succeed; an unreachable server can.
+        self.rejected = rejected
+
 
 @dataclass(frozen=True)
 class DeviceIdentity:
@@ -218,7 +224,8 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
                 body = await response.text()
                 if response.status >= 300:
                     raise EnrollmentError(
-                        f"server rejected enrollment ({response.status}): {body[:200]}")
+                        f"server rejected enrollment ({response.status}): {body[:200]}",
+                        rejected=400 <= response.status < 500)
                 data = json.loads(body)
     except EnrollmentError:
         raise

@@ -29,11 +29,19 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
-		# The API answers machines, not browsers; nothing here should ever
-		# be framed, scripted or embedded.
-		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
 		-Server
 	}
+
+	# The API answers machines, not browsers; nothing here should ever be
+	# framed, scripted or embedded.
+	@api not path /api/v2/dashboard /api/v2/dashboard/*
+	header @api Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+
+	# The one page a person opens: the operations dashboard. It may run its
+	# own script and style - served as files, never inline - and call its own
+	# API, and nothing else. Under the policy above it loaded blank.
+	@dashboard path /api/v2/dashboard /api/v2/dashboard/*
+	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 	# Uploads never come through here - recorders upload pieces straight to
 	# the segment store - so a large body is a mistake or an attack.
@@ -74,7 +82,10 @@
 		format filter {
 			wrap console
 			fields {
-				request>uri query_delete
+				# Everything after '?' goes. There is no filter that drops a whole
+				# query string by name; "query_delete" is not a Caddy module and
+				# stopped the gateway from starting at all.
+				request>uri regexp "\?.*$" ""
 				request>headers>X-Device-Token delete
 				request>headers>X-Cmed-Key delete
 				request>headers>X-Worker-Key delete

@@ -25,6 +25,7 @@ A client's claim about what it uploaded is never taken on trust.
 from __future__ import annotations
 
 import asyncio
+import json
 import hmac
 import logging
 import time
@@ -41,6 +42,7 @@ from db_v2 import V2Repository
 from fastapi.responses import JSONResponse
 
 import confirmation as conf
+import labelling
 from confirmation import FieldError
 from grants import GrantIssuer, new_jti
 from integrity import ChainError, ReceiptSigner, parse_entry, safe_identifier, safe_session_id
@@ -217,6 +219,21 @@ class ChainEntryRequest(BaseModel):
     chain_entry: Dict[str, Any]
 
 
+class ReassignRequest(BaseModel):
+    session_id: str
+    chain_entry: Dict[str, Any]
+    # A grant minted for the patient the recording moves to, as for any start.
+    grant_jti: Optional[str] = None
+
+
+class MarkerRequest(BaseModel):
+    session_id: str
+    chain_entry: Dict[str, Any]
+    # A grant for the patient clicked, when the recorder has one: it is how
+    # that patient's API 2 and 3b find this recording.
+    grant_jti: Optional[str] = Field(None, max_length=128)
+
+
 class CloseRequest(BaseModel):
     session_id: str
     closed_at: Optional[str] = None
@@ -240,11 +257,23 @@ class HeartbeatRequest(BaseModel):
     sent_at: Optional[str] = None
 
 
-class ArchiveCompleteRequest(BaseModel):
-    session_id: str
+class ArchivedPart(BaseModel):
+    part_no: int = Field(..., ge=1, le=1000)
     archive_relpath: str = Field(..., max_length=512)
     sha256: str = Field(..., min_length=64, max_length=64)
     bytes: int = Field(..., ge=1)
+    start_seconds: float = Field(0.0, ge=0)
+    end_seconds: Optional[float] = Field(None, ge=0)
+
+
+class ArchiveCompleteRequest(BaseModel):
+    session_id: str
+    archive_relpath: str = Field(..., max_length=512)
+    # Of the FULL joined audio, also when it was cut into parts: the chain
+    # check and the session receipt do not change.
+    sha256: str = Field(..., min_length=64, max_length=64)
+    bytes: int = Field(..., ge=1)
+    parts: Optional[List[ArchivedPart]] = None
 
 
 # ============================================================
@@ -847,6 +876,202 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
     return {"status": "recorded", "entry_no": entry.entry_no}
 
 
+MARKER_EVENTS = frozenset({labelling.PATIENT_OPENED, labelling.PRESCRIPTION_BUILT})
+
+
+@router.post("/session/marker")
+async def session_marker(body: MarkerRequest, device=Depends(require_device)):
+    """
+    A patient opened, or a prescription built, during a recording - signed into
+    its chain with the second of audio it happened at.
+
+    Nothing is decided here. The recording carries on, and when it closes the
+    rules in labelling.py read every marker with the prescriptions and say who
+    each stretch belongs to. The entry is always kept once it verifies - it is a
+    link in the chain - and a problem with what it says is alerted, not refused.
+    """
+    repo = _repo()
+    session_id = safe_session_id(body.session_id)
+    session = await _session_for_device(session_id, device)
+
+    entry = await _entry_or_400(body.chain_entry)
+    if entry.entry_type != "marker":
+        raise HTTPException(status_code=400, detail="expected a marker entry")
+    duplicate = await _verified_duplicate(session_id, entry, device)
+    if not duplicate:
+        expected_prev = await repo.chain_head(session_id)
+        verdict = integrity.verify_entry(
+            entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
+        if not verdict.ok:
+            logger.info("Deferring marker for %s: %s", session_id, verdict.reason)
+            return {"status": "deferred", "reason": verdict.reason}
+        await repo.append_chain_entry(session_id, entry)
+
+    payload = entry.payload
+    try:
+        event = payload.get("event")
+        if event not in MARKER_EVENTS:
+            raise FieldError("MISSING_FIELD", "event", f"unknown marker event {event!r}")
+        visit = conf.parse_visit(payload.get("patient") or {})
+        seconds = float(payload.get("audio_seconds"))
+        if not seconds >= 0:
+            raise FieldError("MISSING_FIELD", "audio_seconds", "must be 0 or more")
+        at = _parse_time(payload.get("at"))
+    except (FieldError, TypeError, ValueError) as exc:
+        await repo.raise_alert(
+            alert_type="marker_unreadable", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"entry_no": entry.entry_no, "problem": str(exc)})
+        return {"status": "recorded", "entry_no": entry.entry_no, "used": False,
+                **({"duplicate": True} if duplicate else {})}
+
+    jti = None
+    if body.grant_jti:
+        grant = await repo.get_authorisation(body.grant_jti)
+        if (grant is not None
+                and str(grant["device_id"]) == str(device["device_id"])
+                and grant["patient_id"] == visit.patient_id
+                and grant["start_time"] == visit.start_time
+                and grant.get("session_id") in (None, session_id)):
+            await repo.link_authorisation(grant["jti"], session_id)
+            jti = grant["jti"]
+        else:
+            await repo.raise_alert(
+                alert_type="marker_grant_invalid", severity="warning",
+                session_id=session_id, device_id=device["device_id"],
+                detail={"entry_no": entry.entry_no, "event": event})
+
+    await repo.record_click(session_id, entry_no=entry.entry_no, event=event,
+                            audio_seconds=round(seconds, 3), occurred_at=at,
+                            visit=visit, grant_jti=jti)
+    if not duplicate:
+        await repo.audit(
+            event_type=f"session.{event}", actor_type="device", actor_id=visit.doctor_id,
+            device_id=device["device_id"], session_id=session_id,
+            detail={"entry_no": entry.entry_no, "audio_seconds": round(seconds, 3),
+                    "grant_linked": jti is not None})
+    # A marker the PC sent after the recording closed (it was offline) is
+    # evidence too: decide again.
+    if session.get("closed_at"):
+        await relabel_session(session_id)
+    return {"status": "recorded", "entry_no": entry.entry_no, "used": True,
+            "grant_linked": jti is not None,
+            **({"duplicate": True} if duplicate else {})}
+
+
+# A wrong profile corrected within the first minutes is the expected case. A
+# move made much later probably means two consultations ran together - the
+# doctor skipped one prescription - and a person should split the recording.
+REASSIGN_REVIEW_AFTER = timedelta(minutes=5)
+
+
+@router.post("/session/reassign")
+async def reassign_session(body: ReassignRequest, device=Depends(require_device)):
+    """
+    The prescription was built for a patient opened during this recording, not
+    the one it started under: the doctor picked the wrong profile first. The
+    whole recording moves to the right patient.
+
+    The entry is always kept - it is a link in the chain, and dropping it would
+    break every entry after it. The move itself is applied only when the
+    target is a valid consultation at this PC's clinic with a grant from this
+    device; otherwise the recording stays where it was, intact, and a person
+    is alerted. Nothing is ever deleted here.
+    """
+    repo = _repo()
+    session_id = safe_session_id(body.session_id)
+    session = await _session_for_device(session_id, device)
+
+    entry = await _entry_or_400(body.chain_entry)
+    if entry.entry_type != "reassign":
+        raise HTTPException(status_code=400, detail="expected a reassign entry")
+    if await _verified_duplicate(session_id, entry, device):
+        return {"status": "recorded", "entry_no": entry.entry_no, "duplicate": True}
+
+    expected_prev = await repo.chain_head(session_id)
+    verdict = integrity.verify_entry(
+        entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
+    if not verdict.ok:
+        logger.info("Deferring reassign entry for %s: %s", session_id, verdict.reason)
+        return {"status": "deferred", "reason": verdict.reason}
+    await repo.append_chain_entry(session_id, entry)
+
+    problem = None
+    try:
+        target = conf.parse_visit(entry.payload.get("to") or {})
+    except FieldError as exc:
+        target, problem = None, f"target is not a valid consultation: {exc}"
+    clinic = None
+    if target is not None:
+        clinic = await _clinic_for(target.cmed_hospital_id, device)
+        if clinic is None:
+            problem = "target consultation is at another clinic"
+    grant = await repo.get_authorisation(body.grant_jti) if body.grant_jti else None
+    if problem is None and not (
+            grant is not None
+            and str(grant["device_id"]) == str(device["device_id"])
+            and grant["patient_id"] == target.patient_id
+            and grant["start_time"] == target.start_time
+            and grant.get("session_id") in (None, session_id)):
+        problem = "no valid grant for the target consultation"
+    if problem is not None:
+        await repo.raise_alert(
+            alert_type="reassign_not_applied", severity="critical",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"reason": problem, "entry_no": entry.entry_no})
+        logger.warning("Reassign of %s recorded but not applied: %s", session_id, problem)
+        return {"status": "recorded", "entry_no": entry.entry_no, "reassigned": False,
+                "reason": problem}
+
+    await repo.reassign_session(session_id, patient_id=target.patient_id,
+                                doctor_id=target.doctor_id)
+    await repo.link_authorisation(grant["jti"], session_id)
+    state = "confirmed" if grant.get("notice_id") else "pending"
+    await repo.set_session_confirmation(session_id, state, grant_jti=grant["jti"])
+
+    # Usually the move arrives while the recording is still open, and the file
+    # is named at close with the right patient. If the PC was offline and the
+    # recording has already closed, it was named after the wrong patient: name
+    # it again now. If it was archived too, its JSON is rewritten and a person
+    # is told, because the archived folder still carries the first name.
+    if session.get("closed_at"):
+        await _record_file_name(session_id)
+        if await repo.mark_json_stale(session_id):
+            await repo.raise_alert(
+                alert_type="reassigned_after_archive", severity="warning",
+                session_id=session_id, device_id=device["device_id"],
+                detail={"patient_id": target.patient_id})
+
+    opened_at = session.get("opened_at")
+    raw_opened = entry.payload.get("patient_opened_at")
+    target_opened = _parse_time(raw_opened) if raw_opened else None
+    gap = ((target_opened - opened_at).total_seconds()
+           if opened_at is not None and target_opened is not None else 0.0)
+    if gap > REASSIGN_REVIEW_AFTER.total_seconds():
+        await repo.raise_alert(
+            alert_type="possibly_two_consultations", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"split_at": entry.payload.get("patient_opened_at"),
+                    "minutes_into_recording": round(gap / 60, 1)})
+    await repo.audit(
+        event_type="session.reassigned", actor_type="device",
+        actor_id=target.doctor_id, device_id=device["device_id"], session_id=session_id,
+        detail={"seconds_after_start": round(gap, 1), "confirmation": state,
+                "previous_doctor": session.get("doctor_id")})
+    logger.info("Session %s moved to the patient its prescription was built for", session_id)
+    return {"status": "recorded", "entry_no": entry.entry_no, "reassigned": True,
+            "confirmation": state}
+
+
+# How a consultation ends in v3, none of which needs anyone's attention: the
+# doctor's Stop, the next patient after a prescription, the counselling time
+# after it running out, no CMED activity for a long time, or the PC shut down.
+NORMAL_CLOSE_REASONS = frozenset({
+    "doctor_stopped", "superseded_by_new_patient", "counselling_limit",
+    "no_activity_limit", "pc_shutdown",
+})
+
+
 @router.post("/session/close")
 async def close_session(body: CloseRequest, device=Depends(require_device)):
     """
@@ -920,15 +1145,17 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
         local_end=closed_local.time(),
     )
 
-    # The shared file name, and the clinical visit it belongs to.
-    await _record_file_name(session_id)
+    # Who each stretch belongs to, then the shared file name(s) and the
+    # clinical visit(s) they belong to.
+    if await relabel_session(session_id) is None:
+        await _record_file_name(session_id)
 
     # A consultation normally ends because the doctor pressed Stop in CMED.
     # Anything else - stopped from the tray icon, superseded by the next patient,
     # recovered after the PC died mid-consultation - is worth someone's attention
     # the same morning, not a fact buried in a log file on a machine in a
     # consulting room.
-    if body.close_reason and body.close_reason != "doctor_stopped":
+    if body.close_reason and body.close_reason not in NORMAL_CLOSE_REASONS:
         await repo.raise_alert(
             alert_type="abnormal_close", severity="warning",
             session_id=session_id, device_id=device["device_id"],
@@ -983,6 +1210,62 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
 # ============================================================
 # Archive handshake (Option B - the AIMS LAB worker pulls)
 # ============================================================
+
+class HealthEntry(BaseModel):
+    seq: int = Field(..., ge=0)
+    kind: str = Field(..., pattern="^(heartbeat|alert)$")
+    at: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HealthLogRequest(BaseModel):
+    entries: List[HealthEntry] = Field(..., max_length=500)
+
+
+# Recorder alerts that mean a consultation may be missing or damaged. Anything
+# else is a warning: worth reading the same day, not worth waking anyone.
+RECORDER_CRITICAL = frozenset({
+    "capture_failed", "microphone_unavailable", "start_abandoned",
+    "local_chain_invalid", "local_segment_unreadable", "invalid_purge_receipt",
+    "unexpected_agent_exit",
+})
+
+
+@router.post("/device/health")
+async def device_health(body: HealthLogRequest, device=Depends(require_device)):
+    """
+    What a recorder saw while it could not reach this server - a line a minute
+    and every alert - delivered when the network is back, and also each alert
+    the moment it happens when it can.
+
+    Stored before the reply, so a "stored" answer is what lets the recorder
+    delete its copy. A batch sent twice stores nothing twice, and an alert is
+    raised here only the first time it arrives.
+    """
+    entries = []
+    for e in body.entries:
+        at = _parse_time(e.at)
+        data = e.data if len(json.dumps(e.data, default=str)) <= 8_000 else {"truncated": True}
+        entries.append({"seq": e.seq, "kind": e.kind, "at": at, "data": data})
+    if not entries:
+        return {"status": "stored", "stored": 0, "last_seq": None}
+
+    repo = _repo()
+    new = set(await repo.store_health(device["device_id"], entries))
+    now = datetime.now(timezone.utc)
+    for e in entries:
+        if e["kind"] != "alert" or e["seq"] not in new:
+            continue
+        kind = str(e["data"].get("alert_type") or "recorder_alert")[:64]
+        late = (now - e["at"]).total_seconds() > 120
+        await repo.raise_alert(
+            alert_type=kind,
+            severity="critical" if kind in RECORDER_CRITICAL else "warning",
+            session_id=e["data"].get("session_id"), device_id=device["device_id"],
+            detail={"detail": e["data"].get("detail"), "from": "recorder",
+                    "occurred_at": e["at"].isoformat(), "reported_late": late})
+    return {"status": "stored", "stored": len(new), "last_seq": max(e["seq"] for e in entries)}
+
 
 @router.get("/archive/pending")
 async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
@@ -1047,8 +1330,61 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
             # explain a gap without reaching back to the cloud.
             "pauses": await _repo().pauses_for(session["session_id"]),
             "segments": described,
+            **(await _parts_payload(session)),
         })
     return {"sessions": payload}
+
+
+async def _parts_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+    """The cut, for a recording that is more than one patient's."""
+    if int(session.get("parts_count") or 1) <= 1:
+        return {}
+    return {"parts": [{
+        "part_no": p["part_no"],
+        "start_seconds": float(p["start_seconds"]),
+        "end_seconds": float(p["end_seconds"]) if p["end_seconds"] is not None else None,
+        "file_stem": p["file_stem"],
+        "patient_id": p["patient_id"],
+        "doctor_id": p["doctor_id"],
+        "rule": p["rule"],
+        "needs_review": p["needs_review"],
+        "archive_relpath": p.get("archive_relpath"),
+        "sha256": bytes(p["archive_sha256"]).hex() if p.get("archive_sha256") else None,
+    } for p in await _repo().parts_for(str(session["session_id"]))]}
+
+
+@router.get("/archive/recut/pending")
+async def archive_recut_pending(limit: int = 5, _: None = Depends(require_worker)):
+    """
+    Archived recordings whose labels changed where the files are cut - a
+    prescription arrived after archiving. The worker rebuilds the audio from
+    the parts it holds and cuts it again.
+    """
+    limit = max(1, min(limit, 20))
+    out = []
+    for s in await _repo().pending_recut(limit):
+        out.append({
+            "session_id": s["session_id"],
+            "hospital_id": s["hospital_id"],
+            "doctor_id": s["doctor_id"],
+            "patient_ref": s["patient_id"],
+            "session_date": s["session_date"].isoformat() if s["session_date"] else None,
+            "file_stem": s["file_stem"],
+            "timezone": await _repo().hospital_timezone(s["hospital_id"]),
+            "opened_at": s["opened_at"].isoformat() if s["opened_at"] else None,
+            "closed_at": s["closed_at"].isoformat() if s["closed_at"] else None,
+            "audio": {"sample_rate": s.get("sample_rate"), "channels": s.get("channels"),
+                      "sample_width": s.get("sample_width")},
+            "archive_relpath": s["archive_relpath"],
+            "archive_sha256": bytes(s["archive_sha256"]).hex() if s["archive_sha256"] else None,
+            "archive_bytes": s["archive_bytes"],
+            # The files on disk now; `parts` is the new cut.
+            "existing_parts": [{"part_no": p["part_no"],
+                                "archive_relpath": p["archive_relpath"]}
+                               for p in await _repo().archived_parts_for(s["session_id"])],
+            "parts": (await _parts_payload({**s, "parts_count": 2})).get("parts", []),
+        })
+    return {"sessions": out}
 
 
 @router.post("/archive/complete")
@@ -1079,8 +1415,28 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
     except ValueError:
         raise HTTPException(status_code=400, detail="sha256 must be hex")
 
+    recut = session.get("archived_at") is not None and bool(session.get("parts_stale"))
     await repo.mark_archived(session_id, relpath=body.archive_relpath,
                              sha256=archive_hash, byte_length=body.bytes)
+    if body.parts:
+        for part in body.parts:
+            try:
+                part_hash = bytes.fromhex(part.sha256)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="part sha256 must be hex")
+            await repo.mark_part_archived(session_id, part.part_no,
+                                          relpath=part.archive_relpath,
+                                          sha256=part_hash, byte_length=part.bytes)
+        await repo.set_parts_stale(session_id, False)
+    if recut:
+        # Cut again after a late prescription moved a boundary. The receipts
+        # were issued the first time; the pieces may already be gone.
+        await repo.audit(
+            event_type="session.recut", actor_type="service", actor_id="archive-worker",
+            session_id=session_id,
+            detail={"parts": [p.archive_relpath for p in body.parts or []]})
+        return {"status": "recut", "receipts_issued": 0, "objects_deleted": 0,
+                "copy_pending": ctx.copy is not None}
 
     issued = 0
     now = datetime.now(timezone.utc)
@@ -1144,6 +1500,8 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
 class CopyAuthorizeRequest(BaseModel):
     session_id: str
     kind: str = Field(..., pattern="^(audio|json)$")
+    # One patient's part of a recording cut into several.
+    part_no: Optional[int] = Field(None, ge=1, le=1000)
 
 
 class CopyRecord(BaseModel):
@@ -1162,6 +1520,7 @@ class CopyRecord(BaseModel):
 class CopyCompleteRequest(BaseModel):
     session_id: str
     copies: List[CopyRecord]
+    part_no: Optional[int] = Field(None, ge=1, le=1000)
     # False for a JSON written again after archiving (SRS-ARC-13): the audio
     # copy already exists and the pieces are long gone.
     final: bool = True
@@ -1183,7 +1542,10 @@ def copy_object_key(session: Dict[str, Any], kind: str, version: int) -> str:
         raise HTTPException(status_code=409, detail="unsafe file name for this session")
     day = session.get("session_date")
     day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
-    suffix = "flac.enc" if kind == "audio" else "json.enc"
+    # The raw WAV, encrypted (decided with CMED and the study team): no
+    # transcoding stands between the archive and its copy. Older copies made
+    # as FLAC keep their .flac.enc names and still restore.
+    suffix = "wav.enc" if kind == "audio" else "json.enc"
     return (f"copies/{safe_identifier(session['hospital_id'], field='hospital_id')}"
             f"/{safe_identifier(session['doctor_id'], field='doctor_id')}"
             f"/{day}/{stem}.v{version}.{suffix}")
@@ -1203,6 +1565,7 @@ async def archive_copy_pending(limit: int = 5, _: None = Depends(require_worker)
         "archive_relpath": s["archive_relpath"],
         "archive_sha256": bytes(s["archive_sha256"]).hex() if s["archive_sha256"] else None,
         "archive_bytes": s["archive_bytes"],
+        **(await _parts_payload(s)),
     } for s in sessions]}
 
 
@@ -1218,11 +1581,12 @@ async def archive_json_pending(limit: int = 5, _: None = Depends(require_worker)
         "session_id": s["session_id"],
         "file_stem": s["file_stem"],
         "archive_relpath": s["archive_relpath"],
+        **(await _parts_payload(s)),
     } for s in sessions]}
 
 
 @router.get("/archive/clinical/{session_id}")
-async def archive_clinical_document(session_id: str,
+async def archive_clinical_document(session_id: str, part: Optional[int] = None,
                                     _: None = Depends(require_worker)):
     """
     The JSON that is written beside the audio and travels with it into the
@@ -1235,16 +1599,30 @@ async def archive_clinical_document(session_id: str,
     session = await _repo().get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return await _clinical_document(session)
+    if part is None:
+        return await _clinical_document(session)
+    found = next((p for p in await _repo().parts_for(session_id)
+                  if p["part_no"] == part), None)
+    if found is None:
+        raise HTTPException(status_code=404, detail="no such part")
+    return await _clinical_document(session, part=found)
 
 
-async def _clinical_document(session: Dict[str, Any]) -> Dict[str, Any]:
+async def _clinical_document(session: Dict[str, Any],
+                             part: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     repo = _repo()
     session_id = str(session["session_id"])
-    document: Dict[str, Any] = {"file_stem": session.get("file_stem")}
+    document: Dict[str, Any] = {
+        "file_stem": part["file_stem"] if part else session.get("file_stem")}
 
     visit = None
-    if session.get("grant_jti"):
+    if part is not None:
+        visit = conf.Visit(
+            patient_id=part["patient_id"], doctor_id=part["doctor_id"],
+            cmed_hospital_id=part["cmed_hospital_id"], start_time=part["start_time"],
+            visit_date=part["visit_date"].isoformat()
+            if hasattr(part["visit_date"], "isoformat") else str(part["visit_date"]))
+    elif session.get("grant_jti"):
         grant = await repo.get_authorisation(session["grant_jti"])
         if grant and grant["patient_id"] != "REDACTED":
             visit = _visit_from_grant(grant)
@@ -1273,6 +1651,25 @@ async def _clinical_document(session: Dict[str, Any]) -> Dict[str, Any]:
         "archive_relpath": session.get("archive_relpath"),
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if part is not None:
+        document["visit"]["doctor_id"] = part["doctor_id"]
+        part_sha = part.get("archive_sha256")
+        document["recording"].update({
+            "audio_sha256": bytes(part_sha).hex() if part_sha else None,
+            "audio_bytes": part.get("archive_bytes"),
+            "archive_relpath": part.get("archive_relpath"),
+            "derived_from": {
+                "session_id": session_id,
+                "start_seconds": float(part["start_seconds"]),
+                "end_seconds": float(part["end_seconds"])
+                               if part["end_seconds"] is not None else None,
+                "rule": part["rule"],
+                "needs_review": part["needs_review"],
+                # The whole recording, as signed: join the parts in order and
+                # this is its fingerprint.
+                "recording_sha256": bytes(archive_sha).hex() if archive_sha else None,
+            },
+        })
     return document
 
 
@@ -1293,7 +1690,15 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
         raise HTTPException(status_code=409, detail="session is not archived yet")
 
     version = await repo.next_copy_version(session_id, body.kind)
-    object_key = copy_object_key(session, body.kind, version)
+    named = session
+    if body.part_no is not None:
+        part = next((p for p in await repo.parts_for(session_id)
+                     if p["part_no"] == body.part_no), None)
+        if part is None or not part.get("file_stem"):
+            raise HTTPException(status_code=404, detail="no such part")
+        named = {**session, "file_stem": part["file_stem"],
+                 "doctor_id": part["doctor_id"]}
+    object_key = copy_object_key(named, body.kind, version)
     loop = asyncio.get_event_loop()
     upload = await loop.run_in_executor(
         None, copy.get_presigned_upload_url, object_key, 3600)
@@ -1368,6 +1773,16 @@ async def archive_copy_complete(body: CopyCompleteRequest,
             version=copy.version, byte_length=copy.bytes, sha256=digest,
             plain_sha256=plain)
 
+    if body.part_no is not None:
+        # One patient's part of a recording cut into several. The recording
+        # counts as copied - and its pieces go - only on the last part
+        # (`final`), and only when every part is recorded as copied.
+        all_done = await repo.mark_part_copied(session_id, body.part_no)
+        if not (body.final and all_done):
+            if session.get("copied_at"):
+                await repo.clear_json_stale(session_id)     # a JSON written again
+            return {"status": "part_copied", "objects_deleted": 0}
+
     if not body.final:
         # A JSON written again after archiving. Nothing else changes: the audio
         # copy stands and the earlier JSON objects are kept (SRS-ARC-13).
@@ -1438,7 +1853,7 @@ _DIRECTORY_WRITES = set()
 
 async def directory_writes_done() -> None:
     """Wait for everything started behind a reply. For tests."""
-    if _AUDIT_QUEUE is not None:
+    if _audit_writer_alive():
         await _AUDIT_QUEUE.join()
     pending = [t for t in _DIRECTORY_WRITES if not t.done()
                and t.get_coro().__name__ != "_audit_writer"]
@@ -1453,6 +1868,17 @@ def forget_directory() -> None:
 
 
 _AUDIT_QUEUE: "Optional[asyncio.Queue]" = None
+_AUDIT_WRITER: "Optional[asyncio.Task]" = None
+
+
+def _audit_writer_alive() -> bool:
+    """The writer is running, on the loop this code is running on."""
+    if _AUDIT_WRITER is None or _AUDIT_WRITER.done():
+        return False
+    try:
+        return _AUDIT_WRITER.get_loop() is asyncio.get_running_loop()
+    except RuntimeError:
+        return False
 
 
 def _audit_behind(repo, **entry) -> None:
@@ -1468,12 +1894,18 @@ def _audit_behind(repo, **entry) -> None:
     request and into the pool. Queued here, they are written in order by a
     single consumer, and each request pays nothing.
     """
-    global _AUDIT_QUEUE
-    if _AUDIT_QUEUE is None:
+    global _AUDIT_QUEUE, _AUDIT_WRITER
+    # Started on first use, and again if it has stopped. A writer that died -
+    # or one left on an event loop that has since closed - would otherwise
+    # leave every later entry queued for ever, with nothing reading the queue.
+    if not _audit_writer_alive():
+        if _AUDIT_QUEUE is not None and _AUDIT_QUEUE.qsize():
+            logger.error("Audit writer had stopped with %s entries unwritten",
+                         _AUDIT_QUEUE.qsize())
         _AUDIT_QUEUE = asyncio.Queue(maxsize=10000)
-        task = asyncio.create_task(_audit_writer(repo))
-        _DIRECTORY_WRITES.add(task)
-        task.add_done_callback(_DIRECTORY_WRITES.discard)
+        _AUDIT_WRITER = asyncio.create_task(_audit_writer(repo, _AUDIT_QUEUE))
+        _DIRECTORY_WRITES.add(_AUDIT_WRITER)
+        _AUDIT_WRITER.add_done_callback(_DIRECTORY_WRITES.discard)
     try:
         _AUDIT_QUEUE.put_nowait(entry)
     except asyncio.QueueFull:
@@ -1483,18 +1915,17 @@ def _audit_behind(repo, **entry) -> None:
                      entry.get("event_type"))
 
 
-async def _audit_writer(repo) -> None:
+async def _audit_writer(repo, queue: "asyncio.Queue") -> None:
     """Drain the queue, in order, for as long as the server runs."""
-    assert _AUDIT_QUEUE is not None
     while True:
-        entry = await _AUDIT_QUEUE.get()
+        entry = await queue.get()
         try:
             await repo.audit(**entry)
         except Exception as exc:
             logger.warning("Audit entry %s could not be written: %s",
                            entry.get("event_type"), exc)
         finally:
-            _AUDIT_QUEUE.task_done()
+            queue.task_done()
 
 
 async def _remember_doctor(repo, clinic: str, doctor_id: str) -> None:
@@ -1683,7 +2114,8 @@ async def _mark_unconfirmed(session_id: str, row: Dict[str, Any]) -> None:
     await repo.raise_alert(
         alert_type="unconfirmed_recording", severity="warning",
         session_id=session_id, device_id=row.get("device_id"),
-        detail={"reason": "no matching API 2 from CMED within two minutes"})
+        detail={"reason": "no matching API 2 from CMED within two minutes; "
+                          "the recording is kept and will be matched when it arrives"})
 
 
 async def _current_confirmation(session_id: str) -> str:
@@ -1780,6 +2212,150 @@ async def _record_file_name(session_id: str) -> Optional[str]:
     return stem
 
 
+async def relabel_session(session_id: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    Decide who each stretch of a closed recording belongs to (labelling.py),
+    name the result, and tie each part to its clinical visit.
+
+    None when there is nothing to decide - no marker in the recording, which
+    is every recording made by an older recorder - and the caller names the
+    recording as it always did. Run at close, again when a marker or a
+    prescription arrives late. Never deletes anything; a change after the
+    files were cut marks them to be cut again.
+    """
+    repo = _repo()
+    session = await repo.get_session(session_id)
+    if not session or not session.get("closed_at") or not session.get("opened_at"):
+        return None
+    clicks = await repo.clicks_for(session_id)
+    if not clicks:
+        return None
+
+    first_visit, first_jti = await _first_visit(session)
+    events = [labelling.Event(seconds=0.0, kind=labelling.OPEN, visit=first_visit,
+                              at=session["opened_at"], grant_jti=first_jti, entry_no=0)]
+    for c in clicks:
+        events.append(labelling.Event(
+            seconds=float(c["audio_seconds"]), kind=c["event"],
+            visit=conf.Visit(patient_id=c["patient_id"], doctor_id=c["doctor_id"],
+                             cmed_hospital_id=c["cmed_hospital_id"],
+                             start_time=c["start_time"],
+                             visit_date=c["visit_date"].isoformat()
+                             if hasattr(c["visit_date"], "isoformat")
+                             else str(c["visit_date"])),
+            at=c["occurred_at"], grant_jti=c["grant_jti"], entry_no=c["entry_no"]))
+
+    prescribed = set()
+    if ctx.clinical is not None:
+        distinct = {e.visit.patient_id: e.visit for e in events}
+        try:
+            prescribed = await ctx.clinical.prescribed(list(distinct.values()))
+        except Exception as exc:
+            logger.warning("Could not read prescriptions for %s: %s", session_id, exc)
+
+    total = sum(float(s["duration_seconds"]) for s in await repo.segments_for(session_id))
+    parts = labelling.resolve(events, total_seconds=total, prescribed=prescribed,
+                              closed_at=session["closed_at"])
+
+    if len(parts) == 1:
+        only = parts[0]
+        await repo.label_session(session_id, patient_id=only.visit.patient_id,
+                                 doctor_id=only.visit.doctor_id, grant_jti=only.grant_jti)
+        if only.grant_jti and only.grant_jti != session.get("grant_jti"):
+            grant = await repo.get_authorisation(only.grant_jti)
+            if grant and grant.get("notice_id"):
+                await repo.set_session_confirmation(session_id, "confirmed",
+                                                    grant_jti=only.grant_jti)
+    session_stem = await _record_file_name(session_id)
+
+    rows = []
+    for p in parts:
+        start_at = session["opened_at"] if p.part_no == 1 else (p.start_at or session["opened_at"])
+        end_at = session["closed_at"] if p.end_seconds is None else (p.end_at or session["closed_at"])
+        local_start = await _local_time(session["hospital_id"], start_at)
+        local_end = await _local_time(session["hospital_id"], end_at)
+        stem = session_stem if len(parts) == 1 else file_stem_for(
+            p.visit.patient_id, p.visit.doctor_id, session["hospital_id"],
+            local_start, local_end)
+        rows.append({
+            "part_no": p.part_no, "start_seconds": p.start_seconds,
+            "end_seconds": p.end_seconds, "patient_id": p.visit.patient_id,
+            "doctor_id": p.visit.doctor_id, "cmed_hospital_id": p.visit.cmed_hospital_id,
+            "start_time": p.visit.start_time, "visit_date": p.visit.day,
+            "grant_jti": p.grant_jti, "rule": p.rule, "needs_review": p.needs_review,
+            "file_stem": stem, "local_start": local_start.time().replace(tzinfo=None),
+            "local_end": local_end.time().replace(tzinfo=None),
+        })
+
+    old = await repo.parts_for(session_id)
+    layout = [(r["part_no"], round(float(r["start_seconds"]), 3),
+               None if r["end_seconds"] is None else round(float(r["end_seconds"]), 3),
+               r["patient_id"]) for r in rows]
+    old_layout = [(r["part_no"], round(float(r["start_seconds"]), 3),
+                   None if r["end_seconds"] is None else round(float(r["end_seconds"]), 3),
+                   r["patient_id"]) for r in old]
+    same_cut = bool(old) and layout == old_layout
+    changed = not old or not same_cut or [(r["rule"], r["needs_review"]) for r in rows] != [
+        (r["rule"], r["needs_review"]) for r in old]
+    await repo.store_parts(session_id, rows, keep_archive=same_cut)
+
+    if len(parts) > 1 and ctx.clinical is not None:
+        for r, p in zip(rows, parts):
+            try:
+                await ctx.clinical.link_session(p.visit, session_id=session_id,
+                                                file_stem=r["file_stem"],
+                                                hospital_id=session["hospital_id"])
+            except Exception as exc:
+                logger.warning("Could not link part %s of %s: %s", p.part_no,
+                               session_id, exc)
+
+    archived = session.get("archived_at") is not None
+    if archived and old and not same_cut:
+        await repo.set_parts_stale(session_id, True)
+        await repo.raise_alert(
+            alert_type="relabelled_after_archive", severity="warning",
+            session_id=session_id, device_id=session.get("device_id"),
+            detail={"parts": [(r["patient_id"], r["start_seconds"], r["end_seconds"],
+                               r["rule"]) for r in rows]})
+    elif archived and changed:
+        await repo.mark_json_stale(session_id)
+    if changed and any(r["needs_review"] for r in rows):
+        await repo.raise_alert(
+            alert_type="labelling_review", severity="warning",
+            session_id=session_id, device_id=session.get("device_id"),
+            detail={"parts": [{"part_no": r["part_no"], "patient_id": r["patient_id"],
+                               "start_seconds": r["start_seconds"],
+                               "end_seconds": r["end_seconds"], "rule": r["rule"],
+                               "needs_review": r["needs_review"]} for r in rows]})
+    if changed:
+        await repo.audit(
+            event_type="session.labelled", actor_type="service", actor_id="labelling",
+            session_id=session_id,
+            detail={"parts": [(r["patient_id"], r["start_seconds"], r["end_seconds"],
+                               r["rule"]) for r in rows]})
+    return rows
+
+
+async def _first_visit(session: Dict[str, Any]):
+    """
+    The patient the recording was opened for, as CMED named them - from the
+    grant it started under, which a relabel never changes. Falls back to what
+    the session row holds for a recording that was never granted.
+    """
+    repo = _repo()
+    chain = await repo.load_chain(str(session["session_id"]))
+    opened_for = (chain[0].payload.get("patient_ref") if chain else None) \
+        or session["patient_id"]
+    for grant in await repo.grants_for_session(str(session["session_id"])):
+        if grant["patient_id"] == opened_for:
+            return _visit_from_grant(grant), grant["jti"]
+    day = session.get("session_date") or session["opened_at"].date()
+    return conf.Visit(patient_id=opened_for, doctor_id=session["doctor_id"],
+                      cmed_hospital_id=session["hospital_id"],
+                      start_time=session["opened_at"].isoformat(),
+                      visit_date=day.isoformat()), None
+
+
 class RefuseRequest(BaseModel):
     session_id: str
 
@@ -1829,20 +2405,15 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
     """
     Settle confirmation deadlines. The archive worker calls this every pass.
 
-        waiting 24 hours with no API 2  ->  erased and audited   (SRS-CNF-09)
         pending for two minutes         ->  unconfirmed, alert   (SRS-CNF-08)
+
+    Nothing is erased here. A recording without CMED's API 2 used to be
+    deleted after 24 hours, which made every CMED outage a loss of real
+    consultations; it is now archived and kept, and API 2 attaches to it
+    whenever it arrives. Only a patient's refusal erases (SRS-CNS-04).
     """
     repo = _repo()
     now = datetime.now(timezone.utc)
-
-    erased = 0
-    for row in await repo.sessions_in_confirmation(
-            ["pending", "unconfirmed"], opened_before=now - conf.UNCONFIRMED_LIFETIME):
-        removed, _ = await _erase_session(row["session_id"], state="expired")
-        await repo.audit(event_type="session.expired_unconfirmed", actor_type="service",
-                         actor_id="sweep", session_id=row["session_id"],
-                         detail={"objects_deleted": removed})
-        erased += 1
 
     # First, anything that is only waiting because Channel B and the recording
     # crossed: the notice is claimed, so the recording is confirmed (SRS-CNF-07).
@@ -1875,7 +2446,7 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             detail={"archived_at": row["archived_at"].isoformat()
                                    if row["archived_at"] else None})
 
-    return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
+    return {"status": "ok", "marked_unconfirmed": marked, "erased": 0,
             "clinical_loaded": loaded, "copies_overdue": len(overdue),
             "reconciled": len(reconciled)}
 

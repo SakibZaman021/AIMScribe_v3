@@ -45,6 +45,32 @@ def worst(findings: Iterable[Finding]) -> str:
 # Disk
 # ============================================================
 
+# Never ask a volume to keep more than this share of itself free. An absolute
+# floor written for one machine - 500 GB for the UIU array - would otherwise
+# alarm for ever on a smaller one: the droplet's whole disk is 320 GB.
+FLOOR_SHARE_LIMIT = 0.15
+
+
+def effective_floor_gb(setting: Optional[str], default_gb: int, total_bytes: int) -> int:
+    """
+    The floor to apply to one volume.
+
+    Set explicitly, it is used as given - unless it is half the volume or more,
+    which can only be a setting copied from a bigger machine. Unset, or
+    impossible, it is the default, capped at 15% of the volume.
+    """
+    total_gb = total_bytes / 1024 ** 3
+    cap = max(1, int(total_gb * FLOOR_SHARE_LIMIT))
+    if setting not in (None, ""):
+        try:
+            asked = int(float(setting))
+        except ValueError:
+            asked = None
+        if asked is not None and 0 < asked < total_gb / 2:
+            return asked
+    return min(default_gb, cap)
+
+
 def disk_space(name: str, free_bytes: int, total_bytes: int, *,
                floor_gb: int) -> Finding:
     """
