@@ -31,6 +31,9 @@ SET ROLE aims_recordings;
 \i /aims/scripts/010_v3_confirmation_channel_b.sql
 \i /aims/scripts/011_v3_file_names.sql
 \i /aims/scripts/012_v3_cloud_copy.sql
+\i /aims/scripts/013_v3_reassign.sql
+\i /aims/scripts/014_v3_device_health.sql
+\i /aims/scripts/015_v3_consultation_parts.sql
 RESET ROLE;
 -- The monitor reads what exists now, and whatever is added later.
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO aims_monitor;

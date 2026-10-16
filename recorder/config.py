@@ -135,6 +135,9 @@ class AudioConfig:
     sample_width: int = 2          # 16-bit
     frames_per_buffer: int = 2048  # ~46 ms at 44.1 kHz
     input_device_index: Optional[int] = None
+    # Part of the clinic microphone's Windows name. Opened by name and kept at
+    # 100%, so nobody has to choose it in Sound settings. Empty: Windows default.
+    preferred_microphone: str = "Jabra"
 
     @property
     def bytes_per_second(self) -> int:
@@ -172,6 +175,11 @@ class SegmentConfig:
     grace_seconds: float = 30.0
     silence_rms: int = 320          # linear RMS, 0-32767; ~-40 dBFS
     silence_hold_seconds: float = 1.0
+    # The clip being assembled lives in memory until it is sealed - up to a
+    # minute or more of a consultation. This often it is also written, encrypted,
+    # to the session folder, so a power cut or a held power button costs at most
+    # this many seconds. 0 turns it off.
+    partial_flush_seconds: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -244,6 +252,26 @@ class SecurityConfig:
     # How long `start` waits for the server's answer before replying 202
     # RECORDING_PROVISIONAL. Capture never waits (SRS-GRT-07).
     authorise_wait_seconds: float = 1.5
+    # How often a recording the server said no to is asked about again. It is
+    # held, never deleted: the usual cause is a fix still being made on the
+    # server, and the recording is real.
+    authorise_hold_retry_seconds: float = 300.0
+    # A start that failed because the microphone could not be opened is tried
+    # again by the recorder itself - the doctor never re-opens the patient -
+    # every few seconds, for up to fifteen minutes or until CMED moves on.
+    start_retry_seconds: float = 5.0
+    start_retry_limit_seconds: float = 900.0
+    # After a crash and restart, a consultation that was recording within this
+    # long is recorded again by itself, under the same five fields.
+    resume_within_seconds: float = 600.0
+    # A recording ends by itself this long after its prescription is built -
+    # the counselling after the print is kept, the doctor's own time before a
+    # late next patient is not - closing at the first quiet moment within the
+    # grace. And after this long with nothing from CMED while unarmed: a
+    # follow-up with no prescription and no next patient. 0 turns one off.
+    counselling_limit_seconds: float = 120.0
+    end_grace_seconds: float = 10.0
+    no_activity_limit_seconds: float = 900.0
     receipt_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "aimslab_receipt_pub.pem")
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
@@ -311,6 +339,7 @@ class Config:
             sample_width=_int("AIMS_SAMPLE_WIDTH", 2),
             frames_per_buffer=_int("AIMS_FRAMES_PER_BUFFER", 2048),
             input_device_index=_opt_int("AIMS_INPUT_DEVICE_INDEX"),
+            preferred_microphone=_str("AIMS_PREFERRED_MICROPHONE", "Jabra"),
         )
 
         segment = SegmentConfig(
@@ -319,6 +348,7 @@ class Config:
             grace_seconds=_float("AIMS_SEGMENT_GRACE_SECONDS", 30.0),
             silence_rms=_int("AIMS_SILENCE_RMS", 320),
             silence_hold_seconds=_float("AIMS_SILENCE_HOLD_SECONDS", 1.0),
+            partial_flush_seconds=_float("AIMS_PARTIAL_FLUSH_SECONDS", 3.0),
         )
 
         spool = SpoolConfig(
@@ -356,6 +386,9 @@ class Config:
             receipt_public_key_path=_path("AIMS_RECEIPT_PUBLIC_KEY_PATH", keys / "aimslab_receipt_pub.pem"),
             device_key_path=keys / "device_ed25519.dpapi",
             allow_plaintext_keystore=_bool("AIMS_ALLOW_PLAINTEXT_KEYSTORE", False),
+            counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
+            end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),
+            no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 900.0),
         )
 
         pause = PauseConfig(

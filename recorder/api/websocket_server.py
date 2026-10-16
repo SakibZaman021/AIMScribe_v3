@@ -188,7 +188,7 @@ class WebSocketManager:
         result = await self._controller.open_session(trigger, grant=grant)
         code = ("RECORDING_STARTED" if result.get("authorisation") == "granted"
                 else "RECORDING_PROVISIONAL")
-        return code, {
+        data = {
             "session_id": result["session_id"],
             "started_at": result["started_at"],
             "armed": False,
@@ -196,6 +196,12 @@ class WebSocketManager:
             "authorisation": result.get("authorisation"),
             "confirmation": result.get("confirmation"),
         }
+        # Opened while a recording runs unarmed: accepted the same way, so
+        # CMED's page carries on as for any start and sends this patient's
+        # API 2. The recording continues; `session_id` is the running one.
+        if result.get("continued"):
+            data["continued"] = True
+        return code, data
 
     @staticmethod
     def _development_grant(trigger: Trigger) -> crypto.Grant:
@@ -214,7 +220,11 @@ class WebSocketManager:
         )
 
     async def _prescription_built(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """API 3, part one. Arms the gate; the recording keeps running."""
+        """
+        API 3, part one. Arms the gate; the recording keeps running until the
+        next patient, or the counselling limit. Built for any patient opened
+        during the recording; the server works out the labels from it.
+        """
         built = protocol.parse_prescription_built(message)
         result = await self._controller.arm(patient_id=built.patient_id,
                                             session_id=built.session_id)

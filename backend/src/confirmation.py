@@ -2,8 +2,13 @@
 Confirming a recording against CMED's server (SRS 3.2 §5.6).
 
 When a doctor opens a patient, CMED's page sends the trigger to the recorder
-and CMED's server sends API 2 to us. Both carry the same five fields. A
-recording is admitted to the dataset only when the two meet.
+and CMED's server sends API 2 to us. Both carry the same five fields, and
+when the two meet the recording is tied to CMED's clinical record.
+
+Meeting is enrichment, never admission. A recording started by CMED's trigger
+is an authentic consultation whatever happens to API 2: it is archived and kept
+whether API 2 arrives in a second, a month later or never. Deleting it for want
+of API 2 turned every CMED outage into lost consultations.
 
 This module holds the rules that do not need a database: what a valid set of
 five fields is, and the time limits.
@@ -17,11 +22,18 @@ from typing import Any, Dict, Optional
 
 import integrity
 
-NOTICE_MATCH_WINDOW = timedelta(minutes=5)     # SRS-CNF-03: an unclaimed API 2 expires
-CONFIRM_DEADLINE = timedelta(minutes=2)        # SRS-CNF-08: then "unconfirmed"
-UNCONFIRMED_LIFETIME = timedelta(hours=24)     # SRS-CNF-09: then deleted
+# How far back either side looks for the other. The five fields name one
+# consultation to the second, so a long look-back cannot pair the wrong ones;
+# a short one only loses the pairing when a laptop or CMED was offline. Both
+# directions use the same bound, so which message arrives first never matters.
+MATCH_LOOKBACK = timedelta(days=3650)
+NOTICE_MATCH_WINDOW = MATCH_LOOKBACK           # SRS-CNF-03: API 2 first, recording later
+UNCONFIRMED_LIFETIME = MATCH_LOOKBACK          # SRS-CNF-09: recording first, API 2 later
+CONFIRM_DEADLINE = timedelta(minutes=2)        # SRS-CNF-08: then shown "unconfirmed"
 
-ARCHIVABLE = frozenset({"confirmed", "legacy"})
+# Everything a CMED trigger started. Only a patient's refusal removes a
+# recording (SRS-CNS-04); "expired" remains for rows erased by older servers.
+ARCHIVABLE = frozenset({"confirmed", "legacy", "pending", "unconfirmed"})
 WAITING = frozenset({"pending", "unconfirmed"})
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -111,5 +123,6 @@ def current_state(stored: str, opened_at: Optional[datetime], now: datetime) -> 
 
 
 __all__ = ["Visit", "FieldError", "parse_visit", "current_state", "FIVE_FIELDS",
-           "NOTICE_MATCH_WINDOW", "CONFIRM_DEADLINE", "UNCONFIRMED_LIFETIME",
+           "MATCH_LOOKBACK", "NOTICE_MATCH_WINDOW", "CONFIRM_DEADLINE",
+           "UNCONFIRMED_LIFETIME",
            "ARCHIVABLE", "WAITING"]

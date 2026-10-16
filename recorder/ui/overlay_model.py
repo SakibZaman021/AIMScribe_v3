@@ -124,9 +124,8 @@ class OverlayState:
         if event == "session_refused":
             self._say("Recording stopped and deleted - the patient did not consent.")
             return
-        if event == "recording_stopped" and data.get("reason") == "authorisation_refused":
-            self._say("Not recorded - AIMS LAB did not authorise this recording, "
-                      "and it has been deleted.")
+        if event == "session_held" and session_id in (None, self.session_id):
+            self.note = data.get("message") or "Recording. Kept on this PC for now."
             return
         if event == "integrity_alert":
             kind = data.get("alert_type")
@@ -138,6 +137,8 @@ class OverlayState:
             elif kind in ("microphone_unavailable", "capture_failed"):
                 self.shown.add(kind)
                 self.note = "The microphone is not working. Check that it is connected."
+            elif kind == "microphone_switched":
+                self.note = "Microphone changed. Still recording, on this PC's microphone."
             return
         if event == "overlay_message":
             self._say(str(data.get("text", ""))[:200])

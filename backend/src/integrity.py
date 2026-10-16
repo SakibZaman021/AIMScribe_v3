@@ -54,7 +54,10 @@ CHAIN_DOMAIN = b"aimscribe.chain.v2"
 RECEIPT_DOMAIN = b"aimscribe.receipt.v2"
 AUDIT_DOMAIN = b"aimscribe.audit.v2"
 
-VALID_ENTRY_TYPES = frozenset({"open", "segment", "pause", "resume", "close"})
+# "reassign" moves the recording to the patient the prescription was built for,
+# when that patient was opened during it (a wrong profile picked at the start).
+VALID_ENTRY_TYPES = frozenset({"open", "segment", "pause", "resume", "reassign",
+                               "marker", "close"})
 
 
 # ============================================================

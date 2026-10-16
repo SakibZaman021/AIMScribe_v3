@@ -9,6 +9,8 @@ measurement must not stop a prescription being stored.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -122,6 +124,17 @@ class Prescription:
 class PreviousVisit:
     visit_date: date
     prescription: Prescription
+    # The earlier visit's own five fields. CMED sent them when that visit
+    # happened, so they name it exactly; without them (the older shape, a date
+    # only) the visit cannot be told apart from another on the same day, and is
+    # filed under UNKNOWN rather than under today's doctor.
+    doctor_id: Optional[str] = None
+    cmed_hospital_id: Optional[str] = None
+    start_time: Optional[str] = None
+
+    @property
+    def identified(self) -> bool:
+        return bool(self.doctor_id and self.cmed_hospital_id and self.start_time)
 
 
 @dataclass
@@ -218,7 +231,10 @@ def previous_visit(body: Dict[str, Any]) -> Optional[PreviousVisit]:
     # Diagnoses and notes may sit beside the prescription rather than in it.
     merged.setdefault("diagnoses", p.get("diagnoses"))
     merged.setdefault("notes", p.get("notes"))
-    return PreviousVisit(visit_date=when, prescription=prescription(merged))
+    return PreviousVisit(visit_date=when, prescription=prescription(merged),
+                         doctor_id=text(p.get("doctor_id"), 64),
+                         cmed_hospital_id=text(p.get("hospital_id"), 64),
+                         start_time=text(p.get("start_time"), 64))
 
 
 def patient_information(body: Dict[str, Any]) -> PatientInformation:
@@ -242,6 +258,50 @@ def previous_start_time(visit_date: date, live_start_time: str) -> str:
     return f"{visit_date.isoformat()}T00:00:00{offset}"
 
 
+# ------------------------------------------------------------------ fingerprint
+
+# Who an older visit is filed under when CMED did not say (the date-only shape).
+UNKNOWN = "UNKNOWN"
+
+
+def fingerprint_of(*, items: List[Dict[str, Any]], diagnoses: List[str],
+                   investigations: List[str], advice: Optional[str],
+                   follow_up: Optional[str], notes: Optional[str]) -> str:
+    """
+    What a prescription says, as 64 hex characters (CMED_DATA_CONTRACT.md).
+
+    Only what the doctor prescribed counts: the medicines in their order, the
+    diagnoses, the investigations, the advice, the follow-up date and the
+    notes. When it was issued, the order of the keys, spacing and any field not
+    listed here do not, so a prescription sent again is recognised as the same
+    one and a real change is never mistaken for a repeat.
+    """
+    def line(i: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: i.get(k) for k in ("drug", "dose", "frequency", "duration", "instructions")}
+
+    canonical = {
+        "items": [line(i) for i in items],
+        "diagnoses": list(diagnoses),
+        "investigations": list(investigations),
+        "advice": advice,
+        "follow_up": follow_up,
+        "notes": notes,
+    }
+    data = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def fingerprint(p: Prescription) -> str:
+    return fingerprint_of(
+        items=[{"drug": i.drug, "dose": i.dose, "frequency": i.frequency,
+                "duration": i.duration, "instructions": i.instructions} for i in p.items],
+        diagnoses=p.diagnoses, investigations=p.investigations, advice=p.advice,
+        follow_up=p.follow_up_date.isoformat() if p.follow_up_date else None,
+        notes=p.notes)
+
+
 __all__ = ["Demographics", "Paramedic", "Item", "Prescription", "PreviousVisit",
            "PatientInformation", "patient_information", "prescription", "previous_visit",
-           "demographics", "paramedic", "previous_start_time", "blood_pressure", "sex_of"]
+           "demographics", "paramedic", "previous_start_time", "blood_pressure", "sex_of",
+           "fingerprint", "fingerprint_of", "UNKNOWN"]

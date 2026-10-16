@@ -20,7 +20,7 @@ Audio never reaches CMED, and nothing clinical is ever sent back.
 
 Both are **server to server**. The key must never reach a browser.
 
-**Neither message may delay the doctor.** Send them from a queue and retry on
+**Neither message may delay the doctor.** Send them from an outbox and retry on
 failure; a recording is never held up by a clinical message, and a late message
 is reconciled afterwards.
 
@@ -73,8 +73,10 @@ built. It is how the prescription finds its consultation.
   },
 
   "previous_visit": {
-    "date": "2026-06-02",
-    "prescription": { "items": [ … ], "diagnoses": [ … ], "notes": "…" }
+    "doctor_id": "DR0007", "hospital_id": "HOSP003",
+    "start_time": "2026-06-02T09:40:05+06:00", "date": "2026-06-02",
+    "prescription": { "items": [ … ], "diagnoses": [ … ], "investigations": [ … ],
+                      "advice": "…", "follow_up": "2026-06-16", "notes": "…" }
   },
 
   "female_details": { },
@@ -87,50 +89,137 @@ second, tenth. `previous_visit` must be present as a key; **send `null` when
 there is no prior visit to give**, rather than omitting it. That distinction is
 how we tell "nothing to send" from "CMED forgot".
 
-### When to send `previous_visit` — the history rule
+### `previous_visit` — the history rule
 
 `previous_visit` is a **backfill**, not a repeat. It exists so a prior
-consultation we never saw still reaches us.
+consultation we never saw still reaches us, and so a prescription that was
+corrected after that visit reaches us in its corrected form.
 
-| Visit | What AIMS LAB already holds | What CMED sends |
+**Name the earlier visit by its own five fields.** `doctor_id`, `hospital_id`,
+`start_time` and `date` are that visit's own, exactly as CMED sent them when it
+happened; `patient_id` may be given and must be this patient. With them we find
+the visit itself — the live one recorded at the time, or one an earlier API 2
+brought — and never file it under today's doctor.
+
+| What we find for that visit | What we store | `previous_visit.status` in the reply |
 |---|---|---|
-| 1st | nothing | demographics + this visit. `previous_visit: null` |
-| 2nd, and we **do not** hold the 1st | nothing | demographics + this visit + **`previous_visit` = the 1st** |
-| 2nd, and we **do** hold the 1st | visit 1 | demographics + this visit. `previous_visit: null` |
-| 3rd onward | visits 1…n-1 | demographics + this visit. `previous_visit: null` |
+| Held, and its newest prescription has the **same fingerprint** | **Nothing** | `ALREADY_STORED` — that history is held; there is no need to send it again |
+| Held, and the prescription **differs** | It, as that visit's **next version**. The newest version is the one read | `UPDATED`, with the `version` |
+| Not held | That visit, under its real doctor and clinic | `STORED` |
+| `previous_visit` was `null` | — | `NOT_SENT` |
+| The body is safe but has not loaded yet | — (the sweep finishes it) | `PENDING` |
 
-Demographics and the current prescription are sent every time regardless. Only
-the backfill is conditional.
+The rest of API 2 — today's demographics and measurements — is stored as usual
+whatever happens to `previous_visit`, because it is today's visit we need.
 
-**Re-sending costs nothing, and this matters.** Three database constraints make
-a repeat harmless: `intake_once` keeps one row per body, `encounter_once` keeps
-one encounter per patient, doctor, clinic, time and visit date, and
-`prescription_version_once` keeps one prescription per version. A
-`previous_visit` delivered twice updates one row; it never duplicates a visit or
-a medicine.
+**The date-only shape is still accepted**, `{"date": …, "prescription": …}`,
+but it names no doctor or time, so we cannot tell which visit it was. If any
+visit we hold for that patient that day has the same prescription, nothing is
+stored; otherwise it is stored under doctor and clinic `UNKNOWN`. The reply
+says `UNIDENTIFIED`, with `"stored": true` or `false`. Send the five fields
+instead; this shape exists only so nothing already built breaks.
 
-**So the conditional rule is an optimisation, and it carries one risk worth
-naming.** CMED decides from *its own* record of what it has sent. Ours can
-differ: a message that failed its schema check sits in quarantine, a
-consultation the patient refused is erased within five minutes, and a database
-restored from a backup loses whatever arrived after it. In each case CMED
-believes we hold visit n-1 and we do not — and because nothing asks, the gap is
-permanent and silent. That is the failure mode the unconditional version does
-not have.
+**Half a name is refused.** `doctor_id`, `hospital_id` and `start_time` are sent
+together or not at all; a doctor without a time could file a prescription
+against the wrong visit, which is worse than not filing it. A previous visit
+that is this visit, or later than it, is also refused. These come back as
+`422 SCHEMA_INVALID` with the field named.
 
-Two ways to keep the optimisation without the risk, and one of them has to be
-built:
+#### Ask before sending: what do you already hold?
 
-1. **CMED asks instead of remembering.** A read endpoint that answers which
-   visit dates we hold for a patient. CMED's decision then rests on our state,
-   not its memory. *This does not exist yet — it is the one piece the rule needs.*
-2. **The nightly reconciliation reports the gap.** `SRS-CRI-10` already compares
-   records against recordings each night; it should also flag a patient whose
-   history has a hole — visit n present, n-1 absent — so a missed backfill is
-   found the next morning rather than never.
+```
+GET /api/v2/clinical/patient/{patient_id}/visits?limit=50&cursor=...
+X-CMED-Key: <the same key>
+```
 
-Until one of those is in place, **sending `previous_visit` on every returning
-patient is the safer default**, and it costs about two kilobytes.
+```json
+{ "status": 200, "code": "OK", "patient_id": "P0012345",
+  "visits": [
+    { "patient_id": "P0012345", "doctor_id": "DR0007", "hospital_id": "HOSP003",
+      "start_time": "2026-06-02T09:40:05+06:00", "date": "2026-06-02",
+      "source": "live", "prescription_version": 2,
+      "prescription_fingerprint": "f1e71094…ec4806",
+      "received_at": "2026-06-02T03:58:11.204+00:00" } ],
+  "next_cursor": null }
+```
+
+Newest first. `limit` is 1 to 200 (50 if not given); when a page is full,
+`next_cursor` is the value to pass as `cursor` for the next page, unchanged.
+`before=YYYY-MM-DD` optionally limits the list to visits before that date. Only
+identifiers and fingerprints come back — never a name, a medicine or a
+diagnosis — and every request is logged against the patient. A patient we
+hold nothing for gets an empty list. The errors are those of the other two
+endpoints: `401 INVALID_KEY`, `400 INVALID_IDENTIFIER`, and `400 MISSING_FIELD`
+naming `limit` or `before`.
+
+**The rule CMED follows on a returning patient:**
+
+1. Ask for the visits.
+2. For the previous visit, compute the fingerprint of the prescription CMED
+   holds now.
+3. Listed with the same fingerprint → send `previous_visit: null`.
+   Not listed, or listed with a different fingerprint → send `previous_visit`.
+
+The decision then rests on what we hold, not on CMED's memory of what it sent
+— which is wrong after a quarantined message, a refused consultation, or a
+database restored from a backup. **If the question cannot be asked** (our
+server is down, the request times out), **send `previous_visit` anyway.** It
+costs about two kilobytes, and the reply's `ALREADY_STORED` says it was not
+needed.
+
+#### The prescription fingerprint
+
+Sixty-four lowercase hex characters: SHA-256 of one exact JSON text built from
+what the doctor prescribed, and nothing else.
+
+1. Take these six keys, and only these:
+
+   | Key | Value |
+   |---|---|
+   | `items` | a list, in the order prescribed; each entry exactly `drug`, `dose`, `frequency`, `duration`, `instructions` |
+   | `diagnoses` | a list of strings |
+   | `investigations` | a list of strings |
+   | `advice` | a string, or `null` |
+   | `follow_up` | `YYYY-MM-DD`, or `null` |
+   | `notes` | a string, or `null` |
+
+2. Every text value has the spaces at its ends removed. An empty string, or a
+   text key that was not sent, is `null`; a list that was not sent is `[]`. An item with no
+   `drug` is left out. A diagnosis or investigation sent as an object counts
+   as its `text`, or else its `name`.
+3. Write it as JSON with the **keys sorted** at every level, **no spaces**
+   (separators `,` and `:`), and characters such as Bangla written as
+   themselves, not as `\u` escapes. Encode as UTF-8 and hash with SHA-256.
+
+`issued_at`, the order of the keys, spacing, and any field not in the table
+make no difference — a prescription sent again is recognised as the same one.
+A change to any medicine, its order, a diagnosis, the advice, the follow-up or
+the notes is a different fingerprint.
+
+**Worked example.** This prescription:
+
+```json
+{ "issued_at": "2026-10-01T10:20:00+06:00",
+  "items": [ { "drug": "Paracetamol", "dose": "500 mg",
+               "frequency": "1+1+1", "duration": "5 days" } ],
+  "diagnoses": ["Fever"], "investigations": ["CBC"],
+  "advice": "Rest and fluids", "follow_up": "2026-10-08" }
+```
+
+becomes exactly this text (one line):
+
+```
+{"advice":"Rest and fluids","diagnoses":["Fever"],"follow_up":"2026-10-08","investigations":["CBC"],"items":[{"dose":"500 mg","drug":"Paracetamol","duration":"5 days","frequency":"1+1+1","instructions":null}],"notes":null}
+```
+
+whose fingerprint is
+
+```
+f1e7109404fd5d4010c358f0b3afdec79699955299a089eaf2c830fb60ec4806
+```
+
+CMED's implementation should reproduce that hex before it is used; our test
+suite pins the same value (`backend/tests/test_previous_visit.py`).
 
 ### Accepted values
 
@@ -199,7 +288,21 @@ Items keep the order you send them; that order is stored as the line number.
 
 **Sending a corrected prescription is expected.** Send it again with the same
 five fields; the file beside the recording is rewritten and the database keeps
-both versions.
+both versions. Only a real change is a new version: the same prescription with
+a new `issued_at`, or with its keys in another order, has the same fingerprint
+(see §3) and is answered `200 ALREADY_RECEIVED` with the version already held.
+
+**An old message replayed never rolls a visit back.** If an outbox sends
+version 1 again, byte for byte, after version 2 was stored — the usual thing
+after an outage — it is answered `ALREADY_RECEIVED` for version 1 and version 2
+stays the newest. A doctor who really goes back to the first prescription
+produces a new `issued_at`, and that is stored as version 3.
+
+**A late message is never too late.** API 2 and API 3 may arrive hours or days
+after the consultation, after its recording was closed or archived. They are
+stored, tied to the recording, and the JSON file beside it is written again.
+They add to the recording; whether they arrive does not decide whether the
+recording is kept.
 
 ---
 
@@ -210,7 +313,7 @@ both versions.
 | The whole body, unchanged | `intake_records` — once per body, always |
 | `demographics` | `patients`, `encounter_demographics` |
 | `paramedic` | `paramedic_observations` — known fields in columns, the rest in `other` |
-| `previous_visit` | A second `encounters` row, filed at midnight on its date so it always sorts before the live visit |
+| `previous_visit` | The earlier visit's own `encounters` row — the one already held, or a new one under its real doctor and clinic — with its prescription as a new version only if it changed. The date-only shape is filed under `UNKNOWN`, at midnight on its date |
 | `items` | `prescription_items`, one row per medicine |
 | `diagnoses`, `investigations` | `diagnoses`, `investigations` |
 | `female_details`, `male_details` | `female_details`, `male_details` |
@@ -225,17 +328,27 @@ built from the other.
 
 | Code | Meaning | What CMED should do |
 |---|---|---|
-| `202 ACCEPTED` | Stored | Nothing |
-| `202 ALREADY_RECEIVED` | This exact body was already stored | Nothing — **retrying is safe** |
+| `202 ACCEPTED` | Stored | Remove it from the outbox. For API 2, read `previous_visit.status` (§3) |
+| `200 ALREADY_RECEIVED` | Already held: this exact body, or (API 3) a prescription with the same fingerprint as the newest version | **Remove it from the outbox and never send it again.** Retrying was safe |
 | `400 MALFORMED_JSON` | Not a JSON object | Fix and resend; do not retry unchanged |
 | `400 MISSING_FIELD` | A required field is missing or malformed | Fix and resend |
 | `400 INVALID_IDENTIFIER` | An id has characters outside `A-Z a-z 0-9 _ -` | Fix and resend |
 | `401 INVALID_KEY` | Key missing or wrong | Stop and tell us |
 | `413 TOO_LARGE` | Over 1 MB | Split or trim; a body this large is usually a mistake |
 | `422 SCHEMA_INVALID` | **Stored in quarantine**, with the fields listed | Not lost. Fix the shape and resend |
+| `429`, `5xx`, a timeout, no connection | Busy, a problem on our side, or no internet | **Keep it in the outbox** and retry with growing delay. Never drop it |
+
+**Send from an outbox.** Each Aalo branch keeps working on its local CMED server
+through an internet or power cut, and while it is cut off neither message can
+reach us. Write each one to a table on that server at the moment of the click,
+send in order (a visit's API 2 before its API 3), retry while we cannot be
+reached, and remove a message only on `202` or `200`. A message that arrives a
+day late attaches to its recording; a message never sent is the only failure.
 
 **Retries are safe.** The same body twice produces one row, and the reply says
-`ALREADY_RECEIVED` rather than failing.
+`ALREADY_RECEIVED` rather than failing. For API 2 the reply also carries
+`"previous_visit": {"status": …, "version": …, "record_id": …}` (§3); on a
+repeat of a body that stored it, the status is `ALREADY_STORED`.
 
 ---
 

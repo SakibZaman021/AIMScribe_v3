@@ -26,6 +26,7 @@ sys.path.insert(0, str(BACKEND.parent / "recorder"))
 import api_v2                                   # noqa: E402
 import clinical                                 # noqa: E402
 import integrity                                # noqa: E402
+import confirmation as conf                       # noqa: E402
 from confirmation import Visit                  # noqa: E402
 from grants import GrantIssuer                  # noqa: E402
 from integrity import ReceiptSigner             # noqa: E402
@@ -62,6 +63,8 @@ class FakeRepo:
         self.receipts, self.segments = [], {}
         self.alerts, self.audits, self.keys = [], [], {}
         self.copies = []
+        self.chains = {}
+        self.clicks, self.parts = {}, {}
 
     # clinics
     async def hospital_for_cmed_id(self, cmed_id):
@@ -86,6 +89,21 @@ class FakeRepo:
 
     async def get_authorisation(self, jti):
         return dict(self.auths[jti]) if jti in self.auths else None
+
+    # the chain, for the entries that arrive one at a time
+    async def chain_head(self, session_id):
+        chain = self.chains.get(session_id) or []
+        return chain[-1].entry_hash if chain else None
+
+    async def append_chain_entry(self, session_id, entry):
+        self.chains.setdefault(session_id, []).append(entry)
+
+    async def entry_already_stored(self, session_id, entry):
+        return any(e.entry_no == entry.entry_no and e.entry_hash == entry.entry_hash
+                   for e in self.chains.get(session_id) or [])
+
+    async def reassign_session(self, session_id, *, patient_id, doctor_id):
+        self.sessions[session_id].update(patient_id=patient_id, doctor_id=doctor_id)
 
     async def link_authorisation(self, jti, session_id):
         if self.auths[jti]["session_id"] in (None, session_id):
@@ -212,7 +230,8 @@ class FakeRepo:
     async def pending_archive(self, limit=10):
         return [dict(s) for s in self.sessions.values()
                 if s.get("closed_at") and not s.get("archived_at")
-                and not s.get("quarantine_reason")][:limit]
+                and not s.get("quarantine_reason")
+                and s.get("confirmation") in conf.ARCHIVABLE][:limit]
 
     async def hospital_timezone(self, hospital_id):
         return "Asia/Dhaka"
@@ -273,11 +292,80 @@ class FakeRepo:
 
     async def session_for_visit(self, visit):
         for grant in self.auths.values():
-            if grant["session_id"] and self._match(
+            sid = grant["session_id"]
+            current = (self.sessions.get(sid) or {}).get("grant_jti")
+            clicked = any(c["grant_jti"] == grant["jti"] for c in self.clicks.get(sid, []))
+            if sid and (current in (None, grant["jti"]) or clicked) and self._match(
                     grant, visit, grant["hospital_id"]):
-                return dict(self.sessions[grant["session_id"]],
-                            session_id=grant["session_id"])
+                return dict(self.sessions[sid], session_id=sid)
+        for sid, clicks in self.clicks.items():
+            if any((c["patient_id"], c["start_time"]) == (visit.patient_id, visit.start_time)
+                   for c in clicks):
+                return dict(self.sessions[sid], session_id=sid)
         return None
+
+    # consultation parts
+    async def load_chain(self, session_id):
+        return list(self.chains.get(session_id) or [])
+
+    async def grants_for_session(self, session_id):
+        return sorted((dict(g) for g in self.auths.values() if g["session_id"] == session_id),
+                      key=lambda g: g["issued_at"])
+
+    async def record_click(self, session_id, *, entry_no, event, audio_seconds, occurred_at,
+                           visit, grant_jti):
+        rows = self.clicks.setdefault(session_id, [])
+        if any(r["entry_no"] == entry_no for r in rows):
+            return
+        rows.append(dict(entry_no=entry_no, event=event, audio_seconds=audio_seconds,
+                         occurred_at=occurred_at, patient_id=visit.patient_id,
+                         doctor_id=visit.doctor_id, cmed_hospital_id=visit.cmed_hospital_id,
+                         start_time=visit.start_time, visit_date=visit.day,
+                         grant_jti=grant_jti))
+
+    async def clicks_for(self, session_id):
+        return sorted((dict(r) for r in self.clicks.get(session_id, [])),
+                      key=lambda r: (r["audio_seconds"], r["entry_no"]))
+
+    async def parts_for(self, session_id):
+        return [dict(p) for p in self.parts.get(session_id, [])]
+
+    async def store_parts(self, session_id, parts, *, keep_archive):
+        old = {p["part_no"]: p for p in self.parts.get(session_id, [])} if keep_archive else {}
+        keep = ("archive_relpath", "archive_sha256", "archive_bytes", "copied_at")
+        self.parts[session_id] = [
+            dict(p, **{k: (old.get(p["part_no"]) or {}).get(k) for k in keep})
+            for p in parts]
+        self.sessions[session_id]["parts_count"] = len(parts)
+
+    async def set_parts_stale(self, session_id, stale):
+        self.sessions[session_id]["parts_stale"] = stale
+
+    async def label_session(self, session_id, *, patient_id, doctor_id, grant_jti):
+        s = self.sessions[session_id]
+        s.update(patient_id=patient_id, doctor_id=doctor_id)
+        if grant_jti:
+            s["grant_jti"] = grant_jti
+
+    async def mark_part_archived(self, session_id, part_no, *, relpath, sha256, byte_length):
+        for p in self.parts.get(session_id, []):
+            if p["part_no"] == part_no:
+                p.update(archive_relpath=relpath, archive_sha256=sha256,
+                         archive_bytes=byte_length)
+
+    async def mark_part_copied(self, session_id, part_no):
+        for p in self.parts.get(session_id, []):
+            if p["part_no"] == part_no:
+                p["copied_at"] = NOW()
+        return all(p.get("copied_at") for p in self.parts.get(session_id, []))
+
+    async def archived_parts_for(self, session_id):
+        return [{"part_no": p["part_no"], "archive_relpath": p["archive_relpath"]}
+                for p in self.parts.get(session_id, []) if p.get("archive_relpath")]
+
+    async def pending_recut(self, limit=5):
+        return [dict(s) for s in self.sessions.values()
+                if s.get("parts_stale") and s.get("archived_at")][:limit]
 
     # audit and alerts
     async def raise_alert(self, **kw):
@@ -331,6 +419,12 @@ class FakeClinical:
     async def link_session(self, visit, **kw):
         self.linked.append(kw)
         return True
+
+    async def prescribed(self, visits):
+        return {v.patient_id for v in visits
+                if any(r["kind"] == "prescription"
+                       and (r["patient_id"], r["start_time"]) == (v.patient_id, v.start_time)
+                       for r in self.records)}
 
     async def json_document(self, visit, *, actor):
         body = next((r["body"] for r in self.records
@@ -517,11 +611,12 @@ async def test_api2_first_then_grant_is_confirmed(server):
     assert "body" not in server.repo.notices[0]
 
 
-async def test_api2_older_than_five_minutes_confirms_nothing(server):
-    """SRS-CNF-03."""
+@pytest.mark.parametrize("late", [timedelta(minutes=6), timedelta(hours=5), timedelta(days=3)])
+async def test_api2_long_before_the_recording_still_confirms_it(server, late):
+    """SRS-CNF-03 widened: the laptop was offline while CMED's server was not."""
     await send("patient_information", api2())
-    server.repo.notices[0]["received_at"] -= timedelta(minutes=6)
-    assert (await mint())[1]["confirmation"] == "pending"
+    server.repo.notices[0]["received_at"] -= late
+    assert (await mint())[1]["confirmation"] == "confirmed"
 
 
 async def test_one_api2_confirms_one_grant(server):
@@ -648,8 +743,18 @@ async def test_pending_becomes_unconfirmed_after_two_minutes(server):
     assert server.repo.alerts[-1]["alert_type"] == "unconfirmed_recording"
 
 
-async def test_sweep_settles_deadlines(server):
-    """AT-75: 24 hours unconfirmed is erased; two minutes pending is flagged."""
+async def test_a_recording_without_api2_is_archived(server):
+    """API 2 is enrichment: the archive takes the recording without it."""
+    waiting = open_session(server, segments=2)
+    refused = open_session(server, segments=1)
+    for sid, state in ((waiting, "unconfirmed"), (refused, "refused")):
+        server.repo.sessions[sid].update(confirmation=state, closed_at=NOW())
+    ready = {s["session_id"] for s in await server.repo.pending_archive()}
+    assert waiting in ready and refused not in ready
+
+
+async def test_sweep_never_erases_a_recording_without_api2(server):
+    """A day, or a month, without CMED's API 2: kept and archivable, never erased."""
     old = open_session(server, opened_ago=timedelta(hours=25), segments=3)
     slow = open_session(server, opened_ago=timedelta(minutes=3))
     kept = open_session(server, opened_ago=timedelta(hours=30), segments=2)
@@ -658,13 +763,13 @@ async def test_sweep_settles_deadlines(server):
     server.repo.sessions[kept]["confirmation"] = "confirmed"
 
     result = await api_v2.maintenance_sweep()
-    assert (result["erased"], result["marked_unconfirmed"]) == (1, 1)
-    assert server.repo.sessions[old]["confirmation"] == "expired"
-    assert server.repo.sessions[old]["patient_id"] == "REDACTED"
-    assert len(server.bucket.removed) == 3
+    assert (result["erased"], result["marked_unconfirmed"]) == (0, 1)
+    assert server.repo.sessions[old]["confirmation"] == "unconfirmed"
+    assert server.repo.sessions[old]["patient_id"] != "REDACTED"
+    assert server.bucket.removed == []
     assert server.repo.sessions[slow]["confirmation"] == "unconfirmed"
     assert server.repo.sessions[kept]["confirmation"] == "confirmed"
-    assert any(a["event_type"] == "session.expired_unconfirmed" for a in server.repo.audits)
+    assert not any("expired" in a["event_type"] for a in server.repo.audits)
 
 
 # ============================================================
@@ -881,7 +986,7 @@ async def test_the_pieces_are_kept_until_the_copy_is_made(server):
 
 async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
     sid = await archived(server)
-    for kind, suffix in (("audio", "flac.enc"), ("json", "json.enc")):
+    for kind, suffix in (("audio", "wav.enc"), ("json", "json.enc")):
         place = await api_v2.archive_copy_authorize(
             api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
         assert place["object_key"] == \
@@ -899,7 +1004,7 @@ async def test_the_pieces_go_only_after_the_copy_is_recorded(server):
     """AT-64, SRS-ARC-09 steps 6 and 7."""
     sid = await archived(server, segments=4)
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of(server, "audio", "copies/a.v1.flac.enc"),
+        session_id=sid, copies=[copy_of(server, "audio", "copies/a.v1.wav.enc"),
                                 copy_of(server, "json", "copies/a.v1.json.enc", bytes_=2048)]))
     assert (result["status"], result["objects_deleted"]) == ("copied", 4)
     assert len(server.bucket.removed) == 4
@@ -925,7 +1030,7 @@ async def test_a_copy_recorded_twice_finishes_instead_of_failing(server):
     """AT-65: stopped between the upload and the database, the retry completes."""
     sid = await archived(server, segments=2)
     body = api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of(server, "audio", "copies/c.v1.flac.enc")])
+        session_id=sid, copies=[copy_of(server, "audio", "copies/c.v1.wav.enc")])
     first = await api_v2.archive_copy_complete(body)
     second = await api_v2.archive_copy_complete(body)
     assert (first["objects_deleted"], second["objects_deleted"]) == (2, 0)
@@ -936,7 +1041,7 @@ async def test_a_late_prescription_asks_for_the_json_again(server):
     """SRS-ARC-13."""
     sid = await archived(server)
     await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of(server, "audio", "copies/d.v1.flac.enc"),
+        session_id=sid, copies=[copy_of(server, "audio", "copies/d.v1.wav.enc"),
                                 copy_of(server, "json", "copies/d.v1.json.enc", bytes_=2048)]))
 
     status, _ = await send("prescription", prescription())
@@ -1014,10 +1119,10 @@ async def test_without_a_copy_bucket_the_old_behaviour_stands(server):
 async def test_the_clean_up_never_reaches_a_copy(server):
     """AT-67, SRS-ARC-12: the credential that deletes pieces must not touch copies."""
     sid = await archived(server, segments=1)
-    server.repo.segments[sid][0]["object_key"] = "copies/HOSP003/one.v1.flac.enc"
+    server.repo.segments[sid][0]["object_key"] = "copies/HOSP003/one.v1.wav.enc"
 
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
-        session_id=sid, copies=[copy_of(server, "audio", "copies/HOSP003/one.v1.flac.enc")]))
+        session_id=sid, copies=[copy_of(server, "audio", "copies/HOSP003/one.v1.wav.enc")]))
     assert result["objects_deleted"] == 0
     assert server.bucket.removed == []
 
@@ -1032,7 +1137,7 @@ async def test_a_copy_the_store_does_not_have_is_refused(server):
     with pytest.raises(HTTPException) as refused:
         await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
             session_id=sid,
-            copies=[copy_of(server, "audio", "copies/missing.v1.flac.enc",
+            copies=[copy_of(server, "audio", "copies/missing.v1.wav.enc",
                             uploaded=False)]))
     assert refused.value.status_code == 409
     assert server.bucket.removed == []                      # the pieces stay
@@ -1043,11 +1148,11 @@ async def test_a_copy_the_store_does_not_have_is_refused(server):
 async def test_a_copy_stored_short_is_refused(server):
     """The size the store holds must be the size that was sent."""
     sid = await archived(server, segments=3)
-    server.copy.accept("copies/short.v1.flac.enc", 500_000, "ab" * 16)
+    server.copy.accept("copies/short.v1.wav.enc", 500_000, "ab" * 16)
     with pytest.raises(HTTPException) as refused:
         await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
             session_id=sid,
-            copies=[copy_of(server, "audio", "copies/short.v1.flac.enc",
+            copies=[copy_of(server, "audio", "copies/short.v1.wav.enc",
                             bytes_=900_000, uploaded=False)]))
     assert "900000 were sent" in refused.value.detail
     assert server.bucket.removed == []
@@ -1056,11 +1161,11 @@ async def test_a_copy_stored_short_is_refused(server):
 async def test_a_copy_whose_fingerprint_differs_is_refused(server):
     """Right size, wrong bytes - the store's own fingerprint catches it."""
     sid = await archived(server, segments=3)
-    server.copy.accept("copies/wrong.v1.flac.enc", 900_000, "99" * 16)
+    server.copy.accept("copies/wrong.v1.wav.enc", 900_000, "99" * 16)
     with pytest.raises(HTTPException) as refused:
         await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
             session_id=sid,
-            copies=[copy_of(server, "audio", "copies/wrong.v1.flac.enc",
+            copies=[copy_of(server, "audio", "copies/wrong.v1.wav.enc",
                             md5="ab" * 16, uploaded=False)]))
     assert refused.value.status_code == 409
     assert server.repo.alerts[-1]["detail"]["problem"].startswith("the store's fingerprint")
@@ -1070,10 +1175,10 @@ async def test_a_copy_whose_fingerprint_differs_is_refused(server):
 async def test_a_multipart_upload_is_checked_by_size(server):
     """A large object's ETag is not its MD5; the size check stands alone."""
     sid = await archived(server, segments=2)
-    server.copy.accept("copies/big.v1.flac.enc", 900_000, "d41d8cd98f00b204e9800998ecf8427e-3")
+    server.copy.accept("copies/big.v1.wav.enc", 900_000, "d41d8cd98f00b204e9800998ecf8427e-3")
     result = await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
         session_id=sid,
-        copies=[copy_of(server, "audio", "copies/big.v1.flac.enc", uploaded=False)]))
+        copies=[copy_of(server, "audio", "copies/big.v1.wav.enc", uploaded=False)]))
     assert result["status"] == "copied"
 
 

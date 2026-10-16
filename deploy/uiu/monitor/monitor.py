@@ -36,10 +36,13 @@ logger = logging.getLogger("monitor")
 
 STATE = Path(os.getenv("AIMS_MONITOR_STATE", "/state"))
 WATCHED = {
-    # name -> where it is mounted, and how little may be left on it
-    "archive": (Path("/watch/archive"), int(os.getenv("AIMS_DISK_FLOOR_GB", "500"))),
-    "database": (Path("/watch/db"), int(os.getenv("AIMS_DB_FLOOR_GB", "100"))),
-    "backups": (Path("/watch/backups"), int(os.getenv("AIMS_BACKUP_FLOOR_GB", "50"))),
+    # name -> where it is mounted, the setting for how little may be left on
+    # it, and the default when that is unset. The default is capped at a share
+    # of the volume (checks.effective_floor_gb), so one written for the UIU
+    # array does not alarm for ever on a 320 GB droplet.
+    "archive": (Path("/watch/archive"), "AIMS_DISK_FLOOR_GB", 500),
+    "database": (Path("/watch/db"), "AIMS_DB_FLOOR_GB", 100),
+    "backups": (Path("/watch/backups"), "AIMS_BACKUP_FLOOR_GB", 50),
 }
 
 
@@ -49,10 +52,11 @@ WATCHED = {
 
 def disk_findings() -> List[Finding]:
     found = []
-    for name, (path, floor) in WATCHED.items():
+    for name, (path, setting, default_gb) in WATCHED.items():
         if not path.exists():
             continue
         usage = shutil.disk_usage(path)
+        floor = checks.effective_floor_gb(os.getenv(setting), default_gb, usage.total)
         found.append(checks.disk_space(name, usage.free, usage.total, floor_gb=floor))
     return found
 

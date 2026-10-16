@@ -617,6 +617,11 @@ def main() -> int:
         runtime.overlay = Overlay(runtime)
         runtime.overlay.start()
 
+    # Windows shutting down, restarting or signing out closes the consultation
+    # properly first, instead of killing the agent mid-clip.
+    from core.shutdown_guard import guard_runtime
+    runtime.shutdown_guard = guard_runtime(runtime)
+
     server = uvicorn.Server(uvicorn.Config(
         app,
         host=config.security.bind_host,

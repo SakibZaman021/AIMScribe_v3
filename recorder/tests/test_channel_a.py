@@ -172,6 +172,30 @@ async def test_start_granted_is_200_and_echoes_request_id(make_security):
     assert grant is None                 # production: the server is asked, not the page
 
 
+@pytest.mark.parametrize("authorisation,status,code", [
+    ("granted", 200, "RECORDING_STARTED"), ("pending", 202, "RECORDING_PROVISIONAL")])
+async def test_a_click_during_an_unarmed_recording_looks_like_any_start(
+        make_security, authorisation, status, code):
+    """CMED's finished page knows these two codes; it carries on and sends API 2."""
+    manager, controller = _manager(make_security, authorisation=authorisation)
+    original = controller.open_session
+
+    async def continued(trigger, *, grant=None):
+        return {**(await original(trigger, grant=grant)), "continued": True}
+
+    controller.open_session = continued
+    reply = await _send(manager, _start())
+    assert (reply["status"], reply["code"]) == (status, code)
+    assert reply["data"]["continued"] is True and reply["data"]["session_id"] == "S1"
+
+
+async def test_prescription_built_reply_has_no_reassign(make_security):
+    manager, _ = _manager(make_security)
+    reply = await _send(manager, {"command": "prescription_built", "request_id": "r",
+                                  "patient_id": "P0012345", "session_id": "S1"})
+    assert reply["code"] == "GATE_ARMED" and "reassigned_from" not in reply["data"]
+
+
 async def test_start_still_being_authorised_is_202(make_security):
     """SRS-GRT-07: recording, while the server is still being asked."""
     manager, _ = _manager(make_security, authorisation="pending")
@@ -285,15 +309,36 @@ async def test_a_session_starts_unarmed(controller):
     assert controller.status()["armed"] is False
 
 
-async def test_unarmed_session_refuses_the_next_patient(controller):
-    """AT-09: a stray trigger is refused and the recording continues."""
+async def test_unarmed_session_accepts_the_next_patient_and_keeps_recording(controller):
+    """AT-09, revised again: another patient opened mid-consultation is accepted
+    the way CMED's page expects, the recording carries on, and a marker says so."""
     first = await _open(controller, "P1")
-    with pytest.raises(SessionError) as err:
-        await _open(controller, "P2", "2026-09-13T10:05:00+06:00")
-    assert err.value.code == "GATE_NOT_ARMED"
+    again = await _open(controller, "P2", "2026-09-13T10:05:00+06:00")
+    assert again["continued"] is True and again["session_id"] == first["session_id"]
+    assert again["authorisation"] == "granted"          # -> RECORDING_STARTED
     assert controller.status()["session_id"] == first["session_id"]
+    assert controller.status()["focus_patient"] == "P2"
     assert controller.state == "recording"
-    assert any(name == "trigger_refused" for name, _ in controller.events)
+    markers = [e for e in controller._active.spool.chain if e.entry_type == "marker"]
+    assert [(m.payload["event"], m.payload["patient"]["patient_id"]) for m in markers] == [
+        ("patient_opened", "P2")]
+    await _open(controller, "P2", "2026-09-13T10:05:00+06:00")     # page resends
+    assert len([e for e in controller._active.spool.chain if e.entry_type == "marker"]) == 1
+
+
+async def test_the_same_patient_reopened_unarmed_is_the_same_consultation(controller):
+    first = await _open(controller, "P1", "2026-09-13T10:00:00+06:00")
+    again = await _open(controller, "P1", "2026-09-13T10:03:00+06:00")
+    assert again["continued"] is True and again["session_id"] == first["session_id"]
+    assert all(e.entry_type != "marker" for e in controller._active.spool.chain)
+
+
+async def test_the_same_patient_reopened_after_the_prescription_is_already_active(controller):
+    first = await _open(controller, "P1")
+    await controller.arm(patient_id="P1", session_id=first["session_id"])
+    with pytest.raises(SessionError) as err:
+        await _open(controller, "P1", "2026-09-13T10:03:00+06:00")
+    assert err.value.code == "SESSION_ALREADY_ACTIVE"
 
 
 async def test_armed_session_hands_over(controller):
@@ -332,10 +377,9 @@ async def test_arming_with_nothing_recording(controller):
 
 
 async def test_the_same_trigger_twice_is_not_a_new_patient(controller):
-    await _open(controller, "P1")
-    with pytest.raises(SessionError) as err:
-        await _open(controller, "P1")
-    assert err.value.code == "SESSION_ALREADY_ACTIVE"
+    first = await _open(controller, "P1")
+    again = await _open(controller, "P1")
+    assert again["session_id"] == first["session_id"] and again["continued"] is True
 
 
 async def test_clinic_mismatch_is_refused(controller):

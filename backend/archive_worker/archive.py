@@ -307,10 +307,116 @@ def join_wav(segment_paths: List[Path], destination: Path) -> JoinResult:
 
 
 # ============================================================
+# Cutting one recording into consultations
+# ============================================================
+#
+# A recording that held more than one patient - a follow-up with no
+# prescription, then the next patient - is archived as one file per patient.
+# The server decides where each consultation begins (in seconds of the joined
+# audio); here those seconds become exact frame positions and the joined file
+# is cut there. The parts are contiguous and together are every frame of the
+# recording exactly once, so joining them again gives back the joined WAV
+# byte for byte - which is how a recut proves it is cutting the audio the
+# chain describes.
+
+@dataclass
+class WavFormat:
+    channels: int
+    sample_width: int
+    rate: int
+    frames: int
+
+    @property
+    def frame_bytes(self) -> int:
+        return self.channels * self.sample_width
+
+
+def wav_format(path: Path) -> WavFormat:
+    with wave.open(str(path), "rb") as src:
+        return WavFormat(src.getnchannels(), src.getsampwidth(), src.getframerate(),
+                         src.getnframes())
+
+
+def part_frames(starts: List[float], rate: int, total_frames: int) -> List[Tuple[int, int]]:
+    """
+    Frame ranges [start, end) for parts beginning at `starts` seconds.
+
+    Only the starts are used: part n ends exactly where part n+1 begins, the
+    first part begins at frame 0 and the last ends at the last frame, whatever
+    the seconds say. That is what makes it impossible for a cut to drop or
+    repeat a single sample. A start that is not after the one before it, or
+    that is not inside the recording, means the server's parts do not fit this
+    audio - refused, never guessed at.
+    """
+    if not starts:
+        raise ArchiveError("no parts to cut")
+    bounds = [0]
+    for index, seconds in enumerate(starts[1:], start=2):
+        try:
+            frame = int(round(float(seconds) * rate))
+        except (TypeError, ValueError):
+            raise ArchiveError(f"part {index} has no usable start: {seconds!r}")
+        if frame <= bounds[-1] or frame >= total_frames:
+            raise ArchiveError(
+                f"part {index} starts at {seconds}s, which does not fit a "
+                f"{total_frames / rate:.3f}s recording after the part before it")
+        bounds.append(frame)
+    bounds.append(total_frames)
+    return [(bounds[i], bounds[i + 1]) for i in range(len(starts))]
+
+
+def part_bytes(frames: int, fmt: WavFormat) -> int:
+    """Size of a part's WAV: one header plus its frames."""
+    return WAV_HEADER_BYTES + frames * fmt.frame_bytes
+
+
+def cut_wav(source: Path, start_frame: int, end_frame: int,
+            destination: Path) -> JoinResult:
+    """
+    Frames [start_frame, end_frame) of `source` as their own WAV, written to a
+    temporary file, forced to disk, renamed, and hashed from the disk - the same
+    care as join_wav.
+    """
+    tmp = destination.with_suffix(destination.suffix + ".partial")
+    try:
+        with wave.open(str(source), "rb") as src:
+            params = (src.getnchannels(), src.getsampwidth(), src.getframerate())
+            if not 0 <= start_frame < end_frame <= src.getnframes():
+                raise ArchiveError(f"cut {start_frame}-{end_frame} is outside the "
+                                   f"recording ({src.getnframes()} frames)")
+            src.setpos(start_frame)
+            with wave.open(str(tmp), "wb") as out:
+                out.setnchannels(params[0])
+                out.setsampwidth(params[1])
+                out.setframerate(params[2])
+                remaining = end_frame - start_frame
+                while remaining > 0:
+                    chunk = src.readframes(min(65536, remaining))
+                    if not chunk:
+                        raise ArchiveError("the recording ended before the cut did")
+                    out.writeframes(chunk)
+                    remaining -= len(chunk) // (params[0] * params[1])
+        with open(tmp, "rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, destination)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    frames = end_frame - start_frame
+    return JoinResult(path=destination, sha256=sha256_file(destination),
+                      bytes=destination.stat().st_size,
+                      duration_seconds=frames / params[2] if params[2] else 0.0,
+                      frames=frames)
+
+
+# ============================================================
 # Manifest and daily index
 # ============================================================
 
-def write_manifest(audio_path: Path, session: Dict[str, Any], result: JoinResult) -> Path:
+def write_manifest(audio_path: Path, session: Dict[str, Any], result: JoinResult,
+                   derived_from: Optional[Dict[str, Any]] = None) -> Path:
     """
     A self-describing record beside the audio.
 
@@ -342,12 +448,49 @@ def write_manifest(audio_path: Path, session: Dict[str, Any], result: JoinResult
         # The agent's manifest carries the full signed chain.
         "agent_manifest": session.get("manifest"),
     }
+    if derived_from:
+        # One consultation cut from a longer recording: which recording, which
+        # frames, and the fingerprint of the whole joined audio, so the cut can
+        # be checked against the chain without the database.
+        manifest["derived_from"] = derived_from
 
     path = audio_path.with_suffix(".manifest.json")
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
     return path
+
+
+def record_local_release(manifest_path: Path, *, released_at: str,
+                         copy_object_key: str, sha256: str) -> Path:
+    """
+    Note in the manifest that the WAV beside it has left this disk, and where
+    the copy that replaces it is. Written before the WAV is deleted, so the
+    folder never holds a missing file it cannot explain.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        manifest = {}
+    manifest["local_audio"] = {
+        "status": "released",
+        "released_at": released_at,
+        "cloud_copy": copy_object_key,
+        "sha256": sha256,
+        "restore": "python restore.py restore <downloaded copy> <folder>",
+    }
+    tmp = manifest_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, manifest_path)
+    return manifest_path
+
+
+def local_audio_released(manifest_path: Path) -> bool:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (manifest.get("local_audio") or {}).get("status") == "released"
 
 
 def clinical_json_path(audio_path: Path) -> Path:
@@ -386,11 +529,14 @@ def update_day_index(directory: Path) -> Path:
             continue
         entries.append({
             "session_id": data.get("session_id"),
+            "part_no": (data.get("derived_from") or {}).get("part_no"),
             "patient_ref": data.get("patient_ref"),
             "file": data.get("archive", {}).get("filename"),
             "opened_at": data.get("opened_at"),
             "duration_seconds": data.get("archive", {}).get("duration_seconds"),
             "sha256": data.get("archive", {}).get("sha256"),
+            "local_audio": (data.get("local_audio") or {}).get("status", "present"),
+            "cloud_copy": (data.get("local_audio") or {}).get("cloud_copy"),
         })
 
     index = {
@@ -429,7 +575,8 @@ def ensure_space(root: Path, needed: int, *, headroom: int) -> None:
 
 
 __all__ = [
-    "ArchiveError", "JoinResult", "archive_filename", "clinical_json_path",
+    "ArchiveError", "JoinResult", "WavFormat", "archive_filename", "clinical_json_path",
+    "cut_wav", "part_bytes", "part_frames", "wav_format",
     "expected_join_bytes", "free_destination", "ensure_space", "free_bytes",
     "join_wav", "local_times", "name_for", "relative_path", "session_directory",
     "sha256_bytes", "sha256_file", "update_day_index", "write_clinical_json",

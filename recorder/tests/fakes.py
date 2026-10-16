@@ -64,8 +64,8 @@ class ScriptedUploader:
         outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
         if outcome.status == "granted":
             session.record_authorised("jti-test", outcome.confirmation)
-        elif outcome.status == "refused":
-            session.record_authorisation_refused(outcome.code)
+        elif outcome.status == "held":
+            session.record_authorisation_held(outcome.code)
         return outcome
 
     async def notify_pause(self, session, entry):

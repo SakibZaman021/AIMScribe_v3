@@ -26,6 +26,11 @@ CODES: Dict[str, Tuple[int, str]] = {
     # Appendix A.1 and A.2 - the codes CMED sees for its two commands.
     "RECORDING_STARTED": (200, "Recording started."),
     "RECORDING_PROVISIONAL": (202, "Recording. Checking permission with the server."),
+    # No longer sent: a patient opened while a recording runs unarmed is
+    # answered RECORDING_STARTED / RECORDING_PROVISIONAL with "continued", which
+    # CMED's finished page already handles. Kept so an old reply still parses.
+    "PATIENT_NOTED": (202, "Recording continues. The prescription decides whose "
+                           "consultation this is."),
     "GATE_ARMED": (200, "This consultation will end when the next patient is opened."),
     "GATE_ALREADY_ARMED": (200, "This consultation was already marked as finished."),
     "MISSING_FIELD": (400, "A required field is missing or not in the expected format."),
@@ -34,6 +39,9 @@ CODES: Dict[str, Tuple[int, str]] = {
     "CLINIC_MISMATCH": (401, "This PC is registered to a different clinic."),
     "ORIGIN_NOT_ALLOWED": (403, "This page is not allowed to control the recorder."),
     "DOCTOR_NOT_AT_CLINIC": (404, "This doctor is not registered at this clinic."),
+    # No longer sent (see PATIENT_NOTED). Refusing a click stopped CMED's page
+    # for that patient - no API 2 - and locked a follow-up that has no
+    # prescription to build. Kept so a page written against it still parses.
     "GATE_NOT_ARMED": (409, "The current consultation has not been completed yet."),
     "SESSION_ALREADY_ACTIVE": (409, "This consultation is already being recorded."),
     "NO_ACTIVE_SESSION": (409, "Nothing is being recorded."),

@@ -38,6 +38,11 @@ from core.crypto import ChainEntry, DeviceKey
 logger = logging.getLogger(__name__)
 
 JOURNAL_NAME = "journal.jsonl"
+# The clip being assembled, kept encrypted on disk every few seconds, so a power
+# cut loses seconds rather than the minute held in memory. Records are
+# [4-byte big-endian length][spool blob]; record 0 is a small JSON header.
+PARTIAL_NAME = "partial.aimspl"
+WAV_HEADER_BYTES = 44
 SEGMENT_SUFFIX = ".aimspl"
 SPOOL_KEY_NAME = "spool.key"
 
@@ -174,11 +179,14 @@ class SessionSpool:
         self.reported_entries: set = set()
 
         # SRS 3.2 §5: a consultation records before it is authorised, and
-        # nothing is sent until the server has granted it. A hard refusal
-        # deletes it (SRS-GRT-08). Sessions from before v3 carry no trigger and
+        # nothing is sent until the server has granted it. A refusal from the
+        # server holds it here and it is asked again later: a misconfigured
+        # server, a clinic not yet mapped or a key pair out of step must never
+        # cost a real consultation. Sessions from before v3 carry no trigger and
         # load as granted, so they upload exactly as they always did.
-        self.authorisation = "granted"        # pending | granted | refused
-        self.refusal_code = ""
+        self.authorisation = "granted"        # pending | granted
+        self.hold_code = ""                   # why the server last said no
+        self.held_at: Optional[float] = None  # in memory: a restart asks at once
         self.grant_jti: Optional[str] = None
         self.confirmation = ""                # as the grant or the server last said
         # The patient did not consent (SRS §7.8a): nothing is uploaded, local
@@ -340,9 +348,12 @@ class SessionSpool:
                     spool.authorisation = "granted"
                     spool.grant_jti = record.get("grant_jti")
                     spool.confirmation = record.get("confirmation", "")
-                elif kind == "authorisation_refused":
-                    spool.authorisation = "refused"
-                    spool.refusal_code = record.get("code", "")
+                elif kind in ("authorisation_held", "authorisation_refused"):
+                    # "refused" is what earlier versions wrote just before
+                    # deleting; anything still on disk under it is held now.
+                    spool.hold_code = record.get("code", "")
+                elif kind == "reassigned":
+                    spool.meta["reassigned_to"] = record.get("to") or {}
                 elif kind == "confirmation":
                     spool.confirmation = record.get("state", "")
                 elif kind == "refused":
@@ -458,6 +469,98 @@ class SessionSpool:
                         seq_no, self.session_id, duration, len(audio))
             return segment
 
+    # ---- the clip in progress ----
+
+    def write_partial(self, kind: str, data: bytes, started_at: datetime) -> None:
+        """
+        Keep the clip being assembled on disk, encrypted. Called on the segmenter
+        thread every few seconds: "append" adds the newest audio, "reset" starts
+        the file again with what remains after a clip was sealed (nothing at all
+        removes it). Every write is fsync'd: this file exists for power cuts.
+        """
+        path = self.directory / PARTIAL_NAME
+        with self._lock:
+            if kind == "reset":
+                if not data:
+                    path.unlink(missing_ok=True)
+                    self._partial_records = 0
+                    return
+                self._partial_records = 0
+                body = self._partial_record(self._partial_header(started_at))
+                body += self._partial_record(data)
+                _atomic_write(path, body)
+                return
+            if not path.exists():
+                self._partial_records = 0
+                record = self._partial_record(self._partial_header(started_at))
+            else:
+                record = b""
+            record += self._partial_record(data)
+            with open(path, "ab") as handle:
+                handle.write(record)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def _partial_header(self, started_at: datetime) -> bytes:
+        return json.dumps({"started_at": crypto.iso_utc(started_at),
+                           "seq_no": max(self.segments, default=0) + 1}).encode()
+
+    def _partial_record(self, plaintext: bytes) -> bytes:
+        n = getattr(self, "_partial_records", 0)
+        blob = crypto.encrypt_spool_blob(
+            self._spool_key, plaintext,
+            associated=f"{self.session_id}:partial:{n}".encode("ascii"))
+        self._partial_records = n + 1
+        return struct.pack(">I", len(blob)) + blob
+
+    def read_partial(self):
+        """
+        What the clip in progress held when the process stopped, as
+        (start of the unsealed audio, pcm), or None. A record cut short by a
+        power cut, or one that fails authentication, ends the read: everything
+        before it is kept.
+        """
+        path = self.directory / PARTIAL_NAME
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        records, offset, n = [], 0, 0
+        while offset + 4 <= len(raw):
+            (length,) = struct.unpack(">I", raw[offset:offset + 4])
+            blob = raw[offset + 4:offset + 4 + length]
+            if len(blob) < length:
+                break                                   # torn by the power cut
+            try:
+                records.append(crypto.decrypt_spool_blob(
+                    self._spool_key, blob,
+                    associated=f"{self.session_id}:partial:{n}".encode("ascii")))
+            except ValueError:
+                break
+            offset += 4 + length
+            n += 1
+        if not records:
+            return None
+        try:
+            header = json.loads(records[0])
+            started = _parse_iso(header.get("started_at")) or datetime.now(timezone.utc)
+            seq_no = int(header.get("seq_no", 0))
+        except (ValueError, TypeError):
+            return None
+        pcm = b"".join(records[1:])
+        # Sealed, but the process stopped before this file was started again:
+        # the front of it is already in the chain. Keep only what follows.
+        sealed = self.segments.get(seq_no)
+        if sealed is not None:
+            pcm = pcm[max(0, sealed.byte_length - WAV_HEADER_BYTES):]
+            started = sealed.captured_end_at or started
+        width = self.audio["sample_width"] * self.audio["channels"]
+        pcm = pcm[:len(pcm) - len(pcm) % max(1, width)]
+        return (started, pcm) if pcm else None
+
+    def clear_partial(self) -> None:
+        (self.directory / PARTIAL_NAME).unlink(missing_ok=True)
+
     def read_segment(self, seq_no: int) -> bytes:
         """Decrypt one segment and re-verify its hash before handing it to the uploader."""
         segment = self.segments[seq_no]
@@ -543,12 +646,42 @@ class SessionSpool:
             self._append_journal({"rec": "authorised", "grant_jti": grant_jti,
                                   "confirmation": confirmation, "at": time.time()})
 
-    def record_authorisation_refused(self, code: str) -> None:
+    def record_authorisation_held(self, code: str) -> bool:
+        """The server said no. Kept, and asked again later. True the first time."""
         with self._lock:
-            self.authorisation = "refused"
-            self.refusal_code = code
-            self._append_journal({"rec": "authorisation_refused", "code": code,
-                                  "at": time.time()})
+            first = self.hold_code != code
+            self.hold_code = code
+            self.held_at = time.time()
+            if first:
+                self._append_journal({"rec": "authorisation_held", "code": code,
+                                      "at": self.held_at})
+            return first
+
+    def reassign(self, *, to_fields: Dict[str, str], patient_opened_at: datetime,
+                 at: Optional[datetime] = None) -> ChainEntry:
+        """
+        The prescription was built for another patient opened during this
+        recording. The recording - all of it - becomes theirs.
+
+        The opening fields stay as they were: the server opened the session
+        under them, and its grant names them. The move is a signed entry the
+        server applies when it arrives, in chain order, like a pause.
+        """
+        with self._lock:
+            trigger = dict(self.meta.get("trigger") or {})
+            from_fields = trigger or {
+                "patient_id": self.meta.get("patient_ref", ""),
+                "doctor_id": self.meta.get("doctor_id", ""),
+                "hospital_id": self.meta.get("hospital_id", ""),
+            }
+            entry = self.append_chain_entry("reassign", crypto.reassign_payload(
+                from_fields=from_fields, to_fields=to_fields,
+                patient_opened_at=patient_opened_at,
+                at=at or datetime.now(timezone.utc)))
+            self.meta["reassigned_to"] = dict(to_fields)
+            self._append_journal({"rec": "reassigned", "to": dict(to_fields),
+                                  "entry_no": entry.entry_no})
+            return entry
 
     def record_confirmation(self, state: str) -> None:
         with self._lock:
@@ -645,7 +778,7 @@ class SessionSpool:
 
     def pending_notifications(self) -> List[ChainEntry]:
         """
-        Pause and resume entries the backend has not acknowledged.
+        Pause, resume, reassign and marker entries the backend has not acknowledged.
 
         These are chain links, not status updates. If one is missing, every entry
         after it fails verification - the backend sees a prev_hash that does not
@@ -654,7 +787,7 @@ class SessionSpool:
         """
         with self._lock:
             return [e for e in self.chain
-                    if e.entry_type in ("pause", "resume")
+                    if e.entry_type in ("pause", "resume", "reassign", "marker")
                     and e.entry_no not in self.reported_entries]
 
     def mark_close_reported(self) -> None:
@@ -729,6 +862,12 @@ class SessionSpool:
         describing a segment file that was never written, or vice versa.
         """
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # After a power cut the last line can be half written, with no newline.
+        # Appended straight after it, this record would be glued to the torn
+        # fragment and both skipped on the next load - and the first thing
+        # written after a crash is the recovery pause, a chain entry whose loss
+        # breaks every hash after it.
+        line = ends_open(self._journal_path) + line
         with open(self._journal_path, "a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
@@ -773,6 +912,7 @@ class Spool:
         )
 
     def open_session(self, *, device_key: DeviceKey, **kwargs) -> SessionSpool:
+        self._size_cache = None
         return SessionSpool.create(self.root, device_key=device_key,
                                    spool_key=self._key, **kwargs)
 
@@ -803,7 +943,17 @@ class Spool:
             logger.warning("Recovered %s spooled session(s) from a previous run", len(recovered))
         return recovered
 
-    def total_bytes(self) -> int:
+    # How long a measured spool size is reused. Status is asked several times a
+    # second - by the overlay and by CMED's page - and each answer used to walk
+    # every session folder on disk twice; with a day of uploads waiting, that is
+    # thousands of files a second on a modest laptop, exactly during an outage.
+    SIZE_CACHE_SECONDS = 5.0
+
+    def total_bytes(self, *, fresh: bool = False) -> int:
+        cached = getattr(self, "_size_cache", None)     # cleared on open and remove
+        now = time.monotonic()
+        if not fresh and cached is not None and now - cached[1] < self.SIZE_CACHE_SECONDS:
+            return cached[0]
         total = 0
         for directory in self.root.iterdir():
             if not directory.is_dir():
@@ -813,6 +963,7 @@ class Spool:
                     total += item.stat().st_size
                 except OSError:
                     pass
+        self._size_cache = (total, now)
         return total
 
     def pressure(self) -> str:
@@ -825,12 +976,14 @@ class Spool:
         return "ok"
 
     def has_capacity(self, needed_bytes: int) -> bool:
-        return self.total_bytes() + needed_bytes <= self.max_bytes
+        # Measured afresh: this decides whether a consultation may start.
+        return self.total_bytes(fresh=True) + needed_bytes <= self.max_bytes
 
     def discard(self, session: SessionSpool) -> None:
         """Remove a fully archived and purged session directory."""
         if session.is_complete:
             _remove_tree(session.directory)
+            self._size_cache = None
 
     def remove(self, session: SessionSpool, *, reason: str) -> None:
         """
@@ -840,11 +993,22 @@ class Spool:
         """
         logger.warning("Removing session %s from the spool: %s", session.session_id, reason)
         _remove_tree(session.directory)
+        self._size_cache = None
 
 
 # ============================================================
 # Helpers
 # ============================================================
+
+def ends_open(path: Path) -> str:
+    """A newline if the file's last line was cut short, else nothing."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return "" if handle.read(1) == b"\n" else "\n"
+    except (OSError, ValueError):
+        return ""                                # missing or empty
+
 
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write to a temporary file, fsync it, then rename into place."""

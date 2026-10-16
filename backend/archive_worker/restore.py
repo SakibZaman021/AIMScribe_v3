@@ -3,13 +3,21 @@ Bring a recording back from the copy bucket (`SRS-STO-06`, `AT-74`).
 
 The cloud copy is only worth keeping if it can be turned back into the archive,
 so that path is a tool, not a plan. Given files downloaded from the copy bucket,
-this decrypts them, decodes the FLAC back to WAV, and says whether the result
-matches what the archive says it should be.
+this decrypts them and says whether the result matches what the archive says it
+should be. Audio copies are the raw WAV, so a decrypted copy is the archived
+file itself. Copies made earlier as FLAC are decoded back to WAV as well.
 
     set AIMS_COPY_KEY=<the UIU key>
-    python restore.py restore  visit.v1.flac.enc  D:\\restored
+    python restore.py restore  visit.v1.wav.enc  D:\\restored
     python restore.py restore  copies\\2026-09-13  D:\\restored      (a whole folder)
     python restore.py check    D:\\restored\\visit.wav  <sha256 from the catalogue>
+
+A recording that held several consultations is archived, and copied, as one
+file per patient. To get the whole recording back - to check it against the
+chain, or to cut it differently - join the parts in order:
+
+    python restore.py join  D:\\restored\\whole.wav  part1.wav part2.wav part3.wav
+                            --sha256 <the recording's sha256 from the catalogue>
 
 The key is read from `AIMS_COPY_KEY`, the same value the worker uses. Without it
 nothing can be restored, which is the point of encrypting before upload.
@@ -21,6 +29,7 @@ import os
 import sys
 from pathlib import Path
 
+import archive
 import cloudcopy
 from cloudcopy import CopyError
 
@@ -33,7 +42,10 @@ def _key() -> bytes:
 
 
 def restore_one(sealed: Path, into: Path, key: bytes) -> Path:
-    """One `.enc` object back to the file it was made from - WAV for audio."""
+    """
+    One `.enc` object back to the file it was made from. A `.wav.enc` is the
+    WAV already; only an older `.flac.enc` needs decoding.
+    """
     into.mkdir(parents=True, exist_ok=True)
     name = sealed.name[:-len(".enc")] if sealed.name.endswith(".enc") else sealed.name
     plain = cloudcopy.decrypt_file(sealed, into / name, key)
@@ -57,6 +69,16 @@ def restore_one(sealed: Path, into: Path, key: bytes) -> Path:
     return wav
 
 
+def join_parts(parts, destination: Path):
+    """
+    Consultation files back into the recording they were cut from. The parts
+    are contiguous, so this is the joined WAV byte for byte, and its sha256 is
+    the one the catalogue and the chain record for the whole recording.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return archive.join_wav(list(parts), destination)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -70,7 +92,22 @@ def main(argv=None) -> int:
     check.add_argument("path", type=Path)
     check.add_argument("sha256")
 
+    join = commands.add_parser("join", help="join a recording's parts back into one WAV")
+    join.add_argument("destination", type=Path)
+    join.add_argument("parts", type=Path, nargs="+")
+    join.add_argument("--sha256", default="")
+
     args = parser.parse_args(argv)
+
+    if args.command == "join":
+        result = join_parts(args.parts, args.destination)
+        expected = args.sha256.strip().lower()
+        same = not expected or result.sha256.hex() == expected
+        print(f"{args.destination.name}: {len(args.parts)} part(s), "
+              f"{result.duration_seconds:.1f}s, sha256 {result.sha256.hex()}"
+              + ("" if not expected else
+                 ("  matches" if same else f"  DOES NOT MATCH {expected}")))
+        return 0 if same else 1
 
     if args.command == "check":
         actual = cloudcopy.sha256_file(args.path)

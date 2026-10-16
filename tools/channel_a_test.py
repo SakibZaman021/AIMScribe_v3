@@ -16,8 +16,11 @@ the server deletes it after 24 hours on its own - nothing to clean up by hand.
 
 What it proves, beyond "the messages parse":
   * a wrong page address is refused before anything else happens
-  * a repeated start for the same consultation is SESSION_ALREADY_ACTIVE, which
-    is what makes it safe for a page to resend start until it is sure
+  * a repeated start, or a start for another patient, before the prescription
+    is accepted the way any start is (RECORDING_STARTED / _PROVISIONAL, with
+    "continued": true and the running session_id) - the recording carries on,
+    and CMED's page goes on to send that patient's API 2 as usual
+  * after the prescription, the same patient again is SESSION_ALREADY_ACTIVE
   * a dropped socket does not stop a recording - on reconnect the recorder is
     still recording the same session, and says so in its first message
 """
@@ -130,14 +133,24 @@ async def main(origin, as_json):
         return report(run, as_json)
 
     # 5. THE RECOVERY PROPERTY: resending the same start is harmless
+    def continued(reply):
+        d = reply.get("data") or {}
+        ok = (reply.get("code") in ("RECORDING_STARTED", "RECORDING_PROVISIONAL")
+              and d.get("continued") is True and d.get("session_id") == session_id)
+        return "accepted, same recording" if ok else f"{reply.get('code')} {d}"
+
     r = await send(ws, {"command": "start", "trigger": visit}, "t-again")
-    run.check("API 1 again, same five fields (a safe retry)", "SESSION_ALREADY_ACTIVE",
-              r.get("code"))
+    run.check("API 1 again, same five fields (a safe retry)", "accepted, same recording",
+              continued(r))
 
     other = dict(visit, patient_id=f"TEST_CHB_{stamp}")
     r = await send(ws, {"command": "start", "trigger": other}, "t-gate")
-    run.check("API 1 for another patient before the prescription", "GATE_NOT_ARMED",
-              r.get("code"))
+    # Accepted, not refused: the recording carries on and a signed marker notes
+    # the click; the server decides later whose consultation each part was.
+    run.check("API 1 for another patient before the prescription",
+              "accepted, same recording", continued(r))
+    r = await send(ws, {"command": "start", "trigger": visit}, "t-back")
+    run.check("API 1 back to the first patient", "accepted, same recording", continued(r))
 
     await asyncio.sleep(3)
 
@@ -163,6 +176,10 @@ async def main(origin, as_json):
     r = await send(ws, {"command": "prescription_built", "patient_id": visit["patient_id"],
                         "session_id": session_id}, "t-arm2")
     run.check("API 3a again", "GATE_ALREADY_ARMED", r.get("code"))
+
+    r = await send(ws, {"command": "start", "trigger": visit}, "t-armed-again")
+    run.check("API 1 for the same patient after the prescription", "SESSION_ALREADY_ACTIVE",
+              r.get("code"))
 
     r = await send(ws, {"command": "status"}, "t-status")
     d = r.get("data") or {}

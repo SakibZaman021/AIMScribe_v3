@@ -32,7 +32,7 @@ import ssl
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -42,11 +42,14 @@ from core.spool import COMMITTED, PENDING, RECEIPTED, SessionSpool, Spool
 
 logger = logging.getLogger(__name__)
 
+# Returned by a grant lookup that must be tried again later.
+_RETRY = object()
+
 
 @dataclass
 class AuthOutcome:
     """The server's answer to a grant request."""
-    status: str                         # granted | pending | refused
+    status: str                         # granted | pending | held | refused
     code: str
     message: str = ""
     grant: Optional[crypto.Grant] = None
@@ -130,6 +133,17 @@ class UploadManager:
         # SRS 3.2: grants from the server, checked here.
         self._grant_key = None
         self._grant_guard = crypto.GrantGuard()
+        # (session, entry_no) -> the grant minted for a reassign, so a retried
+        # delivery reuses it rather than minting another.
+        self._reassign_grants: Dict[Tuple[str, int], str] = {}
+        # A clicked patient's grant, per marker: jti, or None once given up on.
+        self._marker_grants: Dict[Tuple[str, int], Optional[str]] = {}
+        # When the server first said no to one, so the marker is not held for ever.
+        self._marker_refused_at: Dict[Tuple[str, int], float] = {}
+        # What this PC saw while offline, and every alert (core.health_log).
+        # Set by the runtime; None in tests that do not need it.
+        self.health = None
+        self._health_lock: Optional[asyncio.Lock] = None
         self._auth_locks: Dict[str, asyncio.Lock] = {}
         self._stall_alerted = False
 
@@ -447,17 +461,33 @@ class UploadManager:
 
     async def _notify_chain_entry(self, session: SessionSpool, entry) -> bool:
         """
-        Deliver one pause or resume entry, and remember that it landed.
+        Deliver one pause, resume, reassign or marker entry, and remember that
+        it landed.
 
         Retried by the drain loop until it does. A pause is a link in the hash
         chain, so losing it is not a cosmetic loss of a dashboard update - it
         invalidates every entry recorded after it.
         """
-        endpoint = "/session/pause" if entry.entry_type == "pause" else "/session/resume"
-        result = await self._post(endpoint, {
-            "session_id": session.session_id,
-            "chain_entry": entry.to_wire(),
-        }, attempts=1)
+        body: Dict[str, Any] = {"session_id": session.session_id,
+                                "chain_entry": entry.to_wire()}
+        if entry.entry_type == "reassign":
+            # The recording moves to the patient the prescription was built
+            # for, so the server needs that patient's grant, as for any start.
+            jti = await self._reassign_grant(session, entry)
+            if jti is None:
+                return False
+            body["grant_jti"] = jti
+        elif entry.entry_type == "marker":
+            # A patient clicked during the recording gets a grant of their own,
+            # so the server can tie that patient's API 2 and 3b to it.
+            jti = await self._marker_grant(session, entry)
+            if jti is _RETRY:
+                return False
+            body["grant_jti"] = jti
+        endpoint = {"pause": "/session/pause", "resume": "/session/resume",
+                    "reassign": "/session/reassign",
+                    "marker": "/session/marker"}[entry.entry_type]
+        result = await self._post(endpoint, body, attempts=1)
         if result is None:
             return False
 
@@ -472,6 +502,91 @@ class UploadManager:
 
         session.mark_entry_reported(entry.entry_no)
         return True
+
+    async def _reassign_grant(self, session: SessionSpool, entry) -> Optional[str]:
+        """
+        A grant for the patient a reassign moves the recording to. None until
+        the server gives one; a "no" holds the session as for any grant.
+        """
+        known = self._reassign_grants.get((session.session_id, entry.entry_no))
+        if known:
+            return known
+        if self._holding(session):
+            return None
+        target = dict(entry.payload.get("to") or {})
+        status, body = await self._request_raw("POST", "/grant/mint", target)
+        if status is None or status >= 500 or status in (408, 429):
+            return None
+        if status >= 400:
+            body = body or {}
+            self._hold(session, body.get("code") or "AUTHORISATION_FAILED",
+                       body.get("message", ""))
+            return None
+        try:
+            grant = self._verified_grant(session, target, body or {})
+        except crypto.GrantError as exc:
+            logger.critical("Reassign grant for %s rejected: %s", session.session_id, exc)
+            self._hold(session, "AUTHORISATION_FAILED", str(exc))
+            return None
+        self._reassign_grants[(session.session_id, entry.entry_no)] = grant.jti
+        return grant.jti
+
+    async def _marker_grant(self, session: SessionSpool, entry):
+        """
+        A grant for the patient a `patient_opened` marker names, the first time
+        that patient is opened in this recording; None when none is needed (the
+        recording's own patient, a return, a prescription) or none can be had.
+
+        _RETRY while the server cannot be reached. A "no" is asked again for
+        the usual hold period - the cause is often being fixed on the server -
+        and then the marker is sent without a grant, because the chain behind
+        it must not wait for ever on one patient's paperwork.
+        """
+        payload = entry.payload or {}
+        patient = dict(payload.get("patient") or {})
+        if payload.get("event") != "patient_opened" or not patient.get("patient_id"):
+            return None
+        opening = session.meta.get("trigger") or {}
+        if patient["patient_id"] == (opening.get("patient_id") or session.meta.get("patient_ref")):
+            return None
+        if any(e.entry_type == "marker" and e.entry_no < entry.entry_no
+               and (e.payload.get("patient") or {}).get("patient_id") == patient["patient_id"]
+               for e in session.chain):
+            return None
+        key = (session.session_id, entry.entry_no)
+        if key in self._marker_grants:
+            return self._marker_grants[key]
+
+        status, body = await self._request_raw("POST", "/grant/mint", patient)
+        if status is None or status >= 500 or status in (408, 429):
+            return _RETRY
+        problem = None
+        if status >= 400:
+            problem = (body or {}).get("code") or f"HTTP {status}"
+        else:
+            try:
+                grant = self._verified_grant(session, patient, body or {})
+            except crypto.GrantError as exc:
+                problem = str(exc)
+        if problem is None:
+            self._marker_grants[key] = grant.jti
+            self._marker_refused_at.pop(key, None)
+            return grant.jti
+
+        first = self._marker_refused_at.setdefault(key, time.time())
+        wait = float(getattr(self.cfg.security, "authorise_hold_retry_seconds", 300.0))
+        if time.time() - first < wait:
+            logger.warning("No grant yet for a patient clicked during %s (%s); will ask again",
+                           session.session_id, problem)
+            return _RETRY
+        logger.warning("Sending a marker of %s without a grant: %s", session.session_id, problem)
+        self._emit("integrity_alert", {
+            "session_id": session.session_id,
+            "alert_type": "marker_without_grant",
+            "detail": f"no grant for a patient clicked during the recording: {problem}",
+        })
+        self._marker_grants[key] = None
+        return None
 
     async def notify_pause(self, session: SessionSpool, entry) -> bool:
         """
@@ -536,6 +651,33 @@ class UploadManager:
 
     async def heartbeat(self, status: Dict[str, Any]) -> bool:
         return await self._post("/heartbeat", status, attempts=1) is not None
+
+    async def deliver_health(self) -> int:
+        """
+        Send the health log, oldest first, and delete what the server stored.
+        Called after every heartbeat that landed and whenever an alert is
+        raised, so an alert reaches the dashboard at once when it can.
+        """
+        if self.health is None or self._http is None:
+            return 0
+        if self._health_lock is None:
+            self._health_lock = asyncio.Lock()
+        sent = 0
+        async with self._health_lock:
+            while True:
+                batch = self.health.pending(200)
+                if not batch:
+                    return sent
+                result = await self._post("/device/health", {"entries": batch}, attempts=1)
+                if not result or result.get("status") != "stored":
+                    return sent
+                last = result.get("last_seq")
+                if not isinstance(last, int):
+                    return sent
+                self.health.delivered(last)
+                sent += len(batch)
+                if len(batch) < 200:
+                    return sent
 
     # ---- receipts and deletion ----
 
@@ -614,7 +756,14 @@ class UploadManager:
 
             granted   verified grant stored; the session may upload
             pending   the server could not be reached; recording carries on
-            refused   a hard refusal; the session must be deleted (SRS-GRT-08)
+            held      the server said no; kept, asked again later
+            refused   only for a patient who did not consent
+
+        A "no" from the server deletes nothing. It used to: every 4xx and every
+        grant that failed verification erased the consultation on the laptop,
+        so one wrong key pair on a new server would have erased every recording
+        made against it. Now the audio waits on disk, the alert says why, and
+        the fix - a mapping, a key, a deployment - releases it.
 
         Serialised per session, so the live consultation and the upload loop
         can never mint two grants for the same recording.
@@ -625,8 +774,8 @@ class UploadManager:
         async with lock:
             if session.authorisation == "granted":
                 return AuthOutcome("granted", "GRANTED", "", None, session.confirmation)
-            if session.authorisation == "refused":
-                return AuthOutcome("refused", session.refusal_code or "AUTHORISATION_FAILED", "")
+            if self._holding(session):
+                return AuthOutcome("held", session.hold_code, "")
 
             trigger = dict(session.meta.get("trigger") or {})
             status, body = await self._request_raw("POST", "/grant/mint", trigger)
@@ -640,13 +789,13 @@ class UploadManager:
                 body = body or {}
                 code = body.get("code") or (
                     "DEVICE_NOT_ENROLLED" if status in (401, 403) else "AUTHORISATION_FAILED")
-                return self._refuse_authorisation(session, code, body.get("message", ""))
+                return self._hold(session, code, body.get("message", ""))
 
             try:
                 grant = self._verified_grant(session, trigger, body or {})
             except crypto.GrantError as exc:
                 logger.critical("Grant for %s rejected: %s", session.session_id, exc)
-                return self._refuse_authorisation(session, "AUTHORISATION_FAILED", str(exc))
+                return self._hold(session, "AUTHORISATION_FAILED", str(exc))
 
             confirmation = str((body or {}).get("confirmation") or "pending")
             session.record_authorised(grant.jti, confirmation)
@@ -656,15 +805,21 @@ class UploadManager:
             self.nudge()
             return AuthOutcome("granted", "GRANTED", "", grant, confirmation)
 
-    def _refuse_authorisation(self, session: SessionSpool, code: str,
-                              message: str) -> "AuthOutcome":
-        session.record_authorisation_refused(code)
-        self._emit("integrity_alert", {
-            "session_id": session.session_id,
-            "alert_type": "authorisation_refused",
-            "detail": code,
-        })
-        return AuthOutcome("refused", code, message)
+    def _holding(self, session: SessionSpool) -> bool:
+        """Asked recently and told no: wait before asking again."""
+        wait = float(getattr(self.cfg.security, "authorise_hold_retry_seconds", 300.0))
+        return session.held_at is not None and time.time() - session.held_at < wait
+
+    def _hold(self, session: SessionSpool, code: str, message: str) -> "AuthOutcome":
+        logger.warning("Server said no to %s (%s); audio kept, will ask again",
+                       session.session_id, code)
+        if session.record_authorisation_held(code):
+            self._emit("integrity_alert", {
+                "session_id": session.session_id,
+                "alert_type": "authorisation_held",
+                "detail": f"{code}: recording kept on this PC until the server accepts it",
+            })
+        return AuthOutcome("held", code, message)
 
     def _verified_grant(self, session: SessionSpool, trigger: Dict[str, Any],
                         body: Dict[str, Any]) -> crypto.Grant:
@@ -719,9 +874,10 @@ class UploadManager:
         """
         What must happen before a session may upload. True when it may.
 
-        A refused consultation is erased here and reported until acknowledged.
-        A session not yet authorised asks for its grant - unless it is the one
-        being recorded, which the controller authorises itself.
+        A consultation the patient refused is erased here and reported until
+        acknowledged - the only erasure. A session not yet authorised asks for
+        its grant - unless it is the one being recorded, which the controller
+        authorises itself - and one the server said no to waits and asks again.
         """
         if session.refused:
             session.delete_all_pieces()
@@ -730,17 +886,10 @@ class UploadManager:
                 await self._drop(session, "refusal delivered to the server")
             return False
 
-        if session.authorisation == "refused":
-            if not session.live:
-                await self._drop(session, f"authorisation refused ({session.refusal_code})")
-            return False
-
         if session.needs_authorisation:
             if session.live:
                 return False
             outcome = await self.authorise(session)
-            if outcome.status == "refused":
-                await self._drop(session, f"authorisation refused ({outcome.code})")
             return outcome.status == "granted"
         return True
 

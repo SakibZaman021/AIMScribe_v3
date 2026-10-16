@@ -291,7 +291,7 @@ class V2Repository:
                        quarantine_reason, sample_rate, channels, sample_width,
                        object_prefix, confirmation, grant_jti, file_stem,
                        local_start, local_end, copied_at, segments_deleted_at,
-                       json_stale
+                       json_stale, parts_count, parts_stale
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -626,17 +626,18 @@ class V2Repository:
                        -- The name the server gave this recording when it closed
                        -- (SRS-SES-05). The worker uses it as it stands, so the
                        -- audio, the JSON and the clinical database agree.
-                       s.file_stem, s.local_start, s.local_end, s.confirmation
+                       s.file_stem, s.local_start, s.local_end, s.confirmation,
+                       s.parts_count
                 FROM sessions s
                 WHERE s.closed_at IS NOT NULL
                   AND s.archived_at IS NULL
                   AND s.quarantine_reason IS NULL
                   AND s.status <> 'quarantined'
                   AND s.protocol_version >= 2
-                  -- SRS 3.2 §5.6: only confirmed recordings enter the dataset;
-                  -- sessions from protocol-2 recorders are 'legacy' and archive
-                  -- as before.
-                  AND s.confirmation IN ('confirmed', 'legacy')
+                  -- Every recording a CMED trigger started enters the dataset,
+                  -- with or without API 2 (which attaches later). Refused and
+                  -- erased sessions never do.
+                  AND s.confirmation IN ('confirmed', 'legacy', 'pending', 'unconfirmed')
                   AND EXISTS (SELECT 1 FROM segments g
                                WHERE g.session_id = s.session_id
                                  AND g.state = 'committed')
@@ -672,10 +673,11 @@ class V2Repository:
             rows = await conn.fetch("""
                 SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
                        file_stem, archive_relpath, archive_sha256, archive_bytes,
-                       grant_jti, confirmation
+                       grant_jti, confirmation, parts_count
                   FROM sessions
                  WHERE archived_at IS NOT NULL
                    AND copied_at IS NULL
+                   AND NOT parts_stale
                    AND quarantine_reason IS NULL
                    AND archive_relpath IS NOT NULL
                  ORDER BY archived_at
@@ -691,7 +693,7 @@ class V2Repository:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, hospital_id, doctor_id, session_date, file_stem,
-                       archive_relpath, grant_jti
+                       archive_relpath, grant_jti, parts_count
                   FROM sessions
                  WHERE json_stale
                    AND archived_at IS NOT NULL
@@ -795,18 +797,40 @@ class V2Repository:
         """
         The recording of this visit, if one was granted and opened. Used when a
         prescription arrives late, to mark its JSON for writing again.
+
+        Only while the recording is still this visit's: after a reassign its
+        first grant still names it, but the recording now belongs to the
+        patient the prescription was built for, and the wrong patient's late
+        records must not be attached to it.
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT s.session_id, s.archived_at, s.copied_at
                   FROM grant_authorisations g
                   JOIN sessions s ON s.session_id = g.session_id
-                 WHERE g.patient_id = $1 AND g.doctor_id = $2
+                 WHERE (s.grant_jti IS NULL OR s.grant_jti = g.jti
+                        OR EXISTS (SELECT 1 FROM session_clicks c
+                                    WHERE c.session_id = s.session_id
+                                      AND c.grant_jti = g.jti))
+                   AND g.patient_id = $1 AND g.doctor_id = $2
                    AND g.cmed_hospital_id = $3 AND g.start_time = $4
                    AND g.visit_date = $5
                  ORDER BY g.issued_at DESC LIMIT 1
             """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
                  visit.start_time, visit.day)
+            if row is None:
+                # Clicked during a recording whose grant never came (held, or
+                # the server was unreachable): the marker itself names the visit.
+                row = await conn.fetchrow("""
+                    SELECT s.session_id, s.archived_at, s.copied_at
+                      FROM session_clicks c
+                      JOIN sessions s ON s.session_id = c.session_id
+                     WHERE c.patient_id = $1 AND c.doctor_id = $2
+                       AND c.cmed_hospital_id = $3 AND c.start_time = $4
+                       AND c.visit_date = $5
+                     ORDER BY c.received_at DESC LIMIT 1
+                """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                     visit.start_time, visit.day)
         return dict(row) if row else None
 
     # ============================================================
@@ -899,6 +923,27 @@ class V2Repository:
         logger.warning("Integrity alert [%s/%s] session=%s: %s",
                        severity, alert_type, session_id, detail)
 
+    async def store_health(self, device_id, entries: List[Dict[str, Any]]) -> List[int]:
+        """
+        A recorder's health log, as it kept it while offline. Returns the seqs
+        stored for the first time: a resent batch stores nothing twice, and
+        only new alerts are raised.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                new = []
+                for e in entries:
+                    seq = await conn.fetchval("""
+                        INSERT INTO device_health_log (device_id, seq, kind, occurred_at, data)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (device_id, seq) DO NOTHING
+                        RETURNING seq
+                    """, device_id, e["seq"], e["kind"], e["at"],
+                         json.dumps(e["data"], ensure_ascii=False))
+                    if seq is not None:
+                        new.append(int(seq))
+                return new
+
     # ============================================================
     # Grants
     # ============================================================
@@ -956,6 +1001,24 @@ class V2Repository:
             row = await conn.fetchrow(
                 "SELECT * FROM grant_authorisations WHERE jti = $1", jti)
         return dict(row) if row else None
+
+    async def grants_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Every grant linked to this recording, oldest first."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM grant_authorisations WHERE session_id = $1
+                 ORDER BY issued_at
+            """, session_id)
+        return [dict(r) for r in rows]
+
+    async def reassign_session(self, session_id: str, *, patient_id: str,
+                               doctor_id: str) -> None:
+        """The recording now belongs to the patient its prescription was built for."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions SET patient_id = $2, doctor_id = $3, updated_at = now()
+                 WHERE session_id = $1
+            """, session_id, patient_id, doctor_id)
 
     async def link_authorisation(self, jti: str, session_id: str) -> None:
         async with self._pool.acquire() as conn:
@@ -1194,6 +1257,151 @@ class V2Repository:
                 VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
             """, visit.cmed_hospital_id, hospital_id, visit.patient_id, visit.doctor_id,
                  visit.start_time, visit.day, clinical_record_id))
+
+    # ============================================================
+    # Consultation parts: who each stretch of a recording belongs to
+    # ============================================================
+
+    async def record_click(self, session_id: str, *, entry_no: int, event: str,
+                           audio_seconds: float, occurred_at: datetime, visit,
+                           grant_jti: Optional[str]) -> None:
+        """One marker from the chain. A redelivered marker is stored once."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO session_clicks
+                    (session_id, entry_no, event, audio_seconds, occurred_at,
+                     patient_id, doctor_id, cmed_hospital_id, start_time, visit_date,
+                     grant_jti)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                ON CONFLICT (session_id, entry_no) DO UPDATE
+                   SET grant_jti = COALESCE(session_clicks.grant_jti, EXCLUDED.grant_jti)
+            """, session_id, entry_no, event, audio_seconds, occurred_at,
+                 visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day, grant_jti)
+
+    async def clicks_for(self, session_id: str) -> List[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT entry_no, event, audio_seconds, occurred_at, patient_id,
+                       doctor_id, cmed_hospital_id, start_time, visit_date, grant_jti
+                  FROM session_clicks WHERE session_id = $1
+                 ORDER BY audio_seconds, entry_no
+            """, session_id)
+        return [dict(r) for r in rows]
+
+    async def parts_for(self, session_id: str) -> List[Dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM consultation_parts WHERE session_id = $1 ORDER BY part_no
+            """, session_id)
+        return [dict(r) for r in rows]
+
+    async def store_parts(self, session_id: str, parts: List[Dict[str, Any]], *,
+                          keep_archive: bool) -> None:
+        """
+        The verdict for one recording. `keep_archive`: the cut is unchanged, so
+        the files already archived still stand and only the labels move.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                kept = {}
+                if keep_archive:
+                    for r in await conn.fetch("""
+                        SELECT part_no, archive_relpath, archive_sha256, archive_bytes,
+                               copied_at
+                          FROM consultation_parts WHERE session_id = $1
+                    """, session_id):
+                        kept[r["part_no"]] = r
+                await conn.execute(
+                    "DELETE FROM consultation_parts WHERE session_id = $1", session_id)
+                for part in parts:
+                    old = kept.get(part["part_no"])
+                    await conn.execute("""
+                        INSERT INTO consultation_parts
+                            (session_id, part_no, start_seconds, end_seconds,
+                             patient_id, doctor_id, cmed_hospital_id, start_time,
+                             visit_date, grant_jti, rule, needs_review, file_stem,
+                             local_start, local_end, archive_relpath, archive_sha256,
+                             archive_bytes, copied_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                                $16,$17,$18,$19)
+                    """, session_id, part["part_no"], part["start_seconds"],
+                         part["end_seconds"], part["patient_id"], part["doctor_id"],
+                         part["cmed_hospital_id"], part["start_time"], part["visit_date"],
+                         part["grant_jti"], part["rule"], part["needs_review"],
+                         part["file_stem"], part["local_start"], part["local_end"],
+                         old["archive_relpath"] if old else None,
+                         old["archive_sha256"] if old else None,
+                         old["archive_bytes"] if old else None,
+                         old["copied_at"] if old else None)
+                await conn.execute("""
+                    UPDATE sessions SET parts_count = $2, updated_at = now()
+                     WHERE session_id = $1
+                """, session_id, len(parts))
+
+    async def set_parts_stale(self, session_id: str, stale: bool) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET parts_stale = $2, updated_at = now() "
+                "WHERE session_id = $1", session_id, stale)
+
+    async def label_session(self, session_id: str, *, patient_id: str, doctor_id: str,
+                            grant_jti: Optional[str]) -> None:
+        """A recording that is one patient's, after the rules: name it theirs."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions SET patient_id = $2, doctor_id = $3,
+                                    grant_jti = COALESCE($4, grant_jti),
+                                    updated_at = now()
+                 WHERE session_id = $1
+            """, session_id, patient_id, doctor_id, grant_jti)
+
+    async def mark_part_archived(self, session_id: str, part_no: int, *, relpath: str,
+                                 sha256: bytes, byte_length: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE consultation_parts
+                   SET archive_relpath = $3, archive_sha256 = $4, archive_bytes = $5
+                 WHERE session_id = $1 AND part_no = $2
+            """, session_id, part_no, relpath, sha256, byte_length)
+
+    async def mark_part_copied(self, session_id: str, part_no: int) -> bool:
+        """Returns True once every part of the recording is copied."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE consultation_parts SET copied_at = now()
+                 WHERE session_id = $1 AND part_no = $2
+            """, session_id, part_no)
+            left = await conn.fetchval("""
+                SELECT count(*) FROM consultation_parts
+                 WHERE session_id = $1 AND copied_at IS NULL
+            """, session_id)
+        return int(left) == 0
+
+    async def archived_parts_for(self, session_id: str) -> List[Dict[str, Any]]:
+        """The part files a recut will rebuild the recording from."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT part_no, archive_relpath FROM consultation_parts
+                 WHERE session_id = $1 AND archive_relpath IS NOT NULL
+                 ORDER BY part_no
+            """, session_id)
+        return [dict(r) for r in rows]
+
+    async def pending_recut(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Archived recordings whose labels changed where the files are cut."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
+                       opened_at, closed_at, sample_rate, channels, sample_width,
+                       file_stem, archive_relpath, archive_sha256, archive_bytes
+                  FROM sessions
+                 WHERE parts_stale AND archived_at IS NOT NULL
+                   AND quarantine_reason IS NULL
+                 ORDER BY archived_at
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
 
     async def set_file_names(self, session_id: str, *, file_stem: str, local_start,
                              local_end) -> Optional[str]:

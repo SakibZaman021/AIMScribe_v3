@@ -17,6 +17,10 @@ Changes from v1 that matter:
   same as a three-minute one.
 * Stop is ordered: the capture loop is asked to finish, joined, and only then is
   the stream closed.
+* A microphone that goes mid-consultation - unplugged, or a driver that stops
+  delivering - is replaced by the Windows default, which is the PC's own
+  microphone once a USB one has gone. The recording carries on, and the
+  seconds lost are reported.
 """
 from __future__ import annotations
 
@@ -78,6 +82,11 @@ class AudioRecorder:
     # in step with it so this does not document a depth the system does not use.
     QUEUE_DEPTH = 2048
 
+    # How often the watchdog looks, and how often it tries again for a
+    # microphone when none can be opened.
+    WATCH_INTERVAL = 0.5
+    REOPEN_INTERVAL = 1.0
+
     def __init__(
         self,
         *,
@@ -88,6 +97,9 @@ class AudioRecorder:
         input_device_index: Optional[int] = None,
         on_chunk: Optional[Callable[[bytes], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
+        on_device_change: Optional[Callable[[str, float], None]] = None,
+        stall_seconds: float = 2.5,
+        preferred_name: str = "",
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -97,12 +109,25 @@ class AudioRecorder:
 
         self._on_chunk = on_chunk
         self._on_error = on_error
+        self._on_device_change = on_device_change
+        self.stall_seconds = stall_seconds
+        # Part of the clinic microphone's name ("Jabra"). Opened by name, so it
+        # records whether or not Windows has made it the default.
+        self.preferred_name = preferred_name
 
         self._pyaudio = None
         self._stream = None
         self._thread: Optional[threading.Thread] = None
+        self._watchdog: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._state_lock = threading.RLock()
+        # Each stream gets its own capture thread, numbered: a thread whose
+        # stream has been replaced sees a newer number and stops.
+        self._generation = 0
+        self._failed = False
+        self._last_read = 0.0
+        self._abandoned: list = []
+        self.device_name = "microphone"
 
         self.stats = CaptureStats()
 
@@ -151,35 +176,20 @@ class AudioRecorder:
         return self._running.is_set()
 
     def start(self) -> None:
-        import pyaudio
-
         with self._state_lock:
             if self._running.is_set():
                 logger.warning("Capture already running")
                 return
-
-            try:
-                self._pyaudio = pyaudio.PyAudio()
-                self._stream = self._pyaudio.open(
-                    format=pyaudio.paInt16 if self.sample_width == 2 else pyaudio.paInt32,
-                    channels=self.channels,
-                    rate=self.sample_rate,
-                    input=True,
-                    input_device_index=self.input_device_index,
-                    frames_per_buffer=self.frames_per_buffer,
-                )
-            except Exception as exc:
-                self._teardown_stream()
-                raise AudioCaptureError(f"cannot open input device: {exc}") from exc
-
             self.stats = CaptureStats(started_at=datetime.now(timezone.utc))
+            self._open(self.input_device_index)
             self._running.set()
-            self._thread = threading.Thread(
-                target=self._capture_loop, name="AudioCapture", daemon=True)
-            self._thread.start()
+            self._launch()
+            self._watchdog = threading.Thread(
+                target=self._watch, name="AudioWatchdog", daemon=True)
+            self._watchdog.start()
             logger.info("Capture started: %s Hz, %s ch, %s-bit, device=%s",
                         self.sample_rate, self.channels, self.sample_width * 8,
-                        self.describe_device())
+                        self.device_name)
 
     def stop(self) -> CaptureStats:
         """Ask the capture loop to finish, wait for it, then release the device."""
@@ -188,19 +198,120 @@ class AudioRecorder:
                 return self.stats
             self._running.clear()
 
+        # The watchdog first: once it has gone, nothing swaps the stream under us.
+        watchdog = self._watchdog
+        if watchdog and watchdog.is_alive() and watchdog is not threading.current_thread():
+            watchdog.join(timeout=5.0)
+
         thread = self._thread
         if thread and thread.is_alive():
             # Generous relative to one buffer period; the loop exits after at most
             # one blocking read.
             thread.join(timeout=5.0)
-            if thread.is_alive():
-                logger.error("Capture thread did not exit; releasing the device anyway")
-
-        self._teardown_stream()
+        if thread and thread.is_alive():
+            # Blocked in a read on a device that has gone. Closing the stream under
+            # it can crash PortAudio, so it is left to the operating system.
+            logger.error("Capture thread did not exit; leaving its device to Windows")
+            self._abandon()
+        else:
+            self._teardown_stream()
         self.stats.stopped_at = datetime.now(timezone.utc)
-        logger.info("Capture stopped: %.1f s, %s overruns, %s read errors",
-                    self.duration_seconds, self.stats.overruns, self.stats.read_errors)
+        logger.info("Capture stopped: %.1f s, %s overruns, %s read errors, %s device change(s)",
+                    self.duration_seconds, self.stats.overruns, self.stats.read_errors,
+                    self.stats.device_changes)
         return self.stats
+
+    def _open(self, index: Optional[int]) -> None:
+        """
+        Open `index`, or the Windows default microphone if that fails. A fresh
+        PortAudio handle every time: one created earlier still lists a device
+        that has since been unplugged, and not the one that replaced it.
+        """
+        import pyaudio
+
+        handle = pyaudio.PyAudio()
+        last: Optional[Exception] = None
+        if index is not None:
+            candidates = [index, None]
+        else:
+            candidates = [self._find(handle, self.preferred_name), None]
+            candidates = [c for n, c in enumerate(candidates) if n == 1 or c is not None]
+        for candidate in candidates:
+            try:
+                stream = handle.open(
+                    format=pyaudio.paInt16 if self.sample_width == 2 else pyaudio.paInt32,
+                    channels=self.channels,
+                    rate=self.sample_rate,
+                    input=True,
+                    input_device_index=candidate,
+                    frames_per_buffer=self.frames_per_buffer,
+                )
+            except Exception as exc:
+                last = exc
+                continue
+            if index is not None and candidate != index:
+                logger.warning("Microphone %s could not be opened (%s); using the "
+                               "Windows default instead", index, last)
+            self._pyaudio, self._stream = handle, stream
+            self.device_name = self._name_of(handle, candidate)
+            return
+        try:
+            handle.terminate()
+        except Exception:
+            pass
+        raise AudioCaptureError(f"cannot open input device: {last}")
+
+    @staticmethod
+    def _find(handle, name: str) -> Optional[int]:
+        """The input device whose name contains `name`, on the default host API."""
+        if not name:
+            return None
+        try:
+            host = handle.get_default_host_api_info()["index"]
+        except Exception:
+            host = None
+        try:
+            count = handle.get_device_count()
+        except Exception:
+            return None
+        for i in range(count):
+            try:
+                info = handle.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if (int(info.get("maxInputChannels", 0)) > 0
+                    and (host is None or info.get("hostApi") == host)
+                    and name.lower() in str(info.get("name", "")).lower()):
+                return i
+        return None
+
+    @staticmethod
+    def _name_of(handle, index: Optional[int]) -> str:
+        try:
+            info = (handle.get_default_input_device_info() if index is None
+                    else handle.get_device_info_by_index(index))
+            return str(info.get("name", "microphone"))
+        except Exception:
+            return "microphone"
+
+    def _launch(self) -> None:
+        """A capture thread for the current stream. Called with the state lock held."""
+        self._generation += 1
+        self._failed = False
+        self._last_read = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._capture_loop, args=(self._generation, self._stream),
+            name="AudioCapture", daemon=True)
+        self._thread.start()
+
+    def _abandon(self) -> None:
+        """
+        Let go of a stream whose reader is stuck, without closing it. Kept
+        referenced so the garbage collector cannot close it under that reader.
+        """
+        if self._stream is not None:
+            self._abandoned.append((self._stream, self._pyaudio))
+        self._stream, self._pyaudio = None, None
 
     def _teardown_stream(self) -> None:
         stream, handle = self._stream, self._pyaudio
@@ -220,12 +331,11 @@ class AudioRecorder:
 
     # ---- capture ----
 
-    def _capture_loop(self) -> None:
-        stream = self._stream
+    def _capture_loop(self, generation: int, stream) -> None:
         chunk_frames = self.frames_per_buffer
         consecutive_errors = 0
 
-        while self._running.is_set():
+        while self._running.is_set() and generation == self._generation:
             try:
                 data = stream.read(chunk_frames, exception_on_overflow=False)
                 consecutive_errors = 0
@@ -234,22 +344,24 @@ class AudioRecorder:
                 # does every read after it. Those are the shutdown itself, not a
                 # fault: counting them reported "20 read errors" on a clean stop
                 # and put an alarming message in front of the doctor.
-                if not self._running.is_set():
+                if not self._running.is_set() or generation != self._generation:
                     break
 
                 self.stats.read_errors += 1
                 consecutive_errors += 1
                 logger.error("Audio read failed (%s in a row): %s", consecutive_errors, exc)
                 # A handful of transient failures happen when a device is switched.
-                # A sustained run means the device is gone and recording is not
-                # actually happening, which the caller must be told about.
+                # A sustained run means the device is gone: the watchdog moves the
+                # recording to whichever microphone Windows now offers.
                 if consecutive_errors >= 20:
-                    if self._on_error:
-                        self._on_error(f"input device failed: {exc}")
+                    self._failed = True
                     break
                 time.sleep(0.05)
                 continue
 
+            if generation != self._generation:
+                break                   # replaced while this read was blocked
+            self._last_read = time.monotonic()
             self.stats.frames += chunk_frames
             self.stats.bytes_captured += len(data)
 
@@ -266,6 +378,64 @@ class AudioRecorder:
                                     self.stats.overruns)
             except Exception as exc:
                 logger.error("Chunk consumer raised: %s", exc)
+
+    # ---- failover ----
+
+    def _watch(self) -> None:
+        """
+        Notice a microphone that has stopped delivering, and carry on with another.
+
+        A microphone goes one of two ways: reads fail (the loop gives up after
+        twenty), or - what Windows usually does when a USB microphone is pulled
+        out - a read simply never returns. Either way the consultation must not
+        go on "recording" nothing, so the stream is replaced by the Windows
+        default, which is the PC's own microphone once the USB one has gone.
+        """
+        while self._running.is_set():
+            time.sleep(self.WATCH_INTERVAL)
+            if not self._running.is_set():
+                return
+            stalled = time.monotonic() - self._last_read > self.stall_seconds
+            if self._failed or stalled:
+                self._failover("reads failed" if self._failed else
+                               f"no audio for {self.stall_seconds:.1f}s")
+
+    def _failover(self, why: str) -> None:
+        lost_at = self._last_read
+        logger.critical("Microphone stopped (%s); switching to the default microphone", why)
+        with self._state_lock:
+            if not self._running.is_set():
+                return
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                self._abandon()             # stuck in a read: do not touch it
+            else:
+                self._teardown_stream()
+            self._generation += 1           # whatever that reader returns is discarded
+
+        told = False
+        while True:
+            with self._state_lock:
+                if not self._running.is_set():
+                    return
+                try:
+                    self._open(None)
+                except AudioCaptureError as exc:
+                    error = exc
+                else:
+                    self.stats.device_changes += 1
+                    self._launch()
+                    break
+            if not told and self._on_error:
+                self._on_error(f"the microphone stopped and no other one is available: {error}")
+                told = True
+            time.sleep(self.REOPEN_INTERVAL)
+
+        gap = time.monotonic() - lost_at
+        logger.warning("Recording continues on %s after %.1fs without audio",
+                       self.device_name, gap)
+        if self._on_device_change:
+            self._on_device_change(self.device_name, gap)
 
     # ---- metrics ----
 

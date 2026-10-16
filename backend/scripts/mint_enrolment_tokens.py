@@ -27,8 +27,11 @@ and should be deleted once the machines are installed; a token is useless after
 it is used, and expires anyway.
 
 Environment:
-    AIMS_BACKEND_URL   defaults to the production backend
-    AIMS_ADMIN_KEY     required; the same value set in Render
+    AIMS_BACKEND_URL   required: the server these PCs will enrol with
+    AIMS_ADMIN_KEY     required; the server's admin key
+    AIMS_CMED_ORIGIN   the CMED page address printed on each sheet
+    AIMS_TOKEN_TTL_HOURS  how long an unused token stays valid; 14 days, so a
+                       rollout across many clinics does not outlive its tokens
 """
 from __future__ import annotations
 
@@ -41,9 +44,11 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-BACKEND = os.getenv("AIMS_BACKEND_URL",
-                    "https://aimscribe-backend-render.onrender.com").rstrip("/")
-TTL_HOURS = int(os.getenv("AIMS_TOKEN_TTL_HOURS", "72"))
+# No default: a token minted on the wrong server enrols a PC there, and it then
+# records for a server nobody is watching.
+BACKEND = os.getenv("AIMS_BACKEND_URL", "").rstrip("/")
+CMED_ORIGIN = os.getenv("AIMS_CMED_ORIGIN", "the CMED page address for this clinic")
+TTL_HOURS = int(os.getenv("AIMS_TOKEN_TTL_HOURS", str(14 * 24)))
 CREATED_BY = os.getenv("AIMS_CREATED_BY", "Team_AIMScribe")
 
 
@@ -101,16 +106,17 @@ ON THAT DOCTOR'S PC
   2. Three fields appear. The first two are already filled in:
 
         Backend URL        {BACKEND}
-        CMED web address   https://aim-scribe-exe.vercel.app
+        CMED web address   {CMED_ORIGIN}
 
      Paste the token into the third:
 
         Enrolment token    {token}
 
-  3. Install. When it finishes it should say the PC is ready to record.
+  3. Install. The PC enrols itself as soon as it reaches the server. If the
+     clinic's internet is down, it keeps trying every minute by itself.
 
-  4. Open https://aim-scribe-exe.vercel.app in the browser on that PC.
-     The page should show {row['hospital_id']} and say the PC is ready.
+  4. Open the CMED page on that PC. It should show {row['hospital_id']} and
+     say the PC is ready.
 
 
 WHEN A DIFFERENT DOCTOR USES THIS PC
@@ -129,10 +135,10 @@ IF SOMETHING IS WRONG
       The token was not accepted - most often it was mistyped, already
       used on another machine, or has expired. Ask for a new one.
 
-  The page loads but Start does nothing
-      Check the address is exactly https://aim-scribe-exe.vercel.app.
-      The agent refuses any other address, including Vercel preview
-      links, which is what stops a stray web page recording a patient.
+  The page loads but recording never starts
+      Check the CMED web address was typed exactly as above. The agent
+      refuses any other address, which is what stops a stray web page
+      recording a patient.
 
   Recording works but nothing uploads
       Normal on a poor connection. Audio is held encrypted on the PC -
@@ -149,6 +155,11 @@ def main() -> int:
     source = Path(sys.argv[1])
     if not source.is_file():
         print(f"No such file: {source}")
+        return 1
+
+    if not BACKEND:
+        print("AIMS_BACKEND_URL is not set. Set it to the server these PCs will "
+              "enrol with, e.g. https://aimscribe.example.org")
         return 1
 
     key = admin_key()

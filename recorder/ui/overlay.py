@@ -132,6 +132,7 @@ def _apply_scale() -> None:
 
 class Overlay:
     POLL_MS = 250
+    IDLE_POLL_MS = 500
 
     def __init__(self, runtime, *, visible: bool = True):
         self.runtime = runtime
@@ -464,12 +465,17 @@ class Overlay:
                 self.state.on_event(event, data)
         except queue.Empty:
             pass
+        status = None
         try:
             status = self._status()
             self.apply(self.state.view(status), status)
         except Exception as exc:
             logger.debug("On-screen control refresh failed: %s", exc)
-        self.root.after(self.POLL_MS, self._tick)
+        # Four times a second while recording, for the meter; twice a second
+        # otherwise, still soon enough that the control appears as a recording
+        # starts.
+        recording = bool(status) and (status.get("is_recording") or status.get("is_paused"))
+        self.root.after(self.POLL_MS if recording else self.IDLE_POLL_MS, self._tick)
 
     def apply(self, view, status: Optional[Dict[str, Any]] = None) -> None:
         status = status if status is not None else {}

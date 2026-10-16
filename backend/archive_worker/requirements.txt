@@ -3,7 +3,7 @@
 # Deliberately small. This process runs on the machine holding every consultation
 # recording, so every dependency is attack surface. WAV joining, hashing and path
 # handling are all standard library; what is here is an HTTP client, and - for the
-# cloud copy - a FLAC codec and a cipher.
+# cloud copy - a cipher, and a FLAC codec for reading older copies.
 
 requests>=2.32.0
 
@@ -12,8 +12,8 @@ requests>=2.32.0
 # back to UTC - which files every evening consultation under the previous day.
 tzdata>=2024.1
 
-# The lossless cloud copy (SRS-ARC-11): FLAC encoding and decoding, through
-# libsndfile. Only the worker needs it; the server never touches audio.
+# Reading cloud copies made as FLAC before copies became the raw WAV
+# (restore.py). Nothing is encoded with it any more.
 soundfile>=0.12.1
 
 # AES-256-GCM for the copy, encrypted here before it leaves UIU (SRS-DAT-08).

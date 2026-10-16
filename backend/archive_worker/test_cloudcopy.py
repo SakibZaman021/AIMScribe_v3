@@ -1,9 +1,10 @@
 """
-The lossless cloud copy (SRS-ARC-08..13).
+The cloud copy (SRS-ARC-08..13).
 
 The copy exists so that a lost archive can be rebuilt exactly, and these tests
-are about that word: the FLAC must decode to the same samples, and a copy that
-was changed or cut short must refuse to come back rather than come back short.
+are about that word: the sealed copy must decrypt to the archived WAV byte for
+byte, and a copy that was changed or cut short must refuse to come back rather
+than come back short. Copies made earlier as FLAC must still restore.
 
     cd archive_worker && python -m pytest -q test_cloudcopy.py
 """
@@ -17,9 +18,8 @@ from pathlib import Path
 import pytest
 
 import cloudcopy
+import restore
 from cloudcopy import CopyError
-
-soundfile = pytest.importorskip("soundfile")
 
 KEY = bytes(range(32))
 SAMPLE_RATE = 44100
@@ -42,78 +42,75 @@ def speech_like_wav(path: Path, seconds: float = 0.5) -> Path:
 
 
 # ============================================================
-# Lossless, and proven so
+# The raw WAV, proven the same
 # ============================================================
 
-def test_the_flac_holds_exactly_the_archived_audio(tmp_path):
-    """SRS-ARC-09 step 3, SRS-ARC-11."""
+def test_the_copy_is_the_wav_itself_byte_for_byte(tmp_path):
+    """AT-74, SRS-ARC-09 step 3: a restore produces the archived file exactly."""
     wav = speech_like_wav(tmp_path / "visit.wav")
-    flac = cloudcopy.to_flac(wav, tmp_path / "visit.flac")
 
-    assert flac.exists()
-    assert cloudcopy.flac_matches_wav(flac, wav)
-    assert flac.stat().st_size < wav.stat().st_size      # it did compress
+    sealed = cloudcopy.encrypt_file(wav, tmp_path / "visit.wav.enc", KEY)
+    assert sealed.plain_sha256 == cloudcopy.sha256_file(wav)
+    assert sealed.sha256 == cloudcopy.sha256_file(sealed.path)
+    assert cloudcopy.sealed_sha256(sealed.path, KEY) == cloudcopy.sha256_file(wav)
+
+    back = cloudcopy.decrypt_file(sealed.path, tmp_path / "restored.wav", KEY)
+    assert back.read_bytes() == wav.read_bytes()
 
 
-def test_a_corrupted_flac_is_caught_before_it_is_uploaded(tmp_path):
-    """AT-66: a mismatch is detected, so the pieces are kept."""
+def test_checking_a_sealed_copy_writes_nothing(tmp_path):
     wav = speech_like_wav(tmp_path / "visit.wav")
-    flac = cloudcopy.to_flac(wav, tmp_path / "visit.flac")
+    sealed = cloudcopy.encrypt_file(wav, tmp_path / "visit.wav.enc", KEY)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    cloudcopy.sealed_sha256(sealed.path, KEY)
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
 
-    data = bytearray(flac.read_bytes())
+
+def test_a_damaged_sealed_copy_fails_the_check_before_upload(tmp_path):
+    """AT-66: caught on this machine, so the pieces are kept."""
+    wav = speech_like_wav(tmp_path / "visit.wav")
+    sealed = cloudcopy.encrypt_file(wav, tmp_path / "visit.wav.enc", KEY)
+    data = bytearray(sealed.path.read_bytes())
     data[len(data) // 2] ^= 0xFF
-    flac.write_bytes(bytes(data))
-
-    # Either the samples differ or the file no longer decodes at all. Both mean
-    # the same thing here: do not upload, do not delete the pieces.
-    try:
-        assert not cloudcopy.flac_matches_wav(flac, wav)
-    except CopyError:
-        pass
+    sealed.path.write_bytes(bytes(data))
+    with pytest.raises(CopyError):
+        cloudcopy.sealed_sha256(sealed.path, KEY)
 
 
-def test_a_truncated_flac_does_not_pass_as_the_recording(tmp_path):
-    wav = speech_like_wav(tmp_path / "visit.wav", seconds=0.4)
-    flac = cloudcopy.to_flac(wav, tmp_path / "visit.flac")
-    data = flac.read_bytes()
-    flac.write_bytes(data[: len(data) // 2])
-
-    try:
-        assert not cloudcopy.flac_matches_wav(flac, wav)
-    except CopyError:
-        pass
+def test_no_flac_writer_remains():
+    """Copies are raw WAV; nothing here can make a FLAC any more."""
+    assert not hasattr(cloudcopy, "to_flac")
 
 
-def test_the_fingerprint_is_of_the_audio_not_the_file(tmp_path):
+def test_restore_gives_back_the_wav(tmp_path):
     wav = speech_like_wav(tmp_path / "visit.wav")
-    flac = cloudcopy.to_flac(wav, tmp_path / "visit.flac")
-    assert cloudcopy.audio_fingerprint(flac) == cloudcopy.audio_fingerprint(wav)
-    assert cloudcopy.sha256_file(flac) != cloudcopy.sha256_file(wav)
+    sealed = cloudcopy.encrypt_file(wav, tmp_path / "visit.v1.wav.enc", KEY)
+    out = restore.restore_one(sealed.path, tmp_path / "out", KEY)
+    assert out.name == "visit.v1.wav"
+    assert out.read_bytes() == wav.read_bytes()
 
 
-def test_different_audio_has_a_different_fingerprint(tmp_path):
-    one = speech_like_wav(tmp_path / "one.wav", seconds=0.3)
-    other = speech_like_wav(tmp_path / "other.wav", seconds=0.31)
-    assert cloudcopy.audio_fingerprint(one) != cloudcopy.audio_fingerprint(other)
+def test_an_older_flac_copy_still_restores_to_the_same_audio(tmp_path):
+    """Copies made before the switch to raw WAV must not become unreadable."""
+    soundfile = pytest.importorskip("soundfile")
+    wav = speech_like_wav(tmp_path / "visit.wav")
+    flac = tmp_path / "old.v1.flac"
+    with soundfile.SoundFile(str(wav)) as source:
+        with soundfile.SoundFile(str(flac), mode="w", samplerate=source.samplerate,
+                                 channels=source.channels, format="FLAC",
+                                 subtype=source.subtype) as target:
+            target.write(source.read(dtype="int32", always_2d=True))
+    sealed = cloudcopy.encrypt_file(flac, tmp_path / "old.v1.flac.enc", KEY)
+    flac.unlink()
+
+    out = restore.restore_one(sealed.path, tmp_path / "out", KEY)
+    assert out.suffix == ".wav"
+    assert cloudcopy.audio_fingerprint(out) == cloudcopy.audio_fingerprint(wav)
 
 
 # ============================================================
 # Encrypted before it leaves UIU
 # ============================================================
-
-def test_the_copy_comes_back_byte_for_byte(tmp_path):
-    """AT-74: a restore has to produce the archived file exactly."""
-    wav = speech_like_wav(tmp_path / "visit.wav")
-    flac = cloudcopy.to_flac(wav, tmp_path / "visit.flac")
-
-    sealed = cloudcopy.encrypt_file(flac, tmp_path / "visit.flac.enc", KEY)
-    assert sealed.plain_sha256 == cloudcopy.sha256_file(flac)
-    assert sealed.sha256 == cloudcopy.sha256_file(sealed.path)
-
-    back = cloudcopy.decrypt_file(sealed.path, tmp_path / "restored.flac", KEY)
-    assert back.read_bytes() == flac.read_bytes()
-    assert cloudcopy.flac_matches_wav(back, wav)
-
 
 def test_the_patient_is_not_readable_in_the_uploaded_object(tmp_path):
     """SRS-DAT-08: the storage provider holds nothing it can read."""

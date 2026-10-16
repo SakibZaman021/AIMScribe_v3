@@ -58,6 +58,13 @@ class ForceResetRequest(BaseModel):
 # Runtime
 # ============================================================
 
+NOT_ENROLLED = ("This device is not enrolled. An administrator must install it with "
+                "-EnrollmentToken, or place enrollment.token in the state folder.")
+
+# A PC installed while the clinic's internet was down tries its token again this
+# often, instead of waiting for someone to log off and on.
+ENROL_RETRY_SECONDS = 60
+
 class Runtime:
     """
     Owns every long-lived object the agent needs.
@@ -81,6 +88,7 @@ class Runtime:
         self.problems = cfg.validate()
         self.warnings = cfg.production_warnings()
         self._loop = None
+        self._enrol_task = None
         # The on-screen Stop and Pause control, when a screen is present.
         self.overlay = None
 
@@ -115,7 +123,7 @@ class Runtime:
                 grant_key = crypto.load_public_key(self.cfg.security.grant_public_key_path)
             except Exception as exc:
                 logger.critical("Grant key unavailable (%s); no recording can be authorised, "
-                                "so every recording will be refused and deleted", exc)
+                                "so every recording is held on this PC until it is", exc)
 
         # Enrollment runs before anything else that needs an identity. If it
         # cannot complete, the agent still starts and shows its tray icon - it
@@ -131,9 +139,7 @@ class Runtime:
             logger.error("Enrollment check failed: %s", exc)
 
         if self.identity is None:
-            self.problems.append(
-                "This device is not enrolled. An administrator must install it with "
-                "-EnrollmentToken, or place enrollment.token in the state folder.")
+            self.problems.append(NOT_ENROLLED)
 
         from core.enrollment import load_device_token
 
@@ -146,6 +152,8 @@ class Runtime:
         )
         self.uploader.set_device_token(load_device_token(self.cfg))
         self.uploader.set_grant_key(grant_key)
+        from core.health_log import FILE_NAME as HEALTH_LOG, HealthLog
+        self.uploader.health = HealthLog(self.cfg.paths.state_dir / HEALTH_LOG)
         await self.uploader.start()
 
         self.controller = SessionController(
@@ -165,6 +173,10 @@ class Runtime:
         self.ws.set_controller(self.controller)
         self.ws.set_register_source(self.uploader, self.controller.hospital_id)
 
+        from core.enrollment import read_pending_token
+        if self.identity is None and read_pending_token(self.cfg):
+            self._enrol_task = asyncio.create_task(self._enrol_until_done())
+
         logger.info("Agent ready - %s at %s, device %s (%s), spool holds %.1f h",
                     self.identity.doctor_id if self.identity else "NO DOCTOR",
                     self.identity.hospital_id if self.identity else "NO HOSPITAL",
@@ -181,7 +193,54 @@ class Runtime:
         for warning in self.warnings:
             logger.warning("PRODUCTION WARNING: %s", warning)
 
+    async def _enrol_until_done(self) -> None:
+        """
+        Keep trying the staged token until the server answers. Without this a PC
+        installed while the network was down stayed unable to record until the
+        next logon, which on a clinic PC can be the next morning.
+        """
+        import asyncio
+        from core.enrollment import EnrollmentError, enroll, load_device_token, \
+            read_pending_token
+        from core.uploader import build_ssl_context
+
+        while self.identity is None:
+            await asyncio.sleep(ENROL_RETRY_SECONDS)
+            token = read_pending_token(self.cfg)
+            if not token:
+                return
+            try:
+                identity = await enroll(self.cfg, self.device_key, token,
+                                        ssl_context=build_ssl_context(self.cfg))
+            except EnrollmentError as exc:
+                if exc.rejected:
+                    logger.critical("Enrolment refused by the server, not retrying: %s", exc)
+                    return
+                logger.warning("Enrolment still waiting for the server: %s", exc)
+                continue
+            self.adopt_identity(identity, load_device_token(self.cfg))
+
+    def adopt_identity(self, identity, device_token: Optional[str]) -> None:
+        """Enrolled while running: from now on this PC records and uploads."""
+        self.identity = identity
+        if self.uploader is not None:
+            self.uploader.set_device_token(device_token)
+        if self.controller is not None:
+            self.controller.device_id = identity.device_id
+            self.controller.hospital_id = identity.hospital_id
+            self.controller.doctor_id = identity.doctor_id
+            self.ws.set_register_source(self.uploader, identity.hospital_id)
+        if NOT_ENROLLED in self.problems:
+            self.problems.remove(NOT_ENROLLED)
+        logger.info("Enrolled as device %s at %s; ready to record",
+                    identity.device_id, identity.hospital_id)
+        if self.uploader is not None:
+            self.uploader.nudge()
+
     async def shutdown(self) -> None:
+        task = getattr(self, "_enrol_task", None)
+        if task is not None:
+            task.cancel()
         if self.controller:
             await self.controller.close()
         if self.uploader:
@@ -200,6 +259,16 @@ class Runtime:
             self.overlay.post(event, data)
         if self._loop is None:
             return
+        # Every alert goes to the health log first, then to the server at once
+        # if it can be reached; otherwise it waits there for the network.
+        uploader = getattr(self, "uploader", None)
+        if event == "integrity_alert" and uploader is not None and uploader.health is not None:
+            uploader.health.alert(data)
+            try:
+                self._loop.call_soon_threadsafe(
+                    lambda: self._loop.create_task(uploader.deliver_health()))
+            except RuntimeError:
+                pass
         try:
             self._loop.call_soon_threadsafe(
                 lambda: self._loop.create_task(self.ws.send_event(event, data)))

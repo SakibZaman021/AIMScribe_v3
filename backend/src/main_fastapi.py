@@ -3,8 +3,10 @@ AIMScribe AI Backend - FastAPI Server (Async)
 High-performance async API with true parallelism.
 """
 
+import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -375,17 +377,71 @@ async def front_page():
 # Health Check
 # ============================================================================
 
+# How long one answer about object storage is reused. Asking the store costs a
+# round trip to the provider; /health is polled by Docker, the monitor and
+# uptime checks, and none of them needs an answer fresher than this.
+STORAGE_CHECK_SECONDS = 30
+STORAGE_CHECK_TIMEOUT = 4.0
+_storage_cache: dict = {"at": 0.0, "answer": None}
+_storage_lock = asyncio.Lock()
+
+
+async def _bucket_state(client: Optional[MinIOClient]) -> str:
+    """
+    Whether one bucket answers with the credentials this server holds.
+
+    This used to be the constant "connected", so a server with the wrong R2
+    keys reported healthy while every upload failed. A HEAD on the bucket is
+    the cheapest request that proves the endpoint, the keys and the bucket
+    name together.
+    """
+    if client is None:
+        return "not configured"
+    try:
+        exists = await asyncio.wait_for(
+            asyncio.to_thread(client.client.bucket_exists, client.bucket),
+            timeout=STORAGE_CHECK_TIMEOUT)
+    except asyncio.TimeoutError:
+        return "unreachable"
+    except Exception as exc:
+        logger.warning("Storage check for %s failed: %s", client.bucket, exc)
+        return "refused"
+    return "connected" if exists else "bucket missing"
+
+
+async def _storage_states() -> dict:
+    now = time.monotonic()
+    cached = _storage_cache["answer"]
+    if cached is not None and now - _storage_cache["at"] < STORAGE_CHECK_SECONDS:
+        return cached
+    async with _storage_lock:
+        if _storage_cache["answer"] is not None and                 time.monotonic() - _storage_cache["at"] < STORAGE_CHECK_SECONDS:
+            return _storage_cache["answer"]
+        segments, copies = await asyncio.gather(
+            _bucket_state(ctx.minio), _bucket_state(api_v2.ctx.copy))
+        answer = {"minio": segments, "copy_bucket": copies}
+        _storage_cache.update(at=time.monotonic(), answer=answer)
+        return answer
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     db_healthy = await ctx.db.healthcheck() if ctx.db else False
     redis_healthy = await ctx.redis.healthcheck() if ctx.redis else False
+    storage = await _storage_states()
+    # The segment bucket is where every recording lands, so it counts. The
+    # copy bucket counts only if it is configured: unset is a choice, but set
+    # and failing means copies are silently not being made.
+    storage_healthy = storage["minio"] == "connected" and         storage["copy_bucket"] in ("connected", "not configured")
 
     return {
-        "status": "healthy" if (db_healthy and redis_healthy) else "degraded",
+        "status": "healthy" if (db_healthy and redis_healthy and storage_healthy)
+        else "degraded",
         "database": "connected" if db_healthy else "disconnected",
         "redis": "connected" if redis_healthy else "disconnected",
-        "minio": "connected",
+        "minio": storage["minio"],
+        "copy_bucket": storage["copy_bucket"],
         # Which AIMScribe this is. A machine can be running the live v1
         # server and this one at the same time, and they answer on ports
         # that look alike; anything talking to the wrong one is a long

@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 import api_v2
 from api_v2 import require_admin
@@ -245,6 +245,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
          ORDER BY hospital_id, machine_name
     """, clinic)
 
+    offline = await _offline_periods(conn, [row["device_id"] for row in rows])
+
     now = datetime.now(timezone.utc)
     rooms, silent, holding = [], 0, 0
     for row in rows:
@@ -264,6 +266,7 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             "spool_mb": round((row["spool_bytes"] or 0) / 1024 ** 2, 1),
             "revoked": row["revoked_at"] is not None,
             "silent": is_silent,
+            "offline_periods": offline.get(row["device_id"], []),
         })
         if is_silent:
             silent += 1
@@ -271,6 +274,51 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             holding += 1
     return {"rooms": rooms, "silent": silent, "holding_audio": holding,
             "enrolled": len([r for r in rows if r["revoked_at"] is None])}
+
+
+# Lines a minute apart belong to one outage; a longer gap starts the next.
+OUTAGE_GAP = "3 minutes"
+
+
+async def _offline_periods(conn, device_ids) -> Dict[Any, List[Dict[str, Any]]]:
+    """
+    When each recorder could not reach this server in the last week, and what
+    it was doing meanwhile, from the health log it sent afterwards: "offline
+    10:02-11:40, 3 consultations, microphone fine" rather than a blank.
+    """
+    if not device_ids:
+        return {}
+    rows = await conn.fetch(f"""
+        WITH lines AS (
+            SELECT device_id, occurred_at, data,
+                   CASE WHEN occurred_at - lag(occurred_at) OVER w
+                             <= interval '{OUTAGE_GAP}' THEN 0 ELSE 1 END AS starts
+              FROM device_health_log
+             WHERE kind = 'heartbeat' AND device_id = ANY($1::uuid[])
+               AND occurred_at > now() - interval '7 days'
+            WINDOW w AS (PARTITION BY device_id ORDER BY occurred_at)
+        ), outages AS (
+            SELECT *, sum(starts) OVER (PARTITION BY device_id ORDER BY occurred_at) AS n
+              FROM lines
+        )
+        SELECT device_id, min(occurred_at) AS began, max(occurred_at) AS ended,
+               count(DISTINCT data->>'session_id') AS consultations,
+               bool_or(coalesce((data->>'silent')::boolean, false)) AS silent
+          FROM outages
+         GROUP BY device_id, n
+         ORDER BY ended DESC
+    """, list(device_ids))
+    periods: Dict[Any, List[Dict[str, Any]]] = {}
+    for row in rows:
+        listed = periods.setdefault(row["device_id"], [])
+        if len(listed) < 3:
+            listed.append({
+                "from": row["began"].isoformat(), "to": row["ended"].isoformat(),
+                "minutes": round((row["ended"] - row["began"]).total_seconds() / 60) + 1,
+                "consultations": row["consultations"],
+                "microphone": "silent at times" if row["silent"] else "fine",
+            })
+    return periods
 
 
 async def _reconciliation(conn, start: date, end: date,
@@ -508,7 +556,31 @@ async def page() -> HTMLResponse:
     html = Path(__file__).with_name("dashboard.html")
     if not html.is_file():
         raise HTTPException(status_code=404, detail="dashboard.html is missing")
-    return HTMLResponse(html.read_text(encoding="utf-8"))
+    # The same policy the gateway sets, so the page is as strict when it is
+    # opened on the server itself, without the gateway in front.
+    return HTMLResponse(html.read_text(encoding="utf-8"),
+                        headers={"Content-Security-Policy": PAGE_POLICY})
+
+
+# The page's own policy: its script, its style and its own API, nothing else.
+# No inline script or style is allowed, which is why both are separate files.
+PAGE_POLICY = ("default-src 'none'; script-src 'self'; style-src 'self'; "
+               "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+               "form-action 'none'; frame-ancestors 'none'")
+
+_STATIC = {"dashboard.css": "text/css; charset=utf-8",
+           "dashboard.js": "text/javascript; charset=utf-8"}
+
+
+@router.get("/static/{name}", include_in_schema=False)
+async def static(name: str) -> Response:
+    """The page's style and script. Two named files; nothing else is served."""
+    media_type = _STATIC.get(name)
+    path = Path(__file__).with_name(name)
+    if media_type is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(path.read_text(encoding="utf-8"), media_type=media_type,
+                    headers={"Cache-Control": "no-cache"})
 
 
 __all__ = ["router"]

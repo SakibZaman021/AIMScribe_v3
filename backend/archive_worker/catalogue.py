@@ -56,7 +56,11 @@ CREATE TABLE IF NOT EXISTS archived_sessions (
     -- The lossless cloud copy (SRS-ARC-09). Until this is filled in, this
     -- volume and the pieces in the segment bucket are the only copies.
     copied_at         TEXT,
-    copy_object_key   TEXT
+    copy_object_key   TEXT,
+
+    -- When the WAV left this disk, its copy proven. The row, the JSON and the
+    -- manifest stay; the audio is then only in the copy bucket.
+    local_released_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_cat_patient  ON archived_sessions(patient_id, session_date DESC);
@@ -91,6 +95,35 @@ CREATE TABLE IF NOT EXISTS archived_pauses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cat_pause_session ON archived_pauses(session_id, entry_no);
+
+-- One recording that held more than one consultation - a follow-up with no
+-- prescription, then the next patient - is archived as one file per patient.
+-- The session row above then describes the whole recording (its sha256 is the
+-- joined audio's, the one the chain vouches for) and points at part 1; each
+-- patient's file is a row here. A single-consultation recording has no rows.
+CREATE TABLE IF NOT EXISTS archived_parts (
+    session_id        TEXT NOT NULL,
+    part_no           INTEGER NOT NULL,
+    patient_id        TEXT NOT NULL,
+    doctor_id         TEXT NOT NULL,
+    archive_relpath   TEXT NOT NULL UNIQUE,
+    filename          TEXT NOT NULL,
+    sha256            TEXT NOT NULL,
+    bytes             INTEGER NOT NULL,
+    start_seconds     REAL,
+    end_seconds       REAL,
+    start_frame       INTEGER,
+    end_frame         INTEGER,
+    rule              TEXT,
+    needs_review      INTEGER NOT NULL DEFAULT 0,
+    archived_at       TEXT NOT NULL,
+    copied_at         TEXT,
+    copy_object_key   TEXT,
+    local_released_at TEXT,
+    PRIMARY KEY (session_id, part_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cat_part_patient ON archived_parts(patient_id);
 """
 
 
@@ -111,9 +144,12 @@ class Catalogue:
             # for it. Adding them here keeps an in-place upgrade to one step.
             existing = {row["name"] for row in
                         conn.execute("PRAGMA table_info(archived_sessions)")}
-            for column in ("copied_at", "copy_object_key"):
+            for column in ("copied_at", "copy_object_key", "local_released_at"):
                 if column not in existing:
                     conn.execute(f"ALTER TABLE archived_sessions ADD COLUMN {column} TEXT")
+            if "parts_count" not in existing:
+                conn.execute("ALTER TABLE archived_sessions "
+                             "ADD COLUMN parts_count INTEGER NOT NULL DEFAULT 1")
             conn.commit()
         logger.info("Archive catalogue at %s", self.path)
 
@@ -135,6 +171,7 @@ class Catalogue:
         segments: List[Dict[str, Any]],
         session_date: str,
         pauses: Optional[List[Dict[str, Any]]] = None,
+        parts_count: int = 1,
     ) -> None:
         """Write one archived session. Idempotent: a re-run overwrites its own row."""
         now = datetime.now(timezone.utc).isoformat()
@@ -144,22 +181,26 @@ class Catalogue:
                     INSERT INTO archived_sessions
                         (session_id, patient_id, doctor_id, hospital_id, session_date,
                          archive_relpath, filename, sha256, bytes, opened_at, closed_at,
-                         duration_seconds, paused_seconds, segment_count, archived_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         duration_seconds, paused_seconds, segment_count, archived_at,
+                         parts_count)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         archive_relpath = excluded.archive_relpath,
                         filename        = excluded.filename,
                         sha256          = excluded.sha256,
                         bytes           = excluded.bytes,
-                        segment_count   = excluded.segment_count,
-                        archived_at     = excluded.archived_at
+                        segment_count   = CASE WHEN excluded.segment_count > 0
+                                               THEN excluded.segment_count
+                                               ELSE archived_sessions.segment_count END,
+                        archived_at     = excluded.archived_at,
+                        parts_count     = excluded.parts_count
                 """, (
                     session["session_id"], str(session.get("patient_ref") or ""),
                     str(session.get("doctor_id") or ""), str(session.get("hospital_id") or ""),
                     session_date, archive_relpath, filename, sha256_hex, byte_length,
                     session.get("opened_at"), session.get("closed_at"),
                     session.get("duration_seconds"), session.get("paused_seconds"),
-                    len(segments), now,
+                    len(segments), now, max(1, int(parts_count)),
                 ))
                 for s in segments:
                     conn.execute("""
@@ -184,6 +225,87 @@ class Catalogue:
                           p.get("occurred_at"), p.get("reason"),
                           p.get("authorised_by"), p.get("seconds")))
 
+    # ---- parts: one row per patient's file ----
+
+    def record_part(self, session_id: str, part: Dict[str, Any]) -> None:
+        """One consultation's file, cut from a longer recording. Idempotent."""
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as conn:
+            with conn:
+                # A recut can hand a part's name to another part number; the
+                # row that held that file before is replaced, not duplicated.
+                conn.execute("DELETE FROM archived_parts WHERE archive_relpath = ? "
+                             "AND NOT (session_id = ? AND part_no = ?)",
+                             (part["archive_relpath"], session_id, part["part_no"]))
+                conn.execute("""
+                    INSERT INTO archived_parts
+                        (session_id, part_no, patient_id, doctor_id, archive_relpath,
+                         filename, sha256, bytes, start_seconds, end_seconds,
+                         start_frame, end_frame, rule, needs_review, archived_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(session_id, part_no) DO UPDATE SET
+                        patient_id = excluded.patient_id, doctor_id = excluded.doctor_id,
+                        archive_relpath = excluded.archive_relpath,
+                        filename = excluded.filename, sha256 = excluded.sha256,
+                        bytes = excluded.bytes, start_seconds = excluded.start_seconds,
+                        end_seconds = excluded.end_seconds,
+                        start_frame = excluded.start_frame, end_frame = excluded.end_frame,
+                        rule = excluded.rule, needs_review = excluded.needs_review,
+                        archived_at = excluded.archived_at,
+                        copied_at = CASE WHEN archived_parts.sha256 = excluded.sha256
+                                         THEN archived_parts.copied_at END,
+                        copy_object_key = CASE WHEN archived_parts.sha256 = excluded.sha256
+                                               THEN archived_parts.copy_object_key END,
+                        local_released_at = NULL
+                """, (session_id, part["part_no"], str(part.get("patient_id") or ""),
+                      str(part.get("doctor_id") or ""), part["archive_relpath"],
+                      part["filename"], part["sha256"], part["bytes"],
+                      part.get("start_seconds"), part.get("end_seconds"),
+                      part.get("start_frame"), part.get("end_frame"), part.get("rule"),
+                      1 if part.get("needs_review") else 0, now))
+
+    def session_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM archived_sessions WHERE session_id = ?",
+                               (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def parts_for(self, session_id: str) -> List[Dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT * FROM archived_parts WHERE session_id = ? "
+                                "ORDER BY part_no", (session_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def drop_parts_after(self, session_id: str, last_part_no: int) -> None:
+        """A recut left fewer parts than before."""
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("DELETE FROM archived_parts WHERE session_id = ? "
+                             "AND part_no > ?", (session_id, last_part_no))
+
+    def mark_part_copied(self, session_id: str, part_no: int, object_key: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("UPDATE archived_parts SET copied_at = ?, copy_object_key = ? "
+                             "WHERE session_id = ? AND part_no = ?",
+                             (now, object_key, session_id, part_no))
+
+    def mark_part_released(self, session_id: str, part_no: int, released_at: str) -> None:
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("UPDATE archived_parts SET local_released_at = ? "
+                             "WHERE session_id = ? AND part_no = ?",
+                             (released_at, session_id, part_no))
+
+    def mark_uncopied(self, session_id: str) -> None:
+        """A recut made new files: the copies of the old ones no longer stand for them."""
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("UPDATE archived_sessions SET copied_at = NULL, "
+                             "copy_object_key = NULL, local_released_at = NULL "
+                             "WHERE session_id = ?", (session_id,))
+
     def mark_reported(self, session_id: str) -> None:
         """The backend acknowledged this archive; receipts were issued."""
         now = datetime.now(timezone.utc).isoformat()
@@ -205,6 +327,26 @@ class Catalogue:
                 conn.execute("UPDATE archived_sessions SET copied_at = ?, "
                              "copy_object_key = ? WHERE session_id = ?",
                              (now, object_key, session_id))
+
+    def releasable(self, archived_before: str) -> List[Dict[str, Any]]:
+        """
+        Copied, proven, archived before the cutoff, and still on this disk.
+        Oldest first, so the oldest audio leaves first.
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM archived_sessions WHERE copied_at IS NOT NULL "
+                "AND copy_object_key IS NOT NULL AND local_released_at IS NULL "
+                "AND archived_at <= ? ORDER BY archived_at",
+                (archived_before,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_released(self, session_id: str, released_at: str) -> None:
+        """The WAV is gone from this disk; the copy bucket holds the audio."""
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("UPDATE archived_sessions SET local_released_at = ? "
+                             "WHERE session_id = ?", (released_at, session_id))
 
     def uncopied(self) -> List[Dict[str, Any]]:
         """Archived here, with no cloud copy yet: still only one copy in the world."""

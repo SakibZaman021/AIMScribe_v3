@@ -146,6 +146,28 @@ def test_truncated_journal_line_is_survivable(spool, device_key, audio_params):
     assert len(recovered.segments) == 1
 
 
+def test_what_is_written_after_a_torn_line_survives(spool, device_key, audio_params):
+    """
+    The recovery after a power cut appends a chain entry straight after the
+    torn line. Glued onto the fragment, it used to be skipped on the next load
+    with the fragment - a missing link that broke every hash after it.
+    """
+    session = _open(spool, device_key, audio_params)
+    _seal(session, seconds=1.0)
+    with open(session.directory / "journal.jsonl", "a", encoding="utf-8") as handle:
+        handle.write('{"rec": "segment", "seq_no": 2, "fi')        # the power cut
+
+    survivor = SessionSpool.load(session.directory, device_key=device_key,
+                                 spool_key=spool._key)
+    pause = survivor.append_chain_entry("pause", crypto.pause_payload(
+        reason="non_clinical_interruption", reason_detail="recovered", authorised_by="system",
+        supervisor_required=False, at=datetime.now(timezone.utc)))
+
+    again = SessionSpool.load(session.directory, device_key=device_key, spool_key=spool._key)
+    assert again.chain[-1].entry_hash == pause.entry_hash
+    assert again.verify_chain().ok
+
+
 def test_recover_closes_interrupted_sessions(spool, device_key, audio_params):
     session = _open(spool, device_key, audio_params)
     _seal(session, seconds=1.0)
