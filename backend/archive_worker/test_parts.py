@@ -382,9 +382,9 @@ def test_a_failed_part_copy_never_releases_the_pieces(setup, monkeypatch):
     real = cloudcopy.sealed_sha256
     calls = {"n": 0}
 
-    def flaky(path, key):
+    def flaky(path, key, expect=None):
         calls["n"] += 1
-        return "0" * 64 if calls["n"] == 2 else real(path, key)
+        return "0" * 64 if calls["n"] == 2 else real(path, key, expect)
 
     monkeypatch.setattr(cloudcopy, "sealed_sha256", flaky)
     assert worker.copy_pass() == 0
@@ -411,7 +411,8 @@ def test_the_parts_leave_this_disk_together_once_all_are_copied(setup):
         assert not path.exists()
         manifest = json.loads(path.with_suffix(".manifest.json").read_text(encoding="utf-8"))
         assert manifest["local_audio"]["status"] == "released"
-        assert path.with_suffix(".json").exists()
+        # The clinical JSON names the patient; it leaves with the audio.
+        assert not path.with_suffix(".json").exists()
     assert worker.release_pass(now=later(9)) == 0
 
 

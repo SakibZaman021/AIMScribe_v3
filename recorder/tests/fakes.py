@@ -27,8 +27,14 @@ class FakeRecorder:
 
 
 class FakeSegmenter:
+    pending_seconds = 0.0
+    lost_seconds = 0.0
+
     def __init__(self, **kwargs):
         self.stopped_with = None
+
+    def wait_written(self, timeout):
+        return True
 
     def start(self, at):
         pass

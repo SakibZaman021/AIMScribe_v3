@@ -22,7 +22,9 @@ sed -i "s|auth_file = /etc/pgbouncer/userlist.txt|auth_file = $USERS|" "$CONF"
 
 umask 077
 {
-    printf '"aims_recordings" "%s"\n' "${AIMS_RECORDINGS_PASSWORD:?}"
+    # aims_api, not aims_recordings: the owner of the tables has no login
+    # (018_v3_least_privilege.sql), so it cannot come through here at all.
+    printf '"aims_api" "%s"\n' "${AIMS_API_DB_PASSWORD:?}"
     printf '"aims_clinical_writer" "%s"\n' "${AIMS_CLINICAL_PASSWORD:?}"
     printf '"aims_monitor" "%s"\n' "${AIMS_MONITOR_PASSWORD:?}"
 } > "$USERS"

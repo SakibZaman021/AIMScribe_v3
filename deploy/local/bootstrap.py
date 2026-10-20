@@ -5,6 +5,9 @@ Start AIMScribe in Docker, ready to record.
     python bootstrap.py --down          stop it, keep the data
     python bootstrap.py --reset         stop it and throw the data away
     python bootstrap.py --no-build      start without rebuilding the images
+    python bootstrap.py --lan           let other PCs on the network record
+                                        against this one (default: this
+                                        machine only, every port on 127.0.0.1)
 
 It does the parts nobody should have to do by hand:
 
@@ -68,6 +71,11 @@ def make_env() -> Dict[str, str]:
         values = read_env()
         if values.get("AIMS_GRANT_PRIVATE_KEY"):
             print(f"  using the settings already in {ENV.name}")
+            if not values.get("AIMS_API_DB_PASSWORD"):
+                # A .env from before 018: the server's own database login.
+                update_env({"AIMS_API_DB_PASSWORD": secrets.token_urlsafe(24)})
+                values = read_env()
+                print("  added AIMS_API_DB_PASSWORD - the server's own login, not the owner's")
             return values
 
     from cryptography.hazmat.primitives import serialization
@@ -81,7 +89,8 @@ def make_env() -> Dict[str, str]:
     values = {
         "POSTGRES_SUPERUSER": "aims_admin",
         "POSTGRES_SUPERUSER_PASSWORD": secrets.token_urlsafe(24),
-        "AIMS_RECORDINGS_PASSWORD": secrets.token_urlsafe(24),
+        # The server's login (aims_api). The tables' owner has none.
+        "AIMS_API_DB_PASSWORD": secrets.token_urlsafe(24),
         "AIMS_CLINICAL_PASSWORD": secrets.token_urlsafe(24),
         "AIMS_MONITOR_PASSWORD": secrets.token_urlsafe(24),
         "REDIS_PASSWORD": secrets.token_urlsafe(24),
@@ -237,6 +246,52 @@ def docker_is_running() -> bool:
                               timeout=30).returncode == 0
     except Exception:
         return False
+
+
+def psql(database: str, sql: str) -> subprocess.CompletedProcess:
+    """SQL on stdin, as the superuser, so nothing secret is on a command line."""
+    return subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "sh", "-c",
+         f'psql -v ON_ERROR_STOP=1 -q -U "$POSTGRES_USER" -d {database}'],
+        cwd=HERE, input=sql, text=True, capture_output=True)
+
+
+def wait_for_database(seconds: int = 180) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if psql("aims_recordings", "SELECT 1;").returncode == 0:
+            return True
+        time.sleep(3)
+    return False
+
+
+def ensure_api_role(values: Dict[str, str]) -> None:
+    """
+    The server logs in as aims_api, which reads and writes rows and nothing
+    more; aims_recordings owns the tables and has no login, so the server
+    cannot alter a table or switch off the audit log's triggers (018).
+
+    A new database is created that way. One made before 018 is moved over
+    here: the role is created (or its password set from .env), 018 applied,
+    and the owner's login taken away. Safe to run every time.
+    """
+    password = values["AIMS_API_DB_PASSWORD"].replace("'", "''")
+    done = psql("postgres", f"""
+SELECT 'CREATE ROLE aims_api LOGIN'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aims_api')\\gexec
+ALTER ROLE aims_api LOGIN PASSWORD '{password}';
+GRANT CONNECT ON DATABASE aims_recordings TO aims_api;
+""")
+    if done.returncode != 0:
+        raise SystemExit("Could not create the server's database login (aims_api):\n"
+                         + done.stderr[-800:])
+    with open(ROOT / "backend" / "scripts" / "018_v3_least_privilege.sql",
+              encoding="utf-8") as script:
+        applied = psql("aims_recordings", script.read())
+    if applied.returncode != 0:
+        raise SystemExit("018_v3_least_privilege.sql failed:\n" + applied.stderr[-800:])
+    psql("postgres", "ALTER ROLE aims_recordings NOLOGIN;")
+    print("  the server logs in as aims_api; the tables' owner has no login")
 
 
 # ============================================================
@@ -505,9 +560,13 @@ def main(argv=None) -> int:
     parser.add_argument("--agent-data", default="",
                         help="a data folder for that agent instead of "
                              "ProgramData - for a PC that already has one")
+    parser.add_argument("--lan", action="store_true",
+                        help="publish the server, the storage and CMED's page on "
+                             "every address, for doctors' PCs on the network. "
+                             "Without it they answer this machine only")
     parser.add_argument("--host", default="",
-                        help="the address doctors' PCs reach this machine on "
-                             "(default: this machine's address on the network)")
+                        help="with --lan: the address doctors' PCs reach this "
+                             "machine on (default: its address on the network)")
     args = parser.parse_args(argv)
 
     if args.down or args.reset:
@@ -547,13 +606,24 @@ def main(argv=None) -> int:
         print(PORT_TAKEN.format(port=port, env=ENV.name))
         return 2
 
-    host = args.host or this_machine()
-    # The archive worker runs in a container, where this machine's name means
-    # nothing until it is mapped to the gateway. Without this it cannot follow
-    # the upload links it is given, and nothing is ever archived.
-    update_env({"AIMS_STORAGE_HOST": f"{host}:9000", "AIMS_HOST_NAME": host})
+    lan = args.lan or bool(args.host)
+    if lan:
+        host = args.host or this_machine()
+        # The archive worker shares the storage container's network, where this
+        # machine's name means nothing until it is mapped to the host. Without
+        # this it cannot follow the upload links it is given.
+        update_env({"AIMS_BIND": "0.0.0.0", "AIMS_STORAGE_HOST": f"{host}:9000",
+                    "AIMS_HOST_NAME": host})
+        print(f"  this machine is {host} on the network; upload links will say so")
+        print("  --lan: the server, the storage and CMED's page answer the whole network")
+    else:
+        # This machine only. 127.0.0.1 in the upload links is the storage itself
+        # inside the archive worker's network too, so one address works for both.
+        host = "127.0.0.1"
+        update_env({"AIMS_BIND": "127.0.0.1", "AIMS_STORAGE_HOST": f"{host}:9000",
+                    "AIMS_HOST_NAME": "host.docker.internal"})
+        print("  this machine only: every port on 127.0.0.1 (use --lan for other PCs)")
     values = read_env()
-    print(f"  this machine is {host} on the network; upload links will say so")
     # The browser on a doctor's PC loads CMED's page from this address, so
     # the server has to accept it as an origin as well as localhost.
     origins = [o for o in values.get("AIMS_ALLOWED_ORIGINS", "").split(",") if o]
@@ -561,6 +631,15 @@ def main(argv=None) -> int:
     if page not in origins:
         update_env({"AIMS_ALLOWED_ORIGINS": ",".join(origins + [page])})
         values = read_env()
+
+    # The database first, so the server's login exists before the server does.
+    print("\nStarting the database")
+    compose("up", "-d", "postgres")
+    if not wait_for_database():
+        print("\nThe database did not come up. What it says:")
+        compose("logs", "--tail", "40", "postgres", check=False)
+        return 1
+    ensure_api_role(values)
 
     print("\nBuilding and starting")
     profile = ["--profile", "cmed"] if args.cmed else []

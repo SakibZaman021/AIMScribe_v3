@@ -121,7 +121,7 @@ def test_the_patient_is_not_readable_in_the_uploaded_object(tmp_path):
     sealed = cloudcopy.encrypt_file(plain, tmp_path / "visit.json.enc", KEY)
     blob = sealed.path.read_bytes()
     assert b"Ayesha" not in blob and b"P0012345" not in blob
-    assert blob.startswith(b"AIMSCPY1")
+    assert blob.startswith(b"AIMSCPY2")
 
     back = cloudcopy.decrypt_file(sealed.path, tmp_path / "back.json", KEY)
     assert json.loads(back.read_text(encoding="utf-8")) == document

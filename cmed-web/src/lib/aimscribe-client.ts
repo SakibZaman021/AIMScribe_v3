@@ -11,9 +11,20 @@
  *    `request_id`, `status` and `code`; act on the code, never on the wording
  *    (`SRS-IF1-09`). `200 RECORDING_STARTED` and `202 RECORDING_PROVISIONAL`
  *    both mean recording; the second means permission is still being checked.
- *  - **`prescription_built` ends a consultation.** Opening the next patient no
- *    longer cuts the last one off mid-sentence (§7.7): the recorder refuses
- *    with `GATE_NOT_ARMED` until this is sent.
+ *  - **Every patient click is accepted.** While the running recording has no
+ *    prescription yet, opening any patient - the right one after a wrong pick,
+ *    a glance at another file, the next patient after a follow-up - is
+ *    answered `RECORDING_STARTED` (or `RECORDING_PROVISIONAL`) with
+ *    `data.continued: true` and the RUNNING `session_id`. The recording carries
+ *    on; the recorder notes the click, and the AIMS LAB server later files each
+ *    part under the right patient. The page must still send that patient's
+ *    API 2, and use that `session_id` for their `prescription_built`.
+ *  - **`prescription_built` arms the gate.** The next different patient then
+ *    starts a new recording. If nobody is opened, the recording ends by itself
+ *    2 minutes after the prescription (`counselling_limit`); with no CMED
+ *    activity for 15 minutes (`no_activity_limit`); or when Windows shuts down
+ *    (`pc_shutdown`). `GATE_NOT_ARMED` and `PATIENT_NOTED` are no longer sent;
+ *    they are still understood, for an older recorder.
  *
  * Recording belongs to the recorder, not to this page. Closing the tab,
  * reloading, or losing the socket does not stop a recording; reconnecting
@@ -52,7 +63,14 @@ export interface AgentStatus {
   isRecording: boolean;
   isPaused: boolean;
   sessionId: string | null;
+  /** The patient the recording was opened for. */
   patientRef: string | null;
+  /** The patient opened most recently in this recording (after a wrong pick,
+   *  a glance, or the next patient after a follow-up). */
+  focusPatient: string | null;
+  /** A prescription has been built: the next different patient starts a new
+   *  recording, and this one ends 2 minutes later if nobody is opened. */
+  armed: boolean;
   /** The clinic this machine is enrolled at. Authoritative; not a page choice. */
   hospitalId: string | null;
   doctorId: string | null;
@@ -96,6 +114,8 @@ const EMPTY_STATUS: AgentStatus = {
   isPaused: false,
   sessionId: null,
   patientRef: null,
+  focusPatient: null,
+  armed: false,
   hospitalId: null,
   doctorId: null,
   durationSeconds: 0,
@@ -188,9 +208,10 @@ export class AimscribeClient {
   /**
    * API 3, part one: the prescription is built (§6.1.5).
    *
-   * Until this arrives, opening the next patient is refused with
-   * `GATE_NOT_ARMED` - which is what stops a consultation being cut off
-   * because someone clicked ahead.
+   * Send it with the patient the prescription is for, and the `session_id`
+   * the recorder gave when that patient was opened. It arms the gate: the next
+   * different patient starts a new recording. Built for a patient never opened
+   * in this recording, it is refused with `PATIENT_MISMATCH`.
    */
   async prescriptionBuilt(patientId: string, sessionId: string,
                           occurredAt?: string): Promise<Reply> {
@@ -366,6 +387,8 @@ function mapStatus(message: any): AgentStatus {
     isPaused: Boolean(message.is_paused),
     sessionId: message.session_id ?? null,
     patientRef: message.patient_ref ?? message.patient_id ?? null,
+    focusPatient: message.focus_patient ?? message.patient_ref ?? null,
+    armed: Boolean(message.armed),
     hospitalId: message.hospital_id ?? null,
     doctorId: message.doctor_id ?? null,
     durationSeconds: Number(message.duration_seconds ?? 0),
@@ -389,7 +412,10 @@ export const CODE_NOTES: Record<string, string> = {
   RECORDING_PROVISIONAL: 'Recording. Permission is still being checked.',
   GATE_ARMED: 'This consultation will end when the next patient is opened.',
   GATE_ALREADY_ARMED: 'Already marked as finished.',
+  // Older recorders only; the current one accepts every click.
   GATE_NOT_ARMED: 'Finish the current consultation first.',
+  PATIENT_NOTED: 'Still recording; the prescription decides whose it is.',
+  PATIENT_MISMATCH: 'That patient was not opened during this recording.',
   SESSION_ALREADY_ACTIVE: 'This consultation is already being recorded.',
   CLINIC_MISMATCH: 'This PC belongs to a different clinic.',
   DEVICE_NOT_ENROLLED: 'This PC is not registered with AIMS LAB.',
@@ -399,6 +425,27 @@ export const CODE_NOTES: Record<string, string> = {
   INVALID_IDENTIFIER: 'An identifier contains characters that are not allowed.',
   NO_REPLY: 'AIMScribe did not answer.',
 };
+
+/** A recorder reply that means it is recording a patient opened mid-recording. */
+export function isContinued(reply: Reply): boolean {
+  return RECORDING_CODES.includes(reply.code) && Boolean(reply.data?.continued);
+}
+
+/** Why a recording ended, in plain words, from `recording_stopped.reason`. */
+export const STOP_REASONS: Record<string, string> = {
+  doctor_stopped: 'Stopped by the doctor.',
+  stopped_from_tray: 'Stopped from the AIMScribe tray icon.',
+  superseded_by_new_patient: 'The next patient was opened after the prescription.',
+  counselling_limit: 'Ended by itself 2 minutes after the prescription (counselling time over).',
+  no_activity_limit: 'Ended by itself after 15 minutes with no activity in CMED.',
+  pc_shutdown: 'Ended cleanly because Windows was shutting down or restarting.',
+  agent_shutdown: 'The recorder was closed; it resumes this consultation if restarted soon.',
+  patient_did_not_consent: 'The patient did not consent; the recording is deleted.',
+};
+
+export function stopReason(reason: string): string {
+  return STOP_REASONS[reason] ?? (reason ? reason.replace(/_/g, ' ') : 'Stopped.');
+}
 
 /** Matches the recorder's own list; 'other' requires written detail. */
 export const PAUSE_REASONS = [

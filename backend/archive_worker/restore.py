@@ -21,6 +21,12 @@ chain, or to cut it differently - join the parts in order:
 
 The key is read from `AIMS_COPY_KEY`, the same value the worker uses. Without it
 nothing can be restored, which is the point of encrypting before upload.
+
+Each copy made since format 2 names the recording it belongs to. A copy whose
+file name, or kind (audio / JSON), is not the one it was made as - an object
+renamed or copied onto another recording's key - is refused rather than
+restored as the wrong patient. `--session <id>` also requires the session.
+Restored files are readable by their owner only.
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import archive
 import cloudcopy
@@ -41,14 +48,43 @@ def _key() -> bytes:
     return key
 
 
-def restore_one(sealed: Path, into: Path, key: bytes) -> Path:
+def _stem_of(name: str) -> str:
+    """`<stem>.v3.wav.enc` / `<stem>.wav.enc` -> `<stem>`: the archive's file name."""
+    base = name[:-len(".enc")] if name.endswith(".enc") else name
+    base = base.rsplit(".", 1)[0]                        # .wav / .json / .flac
+    head, _, version = base.rpartition(".")
+    if head and version.startswith("v") and version[1:].isdigit():
+        base = head
+    return base
+
+
+def expected_binding(sealed: Path, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """What a copy with this file name must be bound to."""
+    name = sealed.name
+    expect: Dict[str, Any] = {"stem_sha256": cloudcopy.stem_fingerprint(_stem_of(name))}
+    if name.endswith(".json.enc"):
+        expect["kind"] = "json"
+    elif name.endswith(".wav.enc") or name.endswith(".flac.enc"):
+        expect["kind"] = "audio"
+    if session_id:
+        expect["session_id"] = session_id
+    return expect
+
+
+def restore_one(sealed: Path, into: Path, key: bytes,
+                session_id: Optional[str] = None) -> Path:
     """
     One `.enc` object back to the file it was made from. A `.wav.enc` is the
-    WAV already; only an older `.flac.enc` needs decoding.
+    WAV already; only an older `.flac.enc` needs decoding. A copy bound to a
+    different recording than its name says is refused.
     """
-    into.mkdir(parents=True, exist_ok=True)
+    archive.make_dirs(into)
     name = sealed.name[:-len(".enc")] if sealed.name.endswith(".enc") else sealed.name
-    plain = cloudcopy.decrypt_file(sealed, into / name, key)
+    plain = cloudcopy.decrypt_file(sealed, into / name, key,
+                                   expect=expected_binding(sealed, session_id))
+    if "stem_sha256" not in (cloudcopy.read_binding(sealed) or {}):
+        print(f"  {sealed.name}: not bound to a recording (made before copies were); "
+              f"check its sha256 against the catalogue")
 
     if plain.suffix.lower() != ".flac":
         print(f"  {sealed.name} -> {plain.name}")
@@ -64,6 +100,7 @@ def restore_one(sealed: Path, into: Path, key: bytes) -> Path:
                 target.write(block)
     if not cloudcopy.flac_matches_wav(plain, wav):
         raise CopyError(f"{plain.name} did not decode cleanly to {wav.name}")
+    archive.make_private(wav)
     plain.unlink()
     print(f"  {sealed.name} -> {wav.name}  ({wav.stat().st_size / 1024 ** 2:.1f} MB)")
     return wav
@@ -87,6 +124,8 @@ def main(argv=None) -> int:
     one = commands.add_parser("restore", help="decrypt and decode one file or a folder")
     one.add_argument("source", type=Path)
     one.add_argument("destination", type=Path)
+    one.add_argument("--session", default=None,
+                     help="refuse any copy not bound to this session")
 
     check = commands.add_parser("check", help="compare a restored file with its hash")
     check.add_argument("path", type=Path)
@@ -126,7 +165,7 @@ def main(argv=None) -> int:
     failed = 0
     for sealed in sources:
         try:
-            restore_one(sealed, args.destination, key)
+            restore_one(sealed, args.destination, key, session_id=args.session)
         except CopyError as exc:
             failed += 1
             print(f"  {sealed.name}: {exc}")

@@ -25,14 +25,16 @@ A client's claim about what it uploaded is never taken on trust.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import hmac
 import logging
 import time
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -124,9 +126,20 @@ def _copy_bucket(kind: str = "audio"):
 # ============================================================
 
 async def require_device(
+    request: Request,
     x_device_token: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    """Authenticate an agent by its enrollment-issued bearer token."""
+    """
+    Authenticate an agent: its enrolment-issued bearer token, and - from
+    recorder 3.5 - a signature by the PC's own Ed25519 key over the request.
+
+    The token alone is a bearer secret: anyone who copied it (a backup, a
+    memory dump, another user of the PC) could act as the PC. The signature
+    proves possession of the key the PC's chain is signed with, binds the
+    method, path, body and time, and its nonce is used once. A PC that has
+    signed one request must sign every request after it, so a stolen token
+    stops working the day the PC is upgraded.
+    """
     if not x_device_token:
         raise HTTPException(status_code=401, detail="device token required")
 
@@ -135,7 +148,77 @@ async def require_device(
         raise HTTPException(status_code=401, detail="unknown device token")
     if device["revoked_at"] is not None:
         raise HTTPException(status_code=403, detail="device has been revoked")
+    await _check_device_signature(request, device)
     return device
+
+
+DEVICE_SIGNATURE_WINDOW = 300            # seconds either side of the server's clock
+_NONCE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def device_signatures_required() -> bool:
+    return os.getenv("AIMS_REQUIRE_DEVICE_SIGNATURES", "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def _b64url_decode(text: str) -> bytes:
+    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", text or ""):
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _signed_path(request) -> bytes:
+    """
+    The path exactly as the PC sent it - raw, not decoded - with "?query" when
+    there is one: what the recorder signs (including the /api/v2 prefix).
+    """
+    scope = getattr(request, "scope", None) or {}
+    raw = scope.get("raw_path")
+    if raw is None:
+        raw = request.url.path.encode("utf-8")
+    query = scope.get("query_string")
+    if query is None:
+        query = (request.url.query or "").encode("utf-8")
+    return raw + (b"?" + query if query else b"")
+
+
+async def _check_device_signature(request: Request, device: Dict[str, Any]) -> None:
+    headers = request.headers
+    stamp = headers.get("x-device-timestamp")
+    nonce = headers.get("x-device-nonce")
+    signature = headers.get("x-device-signature")
+    if stamp is None and nonce is None and signature is None:
+        if device.get("signs_requests") or device_signatures_required():
+            raise HTTPException(status_code=401, detail="this PC's requests must be signed")
+        return
+    if not (stamp and nonce and signature):
+        raise HTTPException(status_code=401, detail="incomplete request signature")
+    if not (stamp.isascii() and stamp.isdigit()) or len(stamp) > 12:
+        raise HTTPException(status_code=401, detail="X-Device-Timestamp must be unix seconds")
+    if abs(time.time() - int(stamp)) > DEVICE_SIGNATURE_WINDOW:
+        raise HTTPException(status_code=401,
+                            detail="request signature is outside the 5-minute window; "
+                                   "check the PC's clock")
+    if not _NONCE.match(nonce):
+        raise HTTPException(status_code=401, detail="X-Device-Nonce must be 16-64 "
+                                                    "characters of A-Z a-z 0-9 _ -")
+    try:
+        raw_signature = _b64url_decode(signature)
+    except Exception:
+        raise HTTPException(status_code=401, detail="X-Device-Signature is not base64url")
+    body = await request.body()
+    message = integrity.device_request_message(
+        method=request.method, path=_signed_path(request), timestamp=stamp, nonce=nonce,
+        body=body)
+    if not integrity.verify_device_signature(bytes(device["tpm_pubkey"]), message,
+                                             raw_signature):
+        raise HTTPException(status_code=401, detail="request signature does not verify")
+    if not await _repo().use_device_nonce(device["device_id"], nonce):
+        raise HTTPException(status_code=401, detail="request nonce was already used")
+    if not device.get("signs_requests"):
+        await _repo().mark_device_signs(device["device_id"])
+        logger.info("Device %s now signs its requests; unsigned ones are refused from "
+                    "here on", device["device_id"])
 
 
 def _check_static_key(supplied: Optional[str], env_var: str, label: str) -> None:
@@ -191,6 +274,9 @@ class OpenSessionRequest(BaseModel):
     # The grant this recording was authorised under (v3 recorders). Links the
     # session to CMED's API 2; absent from protocol-2 recorders.
     grant_jti: Optional[str] = Field(None, max_length=128)
+    # A consultation resumed after the recorder crashed or the PC restarted:
+    # the recording it continues (S4).
+    continues_session_id: Optional[str] = Field(None, max_length=64)
 
 
 class AuthorizeRequest(BaseModel):
@@ -257,6 +343,11 @@ class HeartbeatRequest(BaseModel):
     sent_at: Optional[str] = None
     # Server time minus the PC's time, measured by the recorder from our replies.
     clock_offset_seconds: Optional[float] = None
+    # Recordings this PC is holding because this server said no (U3).
+    held: Optional[List[Dict[str, Any]]] = None
+    held_count: Optional[int] = Field(None, ge=0)
+    # BitLocker on the drive holding the PC's audio; None when unknown (X1).
+    disk_encrypted: Optional[bool] = None
 
 
 class ArchivedPart(BaseModel):
@@ -268,6 +359,11 @@ class ArchivedPart(BaseModel):
     end_seconds: Optional[float] = Field(None, ge=0)
 
 
+class JoinedSegment(BaseModel):
+    seq_no: int = Field(..., ge=1, le=10000)
+    sha256: str = Field(..., min_length=64, max_length=64)
+
+
 class ArchiveCompleteRequest(BaseModel):
     session_id: str
     archive_relpath: str = Field(..., max_length=512)
@@ -276,6 +372,11 @@ class ArchiveCompleteRequest(BaseModel):
     sha256: str = Field(..., min_length=64, max_length=64)
     bytes: int = Field(..., ge=1)
     parts: Optional[List[ArchivedPart]] = None
+    # The pieces the worker actually joined into that audio. Receipts, the
+    # "archived" mark and deleting the pieces from the bucket cover these and
+    # nothing else, so a piece that arrived after the worker fetched the list
+    # can never be counted as archived without being in the file.
+    segments: Optional[List[JoinedSegment]] = Field(None, max_length=10000)
 
 
 # ============================================================
@@ -283,12 +384,32 @@ class ArchiveCompleteRequest(BaseModel):
 # ============================================================
 
 def _parse_time(value: Optional[str]) -> datetime:
+    """
+    A time the recorder sent. Missing or unreadable is "now", as it always
+    was. A time with no offset is read as UTC, which is what every recorder
+    writes (crypto.iso_utc): it used to come back naive, and subtracting it
+    from an aware time raised TypeError - a close that failed with a 500 on
+    every retry - while a naive opened_at was filed under the container's
+    idea of the date.
+    """
     if not value:
         return datetime.now(timezone.utc)
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return datetime.now(timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _parse_time_strict(value: Any, field: str) -> datetime:
+    """For fields new in 3.5: an ISO-8601 time with its offset, or 400."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be an ISO-8601 time")
+    if parsed.tzinfo is None:
+        raise HTTPException(status_code=400, detail=f"{field} must carry its time zone")
+    return parsed
 
 
 async def _verified_duplicate(session_id: str, entry, device) -> bool:
@@ -344,6 +465,100 @@ async def _local_date(hospital_id: str, moment: datetime) -> date:
             "be filed under the wrong day for any hospital not on UTC. Install the "
             "tzdata package.", tz_name)
         return moment.astimezone(timezone.utc).date()
+
+
+def _sid(value: Any) -> str:
+    """A session id from a request: a ULID, or 400 (it was a ValueError, a 500)."""
+    try:
+        return safe_session_id(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@asynccontextmanager
+async def _session_lock(session_id: str):
+    """The recording's transaction (db_v2.session_tx), when the store has one."""
+    tx = getattr(_repo(), "session_tx", None)
+    if tx is None:
+        yield None
+        return
+    async with tx(session_id) as conn:
+        yield conn
+
+
+def _closed_to_writes(session: Dict[str, Any]) -> Optional[str]:
+    """Why nothing more may be added to this recording's chain, or None."""
+    if session.get("confirmation") in ("refused", "expired"):
+        return "this consultation has been erased"
+    if session.get("status") == "quarantined" or session.get("quarantine_reason"):
+        return "this recording is quarantined and held for review"
+    if session.get("closed_at") is not None or session.get("status") == "archived":
+        return "this recording is closed"
+    return None
+
+
+async def _chain_append(session_id: str, entry, device, expected_type: str) -> Tuple[str, str]:
+    """
+    Add one signed entry to a recording's chain, under the recording's lock.
+    Returns (outcome, reason): 'recorded', 'duplicate', 'deferred' (an
+    earlier entry has not arrived yet; the PC sends it again), or
+    'quarantined' (another entry already holds this number).
+    """
+    repo = _repo()
+    if entry.entry_type != expected_type or (
+            isinstance(entry.payload, dict)
+            and entry.payload.get("type") not in (None, expected_type)):
+        raise HTTPException(status_code=400, detail=f"expected a {expected_type} entry")
+    if await _verified_duplicate(session_id, entry, device):
+        return "duplicate", ""
+    session = await repo.get_session(session_id) or {}
+    if session.get("confirmation") in ("refused", "expired"):
+        raise HTTPException(status_code=409, detail="this consultation has been erased")
+    tip = await repo.chain_tip(session_id) if hasattr(repo, "chain_tip") else None
+    if tip is not None:
+        expected_no = tip[0] + 1
+        if entry.entry_no > expected_no:
+            return "deferred", "an earlier chain entry has not arrived yet"
+        if entry.entry_no < expected_no:
+            await _quarantine(session_id, device,
+                              f"entry {entry.entry_no} is already taken by another entry",
+                              alert="chain_entry_conflict")
+            return "quarantined", "another entry already holds this number"
+    expected_prev = tip[1] if tip is not None else await repo.chain_head(session_id)
+    verdict = integrity.verify_entry(
+        entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
+    if not verdict.ok:
+        return "deferred", verdict.reason
+    stored = await repo.append_chain_entry(session_id, entry)
+    if stored == "conflict":
+        await _quarantine(session_id, device,
+                          f"entry {entry.entry_no} conflicts with the stored chain",
+                          alert="chain_entry_conflict")
+        return "quarantined", "another entry already holds this number"
+    return ("duplicate" if stored == "duplicate" else "recorded"), ""
+
+
+async def _quarantine(session_id: str, device, reason: str, *, alert: str,
+                      detail: Optional[Dict[str, Any]] = None) -> None:
+    repo = _repo()
+    await repo.quarantine_session(session_id, reason)
+    await repo.raise_alert(alert_type=alert, severity="critical", session_id=session_id,
+                           device_id=device["device_id"] if device else None,
+                           detail={"reason": reason, **(detail or {})})
+
+
+def _genesis_problem(genesis, device, body) -> Optional[str]:
+    payload = genesis.payload if isinstance(genesis.payload, dict) else {}
+    if payload.get("type") != "open":
+        return "genesis payload is not an open entry"
+    if str(payload.get("device_id", "")).lower() != str(device["device_id"]).lower():
+        return "genesis was made by another PC"
+    if body.opened_at and payload.get("opened_at"):
+        said = _parse_time(body.opened_at)
+        signed = _parse_time(payload.get("opened_at"))
+        if abs((said - signed).total_seconds()) > 1:
+            return "opened_at does not match the signed genesis"
+    return None
 
 
 async def _entry_or_400(raw: Dict[str, Any]):
@@ -413,7 +628,7 @@ async def enroll_device(body: EnrollRequest):
 @router.post("/session/open")
 async def open_session(body: OpenSessionRequest, device=Depends(require_device)):
     try:
-        session_id = safe_session_id(body.session_id)
+        session_id = _sid(body.session_id)
         doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
         patient_ref = safe_identifier(body.patient_ref, field="patient_ref")
         hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
@@ -423,6 +638,18 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     if await _repo().refusal(session_id):
         raise HTTPException(status_code=409,
                             detail="this consultation was refused by the patient")
+
+    # A retried open is the same PC sending again. Another PC naming a
+    # recording it does not own is refused: it would otherwise reach that
+    # recording's grant link and continuation, and the audit would show it
+    # as an open by the owner.
+    existing = await _repo().get_session(session_id)
+    if existing is not None and str(existing.get("device_id")) != str(device["device_id"]):
+        await _repo().raise_alert(
+            alert_type="session_owner_mismatch", severity="critical",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"owner": str(existing.get("device_id"))})
+        raise HTTPException(status_code=409, detail="this recording belongs to another PC")
 
     # The clinic is the device's, always (SRS-INV-01; decision D1). A v3
     # recorder cannot get here with another clinic - its grant is refused - so a
@@ -463,6 +690,20 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     genesis = await _entry_or_400(body.genesis)
     if genesis.entry_no != 0 or genesis.entry_type != "open":
         raise HTTPException(status_code=400, detail="genesis must be entry 0 of type open")
+    # The genesis carries no session id, so it is bound here: it must be this
+    # PC's, opened at the moment this request says, and never one that has
+    # opened another recording. Otherwise a genesis and the entries signed
+    # after it could be replayed under a new session id with other audio.
+    problem = _genesis_problem(genesis, device, body)
+    if problem is None and hasattr(_repo(), "genesis_in_use") \
+            and await _repo().genesis_in_use(genesis.entry_hash, session_id):
+        problem = "this genesis entry already opened another recording"
+    if problem is not None:
+        await _repo().raise_alert(
+            alert_type="genesis_rejected", severity="critical",
+            session_id=None, device_id=device["device_id"],
+            detail={"session_id": session_id, "reason": problem})
+        raise HTTPException(status_code=400, detail=f"genesis rejected: {problem}")
 
     verdict = integrity.verify_entry(
         genesis, expected_prev=None, device_pubkey=bytes(device["tpm_pubkey"]))
@@ -498,11 +739,16 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
             logger.debug("Legacy patient upsert skipped: %s", exc)
 
     state = await _link_grant(session_id, body.grant_jti, patient_ref, device)
+    if body.continues_session_id:
+        state = await _link_continuation(session_id, body.continues_session_id,
+                                         patient_ref, device, state)
 
     await _repo().audit(
         event_type="session.opened", actor_type="device",
         actor_id=doctor_id, device_id=device["device_id"], session_id=session_id,
-        detail={"hospital_id": hospital_id, "confirmation": state},
+        detail={"hospital_id": hospital_id, "confirmation": state,
+                **({"continues": body.continues_session_id}
+                   if body.continues_session_id else {})},
     )
     return {"session_id": session_id, "status": "open", "hospital_id": hospital_id,
             "confirmation": state}
@@ -511,7 +757,7 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
 @router.post("/segment/authorize")
 async def authorize_segment(body: AuthorizeRequest, device=Depends(require_device)):
     """Issue a short-lived presigned PUT for exactly one segment."""
-    session = await _session_for_device(safe_session_id(body.session_id), device)
+    session = await _session_for_device(_sid(body.session_id), device)
 
     max_bytes = int(os.getenv("AIMS_MAX_SEGMENT_BYTES", str(64 * 1024 * 1024)))
     if body.bytes > max_bytes:
@@ -544,14 +790,17 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
 @router.post("/segment/commit")
 async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     """
-    Accept a segment only after re-reading it from storage and re-hashing it.
+    Accept a segment only after re-reading it from storage and re-hashing it,
+    and only with a signed chain entry that names exactly this piece.
 
     v1 queued transcription on the client's word that the upload succeeded. Here
     the bytes are fetched back and hashed; a mismatch quarantines the session and
-    the agent keeps its local copy.
+    the agent keeps its local copy. The entry must be a segment entry for this
+    seq_no, these bytes and this hash, the next number in the chain - a
+    signature alone proves only that the PC signed something.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     session = await _session_for_device(session_id, device)
     if session.get("confirmation") in ("refused", "expired"):
         raise HTTPException(status_code=409, detail="this consultation has been erased")
@@ -577,7 +826,8 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     # a busy minute costs the network several times what it should. One short
     # retry absorbs that; a piece that still cannot be read is refused, and
     # refusing is right - the server must never record a piece it has not
-    # verified. (Seen in the 28-room load test.)
+    # verified. (Seen in the 28-room load test.) Done before the recording's
+    # lock is taken: it is the slow part, and it changes nothing.
     loop = asyncio.get_event_loop()
     stored = None
     for attempt, pause in enumerate((0.25, 0.75)):
@@ -614,63 +864,87 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         raise HTTPException(status_code=400, detail="declared byte length does not match")
 
     entry = await _entry_or_400(body.chain_entry)
+    binding = integrity.segment_binding_problem(
+        entry, seq_no=body.seq_no, sha256_hex=body.sha256, byte_length=body.bytes)
+    if binding is not None:
+        async with _session_lock(session_id):
+            await _quarantine(session_id, device, f"chain entry does not match the "
+                              f"segment: {binding}", alert="segment_entry_mismatch",
+                              detail={"seq_no": body.seq_no})
+        return {"status": "quarantined", "reason": binding}
 
-    # A commit whose response was lost gets retried, and the entry arriving the
-    # second time is byte-identical to the one already stored. Verifying it
-    # against a head that has moved past it judged an intact session a forgery
-    # and quarantined it - which is exactly what happened to a real consultation:
-    # ten clips, all present and correct on both sides, held out of the archive.
-    #
-    # A duplicate is answered as the success it is. Only the original entry
-    # hashes to the stored value, so this cannot launder a tampered one.
-    if await _verified_duplicate(session_id, entry, device):
-        logger.info("Segment %s of %s was already committed; treating the retry "
-                    "as the success it is", body.seq_no, session_id)
-        await _issue_custody_receipt(session_id, body.seq_no, claimed)
-        return {"status": "committed", "seq_no": body.seq_no,
-                "object_key": body.object_key, "duplicate": True}
+    async with _session_lock(session_id):
+        current = await repo.get_session(session_id) or session
 
-    expected_prev = await repo.chain_head(session_id)
-    verdict = integrity.verify_entry(
-        entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
-    if not verdict.ok:
-        await repo.quarantine_session(session_id, f"chain entry rejected: {verdict.reason}")
-        await repo.raise_alert(
-            alert_type="chain_entry_rejected", severity="critical",
-            session_id=session_id, device_id=device["device_id"],
-            detail={"seq_no": body.seq_no, "reason": verdict.reason})
-        return {"status": "quarantined", "reason": verdict.reason}
+        # A commit whose response was lost gets retried, and the entry arriving
+        # the second time is byte-identical to the one already stored. It is
+        # answered as the success it is - even after the close, which it may
+        # well have raced - because only the original entry hashes to the
+        # stored value, so this cannot launder a tampered one.
+        if await _verified_duplicate(session_id, entry, device):
+            outcome = "duplicate"
+        else:
+            closed = _closed_to_writes(current)
+            if closed is not None:
+                # After the close nothing joins a recording: it would get a
+                # receipt (so the PC deletes it) without ever being in the file.
+                raise HTTPException(status_code=409, detail=closed)
+            tip = await repo.chain_tip(session_id) if hasattr(repo, "chain_tip") else None
+            expected_prev = tip[1] if tip is not None else await repo.chain_head(session_id)
+            if tip is not None and entry.entry_no > tip[0] + 1:
+                raise HTTPException(status_code=409,
+                                    detail="an earlier chain entry has not arrived yet")
+            if tip is not None and entry.entry_no <= tip[0]:
+                await _quarantine(session_id, device,
+                                  f"entry {entry.entry_no} is already taken by another entry",
+                                  alert="chain_entry_conflict", detail={"seq_no": body.seq_no})
+                return {"status": "quarantined",
+                        "reason": "another entry already holds this number"}
+            verdict = integrity.verify_entry(
+                entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
+            if not verdict.ok:
+                await _quarantine(session_id, device,
+                                  f"chain entry rejected: {verdict.reason}",
+                                  alert="chain_entry_rejected", detail={"seq_no": body.seq_no})
+                return {"status": "quarantined", "reason": verdict.reason}
 
-    outcome = await repo.commit_segment(
-        session_id=session_id,
-        seq_no=body.seq_no,
-        entry=entry,
-        object_key=body.object_key,
-        byte_length=body.bytes,
-        duration_seconds=body.duration_seconds,
-        sha256=claimed,
-        rms_mean=body.rms_mean,
-        captured_start_at=_parse_time(body.captured_start_at),
-        captured_end_at=_parse_time(body.captured_end_at),
-        is_final=body.is_final,
-        clip_name=clip_name(session, body.seq_no),
-    )
+            outcome = await repo.commit_segment(
+                session_id=session_id,
+                seq_no=body.seq_no,
+                entry=entry,
+                object_key=body.object_key,
+                byte_length=body.bytes,
+                duration_seconds=body.duration_seconds,
+                sha256=claimed,
+                rms_mean=body.rms_mean,
+                captured_start_at=_parse_time(body.captured_start_at),
+                captured_end_at=_parse_time(body.captured_end_at),
+                is_final=body.is_final,
+                clip_name=clip_name(current, body.seq_no),
+            )
 
-    if outcome == "conflict":
-        # Same sequence number, different content. Either a bug or an attempt to
-        # overwrite already-committed audio.
-        await repo.quarantine_session(session_id, "duplicate seq_no with a different hash")
-        await repo.raise_alert(
-            alert_type="segment_conflict", severity="critical",
-            session_id=session_id, device_id=device["device_id"],
-            detail={"seq_no": body.seq_no})
-        return {"status": "quarantined", "reason": "segment already committed with different content"}
+            if outcome == "conflict":
+                # Same sequence number or entry number, different content. Either
+                # a bug or an attempt to overwrite already-committed audio.
+                await _quarantine(session_id, device,
+                                  "duplicate seq_no with a different hash",
+                                  alert="segment_conflict", detail={"seq_no": body.seq_no})
+                return {"status": "quarantined",
+                        "reason": "segment already committed with different content"}
+        quarantined = (current.get("status") == "quarantined"
+                       or bool(current.get("quarantine_reason")))
 
     if outcome == "stored":
         await _queue_transcription(session_id, body, session)
-
+    if quarantined:
+        # Held for review: the PC keeps its copy, so no receipt.
+        return {"status": "quarantined", "reason": "this recording is held for review"}
+    if outcome == "duplicate":
+        logger.info("Segment %s of %s was already committed; treating the retry "
+                    "as the success it is", body.seq_no, session_id)
     await _issue_custody_receipt(session_id, body.seq_no, claimed)
-    return {"status": "committed", "seq_no": body.seq_no, "duplicate": outcome == "duplicate"}
+    return {"status": "committed", "seq_no": body.seq_no, "object_key": body.object_key,
+            "duplicate": outcome == "duplicate"}
 
 
 def object_prefix(patient: str, doctor: str, hospital: str,
@@ -758,14 +1032,16 @@ def unique_clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
     return f"{base[:-len('.wav')]}_{str(session['session_id'])[-5:]}.wav"
 
 
-async def _delete_bucket_objects(session_id: str) -> int:
+async def _delete_bucket_objects(session_id: str, *, only_archived: bool = True) -> int:
     """
     Remove a session's clips from object storage.
 
-    Called only after the archive copy is verified and receipts are signed. A
-    failure is logged and left for the retry index rather than raised: the audio
-    is already safe on the AIMS LAB server, and failing the request here would
-    make the worker re-download and re-archive a session that is already done.
+    Called only after the archive copy is verified and receipts are signed, and
+    then only for pieces marked archived - the ones the worker joined. A piece
+    that is not in the archive file is never deleted from the bucket on the
+    strength of its neighbours. (An erase removes everything: only_archived=False.)
+    A failure is logged and left for the retry index rather than raised: the
+    audio is already safe on the AIMS LAB server.
     """
     repo = _repo()
     loop = asyncio.get_event_loop()
@@ -773,6 +1049,8 @@ async def _delete_bucket_objects(session_id: str) -> int:
 
     for segment in await repo.segments_for(session_id):
         if segment.get("object_deleted_at") is not None:
+            continue
+        if only_archived and segment.get("state") not in (None, "archived"):
             continue
         try:
             await loop.run_in_executor(None, _remove_object, segment["object_key"])
@@ -845,29 +1123,23 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
     Record a pause or resume in the chain.
 
     Best-effort from the agent's point of view - it does not block on this - so a
-    duplicate or out-of-order arrival is tolerated. The authoritative copy comes
-    in the manifest at close.
+    duplicate or out-of-order arrival is tolerated: an entry whose predecessor
+    has not landed is "deferred" and sent again.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     await _session_for_device(session_id, device)
 
     entry = await _entry_or_400(body.chain_entry)
-    if entry.entry_type != expected_type:
-        raise HTTPException(status_code=400, detail=f"expected a {expected_type} entry")
-
-    # Same as a segment commit: a redelivered pause is not a chain violation.
-    if await _verified_duplicate(session_id, entry, device):
+    async with _session_lock(session_id):
+        outcome, reason = await _chain_append(session_id, entry, device, expected_type)
+    if outcome == "duplicate":
         return {"status": "recorded", "entry_no": entry.entry_no, "duplicate": True}
+    if outcome != "recorded":
+        logger.info("%s %s entry for %s: %s", outcome.capitalize(), expected_type,
+                    session_id, reason)
+        return {"status": outcome, "reason": reason}
 
-    expected_prev = await repo.chain_head(session_id)
-    verdict = integrity.verify_entry(
-        entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
-    if not verdict.ok:
-        logger.info("Deferring %s entry for %s: %s", expected_type, session_id, verdict.reason)
-        return {"status": "deferred", "reason": verdict.reason}
-
-    await repo.append_chain_entry(session_id, entry)
     await repo.audit(
         event_type=f"session.{expected_type}", actor_type="device",
         actor_id=str(entry.payload.get("authorised_by", "")),
@@ -893,21 +1165,16 @@ async def session_marker(body: MarkerRequest, device=Depends(require_device)):
     link in the chain - and a problem with what it says is alerted, not refused.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     session = await _session_for_device(session_id, device)
 
     entry = await _entry_or_400(body.chain_entry)
-    if entry.entry_type != "marker":
-        raise HTTPException(status_code=400, detail="expected a marker entry")
-    duplicate = await _verified_duplicate(session_id, entry, device)
-    if not duplicate:
-        expected_prev = await repo.chain_head(session_id)
-        verdict = integrity.verify_entry(
-            entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
-        if not verdict.ok:
-            logger.info("Deferring marker for %s: %s", session_id, verdict.reason)
-            return {"status": "deferred", "reason": verdict.reason}
-        await repo.append_chain_entry(session_id, entry)
+    async with _session_lock(session_id):
+        outcome, reason = await _chain_append(session_id, entry, device, "marker")
+    if outcome not in ("recorded", "duplicate"):
+        logger.info("%s marker for %s: %s", outcome.capitalize(), session_id, reason)
+        return {"status": outcome, "reason": reason}
+    duplicate = outcome == "duplicate"
 
     payload = entry.payload
     try:
@@ -981,22 +1248,17 @@ async def reassign_session(body: ReassignRequest, device=Depends(require_device)
     is alerted. Nothing is ever deleted here.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     session = await _session_for_device(session_id, device)
 
     entry = await _entry_or_400(body.chain_entry)
-    if entry.entry_type != "reassign":
-        raise HTTPException(status_code=400, detail="expected a reassign entry")
-    if await _verified_duplicate(session_id, entry, device):
+    async with _session_lock(session_id):
+        outcome, reason = await _chain_append(session_id, entry, device, "reassign")
+    if outcome == "duplicate":
         return {"status": "recorded", "entry_no": entry.entry_no, "duplicate": True}
-
-    expected_prev = await repo.chain_head(session_id)
-    verdict = integrity.verify_entry(
-        entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
-    if not verdict.ok:
-        logger.info("Deferring reassign entry for %s: %s", session_id, verdict.reason)
-        return {"status": "deferred", "reason": verdict.reason}
-    await repo.append_chain_entry(session_id, entry)
+    if outcome != "recorded":
+        logger.info("%s reassign entry for %s: %s", outcome.capitalize(), session_id, reason)
+        return {"status": outcome, "reason": reason}
 
     problem = None
     try:
@@ -1071,6 +1333,8 @@ async def reassign_session(body: ReassignRequest, device=Depends(require_device)
 NORMAL_CLOSE_REASONS = frozenset({
     "doctor_stopped", "superseded_by_new_patient", "counselling_limit",
     "no_activity_limit", "pc_shutdown",
+    # The recorder closes its recording itself while an installer upgrades it.
+    "software_update",
 })
 
 
@@ -1081,71 +1345,104 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
 
     Any gap, break or bad signature quarantines the session: it is held for review,
     never archived automatically, and the agent never gets a purge receipt for it.
+
+    Completeness is proven by the chain, not by the count the PC sends: the
+    close entry names the segment count and is signed, and it can only be
+    added once every entry before it is here. Every segment row must match
+    its own chain entry. A repeated close of a recording already closed,
+    archived or quarantined changes nothing and says where it stands.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
-    session = await _session_for_device(session_id, device)
+    session_id = _sid(body.session_id)
+    await _session_for_device(session_id, device)
 
-    if body.chain_entry:
-        entry = await _entry_or_400(body.chain_entry)
-        if entry.entry_type == "close":
-            expected_prev = await repo.chain_head(session_id)
-            verdict = integrity.verify_entry(
-                entry, expected_prev=expected_prev,
-                device_pubkey=bytes(device["tpm_pubkey"]))
-            if verdict.ok:
-                await repo.append_chain_entry(session_id, entry)
+    async with _session_lock(session_id):
+        session = await repo.get_session(session_id) or {}
+        if session.get("confirmation") in ("refused", "expired"):
+            raise HTTPException(status_code=409, detail="this consultation has been erased")
+        if session.get("status") == "quarantined" or session.get("quarantine_reason"):
+            return {"status": "quarantined",
+                    "reason": session.get("quarantine_reason") or "held for review"}
+        if session.get("closed_at") is not None:
+            chain = await repo.load_chain(session_id)
+            return {"status": "closed", "chain_ok": True, "already": True,
+                    **integrity.chain_summary(chain)}
 
-    chain = await repo.load_chain(session_id)
-    verdict = integrity.verify_chain(chain, device_pubkey=bytes(device["tpm_pubkey"]))
-    summary = integrity.chain_summary(chain)
+        close_entry = None
+        if body.chain_entry:
+            close_entry = await _entry_or_400(body.chain_entry)
+            if close_entry.entry_type != "close":
+                raise HTTPException(status_code=400, detail="expected a close entry")
+            outcome, reason = await _chain_append(session_id, close_entry, device, "close")
+            if outcome == "quarantined":
+                return {"status": "quarantined", "reason": reason}
+            if outcome == "deferred":
+                tip = await repo.chain_tip(session_id) if hasattr(repo, "chain_tip") else None
+                if tip is not None and close_entry.entry_no == tip[0] + 1:
+                    # Next in line yet it does not verify: a forged or
+                    # damaged close, not one still waiting for its clips.
+                    await _quarantine(session_id, device,
+                                      f"close entry rejected: {reason}",
+                                      alert="chain_invalid")
+                    return {"status": "quarantined", "reason": reason}
+                return await _incomplete(session_id, device, body, session,
+                                         agent_segments=_signed_count(close_entry, body))
 
-    if not verdict.ok:
-        await repo.quarantine_session(session_id, verdict.reason)
-        await repo.raise_alert(
-            alert_type="chain_invalid", severity="critical",
-            session_id=session_id, device_id=device["device_id"],
-            detail={"reason": verdict.reason, "failed_entry": verdict.failed_entry_no})
-        await repo.audit(
-            event_type="session.quarantined", actor_type="device",
-            device_id=device["device_id"], session_id=session_id,
-            detail={"reason": verdict.reason})
-        return {"status": "quarantined", "reason": verdict.reason,
-                "failed_entry_no": verdict.failed_entry_no}
+        chain = await repo.load_chain(session_id)
+        verdict = integrity.verify_chain(chain, device_pubkey=bytes(device["tpm_pubkey"]))
+        summary = integrity.chain_summary(chain)
 
-    stored_segments = await repo.segments_for(session_id)
-    if body.segment_count and len(stored_segments) != body.segment_count:
-        # The agent recorded segments the server never received. Not fraud - most
-        # likely an upload still pending - but the session is not complete.
-        await repo.raise_alert(
-            alert_type="segment_count_mismatch", severity="warning",
-            session_id=session_id, device_id=device["device_id"],
-            detail={"agent": body.segment_count, "server": len(stored_segments)})
-        return {"status": "incomplete", "reason": "not all segments have been committed",
-                "server_segments": len(stored_segments), "agent_segments": body.segment_count}
+        if not verdict.ok:
+            await _quarantine(session_id, device, verdict.reason, alert="chain_invalid",
+                              detail={"failed_entry": verdict.failed_entry_no})
+            await repo.audit(
+                event_type="session.quarantined", actor_type="device",
+                device_id=device["device_id"], session_id=session_id,
+                detail={"reason": verdict.reason})
+            return {"status": "quarantined", "reason": verdict.reason,
+                    "failed_entry_no": verdict.failed_entry_no}
 
-    chain_head = chain[-1].entry_hash if chain else None
-    closed_at = _parse_time(body.closed_at)
-    # The clinic's wall clock, resolved here rather than by the database
-    # (SRS-SES-04). An unresolvable zone is logged and falls back to UTC; it
-    # never fails the close, because a close that fails is a recording that is
-    # never archived.
-    opened_local = await _local_time(session["hospital_id"], session["opened_at"]) \
-        if session.get("opened_at") else None
-    closed_local = await _local_time(session["hospital_id"], closed_at)
-    await repo.close_session(
-        session_id,
-        closed_at=closed_at,
-        duration_seconds=body.duration_seconds,
-        paused_seconds=body.paused_seconds,
-        segment_count=len(stored_segments),
-        chain_head=chain_head,
-        manifest=body.manifest or {},
-        close_reason=body.close_reason,
-        local_date=opened_local.date() if opened_local else None,
-        local_start=opened_local.time() if opened_local else None,
-        local_end=closed_local.time(),
-    )
+        stored_segments = await repo.segments_for(session_id)
+        mismatch = _segments_against_chain(chain, stored_segments)
+        if mismatch is not None:
+            await _quarantine(session_id, device, mismatch, alert="chain_invalid")
+            return {"status": "quarantined", "reason": mismatch}
+
+        expected = _signed_count(close_entry, body)
+        if len(stored_segments) != expected:
+            if close_entry is not None:
+                # The close entry is in the chain, so nothing is still on its
+                # way: the signed count and the chain disagree.
+                reason = (f"the signed close names {expected} segment(s); the chain "
+                          f"holds {len(stored_segments)}")
+                await _quarantine(session_id, device, reason, alert="chain_invalid")
+                return {"status": "quarantined", "reason": reason}
+            return await _incomplete(session_id, device, body, session,
+                                     agent_segments=expected,
+                                     server_segments=len(stored_segments))
+
+        chain_head = chain[-1].entry_hash if chain else None
+        closed_at = _parse_time(body.closed_at)
+        # The clinic's wall clock, resolved here rather than by the database
+        # (SRS-SES-04). An unresolvable zone is logged and falls back to UTC; it
+        # never fails the close, because a close that fails is a recording that
+        # is never archived.
+        opened_local = await _local_time(session["hospital_id"], session["opened_at"]) \
+            if session.get("opened_at") else None
+        closed_local = await _local_time(session["hospital_id"], closed_at)
+        await repo.close_session(
+            session_id,
+            closed_at=closed_at,
+            duration_seconds=body.duration_seconds,
+            paused_seconds=body.paused_seconds,
+            segment_count=len(stored_segments),
+            chain_head=chain_head,
+            manifest=body.manifest or {},
+            close_reason=body.close_reason,
+            local_date=opened_local.date() if opened_local else None,
+            local_start=opened_local.time() if opened_local else None,
+            local_end=closed_local.time(),
+        )
 
     # Who each stretch belongs to, then the shared file name(s) and the
     # clinical visit(s) they belong to.
@@ -1177,11 +1474,68 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
     return {"status": "closed", "chain_ok": True, **summary}
 
 
+def _signed_count(close_entry, body: "CloseRequest") -> int:
+    """The segment count the PC signed into its close entry, else the one it sent."""
+    if close_entry is not None and isinstance(close_entry.payload, dict):
+        value = close_entry.payload.get("segment_count")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return body.segment_count
+
+
+def _segments_against_chain(chain, segments) -> Optional[str]:
+    """Every stored piece matches its own chain entry, and every segment entry a piece."""
+    by_no = {e.entry_no: e for e in chain}
+    seen = set()
+    for row in segments:
+        entry = by_no.get(row.get("entry_no")) if row.get("entry_no") is not None else None
+        if entry is None:
+            entry = next((e for e in chain if e.entry_type == "segment"
+                          and isinstance(e.payload, dict)
+                          and e.payload.get("seq_no") == row["seq_no"]), None)
+        if entry is None:
+            return f"segment {row['seq_no']} has no chain entry"
+        problem = integrity.segment_binding_problem(
+            entry, seq_no=row["seq_no"], sha256_hex=bytes(row["sha256"]).hex(),
+            byte_length=row.get("bytes"))
+        if problem is not None:
+            return problem
+        seen.add(entry.entry_no)
+    extra = [e.entry_no for e in chain if e.entry_type == "segment" and e.entry_no not in seen]
+    if extra:
+        return f"chain segment entries {extra[:5]} have no stored piece"
+    return None
+
+
+async def _incomplete(session_id: str, device, body: "CloseRequest", session,
+                      *, agent_segments: int, server_segments: Optional[int] = None):
+    """
+    The PC recorded segments the server has not received yet - almost always
+    the last clip still uploading. Answered "incomplete" and sent again; a
+    person is told once, and only if they are still missing ten minutes on.
+    """
+    repo = _repo()
+    if server_segments is None:
+        server_segments = len(await repo.segments_for(session_id))
+    closed_for = (datetime.now(timezone.utc) - _parse_time(body.closed_at)).total_seconds()
+    if closed_for >= SEGMENTS_LATE_AFTER.total_seconds():
+        first = (await repo.mark_late_alerted(session_id)
+                 if hasattr(repo, "mark_late_alerted") else True)
+        if first:
+            await repo.raise_alert(
+                alert_type="segment_count_mismatch", severity="warning",
+                session_id=session_id, device_id=device["device_id"],
+                detail={"agent": agent_segments, "server": server_segments,
+                        "minutes_since_close": round(closed_for / 60, 1)})
+    return {"status": "incomplete", "reason": "not all segments have been committed",
+            "server_segments": server_segments, "agent_segments": agent_segments}
+
+
 @router.get("/session/{session_id}/receipts")
 async def session_receipts(session_id: str, device=Depends(require_device)):
     """Purge receipts the agent may act on - one per piece, issued the moment the
     piece is verified on arrival (SRS-REC-15)."""
-    sid = safe_session_id(session_id)
+    sid = _sid(session_id)
     await _session_for_device(sid, device)
     return {"session_id": sid, "receipts": await _repo().receipts_for(sid)}
 
@@ -1194,12 +1548,24 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
     A missing heartbeat is how a killed agent or a stalled upload queue becomes
     visible centrally rather than being discovered weeks later.
     """
+    held = None
+    if body.held is not None:
+        held = [{"session_id": str(h.get("session_id", ""))[:64],
+                 "code": str(h.get("code", ""))[:64],
+                 "since": str(h.get("since", ""))[:40]}
+                for h in body.held[:20] if isinstance(h, dict)]
     await _repo().touch_device(
         device["device_id"],
         spool_bytes=body.spool_bytes,
         pending_segments=body.pending_segments,
         app_version=body.app_version or None,
+        held_sessions=held,
+        held_count=body.held_count if body.held_count is not None
+        else (len(held) if held is not None else None),
+        disk_encrypted=body.disk_encrypted,
+        clock_offset_seconds=body.clock_offset_seconds,
     )
+    await _check_recorder(device, body)
     if body.spool_pressure == "critical":
         await _repo().raise_alert(
             alert_type="spool_critical", severity="critical",
@@ -1208,6 +1574,54 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
                     "pending_segments": body.pending_segments})
     await _check_clock(device, body)
     return {"status": "ok"}
+
+
+def min_recorder_version() -> str:
+    return os.getenv("AIMS_MIN_RECORDER_VERSION", "3.4.0").strip() or "3.4.0"
+
+
+def version_tuple(value: Optional[str]) -> Tuple[int, ...]:
+    """'3.4.0' -> (3, 4, 0); anything unreadable sorts below every real version."""
+    parts = []
+    for piece in str(value or "").strip().lstrip("v").split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or (0,)
+
+
+def recorder_outdated(app_version: Optional[str]) -> bool:
+    return bool(app_version) and version_tuple(app_version) < version_tuple(min_recorder_version())
+
+
+RECORDER_ALERT_REPEAT = timedelta(days=1)
+
+
+async def _check_recorder(device, body: "HeartbeatRequest") -> None:
+    """
+    V2 and X1: a PC still on an old build keeps the old failure modes, and a
+    PC whose disk is not encrypted gives up its audio with the laptop. Each
+    is said once a day per PC, not on every heartbeat.
+    """
+    repo = _repo()
+    since = datetime.now(timezone.utc) - RECORDER_ALERT_REPEAT
+    if recorder_outdated(body.app_version) and not await repo.alert_raised_since(
+            "recorder_outdated", device["device_id"], since):
+        await repo.raise_alert(
+            alert_type="recorder_outdated", severity="warning", device_id=device["device_id"],
+            detail={"app_version": body.app_version, "minimum": min_recorder_version(),
+                    "detail": "Reinstall this PC with the current AIMScribeSetup.exe"})
+    if body.disk_encrypted is False and not await repo.alert_raised_since(
+            "disk_not_encrypted", device["device_id"], since):
+        await repo.raise_alert(
+            alert_type="disk_not_encrypted", severity="warning", device_id=device["device_id"],
+            detail={"detail": "Turn on BitLocker on this PC: a stolen laptop's audio is "
+                              "otherwise readable by anyone who can sign in to it"})
+
+
+# A close answered "incomplete" is normal for a few seconds; this long is not.
+SEGMENTS_LATE_AFTER = timedelta(minutes=10)
 
 
 # A PC clock this far off is reported. Recording and uploads still work - the
@@ -1257,7 +1671,7 @@ class HealthLogRequest(BaseModel):
 # Recorder alerts that mean a consultation may be missing or damaged. Anything
 # else is a warning: worth reading the same day, not worth waking anyone.
 RECORDER_CRITICAL = frozenset({
-    "capture_failed", "microphone_unavailable", "start_abandoned",
+    "capture_failed", "microphone_unavailable", "start_abandoned", "disk_full",
     "local_chain_invalid", "local_segment_unreadable", "invalid_purge_receipt",
     "unexpected_agent_exit",
 })
@@ -1363,8 +1777,16 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
             "pauses": await _repo().pauses_for(session["session_id"]),
             "segments": described,
             **(await _parts_payload(session)),
+            **(await _continuation_payload(session["session_id"])),
         })
     return {"sessions": payload}
+
+
+async def _continuation_payload(session_id: str) -> Dict[str, Any]:
+    """S4: {"continues": {...}} and/or {"continued_by": {...}}, each
+    {session_id, file_stem}; nothing for a recording that stands alone."""
+    links = await _repo().continuation_links(session_id)
+    return {k: v for k, v in links.items() if v}
 
 
 async def _parts_payload(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -1426,40 +1848,92 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
 
     This is the only place receipts are minted, and it happens only after the
     worker has re-read the archive file from disk and confirmed its hash. That is
-    what makes deleting the agent's local copy safe.
+    what makes deleting the agent's local copy safe. The worker names the
+    pieces it joined; they must be exactly the pieces held for the recording,
+    and only they are receipted, marked archived and later deleted.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
-    session = await repo.get_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    if session["status"] == "quarantined":
-        raise HTTPException(status_code=409, detail="session is quarantined")
-
+    session_id = _sid(body.session_id)
     if ctx.signer is None:
         # Without a signing key nothing may authorise deletion. Failing here keeps
         # every local copy, which is the safe direction.
         raise HTTPException(status_code=503,
                             detail="receipt signing key is not configured")
-
     try:
         archive_hash = bytes.fromhex(body.sha256)
+        joined = {(j.seq_no, bytes.fromhex(j.sha256)) for j in body.segments or []}
     except ValueError:
         raise HTTPException(status_code=400, detail="sha256 must be hex")
 
-    recut = session.get("archived_at") is not None and bool(session.get("parts_stale"))
-    await repo.mark_archived(session_id, relpath=body.archive_relpath,
-                             sha256=archive_hash, byte_length=body.bytes)
-    if body.parts:
-        for part in body.parts:
-            try:
-                part_hash = bytes.fromhex(part.sha256)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="part sha256 must be hex")
-            await repo.mark_part_archived(session_id, part.part_no,
-                                          relpath=part.archive_relpath,
-                                          sha256=part_hash, byte_length=part.bytes)
-        await repo.set_parts_stale(session_id, False)
+    async with _session_lock(session_id):
+        session = await repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if session.get("confirmation") in ("refused", "expired"):
+            raise HTTPException(status_code=409, detail="this consultation has been erased")
+        if session["status"] == "quarantined" or session.get("quarantine_reason"):
+            raise HTTPException(status_code=409, detail="session is quarantined")
+
+        recut = session.get("archived_at") is not None and bool(session.get("parts_stale"))
+        if session.get("archived_at") is not None and not recut:
+            # Reported twice (the worker was interrupted after the first): the
+            # receipts were issued then.
+            return {"status": "archived", "already": True, "receipts_issued": 0,
+                    "objects_deleted": 0, "copy_pending": ctx.copy is not None}
+
+        if not recut:
+            if body.segments is None:
+                logger.error("Archive worker reported %s without the pieces it joined; "
+                             "refused (update the worker)", session_id)
+                raise HTTPException(status_code=409,
+                                    detail="report the segments joined (seq_no, sha256)")
+            held = {(s["seq_no"], bytes(s["sha256"])) for s in await repo.segments_for(session_id)
+                    if s.get("state") in (None, "committed", "archived")}
+            if joined != held:
+                await repo.raise_alert(
+                    alert_type="archive_segments_mismatch", severity="critical",
+                    session_id=session_id,
+                    detail={"joined": sorted(n for n, _ in joined),
+                            "held": sorted(n for n, _ in held)})
+                raise HTTPException(status_code=409,
+                                    detail="the pieces joined are not the pieces held; "
+                                           "archive it again")
+
+        if not await repo.mark_archived(session_id, relpath=body.archive_relpath,
+                                        sha256=archive_hash, byte_length=body.bytes):
+            raise HTTPException(status_code=409, detail="the recording can no longer be "
+                                                        "archived")
+        if body.parts:
+            for part in body.parts:
+                try:
+                    part_hash = bytes.fromhex(part.sha256)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="part sha256 must be hex")
+                await repo.mark_part_archived(session_id, part.part_no,
+                                              relpath=part.archive_relpath,
+                                              sha256=part_hash, byte_length=part.bytes)
+            await repo.set_parts_stale(session_id, False)
+
+        if not recut:
+            issued = 0
+            now = datetime.now(timezone.utc)
+            for seq_no, digest in sorted(joined):
+                receipt = ctx.signer.sign_segment(
+                    session_id=session_id, seq_no=seq_no, sha256_hex=digest.hex(),
+                    archived_at=now)
+                await repo.store_receipt(
+                    session_id=session_id, scope="segment", seq_no=seq_no,
+                    sha256=digest, payload=receipt["payload"],
+                    signature=bytes.fromhex(receipt["signature"]))
+                issued += 1
+            session_receipt = ctx.signer.sign_session(
+                session_id=session_id, sha256_hex=body.sha256, archived_at=now)
+            await repo.store_receipt(
+                session_id=session_id, scope="session", seq_no=None,
+                sha256=archive_hash, payload=session_receipt["payload"],
+                signature=bytes.fromhex(session_receipt["signature"]))
+            await repo.mark_segments_archived(session_id, [n for n, _ in joined])
+
     if recut:
         # Cut again after a late prescription moved a boundary. The receipts
         # were issued the first time; the pieces may already be gone.
@@ -1469,32 +1943,6 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
             detail={"parts": [p.archive_relpath for p in body.parts or []]})
         return {"status": "recut", "receipts_issued": 0, "objects_deleted": 0,
                 "copy_pending": ctx.copy is not None}
-
-    issued = 0
-    now = datetime.now(timezone.utc)
-    for segment in await repo.segments_for(session_id):
-        receipt = ctx.signer.sign_segment(
-            session_id=session_id,
-            seq_no=segment["seq_no"],
-            sha256_hex=bytes(segment["sha256"]).hex(),
-            archived_at=now,
-        )
-        await repo.store_receipt(
-            session_id=session_id, scope="segment", seq_no=segment["seq_no"],
-            sha256=bytes(segment["sha256"]), payload=receipt["payload"],
-            signature=bytes.fromhex(receipt["signature"]),
-        )
-        issued += 1
-
-    session_receipt = ctx.signer.sign_session(
-        session_id=session_id, sha256_hex=body.sha256, archived_at=now)
-    await repo.store_receipt(
-        session_id=session_id, scope="session", seq_no=None,
-        sha256=archive_hash, payload=session_receipt["payload"],
-        signature=bytes.fromhex(session_receipt["signature"]),
-    )
-
-    await repo.mark_segments_archived(session_id)
 
     # The pieces are not deleted here. SRS-ARC-08: a finished consultation is
     # first kept in the cloud as one merged lossless copy, and only when that
@@ -1598,6 +2046,7 @@ async def archive_copy_pending(limit: int = 5, _: None = Depends(require_worker)
         "archive_sha256": bytes(s["archive_sha256"]).hex() if s["archive_sha256"] else None,
         "archive_bytes": s["archive_bytes"],
         **(await _parts_payload(s)),
+        **(await _continuation_payload(s["session_id"])),
     } for s in sessions]}
 
 
@@ -1614,6 +2063,7 @@ async def archive_json_pending(limit: int = 5, _: None = Depends(require_worker)
         "file_stem": s["file_stem"],
         "archive_relpath": s["archive_relpath"],
         **(await _parts_payload(s)),
+        **(await _continuation_payload(s["session_id"])),
     } for s in sessions]}
 
 
@@ -1627,7 +2077,7 @@ async def archive_clinical_document(session_id: str, part: Optional[int] = None,
     Assembled here rather than at UIU: the clinical database has its own
     credentials and the worker holds none of them.
     """
-    session_id = safe_session_id(session_id)
+    session_id = _sid(session_id)
     session = await _repo().get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1671,6 +2121,7 @@ async def _clinical_document(session: Dict[str, Any],
     document["visit"].setdefault("start_time", started.isoformat() if started else None)
 
     archive_sha = session.get("archive_sha256")
+    links = await _repo().continuation_links(session_id)
     document["recording"] = {
         "session_id": session_id,
         "confirmation": session.get("confirmation"),
@@ -1682,6 +2133,9 @@ async def _clinical_document(session: Dict[str, Any],
         "audio_bytes": session.get("archive_bytes"),
         "archive_relpath": session.get("archive_relpath"),
         "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # A consultation resumed after a crash or restart is two recordings of
+        # one visit; each names the other (S4).
+        **{k: v for k, v in links.items() if v},
     }
     if part is not None:
         document["visit"]["doctor_id"] = part["doctor_id"]
@@ -1714,7 +2168,7 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
     """
     copy = _copy_bucket(body.kind)
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     session = await repo.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1788,11 +2242,25 @@ async def archive_copy_complete(body: CopyCompleteRequest,
     and only now delete the pieces (SRS-ARC-09, steps 6 and 7).
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
-    session = await repo.get_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
+    session_id = _sid(body.session_id)
+    async with _session_lock(session_id):
+        session = await repo.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if session.get("confirmation") in ("refused", "expired"):
+            # Refused while the copy was being made: the copy is deleted, not
+            # recorded (the erase task holds no row for it to find).
+            for copy in body.copies:
+                await _delete_cloud_objects([{"kind": copy.kind,
+                                              "object_key": copy.object_key}])
+            raise HTTPException(status_code=409, detail="this consultation has been erased")
+        if session.get("status") == "quarantined" or session.get("quarantine_reason"):
+            raise HTTPException(status_code=409, detail="session is quarantined")
+        return await _record_copies(body, session_id, session)
 
+
+async def _record_copies(body: "CopyCompleteRequest", session_id: str, session):
+    repo = _repo()
     for copy in body.copies:
         try:
             digest = bytes.fromhex(copy.sha256)
@@ -1851,7 +2319,7 @@ async def archive_copy_failed(body: CopyFailedRequest,
     A step of the copy failed at UIU. The pieces stay where they are and the
     step is retried; this is how the failure becomes visible (SRS-ARC-10).
     """
-    session_id = safe_session_id(body.session_id)
+    session_id = _sid(body.session_id)
     await _repo().raise_alert(
         alert_type="cloud_copy_failed", severity="warning", session_id=session_id,
         detail={"step": body.step, "message": body.message[:500]})
@@ -2140,14 +2608,74 @@ async def _issue_custody_receipt(session_id: str, seq_no: int, sha256: bytes) ->
     return True
 
 
+async def _link_continuation(session_id: str, previous_id: str, patient_ref: str,
+                             device: Dict[str, Any], state: str) -> str:
+    """
+    S4: a consultation resumed after the recorder crashed or the PC restarted.
+    It is the same visit, so it takes the first recording's confirmation and
+    both are filed together. Only a recording from this PC, for this patient,
+    is accepted as the one continued.
+    """
+    repo = _repo()
+    try:
+        previous_id = safe_session_id(previous_id)
+    except ValueError:
+        previous_id = ""
+    previous = await repo.get_session(previous_id) if previous_id else None
+    if (previous is None or previous_id == session_id
+            or str(previous.get("device_id")) != str(device["device_id"])
+            or previous.get("patient_id") != patient_ref):
+        await repo.raise_alert(alert_type="continuation_rejected", severity="warning",
+                               session_id=session_id, device_id=device["device_id"],
+                               detail={"continues": previous_id or None})
+        return state
+    await repo.set_continuation(session_id, previous_id)
+    # The first recording's JSON was written without continued_by if it was
+    # already archived: write it again.
+    if previous.get("archived_at"):
+        await repo.mark_json_stale(previous_id)
+    if previous.get("confirmation") == "confirmed" and state in conf.WAITING:
+        await repo.set_session_confirmation(session_id, "confirmed")
+        return "confirmed"
+    return state
+
+
+async def confirm_continuations(session_id: str) -> List[str]:
+    """A recording was confirmed: so is any recording that continues it."""
+    repo = _repo()
+    confirmed = []
+    for later in await repo.continuations_of(session_id):
+        row = await repo.session_confirmation(later)
+        if row and row.get("confirmation") in conf.WAITING:
+            await repo.set_session_confirmation(later, "confirmed")
+            confirmed.append(later)
+            confirmed += await confirm_continuations(later)
+    return confirmed
+
+
+# A CMED outage leaves every recording unconfirmed at once. One alert per clinic
+# in this window, counting them, instead of one per recording (D4).
+UNCONFIRMED_GROUP_WINDOW = timedelta(hours=6)
+
+
 async def _mark_unconfirmed(session_id: str, row: Dict[str, Any]) -> None:
     repo = _repo()
+    session = await repo.get_session(session_id) or {}
+    previous_id = session.get("continues_session_id")
+    if previous_id:
+        previous = await repo.session_confirmation(previous_id)
+        if previous and previous.get("confirmation") == "confirmed":
+            await repo.set_session_confirmation(session_id, "confirmed")
+            return
     await repo.set_session_confirmation(session_id, "unconfirmed")
-    await repo.raise_alert(
-        alert_type="unconfirmed_recording", severity="warning",
-        session_id=session_id, device_id=row.get("device_id"),
-        detail={"reason": "no matching API 2 from CMED within two minutes; "
-                          "the recording is kept and will be matched when it arrives"})
+    hospital = session.get("hospital_id") or row.get("hospital_id") or "unknown"
+    await repo.group_alert(
+        alert_type="unconfirmed_recording", group=f"unconfirmed:{hospital}",
+        session_id=session_id, window=UNCONFIRMED_GROUP_WINDOW,
+        device_id=row.get("device_id") or session.get("device_id"),
+        detail={"hospital_id": hospital,
+                "reason": "no matching API 2 from CMED within two minutes; the "
+                          "recordings are kept and will be matched when it arrives"})
 
 
 async def _current_confirmation(session_id: str) -> str:
@@ -2168,7 +2696,7 @@ async def session_confirmation(session_id: str, device=Depends(require_device)):
     After two minutes without CMED's API 2 the answer becomes "unconfirmed"
     and an alert is raised (SRS-CNF-08); the recording is never cut.
     """
-    sid = safe_session_id(session_id)
+    sid = _sid(session_id)
     await _session_for_device(sid, device)
     return {"session_id": sid, "confirmation": await _current_confirmation(sid)}
 
@@ -2187,7 +2715,7 @@ async def _erase_session(session_id: str, *, state: str):
         if grant and grant["patient_id"] != "REDACTED":
             visit = _visit_from_grant(grant)
 
-    removed = await _delete_bucket_objects(session_id)
+    removed = await _delete_bucket_objects(session_id, only_archived=False)
     if visit is not None:
         await repo.delete_notices_for(visit)
         if ctx.clinical is not None:
@@ -2231,7 +2759,10 @@ async def _record_file_name(session_id: str) -> Optional[str]:
         local_start=start.time().replace(tzinfo=None),
         local_end=end.time().replace(tzinfo=None))
 
-    if session.get("grant_jti") and ctx.clinical is not None:
+    # A resumed recording leaves the visit linked to the first one (S4); it is
+    # found from there through continuation_links.
+    if (session.get("grant_jti") and ctx.clinical is not None
+            and not session.get("continues_session_id")):
         grant = await repo.get_authorisation(session["grant_jti"])
         if grant and grant["patient_id"] != "REDACTED":
             try:
@@ -2390,6 +2921,45 @@ async def _first_visit(session: Dict[str, Any]):
 
 class RefuseRequest(BaseModel):
     session_id: str
+    # Recorder 3.5 and later: {"session_id", "device_id", "refused_at"} signed
+    # by the PC's own key (base64url, no padding) over its canonical JSON.
+    refusal: Optional[Dict[str, Any]] = None
+    signature: Optional[str] = Field(None, max_length=200)
+
+
+SIGNED_REFUSAL_WINDOW = timedelta(days=7)
+UNSIGNED_REFUSAL_WINDOW = timedelta(hours=2)
+REFUSAL_BURST = 3                         # more than this in an hour is alerted
+
+
+def signed_refusals_required() -> bool:
+    return os.getenv("AIMS_REQUIRE_SIGNED_REFUSAL", "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def _refusal_signed(body: RefuseRequest, device, session_id: str) -> bool:
+    """True for a valid signed refusal, False when unsigned; 400/401 when it is bad."""
+    if body.refusal is None and body.signature is None:
+        return False
+    if not isinstance(body.refusal, dict) or not body.signature:
+        raise HTTPException(status_code=400, detail="a signed refusal needs both "
+                                                    "refusal and signature")
+    refusal = body.refusal
+    if refusal.get("session_id") != session_id:
+        raise HTTPException(status_code=400, detail="the signed refusal names another session")
+    if str(refusal.get("device_id", "")).lower() != str(device["device_id"]).lower():
+        raise HTTPException(status_code=401, detail="the refusal was signed for another PC")
+    refused_at = _parse_time_strict(refusal.get("refused_at"), "refusal.refused_at")
+    if refused_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise HTTPException(status_code=400, detail="refusal.refused_at is in the future")
+    try:
+        raw = _b64url_decode(body.signature)
+    except Exception:
+        raise HTTPException(status_code=400, detail="signature is not base64url")
+    if not integrity.verify_device_signature(bytes(device["tpm_pubkey"]),
+                                             integrity.canonical_json(refusal), raw):
+        raise HTTPException(status_code=401, detail="the refusal signature does not verify")
+    return True
 
 
 @router.post("/session/refuse")
@@ -2397,28 +2967,65 @@ async def refuse_session(body: RefuseRequest, device=Depends(require_device)):
     """
     The patient did not consent (SRS 3.2 §7.8a). The doctor pressed Stop and
     chose "Patient did not consent"; the recorder has already deleted what it
-    held. Here everything else goes, within the request (SRS-CNS-04, -05), and
-    only an audit entry without audio or patient remains (SRS-CNS-06).
+    held. Here everything else goes, within the request (SRS-CNS-04, -05) -
+    the pieces, the chain, CMED's records for the visit, and for a recording
+    already archived its files on the server and its cloud copies - and only
+    an audit entry without audio or patient remains (SRS-CNS-06).
 
-    Accepted for a session this server has never seen, so a refusal made while
-    the PC was offline still stops that session being opened later.
+    The most destructive call there is, so it is bounded. A refusal signed by
+    the PC's own key is accepted for a recording opened in the last 7 days.
+    An unsigned one (recorder 3.4) only within 2 hours of opening and before
+    archiving, and not at all with AIMS_REQUIRE_SIGNED_REFUSAL=on. Older
+    recordings are erased by an administrator. Accepted for a session this
+    server has never seen, so a refusal made while the PC was offline still
+    stops that session being opened later.
     """
     repo = _repo()
-    session_id = safe_session_id(body.session_id)
-    session = await repo.get_session(session_id)
-    if session is not None and str(session["device_id"]) != str(device["device_id"]):
-        raise HTTPException(status_code=403, detail="session belongs to another device")
+    session_id = _sid(body.session_id)
+    signed = _refusal_signed(body, device, session_id)
+    if not signed and signed_refusals_required():
+        raise HTTPException(status_code=401, detail="refusals must be signed by the PC")
 
-    removed, visit = 0, None
-    if session is not None and session.get("confirmation") != "refused":
-        removed, visit = await _erase_session(session_id, state="refused")
+    now = datetime.now(timezone.utc)
+    removed, visit, first = 0, None, False
+    async with _session_lock(session_id):
+        session = await repo.get_session(session_id)
+        if session is not None and str(session["device_id"]) != str(device["device_id"]):
+            raise HTTPException(status_code=403, detail="session belongs to another device")
+        if session is not None and session.get("confirmation") != "refused":
+            opened = session.get("opened_at") or now
+            if signed and now - opened > SIGNED_REFUSAL_WINDOW:
+                raise HTTPException(status_code=403,
+                                    detail="opened more than 7 days ago; an administrator "
+                                           "must erase it")
+            if not signed and (now - opened > UNSIGNED_REFUSAL_WINDOW
+                               or session.get("archived_at") is not None):
+                raise HTTPException(status_code=403,
+                                    detail="an unsigned refusal is accepted only within "
+                                           "2 hours and before archiving; update the "
+                                           "recorder, or an administrator must erase it")
+            removed, visit = await _erase_session(session_id, state="refused")
 
-    first = await repo.record_refusal(
-        session_id=session_id, device_id=device["device_id"],
-        hospital_id=device["hospital_id"],
-        doctor_id=session["doctor_id"] if session else None,
-        visit_sha256=visit.digest() if visit else None)
-    await repo.complete_refusal(session_id)
+        first = await repo.record_refusal(
+            session_id=session_id, device_id=device["device_id"],
+            hospital_id=device["hospital_id"],
+            doctor_id=session["doctor_id"] if session else None,
+            visit_sha256=visit.digest() if visit else None, signed=signed)
+        await repo.complete_refusal(session_id)
+
+    await _finish_erase(session_id)
+    if not signed:
+        await repo.raise_alert(
+            alert_type="unsigned_refusal", severity="warning", session_id=session_id,
+            device_id=device["device_id"],
+            detail={"note": "refusal from a recorder that does not sign them (before 3.5)"})
+    if first and hasattr(repo, "refusals_since"):
+        recent = await repo.refusals_since(device["device_id"], now - timedelta(hours=1))
+        if recent > REFUSAL_BURST:
+            await repo.raise_alert(
+                alert_type="refusal_burst", severity="critical",
+                device_id=device["device_id"],
+                detail={"refusals_last_hour": recent})
 
     if first:
         session_date = session.get("session_date") if session else None
@@ -2428,8 +3035,111 @@ async def refuse_session(body: RefuseRequest, device=Depends(require_device)):
             device_id=device["device_id"], session_id=session_id,
             detail={"hospital_id": device["hospital_id"],
                     "date": session_date.isoformat() if session_date else None,
-                    "objects_deleted": removed})
+                    "objects_deleted": removed, "signed": signed})
     return {"status": "refused", "session_id": session_id, "objects_deleted": removed}
+
+
+@router.post("/admin/session/{session_id}/erase")
+async def admin_erase_session(session_id: str, actor: str = "",
+                              _: None = Depends(require_admin)):
+    """A refusal that came too late for the PC to make: erased by a person."""
+    repo = _repo()
+    sid = _sid(session_id)
+    async with _session_lock(sid):
+        session = await repo.get_session(sid)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        removed, visit = (0, None)
+        if session.get("confirmation") != "refused":
+            removed, visit = await _erase_session(sid, state="refused")
+        await repo.record_refusal(session_id=sid, device_id=session["device_id"],
+                                  hospital_id=session["hospital_id"],
+                                  doctor_id=session.get("doctor_id"),
+                                  visit_sha256=visit.digest() if visit else None,
+                                  signed=None)
+        await repo.complete_refusal(sid)
+    await _finish_erase(sid)
+    await repo.audit(event_type="session.erased", actor_type="admin", actor_id=actor or None,
+                     session_id=sid, detail={"objects_deleted": removed})
+    return {"status": "refused", "session_id": sid, "objects_deleted": removed}
+
+
+# ---- what an erase leaves for later: archive files (the worker) and cloud copies (here)
+
+def _copy_store_for(kind: str):
+    if kind == "json" and ctx.copy_json is not None:
+        return ctx.copy_json
+    return ctx.copy
+
+
+async def _delete_cloud_objects(keys: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Delete cloud copies; returns the ones that could not be deleted yet."""
+    loop = asyncio.get_event_loop()
+    left = []
+    for key in keys:
+        store = _copy_store_for(str(key.get("kind")))
+        if store is None:
+            left.append(key)
+            continue
+        try:
+            await loop.run_in_executor(None, store.client.remove_object, store.bucket,
+                                       key["object_key"])
+        except Exception as exc:
+            logger.warning("Could not delete cloud copy %s yet: %s", key.get("object_key"), exc)
+            left.append(key)
+    return left
+
+
+async def _finish_erase(session_id: str) -> Optional[Dict[str, Any]]:
+    """Try the cloud deletions an erase left; the files are the worker's to remove."""
+    repo = _repo()
+    if not hasattr(repo, "erase_task"):
+        return None
+    task = await repo.erase_task(session_id)
+    if task is None or task.get("completed_at"):
+        return task
+    if task.get("cloud_keys"):
+        left = await _delete_cloud_objects(task["cloud_keys"])
+        await repo.set_erase_cloud_keys(session_id, left)
+        task["cloud_keys"] = left
+    if not task.get("files") and not task.get("cloud_keys"):
+        await repo.complete_erase(session_id)
+    return task
+
+
+class EraseCompleteRequest(BaseModel):
+    session_id: str
+    removed: List[str] = Field(default_factory=list, max_length=1000)
+
+
+@router.get("/archive/erase/pending")
+async def archive_erase_pending(limit: int = 20, _: None = Depends(require_worker)):
+    """Recordings refused after archiving: the files the worker must remove."""
+    repo = _repo()
+    out = []
+    for task in await repo.pending_erase(max(1, min(limit, 100))):
+        task = await _finish_erase(task["session_id"]) or task
+        if task.get("completed_at"):
+            continue
+        out.append({"session_id": task["session_id"], "files": task.get("files") or []})
+    return {"tasks": out}
+
+
+@router.post("/archive/erase/complete")
+async def archive_erase_complete(body: EraseCompleteRequest,
+                                 _: None = Depends(require_worker)):
+    repo = _repo()
+    session_id = _sid(body.session_id)
+    task = await repo.erase_task(session_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="no erase task for this session")
+    left = await _delete_cloud_objects(task.get("cloud_keys") or [])
+    await repo.set_erase_cloud_keys(session_id, left)
+    done = not left and await repo.complete_erase(session_id)
+    await repo.audit(event_type="session.erase_files", actor_type="service",
+                     actor_id="archive-worker", session_id=session_id,
+                     detail={"files_removed": len(body.removed), "cloud_left": len(left)})
+    return {"status": "erased" if done else "pending", "cloud_left": len(left)}
 
 
 @router.post("/maintenance/sweep")
@@ -2446,6 +3156,14 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
     """
     repo = _repo()
     now = datetime.now(timezone.utc)
+
+    # A hospital's CMED client that stops working within 30 days: one alert a
+    # day, so it is renewed before CMED's messages start being refused.
+    try:
+        import cmed_auth
+        await cmed_auth.expiring_clients()
+    except Exception as exc:                    # never stops the sweep
+        logger.warning("Could not check CMED client expiry: %s", exc)
 
     # First, anything that is only waiting because Channel B and the recording
     # crossed: the notice is claimed, so the recording is confirmed (SRS-CNF-07).
@@ -2618,9 +3336,13 @@ async def admin_revoke_device(device_id: str, reason: str = "",
 
 
 class CmedKeyRequest(BaseModel):
+    # The interim static key. It names the hospitals it may speak for and it
+    # expires: a key for every hospital that never ends is what the token
+    # method (cmed_auth.py) replaces.
     label: str = Field(..., min_length=1, max_length=64)
     created_by: str = Field(..., max_length=128)
-    expires_in_days: int = Field(0, ge=0, le=3650)
+    cmed_hospital_ids: List[str] = Field(..., min_length=1, max_length=20)
+    expires_in_days: int = Field(90, ge=1, le=365)
 
 
 class CmedKeyRevokeRequest(BaseModel):
@@ -2634,13 +3356,20 @@ async def admin_cmed_key(body: CmedKeyRequest, _: None = Depends(require_admin))
     kept. Several may be active at once, so a key is replaced by issuing the
     new one, letting CMED switch, then revoking the old label.
     """
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
-                  if body.expires_in_days else None)
+    hospitals = []
+    for value in body.cmed_hospital_ids:
+        try:
+            hospitals.append(integrity.safe_identifier(value, field="cmed_hospital_id"))
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"'{value}' is not a valid hospital id")
+    expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
     key = await _repo().create_cmed_key(label=body.label, created_by=body.created_by,
-                                        expires_at=expires_at)
+                                        expires_at=expires_at,
+                                        cmed_hospital_ids=sorted(set(hospitals)))
     await _repo().audit(event_type="cmed_key.created", actor_type="admin",
-                        actor_id=body.created_by, detail={"label": body.label})
-    return {"cmed_key": key, "label": body.label,
+                        actor_id=body.created_by,
+                        detail={"label": body.label, "hospitals": sorted(set(hospitals))})
+    return {"cmed_key": key, "label": body.label, "cmed_hospital_ids": sorted(set(hospitals)),
             "expires_at": expires_at.isoformat() if expires_at else None,
             "note": "Shown once. Give it to CMED for its server configuration only."}
 

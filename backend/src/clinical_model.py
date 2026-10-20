@@ -231,10 +231,19 @@ def previous_visit(body: Dict[str, Any]) -> Optional[PreviousVisit]:
     # Diagnoses and notes may sit beside the prescription rather than in it.
     merged.setdefault("diagnoses", p.get("diagnoses"))
     merged.setdefault("notes", p.get("notes"))
+    start = text(p.get("start_time"), 64)
+    if start:
+        # The same canonical form as the live visit's own start_time, so the
+        # earlier visit is found however the sender wrote the moment.
+        import confirmation
+        try:
+            start = confirmation.canonical_start(start)[0]
+        except ValueError:
+            pass
     return PreviousVisit(visit_date=when, prescription=prescription(merged),
                          doctor_id=text(p.get("doctor_id"), 64),
                          cmed_hospital_id=text(p.get("hospital_id"), 64),
-                         start_time=text(p.get("start_time"), 64))
+                         start_time=start)
 
 
 def patient_information(body: Dict[str, Any]) -> PatientInformation:

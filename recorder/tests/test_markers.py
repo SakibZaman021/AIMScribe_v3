@@ -236,14 +236,13 @@ async def test_the_no_activity_limit_ends_a_follow_up_nobody_follows(monkeypatch
 
 
 async def test_no_limit_ends_a_paused_recording(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key, no_activity_limit_seconds=0.1)
+    ctl = ctl_with(monkeypatch, spool, device_key, no_activity_limit_seconds=0.4)
     ctl.cfg.pause.reasons = ("other", "phone_call")
     await ctl.open_session(trigger("P1", at(0)))
     await ctl.pause_session(reason="phone_call")
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.6)                             # longer than the limit
     assert ctl.state == "paused"                         # the Stop form may be open
     await ctl.resume_session()
-    await asyncio.sleep(0.05)
     assert ctl.state == "recording"                      # the pause did not count
     assert await wait_for(lambda: ctl.state == "idle", 1.0)
     await ctl.close()

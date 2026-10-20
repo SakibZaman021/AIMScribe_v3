@@ -10,7 +10,10 @@ Nothing about hosting - that is the server team's document.
 
 Sources, all read rather than remembered:
   recorder/api/protocol.py, websocket_server.py      the local channel
-  backend/src/clinical.py, clinical_model.py         the POSTs and the visits GET
+  backend/src/clinical.py, clinical_model.py         the rules every message meets
+  backend/src/cmed_auth.py                           per-hospital clients and tokens
+  backend/src/fhir.py                                the FHIR R4 endpoints and mapping
+  tools/cmed_fhir_client.py                          the examples in Part H are made by it
   backend/src/confirmation.py                        the match and its look-back
   backend/src/api_v2.py                              /doctors, admin, object keys
   backend/scripts/clinical/001_aims_clinical.sql     the tables
@@ -25,9 +28,93 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reportlab.lib.units import mm
 from reportlab.platypus import Spacer, Paragraph, HRFlowable, PageBreak, Preformatted, KeepTogether
 
+from reportlab.platypus import CondPageBreak
+
 from cmed_doc_style import (H1, SUB, H2, H3, BODY, NOTE, BAD, GOOD, CODE,
                             tbl, part, build)
 from cmed_diagrams import architecture, sequence, gate, five_fields
+
+import itertools
+import json as _json
+
+import cmed_fhir_client as _fc
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend" / "src"))
+_n = itertools.count(1)
+_fc.uuid = type("U", (), {"uuid4": staticmethod(lambda: "%08d-0000-4000-8000-000000000000"
+                                                % next(_n))})
+_fc.time = type("T", (), {"strftime": staticmethod(lambda *a: "2026-10-09T04:15:01Z"),
+                          "gmtime": staticmethod(lambda: None)})
+
+_FIVE = {"patient_id": "P0012345", "doctor_id": "DR0042", "hospital_id": "AALO_DHOLPUR",
+         "start_time": "2026-10-09T10:14:32+06:00", "date": "2026-10-09"}
+_API2 = {**_FIVE,
+         "demographics": {"name": "Rahima Khatun", "sex": "female", "age_years": 34,
+                          "date_of_birth": "1992-03-11", "phone": "01700000000",
+                          "address": "Dholpur, Dhaka"},
+         "paramedic": {"recorded_at": "2026-10-09T10:02:10+06:00", "weight_kg": 58.4,
+                       "blood_pressure": "120/80", "pulse_bpm": 78, "temperature_c": 36.8},
+         "previous_visit": {"doctor_id": "DR0007", "hospital_id": "AALO_DHOLPUR",
+                            "start_time": "2026-06-02T09:40:05+06:00", "date": "2026-06-02",
+                            "prescription": {"items": [{"drug": "Napa 500 mg",
+                                                        "dose": "1 tablet",
+                                                        "frequency": "1+1+1",
+                                                        "duration": "5 days"}],
+                                             "diagnoses": ["Fever"], "investigations": []}}}
+_API3 = {**_FIVE, "issued_at": "2026-10-09T10:26:55+06:00",
+         "items": [{"drug": "Napa 500 mg", "dose": "1 tablet", "frequency": "1+1+1",
+                    "duration": "5 days", "instructions": "after food"}],
+         "diagnoses": ["Acute gastritis"], "investigations": ["CBC"],
+         "advice": "avoid spicy food", "follow_up": "2026-11-09"}
+_MSG2 = _fc.to_fhir("patient_information", _API2)
+_MSG3 = _fc.to_fhir("prescription", _API3)
+
+import fhir as _server_fhir  # noqa: E402  the server's own reader
+for _kind, _body, _msg in (("patient_information", _API2, _MSG2),
+                           ("prescription", _API3, _MSG3)):
+    assert _server_fhir.to_body(_server_fhir.Bundle(_msg)) == (_kind, _body), _kind
+
+import security as _security  # noqa: E402
+_security.REQUEST_ID.set("3f9c2a7e5b1d4c08a6e2f0b9d7c41e55")
+_server_fhir.uuid = type("U", (), {"uuid4": staticmethod(
+    lambda: "%08d-0000-4000-8000-000000000000" % next(_n)), "UUID": __import__("uuid").UUID})
+_ENC_ID = "0b6c4f2e-9d1a-4c3b-8e7f-5a2d1c0b9e8f"
+_SEARCH = {"resourceType": "Bundle", "type": "searchset", "total": 1,
+           "link": [{"relation": "self", "url": "https://<aims-host>/fhir/r4/Encounter?"
+                                                "patient.identifier=P0012345&_count=50"}],
+           "entry": [{"fullUrl": f"https://<aims-host>/fhir/r4/Encounter/{_ENC_ID}",
+                      "search": {"mode": "match"},
+                      "resource": _server_fhir._encounter_resource(None, {
+                          "source": "live", "prescription_version": 2,
+                          "prescription_fingerprint": "f1e7109404fd5d4010c358f0b3afdec7"
+                                                      "9699955299a089eaf2c830fb60ec4806",
+                          "received_at": "2026-06-02T03:58:11.204+00:00",
+                          "patient_id": "P0012345", "doctor_id": "DR0007",
+                          "hospital_id": "AALO_DHOLPUR",
+                          "start_time": "2026-06-02T09:40:05+06:00"}, _ENC_ID)}]}
+_REPLY = _server_fhir._response_message(_MSG2, 202, "ACCEPTED", None, {
+    "record_id": "5121", "received_at": "2026-10-09T04:14:33.120+00:00",
+    "previous_visit": {"status": "STORED", "version": 1}})
+_REPLY["timestamp"] = "2026-10-09T04:14:33.130Z"
+_REFUSED = _server_fhir.outcome(403, "HOSPITAL_NOT_ALLOWED",
+                                "This credential may not send data for that hospital.")
+
+
+def _compact(obj, indent=0, width=96, lead=0):
+    """JSON with short objects on one line, so a whole Bundle fits on a page or two."""
+    flat = _json.dumps(obj, ensure_ascii=False)
+    if indent + lead + len(flat) <= width or not isinstance(obj, (dict, list)) or not obj:
+        return flat
+    pad, inner = " " * indent, " " * (indent + 2)
+    if isinstance(obj, list):
+        body = [inner + _compact(v, indent + 2, width) for v in obj]
+    else:
+        body = [f'{inner}"{k}": ' + _compact(v, indent + 2, width, len(k) + 4)
+                for k, v in obj.items()]
+    opening, closing = ("[", "]") if isinstance(obj, list) else ("{", "}")
+    return opening + "\n" + ",\n".join(body) + "\n" + pad + closing
+
+
 
 S = []
 
@@ -36,11 +123,12 @@ S.append(Paragraph("CMED &rarr; AIMS LAB &mdash; Software Integration", H1))
 S.append(Paragraph("<b>Document 1 of 2 &mdash; for CMED's software, database and data team</b> "
                    "&middot; The APIs, the keys, the fields and the data model &middot; "
                    "AIMScribe v3 &middot; AIMS LAB, United International University &middot; "
-                   "16 October 2026", SUB))
+                   "20 October 2026 (per-hospital tokens and FHIR R4)", SUB))
 S.append(HRFlowable(width="100%", thickness=1, color=__import__("cmed_doc_style").RULE,
                     spaceAfter=8))
 S.append(tbl([["", "The two documents"],
-              ["<b>1. This one</b>", "<b>Software integration</b> &mdash; the four APIs, the key, "
+              ["<b>1. This one</b>", "<b>Software integration</b> &mdash; the four APIs, the "
+                                     "per-hospital tokens, FHIR R4, "
                                      "the exact endpoints, every field, every reply code, where "
                                      "the data lands, and how to test it. <b>For the team writing "
                                      "the code</b>"],
@@ -75,49 +163,97 @@ S.append(tbl([["Part", "Covers", "Sections"],
               ["<b>E</b>", "<b>Previous prescriptions</b> &mdash; sending them, and asking "
                            "what we already hold", "18&ndash;19"],
               ["<b>F</b>", "The data model &mdash; where every field lands", "20&ndash;21"],
-              ["<b>G</b>", "Testing, handover, and one page to remember", "22&ndash;25"]],
-             [14 * mm, 116 * mm, 26 * mm], highlight=[5]))
+              ["<b>G</b>", "Testing, handover, and one page to remember", "22&ndash;25"],
+              ["<b>H</b>", "<b>Per-hospital tokens and FHIR R4, field by field</b> &mdash; "
+                           "keys, the token, both messages as FHIR, every reply", "26&ndash;32"]],
+             [14 * mm, 116 * mm, 26 * mm], highlight=[5, 8]))
 
 S.append(PageBreak())
 
 # ============================================================ PART A
-S.append(part("PART A", "The keys and the exact endpoints",
+S.append(part("PART A", "The credentials and the exact endpoints",
               "Copy these. Everything after this explains them"))
 
 S.append(Paragraph("1 &middot; The gateway", H2))
 S.append(Preformatted(
-    'BASE_URL = https://<aims-host>          <-- AIMS LAB sends this with the key\n'
+    'BASE_URL = https://<aims-host>          <-- AIMS LAB sends this with each registration\n'
     '\n'
     'Transport    HTTPS only, TLS 1.2 or 1.3, port 443. HTTP redirects to HTTPS\n'
-    'Encoding     JSON, UTF-8\n'
-    'Body limit   1 MB\n'
-    'Auth         X-CMED-Key: <key>     on the two clinical endpoints only', CODE))
+    'Format       HL7 FHIR R4, application/fhir+json, UTF-8\n'
+    'Body limit   1 MB per message\n'
+    'Identity     one client PER HOSPITAL, with its own key pair (private half stays at CMED)\n'
+    'Token        POST /api/v2/oauth/token  with a signed 5-minute assertion\n'
+    '             -> a 5-minute access token for that hospital only\n'
+    'Auth         Authorization: Bearer <access token>   on every FHIR call', CODE))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Hold the host in configuration, not compiled in.</b> You will get a "
                    "staging host first and a production host later, and they differ.", NOTE))
 
 S.append(Paragraph("2 &middot; The authentication, in full", H2))
+S.append(Paragraph("CMED runs the software for many hospitals, so CMED does not have one "
+                   "identity here &mdash; <b>each hospital does</b>. This is the HL7 <b>SMART "
+                   "Backend Services</b> method (OAuth 2.0 client credentials with a signed "
+                   "JWT assertion, RFC 7523), the standard way one health system's server "
+                   "proves itself to another's.", BODY))
+S.append(Spacer(1, 3))
 S.append(tbl([["", "Channel B &mdash; your server to ours", "Channel A &mdash; your page to the recorder"],
-              ["<b>Credential</b>", "<b><font face='Courier'>X-CMED-Key</font> header</b>",
+              ["<b>Credential</b>", "<b>a key pair per hospital</b>; each call carries a "
+                                    "5-minute <font face='Courier'>Bearer</font> token",
                "<b>none &mdash; and none is possible</b>"],
-              ["Why", "Server to server, so a secret is safe",
+              ["Why", "Server to server, so a secret is safe there &mdash; and only the "
+                      "<b>public</b> half ever leaves CMED",
                "A secret in a web page is readable by anyone who opens the page"],
-              ["<b>What authorises you</b>", "the key",
+              ["<b>What authorises you</b>", "a token bought with an assertion signed by that "
+                                             "hospital's private key; it speaks for <b>that "
+                                             "hospital only</b>",
                "<b>your page's exact web address</b>, on our allow-list, plus loopback-only, plus "
                "same-machine"],
-              ["Issued by", "AIMS LAB, once, out of band. <b>Shown once and not recoverable</b>",
+              ["Who makes it", "<b>CMED makes the key pair</b> and sends AIMS LAB only the public "
+                               "key (a JWK). We never see, store or send a private key",
                "you send us the address; we register it"],
-              ["Scope", "one key for CMED, covering all seven clinics", "one entry per address"],
-              ["Rotation", "ask us &mdash; new key issued before the old is revoked, so there is "
-                           "no window where both fail", "n/a"],
-              ["<b>Where it must live</b>", "<b>your server's secret store or environment</b>",
-               "n/a"]],
-             [28 * mm, 60 * mm, 68 * mm], req=[1], highlight=[3]))
+              ["Scope", "<b>one client per hospital</b>, bound to that hospital's CMED id; "
+                        "optionally only from CMED's server addresses",
+               "one entry per address"],
+              ["Lifetime", "assertion &le; 5 minutes, single use; token 5 minutes; client up to "
+                           "1 year. AIMS LAB renews it in one call and is alerted 30 days before "
+                           "it expires", "n/a"],
+              ["Rotation", "register a second key (a new <font face='Courier'>kid</font>), switch, "
+                           "then we revoke the old one &mdash; no window where both fail", "n/a"],
+              ["<b>Where it must live</b>", "<b>the private key in your server's secret store; "
+                                            "the token in memory only</b>", "n/a"]],
+             [28 * mm, 66 * mm, 62 * mm], req=[1], highlight=[3]))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>The key must never reach a browser</b> &mdash; not in page source, not in "
-                   "a bundled script, not in a mobile app. A wrong or missing key returns "
-                   "<b>401 INVALID_KEY</b>, which is a hard stop: do not retry it, alert your team "
-                   "and contact us.", BAD))
+S.append(tbl([["What a thief would get", "How much damage"],
+              ["A copy of <b>our</b> database", "Public keys and token <b>hashes</b>. Nothing that "
+                                               "can sign or call"],
+              ["One access token", "<b>Five minutes, one hospital</b>, and only from CMED's "
+                                   "addresses if an allow-list is set"],
+              ["One hospital's private key", "That hospital only, until AIMS LAB revokes the "
+                                             "client &mdash; one call, effective at once, live "
+                                             "tokens included"],
+              ["A captured assertion", "Useless: each one is accepted once (its "
+                                       "<font face='Courier'>jti</font> is remembered)"]],
+             [50 * mm, 106 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("<b>A private key must never reach a browser</b> &mdash; not in page source, "
+                   "not in a bundled script, not in a mobile app. A token refused with "
+                   "<b>401 INVALID_TOKEN</b> is not a reason to retry the same token: ask for a "
+                   "new one once; if that is refused too (<b>401 invalid_client</b>), stop, alert "
+                   "your team and contact us. Part H has every detail.", BAD))
+S.append(Spacer(1, 4))
+S.append(tbl([["<b>The interim static key &mdash; for the switch-over only</b>"],
+              ["The older " + "<font face='Courier'>X-CMED-Key</font>" + " header with plain JSON to "
+               "<font face='Courier'>/api/v2/clinical/...</font> still works, <b>but only with a "
+               "key issued for named hospitals</b>, which expires after at most 90 days. A key "
+               "naming no hospital gets <b>403 KEY_NOT_BOUND</b>; a message for a hospital the "
+               "key does not name gets <b>403 HOSPITAL_NOT_ALLOWED</b>. Every reply to it carries "
+               "<font face='Courier'>Deprecation</font>, <font face='Courier'>Sunset</font> "
+               "(31 January 2027 unless agreed otherwise) and a <font face='Courier'>Link</font> "
+               "to the token endpoint. AIMS LAB switches static "
+               "keys off entirely (server setting <font face='Courier'>AIMS_CMED_LEGACY_KEYS=off"
+               "</font>) once CMED is on tokens. <b>Please move to tokens and FHIR before the "
+               "first clinic goes live.</b>"]],
+             [156 * mm], bold_first=False))
 S.append(Spacer(1, 4))
 S.append(tbl([["<b>The address allow-list is a blocking prerequisite, and it is exact</b>"],
               ["Send AIMS LAB <b>every web address your page will be served from</b>, production "
@@ -136,18 +272,31 @@ S.append(Paragraph("3 &middot; Every address CMED calls", H2))
 S.append(tbl([["#", "Method", "Full address", "Auth", "Body", "OK"],
               ["<b>1</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;/health"
                                         "</font>", "<b>none</b>", "none", "<b>200</b>"],
-              ["<b>2</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;/</font>",
+              ["<b>2</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
+                                         "/fhir/r4/metadata</font>",
                "none", "none", "200"],
               ["<b>3</b>", "<b>POST</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
-                                          "/api/v2/clinical/patient-information</font>",
-               "<b>key</b>", "JSON", "<b>202</b>"],
+                                          "/api/v2/oauth/token</font>",
+               "<b>signed assertion</b>", "form", "<b>200</b>"],
               ["<b>4</b>", "<b>POST</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
-                                          "/api/v2/clinical/prescription</font>",
-               "<b>key</b>", "JSON", "<b>202</b>"],
+                                          "/fhir/r4/$process-message</font> &mdash; API 2 and "
+                                          "API 3b",
+               "<b>Bearer</b>", "FHIR", "<b>200</b>"],
               ["<b>5</b>", "<b>GET</b>", "<font face='Courier'>https://&lt;aims-host&gt;"
-                                         "/api/v2/clinical/patient/{patient_id}/visits</font>",
-               "<b>key</b>", "none", "200"]],
-             [8 * mm, 16 * mm, 78 * mm, 18 * mm, 16 * mm, 14 * mm], highlight=[1], req=[3, 4]))
+                                         "/fhir/r4/Encounter?patient.identifier=&lt;id&gt;"
+                                         "</font> &mdash; the visits held",
+               "<b>Bearer</b>", "none", "200"],
+              ["6", "GET", "<font face='Courier'>https://&lt;aims-host&gt;"
+                           "/fhir/r4/.well-known/smart-configuration</font>",
+               "none", "none", "200"],
+              ["7", "GET", "<font face='Courier'>https://&lt;aims-host&gt;"
+                           "/fhir/r4/Encounter/&lt;id&gt;</font> &mdash; one visit, by the id the "
+                           "search gave", "Bearer", "none", "200"],
+              ["8", "GET", "<font face='Courier'>https://&lt;aims-host&gt;"
+                           "/fhir/r4/MessageDefinition/aimscribe-patient-information</font> "
+                           "(and <font face='Courier'>aimscribe-prescription</font>)",
+               "none", "none", "200"]],
+             [8 * mm, 14 * mm, 82 * mm, 20 * mm, 14 * mm, 14 * mm], highlight=[1], req=[3, 4]))
 S.append(Spacer(1, 3))
 S.append(tbl([["Protocol", "Full address", "Auth", "Who"],
               ["<b>WebSocket</b>", "<font face='Courier'>ws://127.0.0.1:5050/ws</font>",
@@ -165,28 +314,31 @@ S.append(tbl([["Message on that socket", "Which API", "Sent when"],
                "optional; the recorder also pushes status unprompted"]],
              [62 * mm, 32 * mm, 62 * mm], highlight=[3]))
 S.append(Spacer(1, 4))
-S.append(tbl([["All seven, one line each, to copy"],
+S.append(tbl([["The ones CMED's code calls, one line each, to copy"],
               ["<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/health</font><br/>"
-               "<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/</font><br/>"
-               "<font face='Courier'>POST https://&lt;aims-host&gt;/api/v2/clinical/"
-               "patient-information</font><br/>"
-               "<font face='Courier'>POST https://&lt;aims-host&gt;/api/v2/clinical/prescription"
+               "<font face='Courier'>POST https://&lt;aims-host&gt;/api/v2/oauth/token</font><br/>"
+               "<font face='Courier'>POST https://&lt;aims-host&gt;/fhir/r4/$process-message"
                "</font><br/>"
-               "<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/api/v2/clinical/patient/"
-               "{patient_id}/visits</font><br/>"
+               "<font face='Courier'>GET &nbsp;https://&lt;aims-host&gt;/fhir/r4/Encounter?"
+               "patient.identifier=&lt;patient_id&gt;</font><br/>"
                "<font face='Courier'>WS &nbsp;&nbsp;ws://127.0.0.1:5050/ws &nbsp;&rarr; \"start\""
                "</font><br/>"
                "<font face='Courier'>WS &nbsp;&nbsp;ws://127.0.0.1:5050/ws &nbsp;&rarr; "
                "\"prescription_built\"</font>"]],
              [156 * mm], bold_first=False))
 S.append(Spacer(1, 4))
-S.append(Paragraph("<b>One GET, and it returns no clinical content.</b> The visits list "
+S.append(Paragraph("<b>One GET, and it returns no clinical content.</b> The visits search "
                    "(section 19) gives identifiers and a fingerprint of each prescription, so CMED "
                    "can ask what we hold before sending history &mdash; never a name, a medicine "
-                   "or a diagnosis. <b>There is no DELETE anywhere.</b> <b>Everything else under "
-                   "<font face='Courier'>/api/v2/</font> is closed to CMED's key</b>; those "
-                   "endpoints belong to the recorders and need each recorder's own device "
-                   "credential.", GOOD))
+                   "or a diagnosis &mdash; and <b>only for the hospital the token speaks for</b>. "
+                   "<b>There is no DELETE anywhere.</b> <b>Everything else is closed to CMED's "
+                   "tokens</b>; the recorder endpoints need each recorder's own device "
+                   "credential. During the switch-over the older JSON endpoints "
+                   "(<font face='Courier'>/api/v2/clinical/patient-information</font>, "
+                   "<font face='Courier'>/prescription</font>, "
+                   "<font face='Courier'>/patient/{id}/visits</font>) accept the same Bearer "
+                   "token, or a hospital-bound static key; they apply exactly the same rules.",
+                   GOOD))
 
 S.append(PageBreak())
 
@@ -498,9 +650,12 @@ S.append(Paragraph("<b>If the doctor finishes for the day or goes to lunch</b>, 
                    "the recorder's own on-screen control. <b>CMED sends nothing, and must not try "
                    "to.</b> The socket also accepts <font face='Courier'>stop</font>, "
                    "<font face='Courier'>pause</font> and <font face='Courier'>resume</font>, but "
-                   "<b>these are not CMED's to use</b>: each records a clinical reason that becomes "
-                   "part of the permanent record, including \"the patient did not consent\", which "
-                   "erases the recording everywhere. <b>Send only "
+                   "<b>these are not CMED's to use</b>: they exist for AIMS LAB's own test page, and "
+                   "each records a reason that becomes part of the permanent record. <b>None of "
+                   "them can erase a recording</b> (recorder 3.5.0 and later): a refusal sent "
+                   "over the socket is recorded as an ordinary stop and the audio is kept. Only "
+                   "the doctor's on-screen \"patient refused\" control erases, and the recorder "
+                   "signs that refusal with the PC's own key. <b>Send only "
                    "<font face='Courier'>start</font> and "
                    "<font face='Courier'>prescription_built</font>.</b>", BAD))
 S.append(Spacer(1, 4))
@@ -653,9 +808,12 @@ S.append(part("PART D", "The two server messages",
 
 S.append(Paragraph("12 &middot; API 2 &mdash; patient information", H2))
 S.append(Preformatted(
-    'POST https://<aims-host>/api/v2/clinical/patient-information\n'
-    'X-CMED-Key: <key>\n'
+    'POST https://<aims-host>/fhir/r4/$process-message      (event: patient-information)\n'
+    'Authorization: Bearer <access token>\n'
+    'Content-Type: application/fhir+json\n'
     '\n'
+    '# The message is a FHIR Bundle (Part H, section 29). What it carries - exactly the\n'
+    '# object our server reads out of it - is this, and every rule below applies to it:\n'
     '{\n'
     '  "patient_id": "P0012345", "doctor_id": "DR0042",\n'
     '  "hospital_id": "AALO_DHOLPUR",\n'
@@ -723,9 +881,11 @@ S.append(Paragraph("<b>Anything else inside <font face='Courier'>paramedic</font
 
 S.append(Paragraph("13 &middot; API 3 Channel B &mdash; the prescription", H2))
 S.append(Preformatted(
-    'POST https://<aims-host>/api/v2/clinical/prescription\n'
-    'X-CMED-Key: <key>\n'
+    'POST https://<aims-host>/fhir/r4/$process-message      (event: prescription)\n'
+    'Authorization: Bearer <access token>\n'
+    'Content-Type: application/fhir+json\n'
     '\n'
+    '# As FHIR in Part H, section 30. What it carries, read back by our server:\n'
     '{\n'
     '  "patient_id": "P0012345", "doctor_id": "DR0042",\n'
     '  "hospital_id": "AALO_DHOLPUR",\n'
@@ -801,28 +961,56 @@ S.append(Paragraph("<b>Every message is stored word for word, exactly as sent, b
 
 S.append(Paragraph("15 &middot; Every reply from the server", H2))
 S.append(tbl([["Code", "Means", "What CMED should do"],
-              ["<b>202 ACCEPTED</b>", "Stored safely", "<b>Remove it from the outbox.</b> For "
+              ["<b>ACCEPTED</b> (FHIR: HTTP 200; interim JSON: 202)", "Stored safely",
+               "<b>Remove it from the outbox.</b> For "
                                                          "API 2, read <font face='Courier'>"
                                                          "previous_visit.status</font> (19.2)"],
-              ["<b>200 ALREADY_RECEIVED</b>", "Already held: this exact message, or (API 3) the "
+              ["<b>ALREADY_RECEIVED</b> (HTTP 200)", "Already held: this exact message, or (API 3) the "
                                               "same prescription by fingerprint",
                "<b>Remove it and never send it again.</b> Retrying was safe"],
               ["400 MALFORMED_JSON", "Not valid JSON", "Fix and resend. Do not retry unchanged"],
               ["400 MISSING_FIELD", "One of the five is missing or malformed", "Fix and resend"],
               ["400 INVALID_IDENTIFIER", "An id has disallowed characters", "Fix and resend"],
-              ["401 INVALID_KEY", "Key missing or wrong", "<b>Stop and contact AIMS LAB</b>"],
-              ["413 TOO_LARGE", "Body over 1 MB", "Check for a file or image in the JSON"],
+              ["400 MALFORMED_FHIR", "The Bundle cannot be read; the element is named in the "
+                                     "OperationOutcome", "Fix and resend"],
+              ["401 INVALID_TOKEN", "Token missing, unknown, expired or revoked",
+               "Get a new token <b>once</b> and resend. Refused again: stop, contact AIMS LAB"],
+              ["403 INSUFFICIENT_SCOPE", "The token was not granted this action",
+               "Ask for both scopes (Part H, 27)"],
+              ["<b>403 HOSPITAL_NOT_ALLOWED</b>", "<b>The message is for a hospital this token "
+                                                  "does not speak for</b>",
+               "<b>Use that hospital's own client.</b> Do not retry; it raises an alert here"],
+              ["401 INVALID_KEY / 403 KEY_NOT_BOUND", "Interim static key wrong, or naming no "
+                                                     "hospital", "<b>Stop and contact AIMS LAB</b>"],
+              ["413 TOO_LARGE", "Body over 1 MB", "Check for a file or image in the message"],
               ["<b>422 SCHEMA_INVALID</b>", "<b>Stored in quarantine</b>, with the bad fields "
                                             "named", "<b>Not lost.</b> Read the list, fix, resend; "
                                                      "alert your team"],
-              ["429, 500, 502, 503, a timeout, no connection", "Busy, a problem on our side, or "
-                                                               "no internet",
+              ["429 RATE_LIMITED, 500, 502, 503, a timeout, no connection",
+               "Too fast, busy, a problem on our side, or no internet",
                "<b>Keep it in the outbox and retry with growing delay.</b> Never drop it"]],
-             [40 * mm, 56 * mm, 60 * mm], highlight=[1, 2], req=[8]))
-S.append(Spacer(1, 4))
-S.append(Paragraph("<b>No rate limit applies to CMED.</b> Seven clinics at fourteen rooms produce "
-                   "roughly one message every two seconds at peak. Send as consultations happen "
-                   "&mdash; but from the outbox in section 16.", GOOD))
+             [40 * mm, 56 * mm, 60 * mm], highlight=[1, 2], req=[13]))
+S.append(Paragraph("<b>Limits, far above CMED's peak, shared by every server process:</b> "
+                   "1,200 requests and 60 token requests a minute per address. Reuse a token "
+                   "until ~30 s before it expires. <b>A lockout belongs to one credential, not to "
+                   "an address:</b> 10 wrong tries with the same credential in 5 minutes lock "
+                   "that credential for 15 minutes (429, Retry-After), so one hospital's revoked "
+                   "client never blocks the others. On the token endpoint the count is per "
+                   "claimed client and address. Requests carrying no credential at all are "
+                   "locked per address only after 100. Addresses on a hospital's allow-list are "
+                   "never locked out. <b>Clock:</b> keep CMED's server on NTP; we allow "
+                   "&plusmn;60 s, and a clock outside that gets 400 \"clock skew\", never a "
+                   "lockout.", GOOD))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Every reply carries a request id</b> &mdash; the "
+                   "<font face='Courier'>X-Request-ID</font> header, and "
+                   "<font face='Courier'>request_id</font> in the body (in FHIR replies, in "
+                   "Parameters and in <font face='Courier'>OperationOutcome.issue.diagnostics"
+                   "</font>). Quote it when you report a problem. Errors outside FHIR and the "
+                   "token endpoint are RFC 9457 <font face='Courier'>application/problem+json"
+                   "</font>. The machine-readable contract is "
+                   "<font face='Courier'>openapi/channel-b.json</font> in the repository.",
+                   NOTE))
 
 S.append(PageBreak())
 S.append(Paragraph("16 &middot; Outages: the outbox on CMED's local server", H2))
@@ -852,7 +1040,7 @@ S.append(tbl([["", "The outbox, as CMED's software team should build it"],
              [8 * mm, 148 * mm], bold_first=False, highlight=[1]))
 S.append(Spacer(1, 4))
 S.append(tbl([["Reply", "The outbox does"],
-              ["<b>202 ACCEPTED</b>", "<b>remove</b> the message"],
+              ["<b>200 ACCEPTED</b>", "<b>remove</b> the message"],
               ["<b>200 ALREADY_RECEIVED</b>", "<b>remove it and never send it again</b> &mdash; "
                                               "we already hold it"],
               ["400 MALFORMED_JSON / MISSING_FIELD / INVALID_IDENTIFIER",
@@ -860,11 +1048,15 @@ S.append(tbl([["Reply", "The outbox does"],
               ["<b>422 SCHEMA_INVALID</b>", "stored in quarantine on our side, so not lost; "
                                             "park it, fix the shape, send the corrected one; "
                                             "alert"],
-              ["401 INVALID_KEY", "<b>stop sending everything</b> and alert &mdash; the key is "
-                                  "wrong or revoked; retrying cannot help"],
+              ["401 INVALID_TOKEN", "get a new token once and resend; if the token itself is "
+                                    "refused (401 invalid_client), <b>stop sending everything</b> "
+                                    "and alert &mdash; the client is wrong or revoked"],
+              ["403 HOSPITAL_NOT_ALLOWED / INSUFFICIENT_SCOPE / KEY_NOT_BOUND",
+               "park it and alert: the wrong hospital's credential was used; retrying cannot "
+               "help"],
               ["413 TOO_LARGE", "park it; something too big is in the body; fix and resend"],
               ["429, 5xx, timeout, no connection", "<b>keep it and retry later</b>"]],
-             [62 * mm, 94 * mm], highlight=[1, 2], req=[7]))
+             [62 * mm, 94 * mm], highlight=[1, 2], req=[8]))
 S.append(Spacer(1, 4))
 S.append(tbl([["API 2 arrives...", "What happens to the recording"],
               ["within a second or two", "Its clinical record is attached at once"],
@@ -888,7 +1080,7 @@ S.append(tbl([["", "Proves", "Does NOT prove"],
               ["<font face='Courier'>200 RECORDING_STARTED</font>",
                "<b>The microphone is live</b> and audio is being written",
                "that the consultation will be kept"],
-              ["<font face='Courier'>202 ACCEPTED</font>",
+              ["<font face='Courier'>200 ACCEPTED</font>",
                "<b>Your message is stored</b> and will not be lost",
                "<b>that it matched a recording</b>"]],
              [48 * mm, 54 * mm, 54 * mm]))
@@ -902,7 +1094,7 @@ S.append(tbl([["<b>The failure that matters, stated plainly</b>"],
                "second, or loses its <font face='Courier'>+06:00</font>, or the clinic code came "
                "from your own settings instead of the laptop:<br/><br/>"
                "&nbsp;&nbsp;&bull; the recorder says <b>200 RECORDING_STARTED</b><br/>"
-               "&nbsp;&nbsp;&bull; our server says <b>202 ACCEPTED</b><br/>"
+               "&nbsp;&nbsp;&bull; our server says <b>200 ACCEPTED</b><br/>"
                "&nbsp;&nbsp;&bull; <b>CMED sees nothing wrong at all</b><br/>"
                "&nbsp;&nbsp;&bull; and the recording is kept <b>with no clinical record "
                "attached</b> &mdash; no demographics, no prescription"
@@ -960,31 +1152,28 @@ S.append(PageBreak())
 S.append(Paragraph("19 &middot; Ask first, and read what we did", H2))
 S.append(H3 and Paragraph("19.1 &nbsp; What do you already hold for this patient?", H3))
 S.append(Preformatted(
-    'GET https://<aims-host>/api/v2/clinical/patient/{patient_id}/visits?limit=50\n'
-    'X-CMED-Key: <key>\n'
-    '\n'
-    '200 { "status": 200, "code": "OK", "patient_id": "P0012345",\n'
-    '      "visits": [\n'
-    '        { "patient_id": "P0012345", "doctor_id": "DR0007",\n'
-    '          "hospital_id": "AALO_DHOLPUR",\n'
-    '          "start_time": "2026-06-02T09:40:05+06:00", "date": "2026-06-02",\n'
-    '          "source": "live", "prescription_version": 2,\n'
-    '          "prescription_fingerprint": "f1e71094...ec4806",\n'
-    '          "received_at": "2026-06-02T03:58:11.204+00:00" } ],\n'
-    '      "next_cursor": null }', CODE))
+    'GET https://<aims-host>/fhir/r4/Encounter?patient.identifier=P0012345&_count=50\n'
+    'Authorization: Bearer <access token>\n\n200 ' + _compact(_SEARCH), CODE))
 S.append(Spacer(1, 3))
 S.append(tbl([["Parameter / reply", "Meaning"],
-              ["<font face='Courier'>limit</font>", "1 to 200, default 50. Newest first"],
-              ["<font face='Courier'>cursor</font>", "When a page is full, "
-                                                     "<font face='Courier'>next_cursor</font> is "
-                                                     "the value to pass as "
-                                                     "<font face='Courier'>cursor</font> for the "
-                                                     "next page, unchanged"],
-              ["<font face='Courier'>before</font>", "Optional, YYYY-MM-DD: only visits before "
-                                                     "that date"],
-              ["a patient we hold nothing for", "<font face='Courier'>\"visits\": []</font>"],
-              ["errors", "401 INVALID_KEY; 400 INVALID_IDENTIFIER; 400 MISSING_FIELD naming "
-                         "<font face='Courier'>limit</font> or <font face='Courier'>before</font>"]],
+              ["<font face='Courier'>patient.identifier</font>", "The patient id, or "
+                                                     "<font face='Courier'>system|id</font>. "
+                                                     "Required"],
+              ["<font face='Courier'>_count</font>", "1 to 200, default 50. Newest first"],
+              ["next page", "When a page is full, follow the <font face='Courier'>next</font> "
+                            "link as it is (it carries an opaque "
+                            "<font face='Courier'>_cursor</font>)"],
+              ["<font face='Courier'>date=ltYYYY-MM-DD</font>", "Optional: only visits before "
+                                                               "that date"],
+              ["<b>which hospitals</b>", "<b>Only visits at the hospital(s) the token speaks "
+                                         "for.</b> A visit at another hospital is not listed; "
+                                         "send its history and the reply says what happened "
+                                         "(19.2)"],
+              ["a patient we hold nothing for", "<font face='Courier'>\"total\": 0</font>, "
+                                                "no entries"],
+              ["errors", "401 INVALID_TOKEN; 403 INSUFFICIENT_SCOPE; 400 INVALID_IDENTIFIER; "
+                         "400 MISSING_FIELD naming <font face='Courier'>_count</font> or "
+                         "<font face='Courier'>date</font> &mdash; each as an OperationOutcome"]],
              [44 * mm, 112 * mm]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Identifiers and fingerprints only</b> &mdash; never a name, a medicine or a "
@@ -1007,8 +1196,11 @@ S.append(tbl([["", "The rule for a returning patient"],
 S.append(PageBreak())
 S.append(H3 and Paragraph("19.2 &nbsp; What the API 2 reply says about previous_visit", H3))
 S.append(Preformatted(
-    '202 { "status": 202, "code": "ACCEPTED", "record_id": "5121",\n'
-    '      "previous_visit": { "status": "ALREADY_STORED", "version": 2, ... } }', CODE))
+    'In the reply message\'s Parameters (section 31):\n'
+    '  { "name": "code", "valueCode": "ACCEPTED" },\n'
+    '  { "name": "record_id", "valueString": "5121" },\n'
+    '  { "name": "previous_visit", "part": [ { "name": "status", "valueString": "ALREADY_STORED" },\n'
+    '                                        { "name": "version", "valueInteger": 2 } ] }', CODE))
 S.append(Spacer(1, 3))
 S.append(tbl([["previous_visit.status", "What we did", "Meaning for CMED"],
               ["<b>ALREADY_STORED</b>", "<b>nothing</b> &mdash; held, same fingerprint",
@@ -1020,7 +1212,12 @@ S.append(tbl([["previous_visit.status", "What we did", "Meaning for CMED"],
               ["NOT_SENT", "&mdash;", "previous_visit was null"],
               ["UNIDENTIFIED", "the date-only shape; <font face='Courier'>\"stored\"</font> "
                                "says whether anything was added", "send the five fields"],
-              ["PENDING", "stored safely, still loading", "nothing; it completes by itself"]],
+              ["PENDING", "stored safely, still loading", "nothing; it completes by itself"],
+              ["<b>NOT_PERMITTED</b>", "<b>nothing</b> &mdash; the earlier visit was at "
+                                       "<b>another hospital</b>, we already hold it, and this "
+                                       "copy differs",
+               "history from another hospital may fill a gap, never change that hospital's own "
+               "record. If it really changed, that hospital's client sends it"]],
              [34 * mm, 62 * mm, 60 * mm], highlight=[1]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Today's patient information in the same API 2 is stored as usual whatever "
@@ -1151,8 +1348,9 @@ S.append(tbl([["", "What", "Needs", "How"],
                "--kind patient_information</font>"],
               ["<b>3</b>", "<b>The server half against a live host</b>", "<b>a staging hostname "
                                                                          "from us</b>",
-               "<font face='Courier'>channel_b_test.py --server https://&lt;host&gt; --key &lt;key&gt;"
-               "</font>"],
+               "<font face='Courier'>channel_b_test.py --server https://&lt;host&gt; "
+               "--client-id &lt;id&gt; --kid &lt;kid&gt; --key-file &lt;private.pem&gt; "
+               "--hospital &lt;CMED id&gt;</font> &mdash; 11 checks (28.3)"],
               ["<b>4</b>", "Watch every message and reply side by side", "the staging site",
                "open <font face='Courier'>/protocol-test</font>"],
               ["<b>5</b>", "<b>A real consultation, all four messages</b>", "a clinic PC",
@@ -1173,78 +1371,48 @@ S.append(Paragraph("<b>Step 6 must be asked for explicitly.</b> Steps 1 to 5 can
 
 S.append(Paragraph("22A &middot; Five commands that test the server half, before you write code", H2))
 S.append(Paragraph("These need no application and no page. Run them as soon as you have the "
-                   "staging hostname and the key.", BODY))
+                   "staging hostname and your first hospital is registered (section 28). They "
+                   "use the reference client, " + "<font face='Courier'>tools/cmed_fhir_client.py"
+                   "</font>, which does exactly what CMED's code will do.", BODY))
 S.append(Spacer(1, 3))
-S.append(H3 and Paragraph("Is it up?", H3))
+S.append(H3 and Paragraph("Is it up, and is it FHIR?", H3))
 S.append(Preformatted(
-    'curl -s https://<aims-host>/health | jq .\n'
-    '# expect: "status": "healthy"\n'
-    '#   and   "system" STARTS WITH "AIMScribe v3"\n'
-    '#         (today it reads "AIMScribe v3 - AIMS LAB server")', CODE))
-S.append(H3 and Paragraph("Is my key accepted? Send a patient", H3))
+    'curl -s https://<aims-host>/health | jq .status          # expect "healthy"\n'
+    'curl -s https://<aims-host>/fhir/r4/metadata | jq .fhirVersion          # "4.0.1"\n'
+    'curl -s https://<aims-host>/fhir/r4/.well-known/smart-configuration | jq .token_endpoint', CODE))
+S.append(H3 and Paragraph("Does my hospital's key buy a token?", H3))
 S.append(Preformatted(
-    'curl -s -o /dev/null -w "%{http_code}\\n" \\\n'
-    '  -X POST https://<aims-host>/api/v2/clinical/patient-information \\\n'
-    '  -H "X-CMED-Key: $CMED_KEY" \\\n'
-    '  -H "Content-Type: application/json" \\\n'
-    '  -d \'{\n'
-    '        "patient_id":  "TEST0001",\n'
-    '        "doctor_id":   "DR0042",\n'
-    '        "hospital_id": "AALO_DHOLPUR",\n'
-    '        "start_time":  "2026-10-09T10:14:32+06:00",\n'
-    '        "date":        "2026-10-09",\n'
-    '        "demographics": { "name": "Test Patient", "sex": "female",\n'
-    '                          "age_years": 34 },\n'
-    '        "previous_visit": null\n'
-    '      }\'\n'
-    '# expect: 202', CODE))
+    'python tools/cmed_fhir_client.py token --server https://<aims-host> \\\n'
+    '    --client-id cmed-aalo-dholpur --kid <kid> --key keys/cmed-aalo-dholpur.private.pem\n'
+    '# expect: 200, "token_type": "bearer", "expires_in": 300,\n'
+    '#         "hospital_ids": ["AALO_DHOLPUR"]   (the token itself is not printed)', CODE))
+S.append(H3 and Paragraph("Every case at once: send, repeat, break, wrong hospital", H3))
+S.append(Preformatted(
+    'python tools/channel_b_test.py --server https://<aims-host> \\\n'
+    '    --client-id cmed-aalo-dholpur --kid <kid> \\\n'
+    '    --key-file keys/cmed-aalo-dholpur.private.pem --hospital AALO_DHOLPUR\n'
+    '# expect: 11/11 as expected, "Channel B: READY"', CODE))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Send that exact command twice.</b> The first gets <b>202</b>, the "
-                   "second <b>200</b> &mdash; "
-                   "the second is <font face='Courier'>ALREADY_RECEIVED</font>. That proves "
-                   "retries are safe, which is the most useful thing to know before writing your "
-                   "queue.", GOOD))
-S.append(H3 and Paragraph("Does validation work? Break it deliberately", H3))
+S.append(Paragraph("<b>It sends the same API 2 twice on purpose.</b> The first gets <b>200 ACCEPTED</b>, the "
+                   "second <b>200 ALREADY_RECEIVED</b>. That proves retries are safe, which is the "
+                   "most useful thing to know before writing your queue. It also breaks a message "
+                   "deliberately, sends one for another hospital (<b>403</b>) and replays an "
+                   "assertion (<b>401</b>) &mdash; the reply names what is wrong each time, and a "
+                   "quarantined message is not lost, so nothing is wasted by experimenting.", GOOD))
+S.append(H3 and Paragraph("Your own message, with a token in hand", H3))
 S.append(Preformatted(
-    '# previous_visit omitted on purpose, and sex is a code rather than a word\n'
-    'curl -s -X POST https://<aims-host>/api/v2/clinical/patient-information \\\n'
-    '  -H "X-CMED-Key: $CMED_KEY" -H "Content-Type: application/json" \\\n'
-    '  -d \'{ "patient_id":"TEST0002", "doctor_id":"DR0042",\n'
-    '        "hospital_id":"AALO_DHOLPUR",\n'
-    '        "start_time":"2026-10-09T10:20:00+06:00", "date":"2026-10-09",\n'
-    '        "demographics": { "name":"Test", "sex":"F" } }\' | jq .\n'
-    '# expect: 422 SCHEMA_INVALID, naming demographics.sex and previous_visit', CODE))
-S.append(Spacer(1, 3))
-S.append(Paragraph("<b>The reply names the bad fields.</b> Build against that &mdash; it is faster "
-                   "than reading this document, and the record is quarantined rather than lost, so "
-                   "nothing is wasted by experimenting.", GOOD))
-S.append(H3 and Paragraph("What do you hold for this patient?", H3))
-S.append(Preformatted(
-    'curl -s -H "X-CMED-Key: $CMED_KEY" \\\n'
-    '  https://<aims-host>/api/v2/clinical/patient/TEST0001/visits | jq .\n'
-    '# expect: 200, "code": "OK", the visits held, each with a fingerprint\n'
-    '# without the key: 401 INVALID_KEY', CODE))
-S.append(H3 and Paragraph("Send the prescription", H3))
-S.append(Preformatted(
-    'curl -s -o /dev/null -w "%{http_code}\\n" \\\n'
-    '  -X POST https://<aims-host>/api/v2/clinical/prescription \\\n'
-    '  -H "X-CMED-Key: $CMED_KEY" -H "Content-Type: application/json" \\\n'
-    '  -d \'{\n'
-    '        "patient_id":  "TEST0001",\n'
-    '        "doctor_id":   "DR0042",\n'
-    '        "hospital_id": "AALO_DHOLPUR",\n'
-    '        "start_time":  "2026-10-09T10:14:32+06:00",   <-- SAME as API 2\n'
-    '        "date":        "2026-10-09",\n'
-    '        "issued_at":   "2026-10-09T10:26:55+06:00",\n'
-    '        "items": [ { "drug": "Napa 500 mg", "dose": "1 tablet",\n'
-    '                     "frequency": "1+1+1", "duration": "5 days" } ],\n'
-    '        "diagnoses":      ["Acute gastritis"],\n'
-    '        "investigations": []\n'
-    '      }\'\n'
-    '# expect: 202', CODE))
+    '# $TOKEN from your own code (or the reference client); my_api2.json a FHIR Bundle\n'
+    'curl -s -X POST https://<aims-host>/fhir/r4/$process-message \\\n'
+    '  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/fhir+json" \\\n'
+    '  --data @my_api2.json | jq \'.entry[2].resource.parameter\'\n'
+    '# expect: [ { "name": "code", "valueCode": "ACCEPTED" }, ... ]\n'
+    '\n'
+    'curl -s -H "Authorization: Bearer $TOKEN" \\\n'
+    '  "https://<aims-host>/fhir/r4/Encounter?patient.identifier=TEST0001" | jq .total\n'
+    '# without a token: 401, an OperationOutcome with INVALID_TOKEN', CODE))
 S.append(Spacer(1, 4))
 S.append(tbl([["The one thing these commands cannot prove"],
-              ["All of them can pass while the integration is still broken, because <b>a 202 "
+              ["All of them can pass while the integration is still broken, because <b>ACCEPTED "
                "means \"stored\", not \"matched to a recording\"</b>. If "
                "<font face='Courier'>start_time</font> differs by a second between API 1 and API 2, "
                "or loses its offset, every reply above is still green and <b>the recording ends "
@@ -1380,11 +1548,13 @@ S.append(Paragraph("<b>The single most important function is <font face='Courier
 S.append(PageBreak())
 S.append(Paragraph("24 &middot; What each side must hand over", H2))
 S.append(tbl([["AIMS LAB gives CMED", "When"],
-              ["The staging and production hostnames", "with the key"],
-              ["<b>The <font face='Courier'>X-CMED-Key</font></b> &mdash; shown once",
-               "on request, out of band"],
-              ["The seven clinic codes", "with the key"],
-              ["<font face='Courier'>channel_b_test.py</font>", "with the key"],
+              ["The staging and production hostnames", "at once"],
+              ["<b>For each hospital: its client id and key id (kid)</b> &mdash; nothing secret",
+               "when we register the public key you send"],
+              ["The seven clinic codes", "with the first registration"],
+              ["<font face='Courier'>cmed_fhir_client.py</font>, "
+               "<font face='Courier'>channel_b_test.py</font>, and the TypeScript reference "
+               "client", "now"],
               ["Confirmation a test recording matched and archived", "<b>on request, step 6</b>"]],
              [100 * mm, 56 * mm]))
 S.append(Spacer(1, 3))
@@ -1397,12 +1567,17 @@ S.append(tbl([["<b>CMED gives AIMS LAB &mdash; both blocking</b>", "Why it block
                "non-default port"],
               ["<b>2. Your own clinic codes</b>, so we can map them to ours",
                "<b>Without the mapping a visit cannot be tied to the clinic it happened in. The "
-               "record is stored and you receive a normal 202, but it is never attached to its "
+               "record is stored and you receive a normal ACCEPTED, but it is never attached to its "
                "recording.</b> Silent from CMED's side; we are alerted"],
+              ["<b>3. One public key (JWK) per hospital</b>, and optionally the addresses "
+               "your servers call from",
+               "<b>Without it that hospital cannot get a token.</b> Public key only &mdash; never "
+               "send a private key; our server refuses one"],
               ["A named technical contact", "So a question either way does not wait a week"],
               ["A staging environment we can send to", "So we can test our side against yours"]],
-             [62 * mm, 94 * mm], req=[1, 2]))
+             [62 * mm, 94 * mm], req=[1, 2, 3]))
 
+S.append(CondPageBreak(90 * mm))
 S.append(Paragraph("25 &middot; One page for the CMED developer", H2))
 S.append(tbl([["Question", "Answer"],
               ["How many messages do I build?", "<b>Four.</b> Two from the browser, two from your "
@@ -1413,12 +1588,17 @@ S.append(tbl([["Question", "Answer"],
               ["Where do I connect, browser side?", "<font face='Courier'>ws://127.0.0.1:5050/ws"
                                                     "</font> &mdash; the same PC, every time"],
               ["Do I need a key there?", "<b>No.</b> We register your page's web address instead"],
-              ["Where do I POST, server side?", "<font face='Courier'>/api/v2/clinical/"
-                                                "patient-information</font> and "
-                                                "<font face='Courier'>/api/v2/clinical/prescription"
-                                                "</font>"],
-              ["How do I authenticate there?", "<font face='Courier'>X-CMED-Key</font>. Server to "
-                                               "server only, never in a browser"],
+              ["Where do I POST, server side?", "<font face='Courier'>/fhir/r4/$process-message"
+                                                "</font> &mdash; a FHIR message Bundle, event "
+                                                "<font face='Courier'>patient-information</font> "
+                                                "or <font face='Courier'>prescription</font>"],
+              ["How do I authenticate there?", "<b>Per hospital</b>: sign a 5-minute assertion "
+                                               "with that hospital's private key, trade it at "
+                                               "<font face='Courier'>/api/v2/oauth/token</font>, "
+                                               "send <font face='Courier'>Bearer</font>. Server "
+                                               "to server only"],
+              ["One key for all hospitals?", "<b>No.</b> One client per hospital; a token for "
+                                             "one hospital is refused for another (403)"],
               ["What do I keep from API 1?", "<b><font face='Courier'>session_id</font></b> "
                                              "&mdash; API 3 Channel A needs it"],
               ["Where does hospital_id come from?", "<b>The <font face='Courier'>doctors</font> "
@@ -1449,15 +1629,348 @@ S.append(tbl([["Question", "Answer"],
                                                       "Late is fine (16)"],
               ["422?", "<b>Nothing lost.</b> Quarantined, with the bad fields named"],
               ["<b>Do you already hold the previous visit?</b>", "<b>Ask:</b> "
-                                                                  "<font face='Courier'>GET .../"
-                                                                  "visits</font>, and compare "
-                                                                  "fingerprints (19)"],
-              ["<b>Does a 202 mean it worked?</b>", "<b>No &mdash; stored, not matched.</b> "
+                                                                  "<font face='Courier'>GET "
+                                                                  "/fhir/r4/Encounter?patient."
+                                                                  "identifier=...</font>, and "
+                                                                  "compare fingerprints (19)"],
+              ["<b>Does ACCEPTED mean it worked?</b>", "<b>No &mdash; stored, not matched.</b> "
                                                     "Section 17"],
               ["What must I send AIMS LAB?", "<b>Your page's exact addresses, and your clinic "
                                              "codes.</b> Both blocking"],
               ["Can I start today?", "<b>Yes &mdash; the whole browser half.</b> Section 22"]],
-             [54 * mm, 102 * mm], highlight=[3, 11, 19, 21, 22]))
+             [54 * mm, 102 * mm], highlight=[3, 12, 20, 22, 23]))
+# ============================================================ PART H
+# The FHIR examples below are made by the reference client at build time and read
+# back by the server's own mapping, so they cannot drift from the code.
+S.append(PageBreak())
+S.append(part("PART H", "Per-hospital tokens and FHIR R4, field by field",
+              "Keys, the token, both server messages as FHIR, and every reply"))
+
+S.append(Paragraph("26 &middot; One client per hospital &mdash; making and registering the key", H2))
+S.append(Paragraph("For each hospital, <b>CMED</b> makes a key pair on its own server. The "
+                   "private key never leaves it. CMED sends AIMS LAB the <b>public</b> key (a "
+                   "JSON Web Key) and the hospital's CMED id; AIMS LAB registers it and returns "
+                   "the <b>client id</b> and <b>key id</b> (<font face='Courier'>kid</font>). "
+                   "Neither is secret.", BODY))
+S.append(Spacer(1, 3))
+S.append(Preformatted(
+    '# CMED, once per hospital (any JOSE library works; this is the reference tool):\n'
+    'python tools/cmed_fhir_client.py keygen --out keys/cmed-aalo-dholpur\n'
+    '#   keys/cmed-aalo-dholpur.private.pem   <- stays on CMED\'s server, owner-only\n'
+    '#   keys/cmed-aalo-dholpur.public.json   <- send this to AIMS LAB\n'
+    '\n'
+    '# AIMS LAB registers it (the admin key is read from AIMS_ADMIN_KEY, never typed):\n'
+    'python tools/cmed_fhir_client.py register --server https://<aims-host> \\\n'
+    '    --client-id cmed-aalo-dholpur --hospital AALO_DHOLPUR \\\n'
+    '    --jwk keys/cmed-aalo-dholpur.public.json [--cidr <CMED server range>]\n'
+    '# -> { "client_id": "cmed-aalo-dholpur", "kid": "<RFC 7638 thumbprint>",\n'
+    '#      "cmed_hospital_ids": ["AALO_DHOLPUR"], "expires_at": "...", ... }', CODE))
+S.append(Spacer(1, 3))
+S.append(tbl([["Rule", "Value"],
+              ["Algorithms accepted", "<b>ES384</b> (P-384, recommended), ES256 (P-256), RS384 "
+                                      "(RSA, 2048 bits or more)"],
+              ["Client id", "3 to 64 of <font face='Courier'>A-Z a-z 0-9 _ . -</font>; we suggest "
+                            "<font face='Courier'>cmed-&lt;clinic&gt;</font>"],
+              ["Hospitals per client", "normally <b>one</b>: the CMED hospital id sent as "
+                                       "<font face='Courier'>hospital_id</font> in every message"],
+              ["Address allow-list", "optional; when set, tokens are issued and accepted only "
+                                     "from those addresses"],
+              ["Client lifetime", "up to 1 year (default 365 days); AIMS LAB renews it"],
+              ["<b>Rotation</b>", "send a new public key; we add it as a second "
+                                  "<font face='Courier'>kid</font>; switch your signer; we "
+                                  "revoke the old <font face='Courier'>kid</font>"],
+              ["<b>Revocation</b>", "AIMS LAB revokes a client in one call: its keys and "
+                                    "<b>every live token</b> stop at once"],
+              ["A private key sent by mistake", "refused by our server, and must then be "
+                                                "replaced: treat it as exposed"]],
+             [44 * mm, 112 * mm], highlight=[6]))
+
+S.append(CondPageBreak(110 * mm))
+S.append(Paragraph("27 &middot; Getting a token", H2))
+S.append(Paragraph("Sign a short JWT with the hospital's private key, then post it. The "
+                   "assertion lives at most <b>5 minutes</b> and is accepted <b>once</b>; the "
+                   "token lives <b>5 minutes</b>. Ask for a new token about 30 seconds before the "
+                   "old one expires, not one per message.", BODY))
+S.append(Spacer(1, 3))
+S.append(Preformatted(
+    'The assertion (JWT), signed ES384:\n'
+    '  header  { "alg": "ES384", "kid": "<kid from registration>", "typ": "JWT" }\n'
+    '  claims  { "iss": "cmed-aalo-dholpur",              <- the client id\n'
+    '            "sub": "cmed-aalo-dholpur",              <- the same\n'
+    '            "aud": "https://<aims-host>/api/v2/oauth/token",\n'
+    '            "iat": 1791519300, "exp": 1791519540,   <- exp at most 5 minutes ahead\n'
+    '            "jti": "7c3e0f0e-...-unique" }           <- new every time, 8-256 chars\n'
+    '\n'
+    'POST https://<aims-host>/api/v2/oauth/token\n'
+    'Content-Type: application/x-www-form-urlencoded\n'
+    '\n'
+    'grant_type=client_credentials\n'
+    '&scope=system/Bundle.c system/Encounter.rs\n'
+    '&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer\n'
+    '&client_assertion=<the signed JWT>\n'
+    '\n'
+    '200 { "access_token": "cat_...", "token_type": "bearer", "expires_in": 300,\n'
+    '      "scope": "system/Bundle.c system/Encounter.rs",\n'
+    '      "hospital_ids": ["AALO_DHOLPUR"] }\n'
+    '\n'
+    '401 { "error": "invalid_client", "error_description": "this assertion was already used" }',
+    CODE))
+S.append(Spacer(1, 3))
+S.append(tbl([["Scope", "Allows", "Also accepted as"],
+              ["<font face='Courier'>system/Bundle.c</font>", "API 2 and API 3b (SMART v2)",
+               "<font face='Courier'>system/MessageHeader.c</font>, "
+               "<font face='Courier'>system/*.write</font>, "
+               "<font face='Courier'>system/*.cruds</font>, and the earlier "
+               "<font face='Courier'>system/clinical.write</font>"],
+              ["<font face='Courier'>system/Encounter.rs</font>", "the visits search and one "
+                                                                 "Encounter",
+               "<font face='Courier'>system/*.read</font>, "
+               "<font face='Courier'>system/Encounter.read</font>"]],
+             [46 * mm, 32 * mm, 78 * mm]))
+S.append(Spacer(1, 3))
+S.append(tbl([["Token refused", "Why"],
+              ["400 unsupported_grant_type / invalid_request", "not client_credentials, or no "
+                                                               "assertion"],
+              ["400 invalid_client", "not a JWT, an algorithm other than the three, no "
+                                     "<font face='Courier'>kid</font> (printable ASCII, up to "
+                                     "128), or a bad client id; <b>\"clock skew\"</b> when "
+                                     "<font face='Courier'>iat</font>/<font face='Courier'>exp"
+                                     "</font> are more than 60 s off (fix NTP; not counted "
+                                     "towards a lockout)"],
+              ["<b>401 invalid_client</b>", "unknown, revoked or expired client or key; wrong "
+                                            "signature; wrong <font face='Courier'>aud</font>; "
+                                            "<font face='Courier'>sub</font> &ne; "
+                                            "<font face='Courier'>iss</font>; expired; more "
+                                            "than 5 minutes long; <b>jti already used</b>; "
+                                            "address not allowed"],
+              ["400 invalid_scope", "none of the scopes asked for is granted"],
+              ["429 RATE_LIMITED", "more than 60 token requests a minute from one address, or "
+                                   "that client locked out after 10 wrong assertions in 5 "
+                                   "minutes"]],
+             [56 * mm, 100 * mm]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Discovery.</b> <font face='Courier'>GET /fhir/r4/.well-known/"
+                   "smart-configuration</font> (also at the host root) gives the token address, "
+                   "<font face='Courier'>private_key_jwt</font> and the algorithms; "
+                   "<font face='Courier'>GET /fhir/r4/metadata</font> is the FHIR "
+                   "CapabilityStatement (FHIR 4.0.1, SMART-on-FHIR security, "
+                   "<font face='Courier'>$process-message</font>, Encounter search). Neither "
+                   "needs a token.", NOTE))
+
+S.append(PageBreak())
+S.append(Paragraph("28 &middot; How a message maps", H2))
+S.append(Paragraph("Both server messages are a FHIR <b>message</b>: a Bundle of "
+                   "<font face='Courier'>\"type\": \"message\"</font> whose <b>first entry is a "
+                   "MessageHeader</b>. Its <font face='Courier'>eventCoding.code</font> says which "
+                   "message it is, and its <font face='Courier'>focus</font> points at this "
+                   "visit's Encounter. Resources reference each other by "
+                   "<font face='Courier'>fullUrl</font> (<font face='Courier'>urn:uuid:...</font>) "
+                   "inside the Bundle. Our server turns the Bundle into exactly the object of "
+                   "sections 12 and 13 and applies the same rules.", BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["Event (eventCoding.code)", "Message", "Section"],
+              ["<font face='Courier'>patient-information</font>", "API 2", "12, 29"],
+              ["<font face='Courier'>prescription</font>", "API 3b", "13, 30"]],
+             [60 * mm, 60 * mm, 36 * mm]))
+S.append(Spacer(1, 3))
+S.append(H3 and Paragraph("28.1 &nbsp; The five fields", H3))
+S.append(tbl([["Field", "FHIR element"],
+              ["<b>patient_id</b>", "Encounter.subject &rarr; Patient.identifier"],
+              ["<b>doctor_id</b>", "Encounter.participant[].individual &rarr; Practitioner"
+                                   ".identifier (a PractitionerRole pointing at one also works)"],
+              ["<b>hospital_id</b>", "Encounter.serviceProvider &rarr; Organization.identifier "
+                                     "&mdash; <b>must be a hospital the token speaks for</b>"],
+              ["<b>start_time</b>", "Encounter.period.start &mdash; <b>date and time with its "
+                                    "offset</b>, the moment the patient was opened. Any "
+                                    "spelling of that moment matches: "
+                                    "<font face='Courier'>04:14:32.000Z</font> and "
+                                    "<font face='Courier'>10:14:32+06:00</font> are the same "
+                                    "visit. We store it as clinic time, whole seconds, "
+                                    "<font face='Courier'>+06:00</font>"],
+              ["<b>date</b>", "not sent separately: the clinic-local date of period.start. (In "
+                              "the interim JSON form, a date that contradicts start_time is "
+                              "refused with 400)"]],
+             [30 * mm, 126 * mm], req=[1, 2, 3, 4]))
+S.append(Spacer(1, 2))
+S.append(Paragraph("<b>Identifiers.</b> Our <b>proposed</b> systems are "
+                   "<font face='Courier'>urn:aimscribe:cmed:patient</font>, "
+                   "<font face='Courier'>urn:aimscribe:cmed:practitioner</font> and "
+                   "<font face='Courier'>urn:aimscribe:cmed:hospital</font>; CMED's own URIs "
+                   "are better, and we register them per hospital. A resource may carry several "
+                   "identifiers (MRN, NID, health ID). We take, in order: the one with the "
+                   "system registered for that hospital; the one with the proposed system; the "
+                   "one marked <font face='Courier'>use: official</font>; the only one there "
+                   "is. Several with none of those is refused, naming the element. "
+                   "Values keep the rule of section 5: "
+                   "<font face='Courier'>A-Z a-z 0-9 _ -</font>, up to 64.", NOTE))
+S.append(Spacer(1, 3))
+S.append(H3 and Paragraph("28.2 &nbsp; API 2 &mdash; patient information", H3))
+S.append(tbl([["Field (section 12)", "FHIR"],
+              ["demographics.name", "Patient.name[0].text (or given + family)"],
+              ["demographics.sex", "Patient.gender: <font face='Courier'>female</font> / "
+                                   "<font face='Courier'>male</font>. "
+                                   "<font face='Courier'>other</font> or "
+                                   "<font face='Courier'>unknown</font> is left out, not "
+                                   "refused"],
+              ["demographics.date_of_birth", "Patient.birthDate"],
+              ["demographics.phone", "Patient.telecom (system phone)"],
+              ["demographics.address", "Patient.address[0].text (or line, city, district)"],
+              ["demographics.age_years", "Observation, LOINC <b>30525-0</b>, unit "
+                                         "<font face='Courier'>a</font>"],
+              ["paramedic.weight_kg", "Observation, LOINC <b>29463-7</b> (or 3141-9); kg, g or "
+                                      "[lb_av]"],
+              ["paramedic.height_cm", "Observation, LOINC <b>8302-2</b> (or 8306-3); cm, m, mm or "
+                                      "[in_i]"],
+              ["paramedic.blood_pressure", "Observation, LOINC <b>85354-9</b>, components "
+                                           "<b>8480-6</b> (systolic) and <b>8462-4</b> "
+                                           "(diastolic)"],
+              ["paramedic.pulse_bpm", "Observation, LOINC <b>8867-4</b>"],
+              ["paramedic.temperature_c", "Observation, LOINC <b>8310-5</b> (or 8331-1); Cel or "
+                                          "[degF]"],
+              ["paramedic.spo2_percent", "Observation, LOINC <b>59408-5</b> (or 2708-6)"],
+              ["paramedic.recorded_at", "the first Observation's effectiveDateTime"],
+              ["paramedic.notes", "Observation.note[].text (an Observation with only a note is "
+                                  "a note)"],
+              ["anything else measured", "any other Observation with a value: kept under its "
+                                         "code text or display, as section 12.2 promises"],
+              ["female_details / male_details", "Observations with category code "
+                                                "<font face='Courier'>female-details</font> / "
+                                                "<font face='Courier'>male-details</font>: "
+                                                "code.text &rarr; value"],
+              ["<b>previous_visit</b>", "<b>a second Encounter in the Bundle</b> (at most one): "
+                                        "its own practitioner, organization and period.start. "
+                                        "Its MedicationRequest, Condition, ServiceRequest and "
+                                        "CarePlan point at it with "
+                                        "<font face='Courier'>encounter</font>. None = null. A "
+                                        "date-only period.start is the date-only shape (18)"]],
+             [44 * mm, 112 * mm], highlight=[17]))
+S.append(Spacer(1, 2))
+S.append(Paragraph("Observations belong to this visit when their "
+                   "<font face='Courier'>encounter</font> points at the focus Encounter, or "
+                   "when they have none.", BODY))
+S.append(Spacer(1, 3))
+S.append(CondPageBreak(70 * mm))
+S.append(H3 and Paragraph("28.3 &nbsp; API 3b &mdash; the prescription", H3))
+S.append(tbl([["Field (section 13)", "FHIR"],
+              ["items[]", "one <b>MedicationRequest</b> per medicine, in order"],
+              ["items[].drug", "medicationCodeableConcept.text (or coding display/code, or a "
+                               "Medication it references)"],
+              ["items[].dose", "dosageInstruction[0].doseAndRate[0].doseQuantity "
+                               "(value and unit)"],
+              ["items[].frequency", "dosageInstruction[0].timing.code.text, e.g. "
+                                    "<font face='Courier'>1+1+1</font> (or timing.repeat "
+                                    "frequency/period)"],
+              ["items[].duration", "timing.repeat.boundsDuration (or "
+                                   "dispenseRequest.expectedSupplyDuration)"],
+              ["items[].instructions", "patientInstruction, text, additionalInstruction"],
+              ["<b>issued_at</b>", "the first MedicationRequest.authoredOn; else "
+                                   "Bundle.timestamp"],
+              ["diagnoses[]", "one <b>Condition</b> each: code.text"],
+              ["investigations[]", "one <b>ServiceRequest</b> each: code.text"],
+              ["advice", "<b>CarePlan</b>.description"],
+              ["follow_up", "CarePlan.period.start (YYYY-MM-DD)"],
+              ["notes", "CarePlan.note[].text"]],
+             [44 * mm, 112 * mm]))
+S.append(Spacer(1, 2))
+S.append(Paragraph("<b>No Condition means no diagnoses</b> &mdash; in FHIR an empty list is "
+                   "simply no resources, so the message always says exactly what the doctor "
+                   "recorded. A MedicationRequest with no medicine name is "
+                   "<b>422 SCHEMA_INVALID</b>, as in section 13.", NOTE))
+
+S.append(PageBreak())
+S.append(Paragraph("29 &middot; API 2 as a FHIR message &mdash; a complete example", H2))
+S.append(Paragraph("Made by the reference client from the object below, and read back by our "
+                   "server into exactly that object when this document was built. CMED's "
+                   "output need not match it character for character; ids and order may differ.",
+                   BODY))
+S.append(Spacer(1, 2))
+S.append(Paragraph("<b>What it carries</b> (the object of section 12)", BODY))
+S.append(Preformatted(_compact(_API2), CODE))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>The FHIR message CMED sends</b> &mdash; POST /fhir/r4/$process-message", BODY))
+S.append(Preformatted(_compact(_MSG2), CODE))
+
+S.append(PageBreak())
+S.append(Paragraph("30 &middot; API 3b as a FHIR message &mdash; a complete example", H2))
+S.append(Paragraph("<b>What it carries</b> (the object of section 13)", BODY))
+S.append(Preformatted(_compact(_API3), CODE))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>The FHIR message CMED sends</b> &mdash; POST /fhir/r4/$process-message", BODY))
+S.append(Preformatted(_compact(_MSG3), CODE))
+
+S.append(PageBreak())
+S.append(Paragraph("31 &middot; The reply", H2))
+S.append(Paragraph("A message that was read is answered with a FHIR <b>response message</b>: "
+                   "a MessageHeader whose <font face='Courier'>response</font> names your "
+                   "MessageHeader's id and says <font face='Courier'>ok</font> or "
+                   "<font face='Courier'>fatal-error</font>; an OperationOutcome; and a "
+                   "Parameters resource carrying the same facts as the JSON replies of "
+                   "section 15. <b>The HTTP status is 200</b> for ACCEPTED and ALREADY_RECEIVED "
+                   "(synchronous FHIR messaging); our own code is in "
+                   "<font face='Courier'>Parameters.code</font>. Errors keep their status "
+                   "(400, 401, 403, 413, 422, 429). Generated by the server's own code:", BODY))
+S.append(Spacer(1, 3))
+S.append(Preformatted(
+    '200  Content-Type: application/fhir+json\n' + _compact(_REPLY) + '\n\n'
+    '# API 3b adds { "name": "version", "valueInteger": n }. A refused-in-quarantine\n'
+    '# message (422) adds "quarantine_id", and the OperationOutcome names each element\n'
+    '# in issue.expression.', CODE))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>A message that could not be read, or was not authorised</b>, is "
+                   "answered with an <b>OperationOutcome</b> alone. Its code is in "
+                   "<font face='Courier'>issue[0].details.coding[0].code</font>; the element at "
+                   "fault, if any, in <font face='Courier'>issue[0].expression</font>.", BODY))
+S.append(Spacer(1, 3))
+S.append(Preformatted(
+    '403 ' + _compact(_REFUSED) + '\n\n'
+    '400 ... "code": "MALFORMED_FHIR", "expression": ["Encounter.serviceProvider"]\n\n'
+    '401 (with WWW-Authenticate: Bearer error="invalid_token") ... "code": "INVALID_TOKEN"',
+    CODE))
+S.append(Spacer(1, 3))
+S.append(tbl([["Code", "HTTP", "Meaning", "What CMED should do"],
+              ["ACCEPTED", "200", "stored", "remove from the outbox"],
+              ["ALREADY_RECEIVED", "200", "already held", "remove; never send again"],
+              ["MALFORMED_FHIR", "400", "the Bundle cannot be read", "fix the named element"],
+              ["MISSING_FIELD / INVALID_IDENTIFIER", "400", "one of the five fields", "fix"],
+              ["SCHEMA_INVALID", "422", "quarantined, not lost", "fix and resend; alert"],
+              ["INVALID_TOKEN", "401", "token missing, unknown, expired", "new token once"],
+              ["INSUFFICIENT_SCOPE", "403", "token lacks the scope", "ask for both scopes"],
+              ["<b>HOSPITAL_NOT_ALLOWED</b>", "403", "<b>another hospital's message</b>",
+               "use that hospital's client; raises an alert here"],
+              ["TOO_LARGE", "413", "over 1 MB", "fix"],
+              ["RATE_LIMITED", "429", "too fast, or locked out", "wait Retry-After"]],
+             [52 * mm, 14 * mm, 46 * mm, 44 * mm], highlight=[1, 2], req=[8]))
+
+S.append(CondPageBreak(80 * mm))
+S.append(Paragraph("32 &middot; Working code to start from", H2))
+S.append(tbl([["File", "What it is"],
+              ["<font face='Courier'>cmed-web/src/lib/cmed-fhir.ts</font>",
+               "<b>TypeScript / Node</b> (the <font face='Courier'>jose</font> library): signs "
+               "the assertion, caches the token, builds both messages, reads the reply. It is "
+               "what our own CMED test page uses"],
+              ["<font face='Courier'>tools/cmed_fhir_client.py</font>",
+               "<b>Python</b> (PyJWT): the same, plus key generation, registration and a token "
+               "check from the command line"],
+              ["<font face='Courier'>tools/channel_b_test.py</font>",
+               "the 11 checks of section 22A against any host"]],
+             [64 * mm, 92 * mm]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Both reference clients are tested against the server in our test "
+                   "suite:</b> a message either makes is read back by our server into exactly "
+                   "the object it was made from (the TypeScript test runs wherever Node is "
+                   "installed). The examples in sections 19.1, 29, 30 and 31 are produced by "
+                   "the server's own code every time this document is built, so this Part and "
+                   "the code cannot disagree. Both clients reuse a token until 30 s before it "
+                   "expires, renew once on 401, honour Retry-After, and back off with jitter.",
+                   GOOD))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Bangladesh's national FHIR guide (BD Core).</b> The messages above are "
+                   "plain FHIR R4 and use the resources and LOINC codes BD Core builds on. If "
+                   "CMED already produces BD Core profiles, send them: extra profile tags and "
+                   "extensions are ignored. Extra identifiers are fine as long as the one this "
+                   "message is about can be told apart (section 28.1). Tell us your identifier "
+                   "systems before testing and we register them per hospital.", NOTE))
+
 S.append(Spacer(1, 6))
 S.append(Paragraph("Prepared by AIMS LAB, United International University. <b>Document 1 of 2</b>; "
                    "the companion is \"Server Deployment\", for the team helping us deploy. Every "

@@ -1,7 +1,7 @@
 # Build-time only. Never installed on a doctor PC.
 -r requirements.txt
 
-pyinstaller>=6.6.0
+pyinstaller==6.21.0
 
 # Test suite
 pytest>=8.0

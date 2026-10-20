@@ -83,6 +83,17 @@ Two of those values are not replaceable if lost:
 - **`AIMS_GRANT_PRIVATE_KEY`** signs recording grants; its public half is built
   into every installed recorder. Changing it means reinstalling the fleet.
 
+No service reads `.env` whole. `docker-compose.yml` gives each one the variables
+it uses and nothing else: the API never sees `AIMS_COPY_KEY`, `AIMS_BACKUP_KEY`,
+the off-site bucket's keys or the superuser's password.
+
+The API logs in to `aims_recordings` as **`aims_api`** (`AIMS_API_DB_PASSWORD`),
+which reads and writes rows and nothing more. The tables belong to
+`aims_recordings`, which has no login: migrations are applied by the superuser
+under `SET ROLE aims_recordings`. So a break-in to the API cannot alter a table
+or switch off the audit log's append-only triggers
+(`backend/scripts/018_v3_least_privilege.sql`).
+
 ## 3. Starting
 
 ```bash
@@ -98,18 +109,26 @@ database (`postgres/init/`). That is the same order
 `backend/tests/test_db_integration.py` proves against a real PostgreSQL, from the
 same baseline file, so a new server gets what the tests run against.
 
-Then, once:
+Then, once. From the internet the admin routes and the dashboard answer 403
+unless the address is in `AIMS_ADMIN_ALLOW`; on this machine they are on the
+gateway's loopback-only door, `http://127.0.0.1:6001` (from a laptop:
+`ssh -L 6001:127.0.0.1:6001 <user>@<server>`):
 
 ```bash
+ADMIN=http://127.0.0.1:6001
 # CMED's clinic identifiers (SRS-ENR-19)
-curl -X POST https://$AIMS_PUBLIC_HOST/api/v2/admin/hospital \
+curl -X POST $ADMIN/api/v2/admin/hospital \
      -H "X-Admin-Key: $AIMS_ADMIN_KEY" -H 'Content-Type: application/json' \
      -d '{"hospital_id":"HOSP003","name":"Dholpur","cmed_hospital_id":"CMED-..."}'
 
-# CMED's Channel B key — shown once, and only CMED keeps it
-curl -X POST https://$AIMS_PUBLIC_HOST/api/v2/admin/cmed-key \
-     -H "X-Admin-Key: $AIMS_ADMIN_KEY" -H 'Content-Type: application/json' \
-     -d '{"label":"cmed-prod","created_by":"aimslab"}'
+# CMED, one client per hospital: CMED sends only the PUBLIC key; nothing
+# secret is issued here. Returns the client_id and kid to send back to CMED.
+python3 ../../tools/cmed_fhir_client.py register --server $ADMIN \
+     --client-id cmed-dholpur --hospital CMED-... \
+     --jwk cmed-dholpur.public.json [--cidr <CMED server address>/32]
+# renew before the year is up (an alert comes 30 days before):
+curl -X POST $ADMIN/api/v2/admin/cmed-client/cmed-dholpur/renew \
+     -H "X-Admin-Key: $AIMS_ADMIN_KEY" -H 'Content-Type: application/json' -d '{"days":365,"created_by":"aimslab"}'
 ```
 
 ## 4. Moving here from Render and Neon
@@ -122,9 +141,13 @@ changes.
 pg_dump "$NEON_URL" --no-owner --format=plain | gzip > neon.sql.gz
 
 # On this server, into the new database:
-gunzip < neon.sql.gz | docker compose exec -T postgres \
-    psql -v ON_ERROR_STOP=1 -U aims_recordings -d aims_recordings
-docker compose exec postgres psql -U aims_recordings -d aims_recordings \
+# (as the superuser, acting as the owner: aims_recordings has no login)
+U=$(docker compose exec -T postgres printenv POSTGRES_USER)
+{ echo "SET ROLE aims_recordings;"; gunzip < neon.sql.gz; } | docker compose exec -T postgres \
+    psql -v ON_ERROR_STOP=1 -U "$U" -d aims_recordings
+docker compose exec -T postgres psql -U "$U" -d aims_recordings \
+    -f /aims/scripts/018_v3_least_privilege.sql  # the API's grants on what came across
+docker compose exec postgres psql -U "$U" -d aims_recordings \
     -c "SELECT count(*) FROM sessions;"          # compare with Neon before cutting over
 ```
 
@@ -159,7 +182,8 @@ after it returns:
 
 ```bash
 docker compose logs --since 2h api | grep -i error
-docker compose exec postgres psql -U aims_recordings -d aims_recordings -c \
+U=$(docker compose exec -T postgres printenv POSTGRES_USER)
+docker compose exec postgres psql -U "$U" -d aims_recordings -c \
   "SELECT confirmation, count(*) FROM sessions WHERE opened_at > now() - interval '1 day'
     GROUP BY confirmation;"
 docker compose logs --since 2h monitor | tail -20
@@ -171,6 +195,12 @@ Both databases are dumped nightly at `AIMS_BACKUP_AT`, encrypted with
 `AIMS_BACKUP_KEY`, and kept for `AIMS_BACKUP_KEEP_DAYS` (`SRS-DAT-16`). Copy
 `/srv/aims/backups` off this machine as well — a backup that only exists on the
 machine it protects is not a backup.
+
+Without `AIMS_BACKUP_KEY` the job refuses to run: the dump is compressed and
+encrypted in one stream, so neither database is ever written in the clear. Each
+backup has a `.sha256` beside it, copied off-site with it; `fetch` and
+`restore.sh` check it and refuse a file that no longer matches. Everything the
+job writes is owner-only (`umask 077`).
 
 **Each quarter**, prove they work rather than assuming it (`SRS-STO-06`,
 `SRS-ARC-07`, `AT-74`):

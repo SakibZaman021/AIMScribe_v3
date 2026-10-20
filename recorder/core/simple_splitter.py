@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
+from collections import deque
 from array import array
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -124,6 +126,10 @@ class Segmenter:
         queue_depth: int = 2048,
         on_partial: Optional[Callable[[str, bytes, datetime], None]] = None,
         partial_every_seconds: float = 0.0,
+        on_write_error: Optional[Callable[[Exception, float], None]] = None,
+        on_write_recovered: Optional[Callable[[float], None]] = None,
+        pending_limit_seconds: float = 600.0,
+        retry_seconds: float = 3.0,
     ):
         self.bytes_per_second = sample_rate * channels * sample_width
         self.sample_width = sample_width
@@ -163,6 +169,21 @@ class Segmenter:
         self._partial_bytes = (int(partial_every_seconds * self.bytes_per_second)
                                if on_partial and partial_every_seconds > 0 else 0)
         self._persisted = 0
+        self._partial_broken = False
+
+        # Clips that could not be written - a full disk - kept in order, in
+        # memory, and tried again every few seconds. Bounded: past the limit the
+        # oldest is given up, loudly, rather than the PC running out of memory
+        # in the middle of a clinic.
+        self._on_write_error = on_write_error
+        self._on_write_recovered = on_write_recovered
+        self._pending: "deque[SealedSegment]" = deque()
+        self._pending_bytes = 0
+        self.pending_limit_bytes = int(pending_limit_seconds * self.bytes_per_second)
+        self.retry_seconds = retry_seconds
+        self._next_retry = 0.0
+        self._failing_since: Optional[float] = None
+        self.lost_seconds = 0.0
 
         # 20 ms is short enough to place a cut precisely inside a gap, long
         # enough for the loudness and zero-crossing figures to mean something.
@@ -274,18 +295,25 @@ class Segmenter:
             self._queue.put_nowait(_Command("stop"))
         except queue.Full:
             pass
-        self._thread.join(timeout=timeout)
-        self._thread = None
+        # With clips still waiting for disk space the thread stays on, writing
+        # them as soon as it can; the caller closes the session after
+        # wait_written(). Joining here would hold Stop for as long as the disk
+        # stays full.
+        self._thread.join(timeout=1.0 if self._pending else timeout)
+        if not self._thread.is_alive():
+            self._thread = None
 
     # ---- worker ----
 
     def _run(self) -> None:
         logger.debug("Segmenter thread started")
         while True:
+            if self._pending and time.monotonic() >= self._next_retry:
+                self._write_pending()
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
-                if self._stop.is_set():
+                if self._stop.is_set() and not self._pending:
                     break
                 continue
 
@@ -296,7 +324,13 @@ class Segmenter:
                     continue
                 if item.kind == "stop":
                     item.done.set()
-                    break
+                    if not self._pending:
+                        break
+                    # Clips still waiting for disk space: stay, and keep trying.
+                    # The session is closed once they are written.
+                    logger.warning("Segmenter stopping with %.0f s of audio still waiting "
+                                   "for disk space; it keeps trying", self.pending_seconds)
+                    continue
 
             self._consume(item)
 
@@ -305,8 +339,15 @@ class Segmenter:
     def _consume(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
         if self._partial_bytes and len(self._buffer) - self._persisted >= self._partial_bytes:
-            self._hand_partial("append", bytes(self._buffer[self._persisted:]))
-            self._persisted = len(self._buffer)
+            if self._partial_broken:
+                self._rewrite_partial()
+            elif self._hand_partial("append", bytes(self._buffer[self._persisted:])):
+                self._persisted = len(self._buffer)
+            else:
+                # One append missed: the copy on disk has a hole in it now, and
+                # a hole would be stitched over silently after a power cut. It
+                # is written whole again as soon as the disk takes it.
+                self._partial_broken = True
 
         level = _rms(chunk, self.sample_width)
         # Rises at once, falls slowly: a meter following the raw value would
@@ -534,35 +575,120 @@ class Segmenter:
         self._rms_samples = 0
         self._segment_started_at = ended
 
-        try:
-            self._on_segment(SealedSegment(
-                pcm=pcm,
-                captured_start_at=started,
-                captured_end_at=ended,
-                rms_mean=mean_rms,
-                is_final=is_final,
-                cut_kind=cut_kind,
-                cut_margin_ms=cut_margin_ms,
-            ))
-            self.segments_emitted += 1
-        except Exception as exc:
-            # Losing a segment here means losing audio, so this is loud.
-            logger.critical("Failed to seal segment: %s", exc, exc_info=True)
-            raise
-        # Only once the clip is safely sealed: until then the copy on disk is
-        # still the only other copy of it.
-        if self._partial_bytes:
-            self._hand_partial("reset", bytes(self._buffer))
-            self._persisted = len(self._buffer)
+        self._emit(SealedSegment(
+            pcm=pcm,
+            captured_start_at=started,
+            captured_end_at=ended,
+            rms_mean=mean_rms,
+            is_final=is_final,
+            cut_kind=cut_kind,
+            cut_margin_ms=cut_margin_ms,
+        ))
 
-    def _hand_partial(self, kind: str, data: bytes) -> None:
+    # ---- writing, and a full disk ----
+
+    def _emit(self, sealed: "SealedSegment") -> None:
+        """Hand one clip to the spool - behind any still waiting, never ahead."""
+        self._pending.append(sealed)
+        self._pending_bytes += len(sealed.pcm)
+        self._write_pending()
+
+    def _write_pending(self) -> None:
+        while self._pending:
+            sealed = self._pending[0]
+            try:
+                self._on_segment(sealed)
+            except Exception as exc:
+                self._next_retry = time.monotonic() + self.retry_seconds
+                if self._failing_since is None:
+                    self._failing_since = time.monotonic()
+                    logger.critical("Could not write a clip (%s); keeping it in memory and "
+                                    "trying again every %.0f s", exc, self.retry_seconds)
+                    if self._on_write_error is not None:
+                        try:
+                            self._on_write_error(exc, self.pending_seconds)
+                        except Exception:
+                            logger.exception("Write-error callback failed")
+                self._trim_pending()
+                self._sync_partial_after_seal(ok=False)
+                return
+            self._pending.popleft()
+            self._pending_bytes -= len(sealed.pcm)
+            self.segments_emitted += 1
+            if self._failing_since is not None and not self._pending:
+                waited = time.monotonic() - self._failing_since
+                self._failing_since = None
+                logger.warning("Disk writable again after %.0f s; every clip kept is written",
+                               waited)
+                if self._on_write_recovered is not None:
+                    try:
+                        self._on_write_recovered(waited)
+                    except Exception:
+                        logger.exception("Write-recovered callback failed")
+        self._sync_partial_after_seal(ok=True)
+
+    def _trim_pending(self) -> None:
+        while self._pending_bytes > self.pending_limit_bytes and len(self._pending) > 1:
+            dropped = self._pending.popleft()
+            self._pending_bytes -= len(dropped.pcm)
+            seconds = len(dropped.pcm) / self.bytes_per_second
+            self.lost_seconds += seconds
+            logger.critical("Disk still full: %.0f s of the oldest unwritten audio given up "
+                            "to stay within memory", seconds)
+
+    @property
+    def pending_seconds(self) -> float:
+        return self._pending_bytes / self.bytes_per_second
+
+    def wait_written(self, timeout: float) -> bool:
+        """True once nothing is waiting for the disk (or nothing ever was)."""
+        deadline = time.monotonic() + timeout
+        while self._pending and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return not self._pending
+
+    def _unwritten(self) -> bytes:
+        """Every byte not yet in a sealed clip: what a power cut would take."""
+        return b"".join(p.pcm for p in self._pending) + bytes(self._buffer)
+
+    def _sync_partial_after_seal(self, *, ok: bool) -> None:
+        if not self._partial_bytes:
+            return
+        if ok and not self._pending:
+            # Only once the clip is safely sealed: until then the copy on disk is
+            # still the only other copy of it.
+            if self._hand_partial("reset", bytes(self._buffer)):
+                self._persisted = len(self._buffer)
+                self._partial_broken = False
+            else:
+                self._partial_broken = True
+            return
+        # Clips waiting: the copy on disk must hold them too, in order, or a
+        # power cut now would lose exactly the audio the disk would not take.
+        self._partial_broken = True
+        self._rewrite_partial()
+
+    def _rewrite_partial(self) -> None:
+        started = (self._pending[0].captured_start_at if self._pending
+                   else self._segment_started_at or datetime.now(timezone.utc))
+        try:
+            self._on_partial("reset", self._unwritten(), started)
+        except Exception as exc:
+            logger.debug("Clip in progress still not on disk: %s", exc)
+            return
+        self._partial_broken = False
+        self._persisted = len(self._buffer)
+
+    def _hand_partial(self, kind: str, data: bytes) -> bool:
         started = self._segment_started_at or datetime.now(timezone.utc)
         try:
             self._on_partial(kind, data, started)
+            return True
         except Exception as exc:
             # Never at the cost of the recording itself: this copy only bounds
             # what a power cut can take.
             logger.error("Could not keep the clip in progress on disk: %s", exc)
+            return False
 
     # ---- metrics ----
 

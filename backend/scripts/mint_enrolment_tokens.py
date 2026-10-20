@@ -28,7 +28,11 @@ it is used, and expires anyway.
 
 Environment:
     AIMS_BACKEND_URL   required: the server these PCs will enrol with
-    AIMS_ADMIN_KEY     required; the server's admin key
+    AIMS_ADMIN_URL     where the admin calls go, when that is not the public
+                       address: from the internet the admin routes answer 403,
+                       so on the server itself this is http://127.0.0.1:6001
+                       (the gateway's loopback-only door). Default: AIMS_BACKEND_URL
+    AIMS_ADMIN_KEY    required; the server's admin key
     AIMS_CMED_ORIGIN   the CMED page address printed on each sheet
     AIMS_TOKEN_TTL_HOURS  how long an unused token stays valid; 14 days, so a
                        rollout across many clinics does not outlive its tokens
@@ -47,6 +51,7 @@ from pathlib import Path
 # No default: a token minted on the wrong server enrols a PC there, and it then
 # records for a server nobody is watching.
 BACKEND = os.getenv("AIMS_BACKEND_URL", "").rstrip("/")
+ADMIN = os.getenv("AIMS_ADMIN_URL", "").rstrip("/") or BACKEND
 CMED_ORIGIN = os.getenv("AIMS_CMED_ORIGIN", "the CMED page address for this clinic")
 TTL_HOURS = int(os.getenv("AIMS_TOKEN_TTL_HOURS", str(14 * 24)))
 CREATED_BY = os.getenv("AIMS_CREATED_BY", "Team_AIMScribe")
@@ -66,9 +71,17 @@ def admin_key() -> str:
     return ""
 
 
+def write_private(path: Path, text: str) -> None:
+    """Created owner-only (0600) from the start, never readable for a moment."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
 def call(path: str, body: dict, key: str):
     request = urllib.request.Request(
-        BACKEND + path, data=json.dumps(body).encode(),
+        ADMIN + path, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "X-Admin-Key": key})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -173,10 +186,15 @@ def main() -> int:
         return 1
 
     out = source.parent / f"enrolment_{datetime.now():%Y%m%d_%H%M}"
-    out.mkdir(parents=True, exist_ok=True)
+    # The sheets are credentials until they are used: the folder and every file
+    # in it are the owner's alone (0700 / 0600), whatever the umask says.
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(out, 0o700)
     expires = datetime.now(timezone.utc) + timedelta(hours=TTL_HOURS)
 
     print(f"backend  {BACKEND}")
+    if ADMIN != BACKEND:
+        print(f"admin    {ADMIN}")
     print(f"machines {len(rows)}")
     print(f"output   {out}\n")
 
@@ -246,8 +264,8 @@ def main() -> int:
         row.setdefault("doctor_name", doctor)
         row.setdefault("hospital_name", hospital)
         label = doctor or (room.replace(" ", "_") or f"PC{len(register) + 1}")
-        (out / f"{hospital}_{label}.txt").write_text(
-            instructions(row, token, expires), encoding="utf-8", newline="\r\n")
+        write_private(out / f"{hospital}_{label}.txt",
+                      instructions(row, token, expires).replace("\n", "\r\n"))
 
         register.append({
             "hospital_id": hospital, "doctor_id": doctor,
@@ -261,7 +279,8 @@ def main() -> int:
     if register:
         # Deliberately no token column: the register says what was issued and to
         # whom, and is safe to keep. The tokens live only in the per-PC files.
-        with (out / "register.csv").open("w", newline="", encoding="utf-8") as handle:
+        fd = os.open(out / "register.csv", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(register[0]))
             writer.writeheader()
             writer.writerows(register)

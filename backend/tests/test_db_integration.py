@@ -207,7 +207,8 @@ async def test_the_whole_server_flow_on_postgres(dbs):
     """API 2 arrives, the recorder asks, the grant comes back confirmed."""
     repo = dbs.repo
     device = await enrolled_device(repo)
-    key = await repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None)
+    key = await repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None,
+                                     cmed_hospital_ids=["CMED-DHOLPUR"])
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from grants import GrantIssuer
     api_v2.ctx.repo, api_v2.ctx.clinical = repo, dbs.clinical
@@ -795,8 +796,10 @@ async def test_the_copy_endpoints_run_on_postgres(dbs):
         await conn.execute("""
             INSERT INTO segments (session_id, seq_no, entry_no, object_key, sha256,
                                   bytes, duration_seconds, state)
-            VALUES ($1, 1, 1, $2, $3, 100, 1.0, 'committed')
+            VALUES ($1, 1, 1, $2, $3, 100, 1.0, 'archived')
         """, sid, f"audio/{sid}/seg_00001.wav", digest)
+    # 'archived': the piece is in the archive file, as /archive/complete marks
+    # it. Only such pieces leave the bucket after the copy.
 
     removed = _server(dbs)
     try:

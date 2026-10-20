@@ -16,9 +16,14 @@
  *    patient says no, the doctor presses Stop on the recorder and chooses
  *    "Patient did not consent", which deletes the recording everywhere
  *    (§7.8a). Nothing about consent is stored here.
- *  - **A consultation ends when the prescription is built**, not when the next
- *    patient is opened (§7.7): the recorder refuses a new patient with
- *    GATE_NOT_ARMED until "Prescription built" is sent.
+ *  - **Opening a patient is always accepted.** Before the prescription, the
+ *    recording carries on (RECORDING_STARTED with `continued`) and the server
+ *    later files each part under the right patient - a wrong pick, a glance,
+ *    or a follow-up with no prescription followed by the next patient. This
+ *    page sends that patient's API 2 every time, and uses the session id from
+ *    that reply for their prescription. After "Prescription built" the next
+ *    patient starts a new recording; with nobody opened, it ends by itself
+ *    two minutes later.
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
@@ -32,6 +37,8 @@ import {
   RECORDING_CODES,
   CODE_NOTES,
   PAUSE_REASONS,
+  isContinued,
+  stopReason,
 } from '@/lib/aimscribe-client';
 
 /**
@@ -109,6 +116,9 @@ export default function DashboardPage() {
   // What this consultation is, as CMED described it. Kept so API 3 carries
   // exactly the same five fields as API 2 and the trigger.
   const [visit, setVisit] = useState<Record<string, string> | null>(null);
+  // The recording this patient was opened into - the running one when the
+  // click came before the last patient's prescription.
+  const [visitSession, setVisitSession] = useState<string | null>(null);
   const [lastReply, setLastReply] = useState<Reply | null>(null);
   const [channelB, setChannelB] = useState<Reply | null>(null);
   // The consulting room is fixed, the doctor in it is not. The register comes
@@ -207,16 +217,12 @@ export default function DashboardPage() {
         // the person in front of the screen finds out - otherwise a consultation
         // ends mid-sentence and the page reports a tidy success.
         const reason = String(message?.reason ?? '');
-        if (reason && reason !== 'doctor_stopped') {
-          setNotice(
-            `Recording stopped from outside CMED (${reason.replace(/_/g, ' ')}). ` +
-              'The audio so far is saved and queued for upload.'
-          );
-        } else {
-          setNotice('Recording stopped and queued for upload.');
-        }
+        setNotice(`Recording ended: ${stopReason(reason)} ` +
+                  'The audio is saved and queued for upload.');
         client.refreshStatus();
       }),
+      client.on('patient_opened', () => client.refreshStatus()),
+      client.on('gate_armed', () => client.refreshStatus()),
       client.on('segment_sealed', () => client.refreshStatus()),
       client.on('segment_committed', () => client.refreshStatus()),
       client.on('ner_ready', (message: any) => {
@@ -294,15 +300,17 @@ export default function DashboardPage() {
 
   // ---- derived ----
 
+  // Judged by the patient opened most recently in the recording, not the one
+  // it started with: after a wrong pick the recording is this patient's.
   const recordingThisPatient = useMemo(
     () => Boolean(status?.isRecording && patientData &&
-                  status.patientRef === patientData.patient_id),
+                  status.focusPatient === patientData.patient_id),
     [status, patientData]
   );
 
   const recordingOtherPatient = useMemo(
     () => Boolean(status?.isRecording && patientData &&
-                  status.patientRef && status.patientRef !== patientData.patient_id),
+                  status.focusPatient && status.focusPatient !== patientData.patient_id),
     [status, patientData]
   );
 
@@ -345,6 +353,12 @@ export default function DashboardPage() {
       if (!reply.ok) {
         throw new Error(CODE_NOTES[reply.code] ?? reply.message ?? 'Refused.');
       }
+      setVisitSession(String(reply.data?.session_id ?? '') || null);
+      if (isContinued(reply)) {
+        setNotice('Opened while the last consultation has no prescription yet: the ' +
+                  'recording carries on, and AIMS LAB files each part under the right ' +
+                  'patient. Build this patient\'s prescription as usual.');
+      }
 
       // API 2, from this app's server. It is what confirms the recording, so
       // a failure here is reported rather than hidden - but it never stops the
@@ -370,8 +384,8 @@ export default function DashboardPage() {
    */
   const handlePrescriptionBuilt = () =>
     withBusy(async () => {
-      if (!visit) throw new Error('Open a patient first.');
-      const sessionId = status?.sessionId ?? '';
+      if (!visit) throw new Error('Open this patient first.');
+      const sessionId = visitSession ?? status?.sessionId ?? '';
       const reply = await clientRef.current!.prescriptionBuilt(visit.patient_id,
                                                                sessionId);
       setLastReply(reply);
@@ -759,7 +773,10 @@ export default function DashboardPage() {
               )}
 
               <div className="mt-6 space-y-3">
-                {!status?.isRecording && (
+                {/* Shown whenever this patient is not the one being recorded:
+                    CMED sends API 1 on every patient click, and the recorder
+                    accepts it whether or not a recording is running. */}
+                {(!status?.isRecording || recordingOtherPatient) && (
                   <>
                     <button
                       onClick={handleStart}
@@ -772,7 +789,10 @@ export default function DashboardPage() {
                     >
                       {!connected ? 'Waiting for AIMScribe…'
                         : !doctorId ? 'Enter the doctor ID to continue'
-                        : 'Open patient (starts recording)'}
+                        : status?.isRecording
+                          ? (status.armed ? 'Open patient (starts a new recording)'
+                                          : 'Open patient (the recording carries on)')
+                          : 'Open patient (starts recording)'}
                     </button>
                     <p className="text-xs text-gray-500 text-center">
                       Recording runs in AIMScribe on this PC and continues if you close this page.
@@ -792,15 +812,21 @@ export default function DashboardPage() {
                         Recording patient {status.patientRef}, not the one shown here.
                       </p>
                     )}
-                    {/* API 3, part one. Until this is sent, the recorder
-                        refuses to open the next patient (§7.7) - which is what
-                        stops a consultation being cut off mid-sentence. */}
+                    {/* API 3, part one. Arms the gate: the next patient opened
+                        starts a new recording, and with nobody opened this one
+                        ends by itself two minutes later. */}
+                    {status?.armed && (
+                      <p className="text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded p-2">
+                        Prescription built. The next patient starts a new recording;
+                        otherwise this one ends by itself 2 minutes after the prescription.
+                      </p>
+                    )}
                     <button
                       onClick={handlePrescriptionBuilt}
-                      disabled={busy}
-                      className="w-full py-3 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700"
+                      disabled={busy || !visit}
+                      className="w-full py-3 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-300"
                     >
-                      Prescription built (ends this consultation)
+                      Prescription built for this patient
                     </button>
                     <button
                       onClick={() => setShowPause(true)}

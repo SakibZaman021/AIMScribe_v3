@@ -1,37 +1,56 @@
 ; ============================================================
 ; AIMScribe Agent - Windows installer
 ;
-; Produces AIMScribeSetup.exe: one file for hospital IT to run on a doctor PC.
-; No PowerShell, no execution policy, no command-line arguments.
+; Produces AIMScribeSetup.exe: one signed file for hospital IT to run on a
+; doctor PC, by hand or silently from a management tool.
 ;
-; What the administrator is asked for:
-;   * the enrolment token for that doctor
-;   * the backend URL and the CMED origin, pre-filled with the defaults below
+; What it does, and nothing more - the way Zoom or WhatsApp install:
+;   * copies the signed program into Program Files
+;   * writes the program's settings (.env) beside it
+;   * creates the four data folders under ProgramData
+;   * registers the logon task that starts the agent
 ;
-; Everything else - the per-install API key, the directory permissions, the
-; logon task, the pinned public keys - happens without being asked, because
-; every one of those was a step someone could get wrong twenty-nine times.
+; What it no longer does. Machine policy - Windows Update active hours, the
+; power plan, the time service - used to be changed here, and an unsigned
+; installer quietly rewriting Windows policy is exactly what antivirus
+; products score as malware. Those settings are now an explicit, separate,
+; signed step an administrator chooses to run (policy\AIMScribe-ClinicPolicy.ps1)
+; or deploys as a Group Policy / Intune profile. See INSTALL_FOR_IT.md.
 ;
-; Build:  ISCC.exe installer.iss
+; Build (BUILD.bat does this for you):
+;   signed:   ISCC /DSignedBuild "/Saimssign=powershell.exe -NoProfile
+;                  -ExecutionPolicy Bypass -File signing\sign.ps1 -File $f"
+;                  /DDefaultBackend=https://<server> /DDefaultOrigin=https://<cmed page>
+;                  installer.iss
+;   dev:      ISCC /DDefaultBackend=... /DDefaultOrigin=... installer.iss
+;             (unsigned - never give it to a clinic)
+;
+; Silent install, for IT and management tools:
+;   AIMScribeSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+;       /BACKEND=https://<server> /ORIGIN=https://<cmed page>
+;       /TOKEN=<enrolment token> [/PIN=<sha256 SPKI pin>[,<backup pin>]]
+;       /LOG="%TEMP%\aimscribe-setup.log"
+;   Exit code 0 only when the program is installed AND the logon task exists.
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.3.0"
+#define AppVersion     "3.5.0"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
-#define AppPublisher   "AIMS LAB"
+#define AppPublisher   "AIMS LAB, United International University"
 #define AppExe         "AIMScribe_Agent.exe"
 
-; Defaults offered on the configuration page on a NEW PC. Set them once when
-; building, so nobody types the server address twenty times:
-;   ISCC /DDefaultBackend=https://<server> /DDefaultOrigin=https://<cmed page> installer.iss
-; An upgrade ignores these and keeps what that PC already has.
+; The server and the CMED page a NEW PC is pointed at. Required: an installer
+; built without them used to fall back to the old v1 server on Render and a
+; test page on vercel.app, so a PC set up from it talked to the wrong system.
+; An upgrade ignores these and keeps what that PC already has; /BACKEND= and
+; /ORIGIN= on the command line override both.
 #ifndef DefaultBackend
-  #define DefaultBackend "https://aimscribe-backend-render.onrender.com"
+  #error Build with /DDefaultBackend=https://<the AIMS LAB server> (see BUILD.bat)
 #endif
 #ifndef DefaultOrigin
-  #define DefaultOrigin  "https://aim-scribe-exe.vercel.app"
+  #error Build with /DDefaultOrigin=https://<CMED's page> (see BUILD.bat)
 #endif
 
 [Setup]
@@ -39,7 +58,10 @@ SetupIconFile={#AppIcon}
 AppId={{8F3A2C41-6E5B-4D77-9A18-3C7E5B2D9F04}
 AppName={#AppName}
 AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
+AppPublisherURL=https://github.com/SakibZaman021/AIMScribe_v3
+AppSupportURL=https://github.com/SakibZaman021/AIMScribe_v3
 DefaultDirName={autopf}\AIMScribe
 DefaultGroupName=AIMScribe
 DisableProgramGroupPage=yes
@@ -48,10 +70,15 @@ OutputBaseFilename=AIMScribeSetup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Program files and the machine-wide data directory both need administrator
-; rights, and the logon task is registered for the machine.
+; Program Files and the machine-wide data folders need administrator rights,
+; and the logon task is registered for the machine. Not overridable: a
+; per-user install would put the settings and the trusted keys somewhere the
+; doctor's account can change.
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0.17763
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#AppExe}
 ; Setup stops the agent itself in PrepareToInstall, so Windows' RestartManager
@@ -59,15 +86,27 @@ UninstallDisplayIcon={app}\{#AppExe}
 ; anything holding our files, finds a Windows service that cannot be closed
 ; (Program Compatibility Assistant, typically), and asks Abort/Retry/Ignore.
 ; On a silent install that prompt defaults to Abort, so the upgrade rolls back
-; and reports failure while the old version keeps running. Across a fleet that
-; is a machine that looks updated and is not.
+; and reports failure while the old version keeps running.
 CloseApplications=no
 RestartApplications=no
 
-; A clinical PC should be told what it is running.
+; Every file a clinic receives is signed by the same publisher: the setup, the
+; uninstaller Setup writes, and (by signing\sign.ps1, before this runs) every
+; program file inside. Unsigned is for a developer's own PC only.
+#ifdef SignedBuild
+SignTool=aimssign $f
+SignedUninstaller=yes
+SignToolRetryCount=3
+SignToolRetryDelay=2000
+#endif
+
+; A clinical PC should be told what it is running, and who made it.
 VersionInfoVersion={#AppVersion}
 VersionInfoCompany={#AppPublisher}
-VersionInfoDescription=AIMScribe consultation recording agent
+VersionInfoDescription=AIMScribe consultation recording agent - setup
+VersionInfoProductName=AIMScribe
+VersionInfoProductVersion={#AppVersion}
+VersionInfoCopyright=Copyright (c) 2026 AIMS LAB, United International University
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -76,13 +115,29 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "dist\AIMScribe_Agent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Public halves only. Identical on every PC and carrying no secret, which is
 ; why they can ship in the installer instead of being copied by hand.
-Source: "keys\aimslab_grant_pub.pem";   DestDir: "{commonappdata}\AIMScribe\keys"; Flags: ignoreversion
-Source: "keys\aimslab_receipt_pub.pem"; DestDir: "{commonappdata}\AIMScribe\keys"; Flags: ignoreversion
+; Beside the program, under Program Files, where only an administrator can
+; change them. They used to sit in ProgramData, which every user may modify:
+; replacing the grant key there let anyone on the PC sign their own grants.
+Source: "keys\aimslab_grant_pub.pem";   DestDir: "{app}\keys"; Flags: ignoreversion
+Source: "keys\aimslab_receipt_pub.pem"; DestDir: "{app}\keys"; Flags: ignoreversion
+; The check IT runs before and after installing, and the optional clinic
+; policy step (both signed with everything else).
+Source: "policy\AIMScribe-Check.ps1";        DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "policy\AIMScribe-ClinicPolicy.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+
+[InstallDelete]
+; The copies an earlier version put in ProgramData. Nothing reads them now,
+; and a file that looks trusted but is not is only a trap.
+Type: files; Name: "{commonappdata}\AIMScribe\keys\aimslab_grant_pub.pem"
+Type: files; Name: "{commonappdata}\AIMScribe\keys\aimslab_receipt_pub.pem"
 
 [Dirs]
-; The agent writes audio and logs as the signed-in doctor, so Users need Modify
-; here - but only here. It cannot alter its own program files.
-Name: "{commonappdata}\AIMScribe";        Permissions: users-modify
+; The agent runs as whoever signs in (audio needs the user's session), so it
+; writes audio, logs, its state and its own keys as that user: Users need
+; Modify on those four folders - and only those. The folder above them is left
+; as Windows has it, and the settings and the trusted public keys live under
+; Program Files, which no ordinary user can change.
+Name: "{commonappdata}\AIMScribe"
 Name: "{commonappdata}\AIMScribe\spool";  Permissions: users-modify
 Name: "{commonappdata}\AIMScribe\logs";   Permissions: users-modify
 Name: "{commonappdata}\AIMScribe\state";  Permissions: users-modify
@@ -90,6 +145,9 @@ Name: "{commonappdata}\AIMScribe\keys";   Permissions: users-modify
 
 [Icons]
 Name: "{group}\AIMScribe Agent"; Filename: "{app}\{#AppExe}"
+Name: "{group}\AIMScribe - check this PC"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy RemoteSigned -NoExit -File ""{app}\tools\AIMScribe-Check.ps1"""; \
+    WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start AIMScribe now"; \
@@ -98,13 +156,30 @@ Filename: "{app}\{#AppExe}"; Description: "Start AIMScribe now"; \
 [UninstallRun]
 Filename: "schtasks.exe"; Parameters: "/Delete /TN ""AIMScribe Agent"" /F"; \
     Flags: runhidden; RunOnceId: "RemoveTask"
-Filename: "taskkill.exe"; Parameters: "/IM {#AppExe} /F"; \
-    Flags: runhidden; RunOnceId: "StopAgent"
 
 [Code]
+const
+  { The agent's own names (recorder/main.py). The stop event is the polite way
+    to ask a running agent to finish its recording and exit, so an upgrade
+    never cuts a consultation off mid-sentence. }
+  StopEventName = 'Global\AIMScribeAgentStop';
+  EVENT_MODIFY_STATE = $0002;
+  StopWaitSeconds = 30;
+
 var
   ConfigPage: TInputQueryWizardPage;
   KeptApiKey: String;
+  InstallProblem: String;
+
+function OpenEvent(dwDesiredAccess: Longword; bInheritHandle: Boolean;
+  lpName: String): Longword;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SetEvent(hEvent: Longword): Boolean;
+  external 'SetEvent@kernel32.dll stdcall';
+function CloseHandle(hObject: Longword): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+{ ------------------------------------------------------------ the old settings }
 
 { The settings file of the version being upgraded, if there is one. }
 function PreviousEnv(): String;
@@ -131,19 +206,20 @@ begin
     end;
 end;
 
-{ An upgrade keeps the PC's own settings. It used to offer the build's defaults,
-  so pressing Next on an upgrade quietly moved a PC to another server - one
-  enrolled somewhere it no longer talked to - and gave it a new local key. }
-function Kept(const Key, Default: String): String;
+{ What a setting should be, in order: the command line (/BACKEND= etc.), the
+  value this PC already has, then the build's default. An upgrade keeps the
+  PC's own settings: it used to offer the build's defaults, so pressing Next
+  on an upgrade quietly moved a PC to another server. }
+function Choose(const Param, Key, Default: String): String;
 begin
-  Result := EnvValue(Key);
+  Result := Trim(ExpandConstant('{param:' + Param + '|}'));
+  if Result = '' then Result := EnvValue(Key);
   if Result = '' then Result := Default;
 end;
 
 { An upgrade, not a first install. Enrolment lives under ProgramData and is
   never touched by Setup, so a machine that has already been enrolled keeps its
-  doctor and hospital across every upgrade. Detecting that is what lets the
-  token field be left empty without a frightening warning. }
+  doctor and hospital across every upgrade. }
 function AlreadyEnrolled(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{commonappdata}\AIMScribe\state\device.token'));
@@ -171,110 +247,147 @@ begin
   else
     ConfigPage.Add('Enrolment token:', False);
 
-  ConfigPage.Values[0] := Kept('AIMS_BACKEND_URL', '{#DefaultBackend}');
-  ConfigPage.Values[1] := Kept('AIMS_ALLOWED_ORIGINS', '{#DefaultOrigin}');
-  ConfigPage.Values[2] := '';
-  KeptApiKey := EnvValue('AIMS_LOCAL_API_KEY');
+  ConfigPage.Values[0] := Choose('BACKEND', 'AIMS_BACKEND_URL', '{#DefaultBackend}');
+  ConfigPage.Values[1] := Choose('ORIGIN', 'AIMS_ALLOWED_ORIGINS', '{#DefaultOrigin}');
+  ConfigPage.Values[2] := Trim(ExpandConstant('{param:TOKEN|}'));
+  { Kept across an upgrade only if it was made by the secure generator. A key
+    from 3.4 or earlier came from Random() and is replaced, once. }
+  if EnvValue('AIMS_LOCAL_API_KEY_SOURCE') = 'csprng' then
+    KeptApiKey := EnvValue('AIMS_LOCAL_API_KEY')
+  else
+    KeptApiKey := '';
+end;
+
+{ ------------------------------------------------------------ checking the input }
+
+function StartsWith(const S, Prefix: String): Boolean;
+begin
+  Result := Copy(S, 1, Length(Prefix)) = Prefix;
+end;
+
+{ '' when the three values are usable; otherwise what is wrong, in words an
+  IT person can act on. Used by the wizard page and, for a silent install,
+  before anything is copied - a silent install with a bad value must fail
+  with a non-zero exit code, not install a PC that cannot work. }
+function ConfigProblem(): String;
+var
+  Backend, Origin, Token: String;
+begin
+  Result := '';
+  Backend := Trim(ConfigPage.Values[0]);
+  Origin := Trim(ConfigPage.Values[1]);
+  Token := Trim(ConfigPage.Values[2]);
+  if Backend = '' then
+    Result := 'A backend URL is required (/BACKEND=https://...).'
+  else if not StartsWith(Lowercase(Backend), 'https://') then
+    Result := 'The backend URL must start with https:// - recordings never travel ' +
+              'unencrypted.'
+  else if Origin = '' then
+    Result := 'The CMED web address is required (/ORIGIN=https://...). The agent ' +
+              'refuses connections from any other page, so recording cannot start ' +
+              'without it.'
+  else if (Pos('*', Origin) > 0) or (Pos(' ', Origin) > 0) then
+    Result := 'The CMED web address must be exact addresses, with no * or spaces.'
+  else if (Token <> '') and (Length(Token) < 20) then
+    // A real token is 43 characters. Anything much shorter is a placeholder
+    // typed to get past this page, and the machine then installs cleanly,
+    // starts cleanly, and refuses to record.
+    Result := 'That does not look like an enrolment token. A token is about 43 ' +
+              'characters, issued by the AIMScribe administrator for this PC. Leave ' +
+              'it empty to enrol this machine later.';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Problem: String;
 begin
   Result := True;
-  if CurPageID = ConfigPage.ID then
+  if CurPageID <> ConfigPage.ID then Exit;
+  Problem := ConfigProblem();
+  if Problem <> '' then
   begin
-    if Trim(ConfigPage.Values[0]) = '' then
-    begin
-      MsgBox('A backend URL is required.', mbError, MB_OK);
+    if not WizardSilent() then MsgBox(Problem, mbError, MB_OK);
+    { A silent install is refused in PrepareToInstall, with an exit code. }
+    Result := WizardSilent();
+    Exit;
+  end;
+  if (Trim(ConfigPage.Values[2]) = '') and not AlreadyEnrolled() and not WizardSilent() then
+    if MsgBox('No enrolment token was entered.' + #13#10 + #13#10 +
+              'AIMScribe will install and start, but will refuse to record ' +
+              'until this PC is enrolled. Continue anyway?',
+              mbConfirmation, MB_YESNO) = IDNO then
       Result := False;
-      Exit;
-    end;
-    if Trim(ConfigPage.Values[1]) = '' then
+end;
+
+{ ------------------------------------------------------------ the local key }
+
+{ Windows' own cryptographic random number generator. Pascal's Random() is a
+  predictable sequence seeded from the clock. }
+function BCryptGenRandom(hAlgorithm: Longword; pbBuffer: AnsiString;
+  cbBuffer: Longword; dwFlags: Longword): Longword;
+  external 'BCryptGenRandom@bcrypt.dll stdcall';
+
+{ A local API key, unique per install: 44 characters from 62, about 262 bits,
+  without bias - bytes from 248 up are thrown away rather than folded onto the
+  first letters. }
+function NewApiKey(): String;
+var
+  Buffer: AnsiString;
+  Alphabet: String;
+  I, B: Integer;
+begin
+  Alphabet := 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  Result := '';
+  while Length(Result) < 44 do
+  begin
+    SetLength(Buffer, 64);
+    { BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2; STATUS_SUCCESS = 0 }
+    if BCryptGenRandom(0, Buffer, 64, 2) <> 0 then
+      RaiseException('Windows could not supply secure random numbers for the ' +
+                     'recorder''s local key.' + #13#10 + 'AIMScribe has not been installed.');
+    for I := 1 to 64 do
     begin
-      MsgBox('The CMED web address is required. The agent refuses connections' + #13#10 +
-             'from any other origin, so recording cannot start without it.',
-             mbError, MB_OK);
-      Result := False;
-      Exit;
-    end;
-    if Trim(ConfigPage.Values[2]) = '' then
-    begin
-      // An upgrade of an enrolled machine is the ordinary case across a fleet,
-      // and it needs no token at all. Warning here sent people hunting for a
-      // token that does not exist and cannot be reissued - the original was
-      // consumed when the PC was first set up.
-      if not AlreadyEnrolled() then
-      begin
-        if MsgBox('No enrolment token was entered.' + #13#10 + #13#10 +
-                  'AIMScribe will install and start, but will refuse to record ' +
-                  'until this PC is enrolled. Continue anyway?',
-                  mbConfirmation, MB_YESNO) = IDNO then
-          Result := False;
-      end;
-    end
-    else if Length(Trim(ConfigPage.Values[2])) < 20 then
-    begin
-      // A real token is 43 characters. Anything much shorter is a placeholder
-      // typed to get past this page, and the machine then installs cleanly,
-      // starts cleanly, and refuses to record - which is discovered by a doctor
-      // with a patient in front of them rather than by the person installing it.
-      MsgBox('That does not look like an enrolment token.' + #13#10 + #13#10 +
-             'A token is about 43 characters, issued by the AIMScribe ' +
-             'administrator for this specific PC. Leave the field empty if you ' +
-             'intend to enrol this machine later.',
-             mbError, MB_OK);
-      Result := False;
+      B := Ord(Buffer[I]);
+      if (B < 248) and (Length(Result) < 44) then
+        Result := Result + Copy(Alphabet, (B mod 62) + 1, 1);
     end;
   end;
 end;
 
-{ A local API key, unique per install. Not security-critical on its own - the
-  listener is bound to 127.0.0.1 and every recording still needs a signed grant
-  - but a shared key across thirty machines would be one stolen value away from
-  driving all of them. }
-function NewApiKey(): String;
-var
-  I: Integer;
-  Alphabet: String;
-begin
-  Alphabet := 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  Result := '';
-  for I := 1 to 44 do
-    Result := Result + Copy(Alphabet, Random(Length(Alphabet)) + 1, 1);
-end;
+{ ------------------------------------------------------------ writing the settings }
 
 procedure WriteEnvFile();
 var
   Env: TStringList;
-  DataDir: String;
+  DataDir, Pins: String;
 begin
   DataDir := ExpandConstant('{commonappdata}\AIMScribe');
+  Pins := Choose('PIN', 'AIMS_TLS_PINS', '');
   Env := TStringList.Create;
   try
-    Env.Add('# Written by AIMScribeSetup. Do not edit by hand.');
+    Env.Add('# Written by AIMScribeSetup {#AppVersion}. Do not edit by hand.');
     Env.Add('AIMS_BACKEND_URL=' + Trim(ConfigPage.Values[0]));
     Env.Add('# Protocol 2. The v1 prefix serves the transcription API and has');
     Env.Add('# none of the enrolment or session endpoints.');
     Env.Add('AIMS_BACKEND_API_PREFIX=/api/v2');
+    Env.Add('# The server''s public key, pinned (SHA-256 of its SubjectPublicKeyInfo,');
+    Env.Add('# base64; current and backup, comma-separated). Empty: the Windows');
+    Env.Add('# certificate store decides, which antivirus HTTPS inspection can subvert.');
+    Env.Add('AIMS_TLS_PINS=' + Pins);
     Env.Add('');
     Env.Add('AIMS_SAMPLE_RATE=44100');
     Env.Add('AIMS_CHANNELS=1');
     Env.Add('AIMS_SAMPLE_WIDTH=2');
     Env.Add('AIMS_FRAMES_PER_BUFFER=2048');
-    Env.Add('# The clinic speakerphone, opened by name and kept at 100%, whatever');
-    Env.Add('# Windows has as its default. Without it, the PC''s own microphone records.');
-    Env.Add('AIMS_PREFERRED_MICROPHONE=Jabra');
+    Env.Add('# The clinic speakerphone, opened by name and set to 100% when a');
+    Env.Add('# recording starts. Without it, the PC''s own microphone records.');
+    Env.Add('AIMS_PREFERRED_MICROPHONE=' + Choose('MICROPHONE', 'AIMS_PREFERRED_MICROPHONE', 'Jabra'));
     Env.Add('');
     Env.Add('# A clip is the unit of upload, retry and loss. Short clips mean');
-    Env.Add('# a failure risks a minute, not three, and transcripts arrive while');
-    Env.Add('# the doctor is still talking. The server merges them back.');
+    Env.Add('# a failure risks a minute, not three. The server merges them back.');
     Env.Add('AIMS_SEGMENT_MIN_SECONDS=30');
     Env.Add('AIMS_SEGMENT_MAX_SECONDS=60');
-    Env.Add('# Keep listening this much longer for a natural pause before');
-    Env.Add('# cutting a talker mid-sentence.');
     Env.Add('AIMS_SEGMENT_GRACE_SECONDS=15');
-    Env.Add('# A cut needs three seconds of quiet - far longer than a breath');
-    Env.Add('# between sentences - so it cannot land inside a phrase. Past 60s');
-    Env.Add('# the clip is overdue and half that will do.');
     Env.Add('AIMS_SILENCE_HOLD_SECONDS=3');
     Env.Add('');
     Env.Add('AIMS_SPOOL_DIR=' + DataDir + '\spool');
@@ -293,11 +406,17 @@ begin
       Env.Add('AIMS_LOCAL_API_KEY=' + KeptApiKey)
     else
       Env.Add('AIMS_LOCAL_API_KEY=' + NewApiKey());
+    Env.Add('AIMS_LOCAL_API_KEY_SOURCE=csprng');
     Env.Add('AIMS_REQUIRE_GRANT=true');
     Env.Add('AIMS_ENABLE_DOCS=false');
     Env.Add('');
     Env.Add('AIMS_GRANT_ISSUER=aimslab');
     Env.Add('AIMS_GRANT_AUDIENCE=aimscribe-recorder');
+    Env.Add('# The server''s public keys, trusted from Program Files only.');
+    Env.Add('AIMS_GRANT_PUBLIC_KEY_PATH=' + ExpandConstant('{app}\keys\aimslab_grant_pub.pem'));
+    Env.Add('AIMS_RECEIPT_PUBLIC_KEY_PATH=' + ExpandConstant('{app}\keys\aimslab_receipt_pub.pem'));
+    Env.Add('# This file is the only source of these settings: the recorder ignores');
+    Env.Add('# AIMS_* environment variables, which any program on the PC can set.');
     Env.Add('');
     Env.Add('AIMS_HEARTBEAT_SECONDS=30');
     Env.Add('AIMS_LOG_LEVEL=INFO');
@@ -324,13 +443,16 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------ the logon task }
+
 procedure Append(var Lines: TArrayOfString; const Line: String);
 begin
   SetArrayLength(Lines, GetArrayLength(Lines) + 1);
   Lines[GetArrayLength(Lines) - 1] := Line;
 end;
 
-procedure RegisterLogonTask();
+{ '' on success, otherwise why the task is not there. }
+function RegisterLogonTask(): String;
 var
   ResultCode: Integer;
   Xml: TArrayOfString;
@@ -341,43 +463,36 @@ begin
 
     Defined by XML rather than by schtasks flags, because the two settings that
     matter most have no flags and default to the wrong value on a laptop:
-
-      DisallowStartIfOnBatteries  defaults True - the agent then never starts at
-                                  logon on an unplugged laptop, and schtasks
-                                  still reports success. This cost an evening to
-                                  find on a machine sitting at 19% battery.
+      DisallowStartIfOnBatteries  defaults True - the agent never starts at
+                                  logon on an unplugged laptop.
       StopIfGoingOnBatteries      defaults True - Windows would kill the agent
-                                  mid-consultation the moment someone unplugged
-                                  the trolley.
+                                  mid-consultation when someone unplugged it.
 
-    Doctors' machines are laptops and they are not always plugged in. }
-
+    Started once at sign-in, and restarted by Windows if it fails - three
+    times, a minute apart. It used to be re-launched every minute all day and
+    could not be ended by Windows; that is how persistent malware behaves, and
+    antivirus products treat it accordingly. A normal app is started once. }
+  Result := '';
   XmlPath := ExpandConstant('{tmp}\aimscribe_task.xml');
   SetArrayLength(Xml, 0);
     { No encoding declaration, and saved without a byte-order mark below.
-      schtasks parses the first two bytes literally: a BOM, or a declaration
-      that disagrees with the actual encoding, fails with nothing more useful
-      than "(1,2): incorrect document syntax". }
+      schtasks parses the first two bytes literally. }
   Append(Xml, '<?xml version="1.0"?>');
   Append(Xml, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
   Append(Xml, '  <RegistrationInfo>');
-  Append(Xml, '    <Description>Starts the AIMScribe recording agent at logon.</Description>');
+  Append(Xml, '    <Author>AIMS LAB</Author>');
+  Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in.</Description>');
   Append(Xml, '  </RegistrationInfo>');
-    { At logon, and again every minute after it. While the agent runs the extra
-      starts are ignored (IgnoreNew below); if it has stopped for any reason, it
-      is running again within a minute, with nobody touching the PC. }
-  Append(Xml, '  <Triggers><LogonTrigger>');
-  Append(Xml, '    <Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
-  Append(Xml, '    <Enabled>true</Enabled>');
-  Append(Xml, '  </LogonTrigger></Triggers>');
+  Append(Xml, '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>');
   Append(Xml, '  <Principals><Principal id="Author">');
   Append(Xml, '    <GroupId>S-1-5-32-545</GroupId>');
-  Append(Xml, '    <RunLevel>HighestAvailable</RunLevel>');
+    { Least privilege: nothing the agent does needs administrator rights. }
+  Append(Xml, '    <RunLevel>LeastPrivilege</RunLevel>');
   Append(Xml, '  </Principal></Principals>');
   Append(Xml, '  <Settings>');
   Append(Xml, '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
   Append(Xml, '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
-  Append(Xml, '    <AllowHardTerminate>false</AllowHardTerminate>');
+  Append(Xml, '    <AllowHardTerminate>true</AllowHardTerminate>');
   Append(Xml, '    <StartWhenAvailable>true</StartWhenAvailable>');
   Append(Xml, '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>');
   Append(Xml, '    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>');
@@ -385,11 +500,10 @@ begin
   Append(Xml, '    <Enabled>true</Enabled>');
   Append(Xml, '    <Hidden>false</Hidden>');
   Append(Xml, '    <RunOnlyIfIdle>false</RunOnlyIfIdle>');
-    { A consultation can outlast any limit worth setting, and the agent is meant
-      to run all day. }
+    { The agent is meant to run all day. }
   Append(Xml, '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
   Append(Xml, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
-  Append(Xml, '    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>');
+  Append(Xml, '    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>');
   Append(Xml, '  </Settings>');
   Append(Xml, '  <Actions Context="Author"><Exec>');
   Append(Xml, '    <Command>"' + ExpandConstant('{app}\{#AppExe}') + '"</Command>');
@@ -402,94 +516,143 @@ begin
 
   { Three ways this goes wrong, and all three used to end with Setup reporting
     success: schtasks not launching, schtasks failing, and schtasks reporting
-    success while creating nothing. A machine that half-installed is worse than
-    one that plainly did not: the second gets fixed, the first gets used. }
+    success while creating nothing. }
   if not Exec('schtasks.exe', '/Create /TN "AIMScribe Agent" /XML "' + XmlPath + '" /F',
               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    RaiseException('Could not run schtasks.exe to register the startup task.' + #13#10 +
-                   'AIMScribe has not been installed.');
-
+  begin
+    Result := 'Could not run schtasks.exe to register the startup task.';
+    Exit;
+  end;
   if ResultCode <> 0 then
-    RaiseException('Registering the startup task failed (schtasks returned ' +
-                   IntToStr(ResultCode) + ').' + #13#10 +
-                   'AIMScribe has not been installed.');
-
+  begin
+    Result := 'Registering the startup task failed (schtasks returned ' +
+              IntToStr(ResultCode) + ').';
+    Exit;
+  end;
   Exec('schtasks.exe', '/Query /TN "AIMScribe Agent"', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if ResultCode <> 0 then
-    RaiseException('The startup task was reported as created but does not ' +
-                   'exist.' + #13#10 + 'AIMScribe has not been installed.');
+    Result := 'The startup task was reported as created but does not exist.';
+end;
+
+{ ------------------------------------------------------------ stopping a running agent }
+
+{ True while any copy of the agent is running, for any user. tasklist run
+  elevated sees every session; its output goes through a file because Exec
+  cannot capture it. }
+function AgentRunning(): Boolean;
+var
+  ResultCode: Integer;
+  OutFile: String;
+  Output: AnsiString;
+begin
+  // GetTempDir rather than the tmp constant: this also runs in the uninstaller.
+  OutFile := AddBackslash(GetTempDir()) + 'aimscribe_tasklist.txt';
+  DeleteFile(OutFile);
+  Result := False;
+  if Exec(ExpandConstant('{cmd}'),
+          '/C tasklist /FI "IMAGENAME eq {#AppExe}" /NH > "' + OutFile + '"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    if LoadStringFromFile(OutFile, Output) then
+      Result := Pos(Lowercase('{#AppExe}'), Lowercase(String(Output))) > 0;
+end;
+
+{ Ask the agent to finish and exit: it closes the open recording as
+  "software_update", writes what it holds to disk, and leaves. Only if it has
+  not gone after StopWaitSeconds is it ended by force - the timed fallback,
+  logged, never the first resort. Returns how it stopped, for the log. }
+function StopAgent(): String;
+var
+  Handle: Longword;
+  I, ResultCode: Integer;
+begin
+  Result := 'not running';
+  if not AgentRunning() then Exit;
+
+  Handle := OpenEvent(EVENT_MODIFY_STATE, False, StopEventName);
+  if Handle <> 0 then
+  begin
+    SetEvent(Handle);
+    CloseHandle(Handle);
+    for I := 1 to StopWaitSeconds do
+    begin
+      Sleep(1000);
+      if not AgentRunning() then
+      begin
+        Result := 'stopped when asked';
+        Exit;
+      end;
+    end;
+  end;
+
+  { An older agent (3.4 and before) has no stop event; the task's own End is
+    the next most polite thing. }
+  Exec('schtasks.exe', '/End /TN "AIMScribe Agent"', '', SW_HIDE,
+       ewWaitUntilTerminated, ResultCode);
+  for I := 1 to 5 do
+  begin
+    Sleep(1000);
+    if not AgentRunning() then
+    begin
+      Result := 'stopped by the task scheduler';
+      Exit;
+    end;
+  end;
+
+  Exec('taskkill.exe', '/IM "{#AppExe}" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(2000);
+  Result := 'ended by force after waiting ' + IntToStr(StopWaitSeconds) + ' s';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
 begin
-  // Reinstalling or upgrading over a running agent leaves its files locked, and
-  // Setup reports only "file in use". Stop it first: this is the upgrade path
-  // for every machine in the fleet, not just a convenience today.
-  Result := '';
-
-  Exec('schtasks.exe', '/End /TN "AIMScribe Agent"', '',
-       SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('taskkill.exe', '/IM "{#AppExe}" /F', '',
-       SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  // Give Windows a moment to release the handles before Setup copies over them.
-  Sleep(2000);
+  { A silent install with a bad value fails here, before anything is copied,
+    with a non-zero exit code a management tool will report. }
+  Result := ConfigProblem();
+  if Result <> '' then Exit;
+  Log('Running agent: ' + StopAgent());
 end;
 
-procedure PowerCfg(const Args: String);
-var
-  ResultCode: Integer;
+function InitializeUninstall(): Boolean;
 begin
-  Exec('powercfg.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('Running agent: ' + StopAgent());
+  Result := True;
 end;
 
-{ A consultation PC, used for nothing else. Two Windows power habits end a
-  recording without anyone deciding to:
-    closing the lid sleeps the laptop;
-    USB selective suspend can switch the speakerphone off to save power.
-  Both are turned off for the active power plan. Idle sleep is not touched:
-  the agent itself keeps Windows awake while a recording is open. }
-procedure ConfigurePower();
-begin
-  PowerCfg('/SETACVALUEINDEX SCHEME_CURRENT SUB_BUTTONS LIDACTION 0');
-  PowerCfg('/SETDCVALUEINDEX SCHEME_CURRENT SUB_BUTTONS LIDACTION 0');
-  PowerCfg('/SETACVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0');
-  PowerCfg('/SETDCVALUEINDEX SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0');
-  PowerCfg('/SETACTIVE SCHEME_CURRENT');
-end;
-
-{ Windows time sync, on and running. The recorder checks the server's
-  permission against the server's own clock, so a wrong PC clock no longer
-  stops uploads - but the times it stamps, and so the file names, follow the
-  PC's clock. Kept right here. Domain PCs keep their domain time source as
-  well (ALL = the domain hierarchy plus these servers). Failures are ignored:
-  a hospital network may block time servers, and recording does not depend
-  on it. }
-procedure ConfigureTime();
-var
-  ResultCode: Integer;
-begin
-  Exec('sc.exe', 'config w32time start= auto', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('net.exe', 'start w32time', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('w32tm.exe', '/config /syncfromflags:ALL ' +
-       '"/manualpeerlist:time.windows.com,0x9 time.google.com,0x9 pool.ntp.org,0x9" /update',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('w32tm.exe', '/resync /force', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-end;
+{ ------------------------------------------------------------ after the copy }
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
 begin
-  if CurStep = ssPostInstall then
+  if CurStep <> ssPostInstall then Exit;
+  WriteEnvFile();
+  StageEnrollmentToken();
+  InstallProblem := RegisterLogonTask();
+  if InstallProblem <> '' then
   begin
-    WriteEnvFile();
-    StageEnrollmentToken();
-    RegisterLogonTask();
-    ConfigurePower();
-    ConfigureTime();
+    Log('INSTALL INCOMPLETE: ' + InstallProblem);
+    if not WizardSilent() then
+      MsgBox(InstallProblem + #13#10 + #13#10 +
+             'The program is installed but will not start by itself. Run Setup ' +
+             'again, or contact AIMS LAB.', mbError, MB_OK);
+    Exit;
   end;
+  { A silent install has no "Start now" box to tick: start it in the signed-in
+    doctor's session through the task, as Windows will at every sign-in. }
+  if WizardSilent() then
+    Exec('schtasks.exe', '/Run /TN "AIMScribe Agent"', '', SW_HIDE,
+         ewWaitUntilTerminated, ResultCode);
+end;
+
+{ Non-zero when the PC was left unable to start the agent, so a management
+  tool (Intune, PDQ, a script) reports the failure instead of a green tick. }
+function GetCustomSetupExitCode(): Integer;
+begin
+  if InstallProblem <> '' then
+    Result := 8
+  else
+    Result := 0;
 end;
 
 procedure InitializeUninstallProgressForm();

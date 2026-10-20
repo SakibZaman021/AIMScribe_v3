@@ -32,6 +32,13 @@ FOLDER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 # Canonical PCM WAV header written by the agent. Fixed size, no extra chunks.
 WAV_HEADER_BYTES = 44
 
+# Patient audio and clinical records are readable by this worker's user and no
+# one else on the machine. The worker also sets umask 077 at start, so files
+# made by libraries (wave, sqlite) are private too; these are the explicit
+# belt to that braces, for files written before the umask applied.
+PRIVATE_FILE = 0o600
+PRIVATE_DIR = 0o700
+
 
 class ArchiveError(RuntimeError):
     """Something about this session cannot be archived safely. Never force it."""
@@ -47,6 +54,79 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> bytes:
 
 def sha256_bytes(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
+
+
+# ============================================================
+# Permissions and removal
+# ============================================================
+
+def make_private(path: Path, mode: int = PRIVATE_FILE) -> None:
+    """Owner-only, where the filesystem has POSIX modes. Best effort elsewhere."""
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        logger.debug("Could not restrict %s: %s", path.name, exc)
+
+
+def make_dirs(directory: Path) -> Path:
+    """mkdir -p, every level it creates owner-only."""
+    missing = []
+    current = directory
+    while not current.exists() and current != current.parent:
+        missing.append(current)
+        current = current.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIR)
+    for created in missing:
+        make_private(created, PRIVATE_DIR)
+    return directory
+
+
+def tighten_tree(root: Path) -> int:
+    """
+    Make everything already under the archive root owner-only: files archived
+    before files were written private. Once per volume - a marker records it.
+    Returns how many entries were changed.
+    """
+    marker = root / ".permissions_v1"
+    if marker.exists():
+        return 0
+    changed = 0
+    for current, dirs, files in os.walk(root):
+        for name in dirs:
+            make_private(Path(current) / name, PRIVATE_DIR)
+            changed += 1
+        for name in files:
+            make_private(Path(current) / name, PRIVATE_FILE)
+            changed += 1
+    marker.write_text("archive files made owner-only\n", encoding="utf-8")
+    make_private(marker)
+    return changed
+
+
+def remove_securely(path: Path) -> bool:
+    """
+    Overwrite a small file with zeros, force that to disk, then delete it, so
+    the record is not left readable in the freed blocks. On copy-on-write or
+    flash storage the overwrite may land elsewhere; the volume's own encryption
+    covers that case. Returns whether a file was removed.
+    """
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return False
+    try:
+        with open(path, "r+b") as handle:
+            remaining = size
+            while remaining > 0:
+                step = min(remaining, 1 << 20)
+                handle.write(b"\0" * step)
+                remaining -= step
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        logger.warning("Could not overwrite %s before removing it: %s", path.name, exc)
+    path.unlink(missing_ok=True)
+    return True
 
 
 # ============================================================
@@ -165,19 +245,34 @@ def expected_join_bytes(segment_bytes: List[int]) -> int:
     return WAV_HEADER_BYTES + sum(max(0, int(b) - WAV_HEADER_BYTES) for b in segment_bytes)
 
 
-def free_destination(directory: Path, filename: str, expected_bytes: int) -> Tuple[Path, bool]:
+def free_destination(directory: Path, filename: str, expected_bytes: int, *,
+                     session_id: Optional[str] = None,
+                     segment_hashes: Optional[List[Tuple[int, str]]] = None
+                     ) -> Tuple[Path, bool]:
     """
     Resolve where this session's audio goes.
 
-    Returns (path, is_ours). `is_ours` means the file is already there at exactly
-    the size this session would produce - an interrupted run, safe to re-report.
-    Anything else at that name is a genuine collision, so we step to `_02`, `_03`
+    Returns (path, is_ours). `is_ours` means the file already there is this
+    session's - an interrupted run, safe to re-report. With `session_id` that
+    is decided by the manifest beside it (same session, and with
+    `segment_hashes` the same pieces in the same order), not by the size:
+    with fixed-length pieces two consultations can produce files of the same
+    size, and a size match used to re-report another recording's file as this
+    one's. Without `session_id` the size alone decides, as before. Anything
+    else at that name is a genuine collision, so we step to `_02`, `_03`
     rather than overwrite another patient's consultation.
     """
+    def ours(path: Path) -> bool:
+        if path.stat().st_size != expected_bytes:
+            return False
+        if session_id is None:
+            return True
+        return _manifest_matches(path, session_id, segment_hashes)
+
     candidate = directory / filename
     if not candidate.exists():
         return candidate, False
-    if candidate.stat().st_size == expected_bytes:
+    if ours(candidate):
         return candidate, True
 
     stem, suffix = filename.rsplit(".", 1)
@@ -188,9 +283,26 @@ def free_destination(directory: Path, filename: str, expected_bytes: int) -> Tup
                 "Archive name %s is taken by a different session; using %s instead",
                 filename, candidate.name)
             return candidate, False
-        if candidate.stat().st_size == expected_bytes:
+        if ours(candidate):
             return candidate, True
     raise ArchiveError(f"could not find a free archive name for {filename}")
+
+
+def _manifest_matches(audio_path: Path, session_id: str,
+                      segment_hashes: Optional[List[Tuple[int, str]]]) -> bool:
+    """The manifest beside this file names this session (and these pieces)."""
+    try:
+        manifest = json.loads(audio_path.with_suffix(".manifest.json")
+                              .read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if manifest.get("session_id") != session_id:
+        return False
+    if segment_hashes is None:
+        return True
+    held = [(int(s.get("seq_no")), str(s.get("sha256", "")).lower())
+            for s in manifest.get("segments") or []]
+    return held == [(int(n), str(h).lower()) for n, h in segment_hashes]
 
 
 def relative_path(hospital_id: str, doctor_id: str, session_date: str,
@@ -289,6 +401,7 @@ def join_wav(segment_paths: List[Path], destination: Path) -> JoinResult:
         with open(tmp, "rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
+        make_private(tmp)
 
         os.replace(tmp, destination)
     except Exception:
@@ -399,6 +512,7 @@ def cut_wav(source: Path, start_frame: int, end_frame: int,
         with open(tmp, "rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
+        make_private(tmp)
         os.replace(tmp, destination)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -453,12 +567,23 @@ def write_manifest(audio_path: Path, session: Dict[str, Any], result: JoinResult
         # frames, and the fingerprint of the whole joined audio, so the cut can
         # be checked against the chain without the database.
         manifest["derived_from"] = derived_from
+    # A consultation that a restart split into two recordings: each names the
+    # other, so the two files are found together without the database.
+    for key, value in continuation_links(session).items():
+        manifest[key] = value
 
     path = audio_path.with_suffix(".manifest.json")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    _write_private_json(path, path.with_suffix(".tmp"), manifest)
     return path
+
+
+def _write_private_json(path: Path, tmp: Path, data: Any, **dump: Any) -> None:
+    """Written whole to a private temporary file, then renamed over the old one."""
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2, ensure_ascii=False, **dump))
+    make_private(tmp)
+    os.replace(tmp, path)
 
 
 def record_local_release(manifest_path: Path, *, released_at: str,
@@ -467,6 +592,12 @@ def record_local_release(manifest_path: Path, *, released_at: str,
     Note in the manifest that the WAV beside it has left this disk, and where
     the copy that replaces it is. Written before the WAV is deleted, so the
     folder never holds a missing file it cannot explain.
+
+    The clinical JSON leaves with the audio: it names the patient, and a
+    folder whose audio is gone has no reason to keep it. It is not lost - the
+    clinical database holds the record, the worker writes the file again from
+    there whenever it is needed (a late prescription, a recut, a restore), and
+    the encrypted copy of it sits beside the audio's in the copy bucket.
     """
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -478,11 +609,47 @@ def record_local_release(manifest_path: Path, *, released_at: str,
         "cloud_copy": copy_object_key,
         "sha256": sha256,
         "restore": "python restore.py restore <downloaded copy> <folder>",
+        "clinical_json": "released with the audio; written again from the clinical "
+                         "database when needed, and kept encrypted in the copy bucket",
     }
-    tmp = manifest_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, manifest_path)
+    _write_private_json(manifest_path, manifest_path.with_suffix(".tmp"), manifest)
     return manifest_path
+
+
+def erase_recording_files(audio_path: Path) -> List[Path]:
+    """
+    Everything this recording left under its name: the WAV, the clinical
+    JSON, the manifest, a sealed copy or a half-written file. Each is
+    overwritten and deleted; a folder left empty is removed. Returns what
+    went. The day's _index.json is rebuilt by the caller.
+    """
+    removed: List[Path] = []
+    stem = audio_path.name[:-len(audio_path.suffix)] if audio_path.suffix else audio_path.name
+    directory = audio_path.parent
+    if not directory.exists():
+        return removed
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and (path.name == audio_path.name
+                               or path.name.startswith(stem + ".")):
+            if remove_securely(path):
+                removed.append(path)
+    # The folder's own index names the patient too: rebuilt from what is
+    # left, and gone with the folder when nothing is.
+    left = [p for p in directory.iterdir() if p.name != "_index.json"]
+    if left:
+        update_day_index(directory)
+    else:
+        remove_securely(directory / "_index.json")
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def release_clinical_json(audio_path: Path) -> bool:
+    """The JSON beside a released WAV, removed the same way. True if one was there."""
+    return remove_securely(clinical_json_path(audio_path))
 
 
 def local_audio_released(manifest_path: Path) -> bool:
@@ -508,10 +675,7 @@ def write_clinical_json(audio_path: Path, document: Dict[str, Any]) -> Path:
     a reader either sees the old file or the new one, never half of either.
     """
     path = clinical_json_path(audio_path)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(document, indent=2, ensure_ascii=False, sort_keys=False),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    _write_private_json(path, path.with_suffix(".json.tmp"), document, sort_keys=False)
     return path
 
 
@@ -546,9 +710,7 @@ def update_day_index(directory: Path) -> Path:
         "sessions": entries,
     }
     path = directory / "_index.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    _write_private_json(path, path.with_suffix(".tmp"), index)
     return path
 
 
@@ -558,6 +720,33 @@ def update_day_index(directory: Path) -> Path:
 
 def free_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
+
+
+# Never ask a volume to keep more than this share of itself free - the same cap
+# the monitor applies to its floors, so a floor written for the 64 TB UIU array
+# does not release everything on a 320 GB droplet.
+PRESSURE_SHARE_LIMIT = 0.15
+
+
+def pressure_floor(path: Path, configured: Optional[int], default: int) -> int:
+    """The free space below which archived WAVs leave early, in bytes."""
+    floor = configured if configured is not None and configured > 0 else default
+    try:
+        total = shutil.disk_usage(path).total
+    except OSError:
+        return floor
+    return min(floor, int(total * PRESSURE_SHARE_LIMIT))
+
+
+def continuation_links(session: Dict[str, Any]) -> Dict[str, Any]:
+    """`continues` / `continued_by` ({session_id, file_stem}) when the server sent them."""
+    links = {}
+    for key in ("continues", "continued_by"):
+        value = session.get(key)
+        if isinstance(value, dict) and value.get("session_id"):
+            links[key] = {"session_id": value["session_id"],
+                          "file_stem": value.get("file_stem")}
+    return links
 
 
 def ensure_space(root: Path, needed: int, *, headroom: int) -> None:
@@ -578,7 +767,9 @@ __all__ = [
     "ArchiveError", "JoinResult", "WavFormat", "archive_filename", "clinical_json_path",
     "cut_wav", "part_bytes", "part_frames", "wav_format",
     "expected_join_bytes", "free_destination", "ensure_space", "free_bytes",
+    "pressure_floor", "continuation_links",
     "join_wav", "local_times", "name_for", "relative_path", "session_directory",
     "sha256_bytes", "sha256_file", "update_day_index", "write_clinical_json",
-    "write_manifest",
+    "write_manifest", "make_private", "make_dirs", "tighten_tree", "remove_securely",
+    "release_clinical_json", "PRIVATE_FILE", "PRIVATE_DIR",
 ]

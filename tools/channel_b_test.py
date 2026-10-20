@@ -17,6 +17,13 @@ against §6.2.4:
     python tools/channel_b_test.py --server https://test.aimscribe.example \\
         --key "$CMED_TEST_KEY" --hospital CMED-DHK-BANANI-01
 
+**The token method and FHIR R4** - what CMED moves to. One hospital's client,
+its private key, and the key id AIMS LAB returned when it was registered:
+
+    python tools/channel_b_test.py --server https://test.aimscribe.example \\
+        --client-id cmed-hosp003 --kid <kid> --key-file cmed-hosp003.private.pem \\
+        --hospital CMED-HOSP003
+
 Nothing here needs a recorder or a patient. The messages are made up and
 the identifiers say so, which matters because a test that has to be run
 against real patients never gets run.
@@ -34,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import clinical                                        # noqa: E402
 import confirmation as conf                            # noqa: E402
@@ -261,6 +269,78 @@ def as_text(results: List[Dict[str, Any]]) -> str:
 
 
 # ============================================================
+# The token method and FHIR R4
+# ============================================================
+
+def run_fhir_cases(server: str, client_id: str, kid: str, private_pem: bytes, *,
+                   hospital: str, patient: str, doctor: str,
+                   audience: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    The same questions as run_cases, asked the way CMED will ask them, plus
+    the ones only a token can answer: another hospital, no token, a replayed
+    assertion.
+    """
+    import cmed_fhir_client as fc
+
+    start = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=6))).replace(microsecond=0).isoformat()
+    bodies = {kind: sample(kind, hospital=hospital, patient=patient, doctor=doctor,
+                           start_time=start)
+              for kind in ("patient_information", "prescription")}
+    results: List[Dict[str, Any]] = []
+
+    def record(name, why, expected, status, code, message=""):
+        results.append({"case": name, "why": why, "expected": expected,
+                        "got": f"{status} {code}".strip(),
+                        "passed": f"{status} {code}".strip() == expected,
+                        "message": message, "fields": []})
+
+    signed = fc.assertion(private_pem, kid, client_id,
+                          audience or server.rstrip("/") + fc.TOKEN_PATH)
+    status, reply = fc.get_token(server, client_id, kid, private_pem, signed=signed)
+    record("A token for this hospital", "a signed 5-minute assertion buys a 5-minute token",
+           "200 bearer", status, reply.get("token_type", reply.get("error", "")))
+    token = reply.get("access_token")
+    status, reply = fc.get_token(server, client_id, kid, private_pem, signed=signed)
+    record("The same assertion again", "each assertion works once (its jti is remembered)",
+           "401 invalid_client", status, reply.get("error", ""))
+    if not token:
+        return results
+
+    def fhir_case(name, why, kind, body, expected, *, use_token=True, raw=None):
+        message = raw if raw is not None else fc.to_fhir(kind, body)
+        status, reply = fc.send_fhir(server, token if use_token else None, message)
+        code, text = fc.reply_code(reply)
+        record(name, why, expected, status, code, text)
+
+    api2, rx = bodies["patient_information"], bodies["prescription"]
+    fhir_case("A good API 2", "stored before the reply is sent",
+              "patient_information", api2, "200 ACCEPTED")
+    fhir_case("The same API 2 again", "a retry never stores the visit twice",
+              "patient_information", api2, "200 ALREADY_RECEIVED")
+    broken = fc.to_fhir("patient_information", api2)
+    broken["entry"][1]["resource"].pop("serviceProvider")
+    fhir_case("An API 2 with no hospital", "the element is named in the OperationOutcome",
+              "patient_information", api2, "400 MALFORMED_FHIR", raw=broken)
+    fhir_case("A good prescription", "one MedicationRequest per medicine",
+              "prescription", rx, "200 ACCEPTED")
+    fhir_case("The prescription, changed", "a new version; earlier ones are kept",
+              "prescription", {**rx, "advice": "Changed advice"}, "200 ACCEPTED")
+    fhir_case("A medicine with no name", "every MedicationRequest needs its medicine",
+              "prescription", {**rx, "items": [{"drug": "", "dose": "5 mg"}]},
+              "422 SCHEMA_INVALID")
+    fhir_case("Another hospital's patient", "a token speaks for its own hospital only",
+              "patient_information", {**api2, "hospital_id": hospital + "-OTHER"},
+              "403 HOSPITAL_NOT_ALLOWED")
+    fhir_case("No token", "every message needs a bearer token",
+              "patient_information", api2, "401 INVALID_TOKEN", use_token=False)
+    fhir_case("A message over 1 MB", "the limit is per message",
+              "prescription", {**rx, "notes": "x" * (MAX_BODY_BYTES + 1000)},
+              "413 TOO_LARGE")
+    return results
+
+
+# ============================================================
 # Command line
 # ============================================================
 
@@ -269,6 +349,11 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--server", help="the AIMS LAB test server")
     parser.add_argument("--key", default="", help="the key AIMS LAB issued to CMED")
+    parser.add_argument("--client-id", default="", help="token method: the hospital's client")
+    parser.add_argument("--kid", default="", help="token method: the registered key id")
+    parser.add_argument("--key-file", type=Path, help="token method: the private key PEM")
+    parser.add_argument("--audience", help="token method: the server's public token URL, "
+                                           "if it differs from --server")
     parser.add_argument("--hospital", default="CMED-TEST-01")
     parser.add_argument("--patient", default="TESTP0001")
     parser.add_argument("--doctor", default="TESTDR01")
@@ -301,9 +386,20 @@ def main(argv=None) -> int:
               if args.json else verdict.text())
         return 0 if verdict.ok else 1
 
+    if args.server and args.client_id:
+        if not (args.kid and args.key_file):
+            parser.error("--client-id needs --kid and --key-file")
+        print(f"Trying Channel B (token + FHIR R4) against {args.server}\n")
+        results = run_fhir_cases(args.server, args.client_id, args.kid,
+                                 args.key_file.read_bytes(), hospital=args.hospital,
+                                 patient=args.patient, doctor=args.doctor,
+                                 audience=args.audience)
+        print(json.dumps(results, indent=2) if args.json else as_text(results))
+        return 0 if all(r["passed"] for r in results) else 1
+
     if not args.server or not args.key:
-        parser.error("--server and --key are needed to try the interface "
-                     "(or use --validate / --sample)")
+        parser.error("--server and --key (or --client-id) are needed to try the "
+                     "interface (or use --validate / --sample)")
 
     print(f"Trying Channel B against {args.server}\n")
     results = run_cases(args.server, args.key, hospital=args.hospital,

@@ -23,18 +23,32 @@ export const dynamic = 'force-dynamic';
 
 export async function GET() {
   const cmedKey = process.env.AIMS_CMED_KEY ?? '';
+  const clientId = process.env.AIMS_CMED_CLIENT_ID ?? '';
+  const keyId = process.env.AIMS_CMED_KEY_ID ?? '';
+  const privateKey = process.env.AIMS_CMED_PRIVATE_KEY ?? '';
+  const tokenMethod = Boolean(clientId && keyId && privateKey);
   const server = process.env.AIMS_SERVER_URL ?? '';
   const webhook = process.env.AIMSCRIBE_WEBHOOK_SECRET ?? '';
   const legacyGrantKey = process.env.AIMS_GRANT_PRIVATE_KEY ?? '';
 
   return NextResponse.json({
-    ok: Boolean(cmedKey) && server.startsWith('https://'),
+    ok: (tokenMethod || Boolean(cmedKey)) && server.startsWith('https://'),
+
+    // The method CMED moves to: this hospital's own client, a private key held
+    // here only, 5-minute tokens, FHIR R4. Reported by shape, never by value.
+    channel_b_token_method: {
+      set: tokenMethod,
+      client_id: clientId || null,
+      key_id_set: Boolean(keyId),
+      private_key_looks_like_pem: privateKey.includes('BEGIN PRIVATE KEY'),
+      note: 'Preferred. When set, API 2 and API 3b go as FHIR R4 with a bearer token.',
+    },
 
     channel_b_key: {
       set: Boolean(cmedKey),
       length: cmedKey.length,
-      note: 'Issued by AIMS LAB, kept on this server only. Without it, ' +
-            'API 2 and API 3 cannot be sent and no recording is confirmed.',
+      note: 'The interim static key, issued for this hospital only. Used only ' +
+            'when the token method is not configured.',
     },
 
     aims_server: {

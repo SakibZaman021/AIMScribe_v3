@@ -11,15 +11,14 @@ from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import settings
 from database.postgres_async import AsyncPostgreSQLDatabase
 from storage.minio_client import get_minio_client, MinIOClient
-from message_queue.redis_async import AsyncRedisClient, push_transcription_job_async
+from message_queue.redis_async import AsyncRedisClient
 
 # Protocol 2: device identity, integrity chain, purge receipts, archive handshake.
 import api_v2
@@ -27,6 +26,9 @@ import schema_check
 from api_v2 import router as v2_router
 from clinical import router as clinical_router
 from dashboard import router as dashboard_router
+import cmed_auth
+import fhir
+import security
 from grants import GrantIssuer
 from clinical_store import ClinicalStore
 from db_v2 import V2Repository
@@ -35,80 +37,11 @@ from integrity import ReceiptSigner
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format='%(asctime)s - API - %(levelname)s - %(message)s'
+    # Every line names its request (security.REQUEST_ID), so one failure can be
+    # followed from the gateway through the API to the archive worker.
+    format='%(asctime)s - API - %(levelname)s - [%(request_id)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Pydantic Models (Request/Response)
-# ============================================================================
-
-class HealthScreeningInput(BaseModel):
-    bp_systolic: str = None
-    bp_diastolic: str = None
-    diabetes_fasting: str = None
-    diabetes_random: str = None
-    height_cm: str = None
-    weight_kg: str = None
-    temperature: str = None
-    pulse_rate: str = None
-
-
-class SessionCreateRequest(BaseModel):
-    patient_id: str
-    session_id: str = None  # Client-provided session ID (PatientID_DoctorID_HospitalID_YYYYMMDD)
-    patient_name: str = None
-    age: str = None
-    gender: str = None
-    doctor_id: str = "DR_DEFAULT"
-    hospital_id: str = "HOSP_DEFAULT"
-    health_screening: HealthScreeningInput = None
-    # Webhook URLs for CMED integration
-    ner_webhook_url: str = None
-    status_webhook_url: str = None
-
-
-class SessionCreateResponse(BaseModel):
-    session_id: str
-    status: str
-    created_at: str
-
-
-class UploadRequestModel(BaseModel):
-    session_id: str
-    clip_number: int
-
-
-class UploadCompleteRequest(BaseModel):
-    session_id: str
-    clip_number: int
-    object_key: str
-    is_final: bool = False
-
-
-class StatusResponse(BaseModel):
-    session_id: str
-    status: str
-    total_clips_transcribed: int
-    has_transcript: bool
-    has_ner: bool
-    ner_version: int
-    updated_at: str
-
-
-class DoctorReviewRequest(BaseModel):
-    session_id: str
-    doctor_id: str
-    field_name: str
-    original_value: object = None
-    edited_value: object = None
-
-
-class PrescriptionRequest(BaseModel):
-    session_id: str
-    doctor_id: str
-    prescription: dict
 
 
 # ============================================================================
@@ -282,11 +215,17 @@ async def lifespan(app: FastAPI):
 # FastAPI Application
 # ============================================================================
 
+# The interactive API pages (/docs, /redoc, /openapi.json) listed every route
+# to anyone on the internet. Off unless a developer machine asks for them.
+_DOCS = os.getenv("AIMS_ENABLE_API_DOCS", "").strip().lower() in ("1", "true", "yes")
+
 app = FastAPI(
-    title="AIMScribe AI Backend",
-    description="Async API for Bengali Medical NER Extraction",
-    version="6.0.0",
-    lifespan=lifespan
+    title="AIMScribe v3",
+    version="3.5.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
 )
 
 # CORS middleware
@@ -307,11 +246,20 @@ app.add_middleware(
     allow_origins=_allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key", "X-Device-Token"],
+    allow_headers=["Content-Type", "X-Device-Token"],
     max_age=600,
 )
 
+# Every request: a per-address rate limit, and errors that never carry
+# internals (stack traces, SQL, file paths) back to the caller.
+security.install(app)
+
 app.include_router(v2_router)
+# CMED's identity: per-hospital clients, signed assertions, short-lived tokens
+# (SMART Backend Services), and the FHIR R4 form of API 2 and API 3b.
+app.include_router(cmed_auth.router)
+app.include_router(fhir.router)
+app.include_router(fhir.well_known)
 # Channel B: CMED's server sends API 2 and prescriptions here (SRS 3.2 §6.2).
 app.include_router(clinical_router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
@@ -328,7 +276,7 @@ app.include_router(dashboard_router)
 # ============================================================================
 
 SYSTEM_NAME = "AIMScribe v3 - AIMS LAB server"
-SYSTEM_VERSION = "3.3.0"
+SYSTEM_VERSION = "3.5.0"
 SRS_VERSION = "3.3"
 
 _FRONT_PAGE = """<!DOCTYPE html>
@@ -364,8 +312,8 @@ _FRONT_PAGE = """<!DOCTYPE html>
     <tr><td>Dashboard</td><td><a href="/api/v2/dashboard">/api/v2/dashboard</a>
         - asks for the administrator key</td></tr>
     <tr><td>Recorders talk to</td><td><code>/api/v2/…</code></td></tr>
-    <tr><td>CMED talks to</td><td><code>/api/v2/clinical/patient-information</code>,
-        <code>/api/v2/clinical/prescription</code></td></tr>
+    <tr><td>CMED talks to</td><td><code>/fhir/r4</code> (FHIR R4, signed per-hospital
+        tokens from <code>/api/v2/oauth/token</code>)</td></tr>
   </table>
   <footer>Recordings are held at UIU. Nothing on this page reads a
   consultation.</footer>
@@ -445,9 +393,7 @@ async def _schema_state() -> str:
     return schema_check.STATE.summary()
 
 
-@app.get("/health")
-async def health():
-    """Health check endpoint."""
+async def _details() -> dict:
     db_healthy = await ctx.db.healthcheck() if ctx.db else False
     redis_healthy = await ctx.redis.healthcheck() if ctx.redis else False
     storage = await _storage_states()
@@ -479,358 +425,50 @@ async def health():
     }
 
 
-async def _require_admin_key(x_admin_key: Optional[str] = Header(None)) -> None:
-    """Admin gate for diagnostics. Constant-time to avoid leaking the key by timing."""
+def _may_see_details(request: Request) -> bool:
+    """
+    The full answer (versions, missing migrations, storage states) is for the
+    operator: the monitor and Docker, which call the API directly on the
+    internal network, or anyone with the admin key. Through the public
+    gateway a caller learns only whether the server is up.
+    """
     import hmac as _hmac
+    supplied = request.headers.get("x-admin-key") or ""
     expected = os.getenv("AIMS_ADMIN_KEY", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="admin key is not configured")
-    if not x_admin_key or not _hmac.compare_digest(x_admin_key, expected):
-        raise HTTPException(status_code=401, detail="invalid admin key")
+    if expected and supplied and _hmac.compare_digest(supplied, expected):
+        return True
+    return "x-forwarded-for" not in request.headers
 
 
-@app.get("/api/v1/diagnostic/azure-ner")
-async def diagnostic_azure_ner(_: None = Depends(_require_admin_key)):
+@app.get("/health")
+async def health(request: Request):
+    """Health: always 200 while the process runs; the body says how well."""
+    answer = await _details()
+    if _may_see_details(request):
+        return answer
+    return {"status": answer["status"], "system": SYSTEM_NAME}
+
+
+@app.get("/health/live")
+async def health_live():
+    """The process is up and answering. For Docker's restart decision."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def health_ready(request: Request):
     """
-    Test Azure OpenAI NER connectivity.
-
-    Now admin-only. Unauthenticated, this returned the Azure endpoint, deployment
-    name, API version and whether a key was configured - a free reconnaissance
-    endpoint for anyone who found the service.
+    503 unless this server can do its work: database reachable, every
+    migration applied, the segment store answering. For load balancers and
+    the monitor - a server that is up but cannot store a recording is not
+    ready, and saying 200 there hid exactly that.
     """
-    import httpx
-    from config import settings
-
-    endpoint = settings.azure_ner_endpoint
-    deployment = settings.azure_ner_deployment
-    api_version = settings.azure_api_version
-    api_key = settings.azure_ner_api_key
-
-    # Build the full URL
-    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
-
-    # Simple test payload
-    payload = {
-        "messages": [{"role": "user", "content": "Say hello"}],
-        "max_completion_tokens": 10
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": api_key
-    }
-
-    result = {
-        "endpoint": endpoint,
-        "deployment": deployment,
-        "api_version": api_version,
-        "url_tested": url,
-        "api_key_present": bool(api_key and len(api_key) > 10),
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            result["status_code"] = response.status_code
-            result["success"] = response.status_code == 200
-
-            if response.status_code == 200:
-                data = response.json()
-                result["model"] = data.get("model", "unknown")
-                result["message"] = "Azure NER connection successful"
-            else:
-                result["error"] = response.text[:500]
-                result["message"] = "Azure NER connection failed"
-
-    except httpx.ConnectError as e:
-        result["success"] = False
-        result["error_type"] = "ConnectError"
-        result["error"] = str(e)
-        result["message"] = "Failed to connect to Azure endpoint"
-
-    except httpx.TimeoutException as e:
-        result["success"] = False
-        result["error_type"] = "TimeoutError"
-        result["error"] = str(e)
-        result["message"] = "Connection timed out"
-
-    except Exception as e:
-        result["success"] = False
-        result["error_type"] = type(e).__name__
-        result["error"] = str(e)
-        result["message"] = f"Unexpected error: {type(e).__name__}"
-
-    return result
-
-
-# ============================================================================
-# Session Management
-# ============================================================================
-
-@app.post("/api/v1/session/create", response_model=SessionCreateResponse)
-async def create_session(request: SessionCreateRequest):
-    """Create a new recording session with patient demographics and health screening."""
-    try:
-        # Convert health_screening to dict if provided
-        health_screening_dict = None
-        if request.health_screening:
-            health_screening_dict = request.health_screening.model_dump(exclude_none=True)
-
-        # Create session with health screening and webhook URLs (async)
-        # Use client-provided session_id if available
-        session_id = await ctx.db.create_session(
-            request.patient_id,
-            request.doctor_id,
-            request.hospital_id,
-            session_id=request.session_id,  # Client-provided session ID
-            health_screening=health_screening_dict,
-            ner_webhook_url=request.ner_webhook_url,
-            status_webhook_url=request.status_webhook_url
-        )
-
-        # Upsert patient with demographics from request
-        patient_data = {
-            'patient_id': request.patient_id,
-            'name': request.patient_name or 'Unknown Patient',
-            'age': request.age or 'N/A',
-            'gender': request.gender or 'N/A'
-        }
-        await ctx.db.upsert_patient(patient_data)
-
-        return SessionCreateResponse(
-            session_id=session_id,
-            status="active",
-            created_at=datetime.now().isoformat()
-        )
-
-    except Exception as e:
-        logger.error(f"Create session failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Audio Upload (Presigned URLs)
-# ============================================================================
-
-@app.post("/api/v1/upload/request")
-async def request_upload_url(request: UploadRequestModel):
-    """Get a presigned URL for uploading an audio clip."""
-    try:
-        # Generate object key
-        object_key = MinIOClient.generate_object_key(
-            request.session_id,
-            request.clip_number
-        )
-
-        # Generate presigned URL (sync - fast operation)
-        upload_url = ctx.minio.get_presigned_upload_url(object_key, expires=300)
-
-        # Create pending record (async)
-        await ctx.db.save_clip_record(
-            request.session_id,
-            request.clip_number,
-            object_key
-        )
-
-        return {
-            "upload_url": upload_url,
-            "object_key": object_key,
-            "expires_in": 300
-        }
-
-    except Exception as e:
-        logger.error(f"Presigned URL generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/v1/upload/complete")
-async def complete_upload(request: UploadCompleteRequest):
-    """Notify that upload is complete. Pushes job to processing queue."""
-    try:
-        # Verify session exists (async)
-        session = await ctx.db.get_session(request.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        # Push to Redis queue (async)
-        job_data = await push_transcription_job_async(
-            ctx.redis,
-            session_id=request.session_id,
-            clip_number=request.clip_number,
-            object_key=request.object_key,
-            patient_id=session['patient_id'],
-            is_final=request.is_final
-        )
-
-        # Get queue length (async)
-        queue_length = await ctx.redis.queue_length("aimscribe:transcription_queue")
-
-        return {
-            "status": "queued",
-            "job_id": job_data['job_id'],
-            "queue_position": queue_length
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Job queuing failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Results & Monitoring
-# ============================================================================
-
-@app.get("/api/v1/session/{session_id}/status", response_model=StatusResponse)
-async def get_session_status(session_id: str):
-    """Get processing status for a session."""
-    try:
-        # All queries run concurrently with asyncio.gather
-        import asyncio
-
-        session, full_transcript, ner_result, clip_count = await asyncio.gather(
-            ctx.db.get_session(session_id),
-            ctx.db.get_full_transcript(session_id),
-            ctx.db.get_latest_ner(session_id),
-            ctx.db.get_clip_count(session_id)
-        )
-
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        return StatusResponse(
-            session_id=session_id,
-            status=session['status'],
-            total_clips_transcribed=clip_count,
-            has_transcript=bool(full_transcript),
-            has_ner=bool(ner_result),
-            ner_version=ner_result['version'] if ner_result else 0,
-            updated_at=datetime.now().isoformat()
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Status check failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/transcript/{session_id}")
-async def get_transcript(session_id: str):
-    """Get full cumulative transcript."""
-    try:
-        transcript = await ctx.db.get_full_transcript(session_id)
-        return {
-            "session_id": session_id,
-            "transcript": transcript or ""
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/ner/{session_id}")
-async def get_ner_result(session_id: str):
-    """Get latest NER result with individual fields."""
-    try:
-        result = await ctx.db.get_latest_ner(session_id)
-        if not result:
-            return {"version": 0, "fields": None}
-
-        fields = {
-            "patient_name": result.get('patient_name'),
-            "age": result.get('age'),
-            "gender": result.get('gender'),
-            "chief_complaints": result.get('chief_complaints'),
-            "drug_history": result.get('drug_history'),
-            "on_examination": result.get('on_examination'),
-            "systemic_examination": result.get('systemic_examination'),
-            "additional_notes": result.get('additional_notes'),
-            "investigations": result.get('investigations'),
-            "diagnosis": result.get('diagnosis'),
-            "medications": result.get('medications'),
-            "advice": result.get('advice'),
-            "follow_up": result.get('follow_up'),
-            "health_screening": result.get('health_screening'),
-        }
-
-        return {
-            "version": result['version'],
-            "is_final": result['is_final'],
-            "created_at": result['created_at'],
-            "fields": fields,
-            "full_ner_json": result.get('full_ner_json')
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Doctor Reviews
-# ============================================================================
-
-@app.post("/api/v1/doctor-review")
-async def save_doctor_review(request: DoctorReviewRequest):
-    """Save a doctor's edit to a NER field."""
-    try:
-        review_id = await ctx.db.save_doctor_review(
-            session_id=request.session_id,
-            doctor_id=request.doctor_id,
-            field_name=request.field_name,
-            original_value=request.original_value,
-            edited_value=request.edited_value
-        )
-        return {"review_id": review_id, "status": "saved"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/doctor-review/{session_id}")
-async def get_doctor_reviews(session_id: str):
-    """Get all doctor reviews for a session."""
-    try:
-        reviews = await ctx.db.get_doctor_reviews(session_id)
-        return {"session_id": session_id, "reviews": reviews}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Prescriptions
-# ============================================================================
-
-@app.post("/api/v1/prescription")
-async def save_prescription(request: PrescriptionRequest):
-    """Save final prescription data (doctor presses Print)."""
-    try:
-        # Get patient_id from session
-        session = await ctx.db.get_session(request.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        prescription_id = await ctx.db.save_prescription(
-            session_id=request.session_id,
-            patient_id=session['patient_id'],
-            doctor_id=request.doctor_id,
-            prescription=request.prescription
-        )
-        return {"prescription_id": prescription_id, "status": "saved"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/v1/prescription/{session_id}")
-async def get_prescription(session_id: str):
-    """Get latest prescription for a session."""
-    try:
-        prescription = await ctx.db.get_prescription(session_id)
-        if not prescription:
-            return {"session_id": session_id, "prescription": None}
-        return {"session_id": session_id, "prescription": prescription}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    answer = await _details()
+    ready = (answer["database"] == "connected" and answer["schema"] == "ok"
+             and answer["minio"] == "connected")
+    body = answer if _may_see_details(request) else {"status": answer["status"]}
+    return JSONResponse(status_code=200 if ready else 503,
+                        content={**body, "ready": ready})
 
 
 # ============================================================================

@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core import crypto
 from core.crypto import DeviceKey, Grant
+from core.disk import MIN_FREE_BYTES, DriveFacts
 from core.microphone import make_ready
 from core.power import keep_awake
 from core.recorder import AudioCaptureError, AudioRecorder
@@ -55,11 +56,17 @@ CLOSING = "closing"
 
 # The Stop reason that erases a consultation (SRS 3.2 §7.8a).
 REFUSAL_REASON = "patient_did_not_consent"
+# How often an interrupted recording that could not be closed at startup
+# (the disk was full) is tried again.
+RECOVERY_RETRY_SECONDS = 30.0
 
 # Recorded as a pause the moment Stop is pressed, so the microphone cuts at once
 # and the gap is explained in the chain while the doctor picks a reason
 # (SRS-UIX-08). Not a reason anyone chooses; the on-screen control sets it.
 STOP_HOLD_REASON = "stop_requested"
+# Windows asked whether it may shut down; the answer is not in yet.
+SHUTDOWN_HOLD_REASON = "pc_shutdown_pending"
+_INTERNAL_PAUSES = (STOP_HOLD_REASON, SHUTDOWN_HOLD_REASON)
 
 # What the doctor's screen says when the server has not accepted a recording
 # yet. The recording carries on and is kept on this PC; nothing is deleted.
@@ -133,16 +140,32 @@ class ActiveSession:
     confirmation: str = ""                # confirming | confirmed | unconfirmed
     # Stop was pressed and the reason form is open (SRS-UIX-08).
     stop_hold: bool = False
+    # Paused because Windows asked to shut down; resumed if it is cancelled.
+    shutdown_hold: bool = False
     audio_seconds: float = 0.0
     paused_seconds: float = 0.0
     pause: Optional[PauseRecord] = None
     pauses: List[Dict[str, Any]] = field(default_factory=list)
-    consecutive_silent: int = 0
-    silence_alerted: bool = False
+    # Where this recording's clips are written, bound when it opens. A clip
+    # that waited for disk space is written into its own recording, never into
+    # whichever one is open when the disk frees up.
+    sink: Optional["SegmentSink"] = None
 
     @property
     def session_id(self) -> str:
         return self.spool.session_id
+
+    @property
+    def consecutive_silent(self) -> int:
+        return self.sink.consecutive_silent if self.sink else 0
+
+
+@dataclass
+class SegmentSink:
+    """One recording's clip writer: its spool and its own silence count."""
+    spool: SessionSpool
+    consecutive_silent: int = 0
+    silence_alerted: bool = False
 
 
 class SessionController:
@@ -164,6 +187,8 @@ class SessionController:
         self._log_salt = log_salt
 
         self._state = IDLE
+        self._drive = DriveFacts(getattr(spool, "root", "."))
+        self._disk_full_reported = False
         self._active: Optional[ActiveSession] = None
         self._lock = asyncio.Lock()
         # Strong references to fire-and-forget tasks. Without this the event loop
@@ -191,7 +216,7 @@ class SessionController:
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._prepare_microphone()
+        self._drive.probe_in_background()
         await self._recover_previous_sessions()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="Heartbeat")
         self._spawn(self._resume_after_restart())
@@ -222,30 +247,72 @@ class SessionController:
         A session that was still open when the process died is closed short and the
         interruption is recorded, so the gap is explained rather than mysterious.
         """
-        for session in self._spool.recover(self._device_key):
-            if session.closed_at is None:
-                logger.warning("Session %s was interrupted; closing it short",
-                               session.session_id)
-                saved = self._seal_partial(session)
-                session.append_chain_entry("pause", crypto.pause_payload(
-                    reason="non_clinical_interruption",
-                    reason_detail="agent stopped unexpectedly; recovered at startup",
-                    authorised_by="system",
-                    supervisor_required=False,
-                    at=datetime.now(timezone.utc),
-                ))
-                total = sum(s.duration_seconds for s in session.segments.values())
-                session.close(duration_seconds=total, paused_seconds=0.0,
-                              reason="recovered_after_unclean_shutdown")
-                self._emit("integrity_alert", {
-                    "session_id": session.session_id,
-                    "alert_type": "unexpected_agent_exit",
-                    "detail": ("session recovered from the spool after an unclean shutdown"
-                               + (f"; {saved:.1f}s of the clip in progress were saved from disk"
-                                  if saved else "")),
-                })
-            session.clear_partial()
-            await self._uploader.track(session)
+        try:
+            found = list(self._spool.recover(self._device_key))
+        except Exception as exc:
+            logger.critical("The spool could not be read at startup: %s", exc)
+            self._emit("integrity_alert", {"session_id": None, "alert_type": "spool_unreadable",
+                                           "detail": str(exc)})
+            return
+        retry = []
+        for session in found:
+            try:
+                await self._recover_one(session)
+            except OSError as exc:
+                # A full disk must not keep the recorder from starting: the
+                # next patient can still be recorded once there is room. This
+                # one is closed later, when the disk has room.
+                self._report_disk_full(session.session_id,
+                                       f"an interrupted recording could not be closed ({exc})")
+                retry.append(session)
+            except Exception as exc:
+                logger.exception("Could not recover session %s", session.session_id)
+                self._emit("integrity_alert", {"session_id": session.session_id,
+                                               "alert_type": "recovery_failed",
+                                               "detail": str(exc)})
+        if retry:
+            self._spawn(self._recover_later(retry))
+
+    async def _recover_later(self, sessions) -> None:
+        while sessions:
+            await asyncio.sleep(RECOVERY_RETRY_SECONDS)
+            still = []
+            for session in sessions:
+                try:
+                    await self._recover_one(session)
+                except OSError:
+                    still.append(session)
+            sessions = still
+
+    async def _recover_one(self, session) -> None:
+        """
+        One session left in the spool by a previous run. One that was still
+        open when the process died is closed short and the interruption is
+        recorded, so the gap is explained rather than mysterious.
+        """
+        if session.closed_at is None:
+            logger.warning("Session %s was interrupted; closing it short",
+                           session.session_id)
+            saved = self._seal_partial(session)
+            session.append_chain_entry("pause", crypto.pause_payload(
+                reason="non_clinical_interruption",
+                reason_detail="agent stopped unexpectedly; recovered at startup",
+                authorised_by="system",
+                supervisor_required=False,
+                at=datetime.now(timezone.utc),
+            ))
+            total = sum(s.duration_seconds for s in session.segments.values())
+            session.close(duration_seconds=total, paused_seconds=0.0,
+                          reason="recovered_after_unclean_shutdown")
+            self._emit("integrity_alert", {
+                "session_id": session.session_id,
+                "alert_type": "unexpected_agent_exit",
+                "detail": ("session recovered from the spool after an unclean shutdown"
+                           + (f"; {saved:.1f}s of the clip in progress were saved from disk"
+                              if saved else "")),
+            })
+        session.clear_partial()
+        await self._uploader.track(session)
 
     @staticmethod
     def _seal_partial(session) -> float:
@@ -283,6 +350,7 @@ class SessionController:
         patient_name: str = "",
         session_id: Optional[str] = None,
         retrying: bool = False,
+        continues_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         API 1: CMED's trigger. The microphone opens now (SRS-GRT-07).
@@ -383,6 +451,15 @@ class SessionController:
                 raise SessionError(
                     "Local audio buffer is full. Recording cannot start until the "
                     "backlog uploads. Contact support.", code="AGENT_NOT_READY")
+            # The drive itself, not only the spool's own cap: a C: drive full of
+            # other files cannot hold the next clip however empty the spool is.
+            free = self._drive.free_bytes()
+            if free is not None and free < MIN_FREE_BYTES:
+                self._report_disk_full(None, f"only {free / 2**20:.0f} MB free on the PC's "
+                                             f"disk; a new recording needs at least 1 GB")
+                raise SessionError(
+                    "This PC's disk is almost full, so a new recording cannot start. "
+                    "Free some space on the C: drive.", code="AGENT_NOT_READY")
 
             spool_session = self._spool.open_session(
                 device_key=self._device_key,
@@ -401,8 +478,10 @@ class SessionController:
                 session_id=session_id,
                 # With a grant in hand there is nothing to ask for later.
                 trigger=None if grant is not None else trigger.fields(),
+                continues_session_id=continues_session_id,
             )
 
+            sink = SegmentSink(spool=spool_session)
             segmenter = Segmenter(
                 sample_rate=self.cfg.audio.sample_rate,
                 channels=self.cfg.audio.channels,
@@ -412,9 +491,14 @@ class SessionController:
                 grace_seconds=self.cfg.segment.grace_seconds,
                 silence_rms=self.cfg.segment.silence_rms,
                 silence_hold_seconds=self.cfg.segment.silence_hold_seconds,
-                on_segment=self._on_segment_sealed,
+                on_segment=lambda sealed, sink=sink: self._seal_into(sink, sealed),
                 on_partial=spool_session.write_partial,
                 partial_every_seconds=getattr(self.cfg.segment, "partial_flush_seconds", 3.0),
+                on_write_error=lambda exc, waiting, sid=spool_session.session_id:
+                    self._report_disk_full(sid, f"a clip could not be written ({exc}); "
+                                                f"{waiting:.0f} s of audio kept in memory "
+                                                f"and tried again every few seconds"),
+                on_write_recovered=self._disk_recovered,
             )
             recorder = AudioRecorder(
                 sample_rate=self.cfg.audio.sample_rate,
@@ -429,6 +513,7 @@ class SessionController:
             )
 
             opened_at = boundary
+            await self._ready_microphone()
             segmenter.start(opened_at)
             try:
                 recorder.start()
@@ -468,6 +553,7 @@ class SessionController:
                 confirmation="" if grant is not None else "confirming",
                 focus=trigger.fields(),
                 seen={patient_ref: trigger.fields()},
+                sink=sink,
             )
             self._active = active
             self.state = RECORDING
@@ -756,7 +842,7 @@ class SessionController:
                 raise SessionError("Recording is already paused.")
 
             if reason not in self.cfg.pause.reasons and not (
-                    internal and reason == STOP_HOLD_REASON):
+                    internal and reason in _INTERNAL_PAUSES):
                 raise SessionError(
                     f"Unknown pause reason. Choose one of: {', '.join(self.cfg.pause.reasons)}")
             if reason == "other" and not reason_detail.strip():
@@ -773,9 +859,10 @@ class SessionController:
             # then flush. Flushing first would let audio recorded after the pause
             # decision land in the next segment, blurring the boundary the chain
             # entry claims is exact.
-            stats = active.recorder.stop()
+            loop = asyncio.get_running_loop()
+            stats = await loop.run_in_executor(None, active.recorder.stop)
             active.audio_seconds += stats.bytes_captured / max(1, active.recorder.bytes_per_second)
-            active.segmenter.flush(is_final=False)
+            await loop.run_in_executor(None, lambda: active.segmenter.flush(is_final=False))
 
             now = datetime.now(timezone.utc)
             entry = active.spool.append_chain_entry("pause", crypto.pause_payload(
@@ -838,6 +925,30 @@ class SessionController:
         active.stop_hold = True
         return {**result, "held": True}
 
+    async def hold_for_shutdown(self) -> Dict[str, Any]:
+        """
+        Windows asked whether it may shut down. Stop the microphone and write the
+        clip so far, but do not end the consultation: the shutdown may still be
+        cancelled, and then it carries on.
+        """
+        active = self._active
+        if active is None or self.state != RECORDING:
+            return {"status": "unchanged", "session_id": active.session_id if active else None}
+        result = await self.pause_session(
+            reason=SHUTDOWN_HOLD_REASON, reason_detail="Windows asked to shut down",
+            internal=True)
+        active.shutdown_hold = True
+        return result
+
+    async def release_shutdown_hold(self) -> Dict[str, Any]:
+        """The shutdown was cancelled: recording carries on."""
+        active = self._active
+        if active is None or not active.shutdown_hold:
+            return {"status": "unchanged",
+                    "session_id": active.session_id if active else None}
+        active.shutdown_hold = False
+        return await self.resume_session()
+
     async def release_stop_hold(self) -> Dict[str, Any]:
         """The doctor cancelled Stop: recording carries on (SRS-UIX-07)."""
         active = self._active
@@ -853,13 +964,24 @@ class SessionController:
             if self.state != PAUSED or active.pause is None:
                 raise SessionError("Recording is not paused.")
 
+            # The microphone first. If it cannot open, nothing has changed: the
+            # recording is still paused, the chain has no resume for audio that
+            # never existed, and Resume can simply be pressed again.
+            now = datetime.now(timezone.utc)
+            active.segmenter.set_segment_start(now)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, active.recorder.start)
+            except AudioCaptureError as exc:
+                raise SessionError(
+                    "The microphone could not be reopened. Check the device and try again."
+                ) from exc
+
             paused_for = time.monotonic() - active.pause.started_monotonic
             active.paused_seconds += paused_for
             # A pause counts towards neither limit.
             active.last_cmed_at += paused_for
             if active.armed_at is not None:
                 active.armed_at += paused_for
-            now = datetime.now(timezone.utc)
 
             entry = active.spool.append_chain_entry("resume", crypto.resume_payload(
                 at=now, paused_seconds=paused_for))
@@ -872,20 +994,6 @@ class SessionController:
                 "seconds": round(paused_for, 1),
             })
             active.pause = None
-
-            # Segmenter keeps running across a pause; only capture restarts. Its
-            # segment clock is moved to now, otherwise the next segment's
-            # timestamps would continue from before the pause and imply audio that
-            # was never recorded.
-            active.segmenter.set_segment_start(now)
-            try:
-                active.recorder.start()
-            except AudioCaptureError as exc:
-                self.state = PAUSED
-                raise SessionError(
-                    "The microphone could not be reopened. Check the device and try again."
-                ) from exc
-
             self.state = RECORDING
             self._spawn(self._uploader.notify_resume(active.spool, entry))
 
@@ -908,7 +1016,8 @@ class SessionController:
         # A deliberate stop ends the consultation: nothing to retry or resume.
         # Shutting the recorder down is not a stop - the consultation may well
         # carry on, and the restart picks it up.
-        if reason not in ("agent_shutdown", "pc_shutdown"):
+        # Nor is a software update: the updated agent resumes the consultation.
+        if reason not in ("agent_shutdown", "pc_shutdown", "software_update"):
             self._forget()
         if reason == REFUSAL_REASON:
             if self._active is None:
@@ -947,21 +1056,34 @@ class SessionController:
             })
             active.pause = None
 
+        # Off the event loop: joining the capture threads and writing the last
+        # clip can take seconds (a microphone just pulled, a slow disk), and
+        # meanwhile CMED's next message and the overlay must still be answered.
+        loop = asyncio.get_running_loop()
         if active.recorder.is_running:
-            stats = active.recorder.stop()
+            stats = await loop.run_in_executor(None, active.recorder.stop)
             active.audio_seconds += stats.bytes_captured / max(1, active.recorder.bytes_per_second)
             self._check_capture_health(active, stats)
 
         # Seals the tail as the final segment.
-        active.segmenter.stop(seal_remaining=True)
+        await loop.run_in_executor(None, lambda: active.segmenter.stop(seal_remaining=True))
 
-        close_entry = active.spool.close(
-            duration_seconds=active.audio_seconds,
-            paused_seconds=active.paused_seconds,
-            reason=reason,
-            detail=detail,
-            at=at,
-        )
+        close_args = dict(duration_seconds=active.audio_seconds,
+                          paused_seconds=active.paused_seconds,
+                          reason=reason, detail=detail, at=at)
+        if active.segmenter.pending_seconds > 0:
+            # The disk is full: clips are still in memory, waiting. The close
+            # entry must follow them in the chain, so it is written once they
+            # are - in the background, so Stop answers now and the next patient
+            # is not held up by this one.
+            self._spawn(self._finish_close_later(active, close_args))
+            return self._closed(active, reason, chain_ok=True, deferred=True)
+        try:
+            close_entry = active.spool.close(**close_args)
+        except OSError as exc:
+            self._report_disk_full(active.session_id, f"the close could not be written ({exc})")
+            self._spawn(self._finish_close_later(active, close_args))
+            return self._closed(active, reason, chain_ok=True, deferred=True)
         verdict = active.spool.verify_chain()
         if not verdict.ok:
             logger.critical("Local chain verification failed for %s: %s",
@@ -981,7 +1103,11 @@ class SessionController:
             paused_seconds=active.paused_seconds,
         ))
         self._uploader.nudge()
+        active.spool.live = False
+        return self._closed(active, reason, chain_ok=verdict.ok)
 
+    def _closed(self, active: ActiveSession, reason: str, *, chain_ok: bool,
+                deferred: bool = False) -> Dict[str, Any]:
         result = {
             "status": "stopped",
             "session_id": active.session_id,
@@ -990,18 +1116,79 @@ class SessionController:
             "segment_count": len(active.spool.segments),
             "pauses": active.pauses,
             "reason": reason,
-            "chain_ok": verdict.ok,
+            "chain_ok": chain_ok,
         }
+        if deferred:
+            result["waiting_for_disk"] = True
 
-        logger.info("Session %s stopped: %.1f s audio, %s segments, %s pause(s), reason=%s",
+        logger.info("Session %s stopped: %.1f s audio, %s segments, %s pause(s), reason=%s%s",
                     active.session_id, active.audio_seconds,
-                    len(active.spool.segments), len(active.pauses), reason)
+                    len(active.spool.segments), len(active.pauses), reason,
+                    " (closing once the disk has room)" if deferred else "")
 
-        active.spool.live = False
         self._active = None
         self.state = IDLE
         self._emit("recording_stopped", result)
         return result
+
+    async def _finish_close_later(self, active: ActiveSession, close_args: Dict[str, Any]) -> None:
+        """
+        Close a recording whose last clips were waiting for disk space: once they
+        are written, write the close, then report it. Tried every few seconds
+        for as long as the agent runs; on a restart the interrupted-session
+        recovery closes it instead, with nothing lost that reached the disk.
+        """
+        loop = asyncio.get_running_loop()
+        while not await loop.run_in_executor(None, active.segmenter.wait_written, 5.0):
+            pass
+        active.segmenter.stop(seal_remaining=False)
+        while True:
+            try:
+                active.spool.close(**close_args)
+                break
+            except OSError:
+                await asyncio.sleep(5.0)
+        verdict = active.spool.verify_chain()
+        if not verdict.ok:
+            self._emit("integrity_alert", {"session_id": active.session_id,
+                                           "alert_type": "local_chain_invalid",
+                                           "detail": verdict.reason})
+        if active.segmenter.lost_seconds:
+            self._emit("integrity_alert", {
+                "session_id": active.session_id, "alert_type": "disk_full",
+                "detail": f"{active.segmenter.lost_seconds:.0f} s of audio could not be kept: "
+                          f"the disk stayed full past the memory limit"})
+        active.spool.live = False
+        await self._uploader.close_remote(active.spool, duration_seconds=active.audio_seconds,
+                                          paused_seconds=active.paused_seconds)
+        self._uploader.nudge()
+        logger.info("Session %s closed after waiting for disk space", active.session_id)
+
+    # ---- the disk ----
+
+    def _report_disk_full(self, session_id: Optional[str], detail: str) -> None:
+        """disk_full, once until the disk has room again. Any thread."""
+        if self._disk_full_reported:
+            return
+        self._disk_full_reported = True
+        logger.critical("DISK FULL: %s", detail)
+        self._emit("integrity_alert", {"session_id": session_id, "alert_type": "disk_full",
+                                       "detail": detail})
+
+    def _disk_recovered(self, waited: float) -> None:
+        self._disk_full_reported = False
+        logger.warning("Disk writable again after %.0f s", waited)
+
+    def _check_disk(self) -> Optional[int]:
+        free = self._drive.free_bytes()
+        if free is None:
+            return None
+        if free < MIN_FREE_BYTES:
+            self._report_disk_full(self._active.session_id if self._active else None,
+                                   f"only {free / 2**20:.0f} MB free on the PC's disk")
+        elif self._disk_full_reported and free > 2 * MIN_FREE_BYTES:
+            self._disk_full_reported = False
+        return free
 
     async def refuse_session(self) -> Dict[str, Any]:
         """
@@ -1013,10 +1200,11 @@ class SessionController:
         """
         async with self._lock:
             active = self._require_active()
+            loop = asyncio.get_running_loop()
             if active.recorder.is_running:
-                active.recorder.stop()
+                await loop.run_in_executor(None, active.recorder.stop)
             # Stop the cutter before deleting, so no piece lands afterwards.
-            active.segmenter.stop(seal_remaining=False)
+            await loop.run_in_executor(None, lambda: active.segmenter.stop(seal_remaining=False))
             deleted = active.spool.refuse()
             active.spool.live = False
             self._active = None
@@ -1112,7 +1300,7 @@ class SessionController:
                       f"consultation was last seen live; recording it again by itself",
         })
         try:
-            await self.open_session(trigger)
+            await self.open_session(trigger, continues_session_id=wanted.get("session_id"))
         except SessionError as exc:
             if exc.code != "AGENT_NOT_READY":           # the microphone retries itself
                 logger.warning("Could not resume after restart: %s", exc.code)
@@ -1162,20 +1350,23 @@ class SessionController:
 
     # ---- callbacks ----
 
-    def _on_segment_sealed(self, sealed: SealedSegment) -> None:
+    def _seal_into(self, sink: SegmentSink, sealed: SealedSegment) -> None:
         """
-        Runs on the segmenter thread. Writes to the spool, then wakes the uploader.
+        Runs on the segmenter thread. Writes one clip into the recording it was
+        captured for, then wakes the uploader.
 
         Disk I/O here is deliberate: this thread exists so the capture thread does
-        not have to do it.
+        not have to do it. Any failure raises, so the segmenter keeps the clip and
+        tries again: returning would tell it the clip was written.
         """
-        active = self._active
-        if active is None:
-            logger.error("Sealed segment arrived with no active session; discarding is not an "
-                         "option, writing to the last known spool is not safe - dropping")
+        spool = sink.spool
+        if getattr(spool, "refused", False):
+            # The patient refused: nothing of this consultation may be kept.
+            # The segmenter was stopped before the refusal; this is a clip that
+            # was already in flight, and it is dropped on purpose.
+            logger.warning("Dropping a clip of refused session %s", spool.session_id)
             return
-
-        segment = active.spool.seal_segment(
+        segment = spool.seal_segment(
             sealed.pcm,
             captured_start_at=sealed.captured_start_at,
             captured_end_at=sealed.captured_end_at,
@@ -1188,25 +1379,28 @@ class SessionController:
         # two consecutive silent segments: a single quiet clip is unremarkable, and
         # an alert per segment is noise nobody reads.
         if sealed.rms_mean < (self.cfg.segment.silence_rms / 4):
-            active.consecutive_silent += 1
-            if active.consecutive_silent >= 2 and not active.silence_alerted:
-                active.silence_alerted = True
+            sink.consecutive_silent += 1
+            if sink.consecutive_silent >= 2 and not sink.silence_alerted:
+                sink.silence_alerted = True
                 self._emit("integrity_alert", {
-                    "session_id": active.session_id,
+                    "session_id": spool.session_id,
                     "seq_no": segment.seq_no,
                     "alert_type": "silent_session",
-                    "detail": (f"{active.consecutive_silent} consecutive segments at the "
+                    "detail": (f"{sink.consecutive_silent} consecutive segments at the "
                                f"noise floor (mean RMS {sealed.rms_mean:.1f}) - check that "
                                f"the microphone is connected and not muted"),
                 })
         else:
-            active.consecutive_silent = 0
+            sink.consecutive_silent = 0
 
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._uploader.nudge)
+            try:
+                self._loop.call_soon_threadsafe(self._uploader.nudge)
+            except RuntimeError:                  # the loop has closed (shutdown)
+                pass
 
         self._emit("segment_sealed", {
-            "session_id": active.session_id,
+            "session_id": spool.session_id,
             "seq_no": segment.seq_no,
             "duration_seconds": round(segment.duration_seconds, 1),
             "is_final": segment.is_final,
@@ -1224,6 +1418,10 @@ class SessionController:
     def _on_microphone_switched(self, device: str, seconds_lost: float) -> None:
         """Called from the audio watchdog: the recording moved to another microphone."""
         active = self._active
+        if active is not None:
+            # The gap is real time with no audio. Without this every later clip's
+            # timestamps would be early by the length of the gap.
+            active.segmenter.set_segment_start(datetime.now(timezone.utc))
         self._emit("integrity_alert", {
             "session_id": active.session_id if active else None,
             "alert_type": "microphone_switched",
@@ -1269,14 +1467,21 @@ class SessionController:
         self._state = value
         keep_awake(value != IDLE)
 
-    def _prepare_microphone(self) -> None:
-        """The clinic microphone at 100% and unmuted. Off the event loop; cheap."""
+    async def _ready_microphone(self) -> None:
+        """
+        The clinic microphone at 100% and unmuted, just before a recording
+        starts - never at sign-in or while idle, when changing a device's level
+        is no business of a recorder that is not recording. Off the event loop,
+        and never allowed to delay or stop the start.
+        """
         name = getattr(self.cfg.audio, "preferred_microphone", "")
-        if not name or self._loop is None or self._active is not None:
+        if not name:
             return
-        task = self._loop.run_in_executor(None, make_ready, name)
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, make_ready, name), 1.0)
+        except Exception as exc:
+            logger.info("Could not set the microphone level before recording: %s", exc)
 
     async def _heartbeat_loop(self) -> None:
         """
@@ -1291,8 +1496,7 @@ class SessionController:
                 await asyncio.sleep(interval)
                 if self._active is not None:
                     self._keeper.touch()           # still live, for a restart to see
-                else:
-                    self._prepare_microphone()     # someone may have turned it down
+                self._check_disk()
                 payload = self.heartbeat_payload()
                 health = getattr(self._uploader, "health", None)
                 if await self._uploader.heartbeat(payload):
@@ -1308,6 +1512,8 @@ class SessionController:
     def heartbeat_payload(self) -> Dict[str, Any]:
         upload = self._uploader.status()
         active = self._active
+        held_of = getattr(self._uploader, "held_sessions", None)
+        held = list(held_of()) if callable(held_of) else []
         return {
             "device_id": self.device_id,
             "app_version": self.cfg.app_version,
@@ -1327,6 +1533,12 @@ class SessionController:
             # replies; the server raises clock_skew when it is large.
             "clock_offset_seconds": (round(offset, 1) if (offset := getattr(
                 self._uploader, "clock_offset", None)) is not None else None),
+            # Recordings kept on this PC because the server said no, and why.
+            "held": held[:20],
+            "held_count": len(held),
+            # BitLocker on the drive holding the audio: true, false, or unknown.
+            "disk_encrypted": self._drive.encrypted,
+            "disk_free_bytes": self._drive.free_bytes(),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 

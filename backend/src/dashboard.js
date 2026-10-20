@@ -228,7 +228,8 @@ function drawRooms(d) {
     return;
   }
   $("rooms").innerHTML = `<table><thead><tr><th>Machine</th><th>Clinic</th>
-      <th>Version</th><th class="num">Holding</th><th>Last seen</th><th>State</th>
+      <th>Version</th><th class="num">Holding</th><th class="num">Held</th>
+      <th>Disk</th><th class="num">Clock</th><th>Last seen</th><th>State</th>
       <th>Offline this week</th></tr></thead><tbody>`
     + rooms.map((q) => {
         const st = q.revoked ? ["bad", "revoked"]
@@ -236,13 +237,68 @@ function drawRooms(d) {
         const seen = q.minutes_since_seen == null ? "never"
           : q.minutes_since_seen < 60 ? `${Math.round(q.minutes_since_seen)} min ago`
           : `${Math.round(q.minutes_since_seen / 60)} h ago`;
+        const version = q.outdated
+          ? `<span class="tag warn" title="below ${esc(d.recorders.minimum_version)}">`
+            + `${esc(q.app_version || "?")} · update</span>`
+          : esc(q.app_version || "—");
+        const disk = q.disk_encrypted === true ? `<span class="tag good">encrypted</span>`
+          : q.disk_encrypted === false ? `<span class="tag warn">not encrypted</span>`
+          : `<span class="hint">—</span>`;
+        const clock = q.clock_offset_seconds == null ? `<span class="hint">—</span>`
+          : Math.abs(q.clock_offset_seconds) >= 120
+            ? `<span class="tag warn">${num(q.clock_offset_seconds)} s</span>`
+            : `${num(q.clock_offset_seconds)} s`;
+        const held = q.held_count
+          ? `<span class="tag bad" title="${esc((q.held || []).map((h) => h.code).join(", "))}">`
+            + `${num(q.held_count)}</span>`
+          : `<span class="hint">0</span>`;
         return `<tr><td>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</td>`
-          + `<td>${esc(q.hospital_id)}</td><td>${esc(q.app_version || "—")}</td>`
+          + `<td>${esc(q.hospital_id)}</td><td>${version}</td>`
           + `<td class="num">${num(q.pending_segments)} · ${num(q.spool_mb)} MB</td>`
+          + `<td class="num">${held}</td><td>${disk}</td><td class="num">${clock}</td>`
           + `<td>${esc(seen)}</td>`
           + `<td><span class="tag ${st[0]}">${st[1]}</span></td>`
           + `<td>${offlineText(q.offline_periods)}</td></tr>`;
       }).join("") + `</tbody></table>`;
+}
+
+/* S10: recordings a person should look at, with the parts and rule behind each. */
+function drawReview(d) {
+  const items = (d.review && d.review.items) || [];
+  if (!items.length) {
+    $("review").innerHTML = `<div class="empty">Nothing to review.</div>`;
+    return;
+  }
+  $("review").innerHTML = `<table><thead><tr><th>Raised</th><th>Why</th><th>Recording</th>
+      <th>Files</th></tr></thead><tbody>`
+    + items.map((it) => {
+        const why = it.alert_type === "relabelled_after_archive"
+          ? `<span class="tag warn">relabelled after archiving</span>`
+          : `<span class="tag warn">rules unsure</span>`;
+        const parts = (it.parts || []).map((p) =>
+          `${esc(p.file_stem || p.patient_id)} · ${esc(p.rule)}`
+          + `${p.needs_review ? ` <span class="tag bad">check</span>` : ""}`).join("<br>")
+          || esc(it.file_stem || "—");
+        return `<tr><td>${esc(new Date(it.raised_at).toLocaleString())}</td><td>${why}</td>`
+          + `<td>${esc(it.hospital_id || "")} · ${esc(String(it.session_id || "").slice(-8))}</td>`
+          + `<td>${parts}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+}
+
+/* U3: recordings kept on a PC because this server said no, and why. */
+function drawHeld(d) {
+  const held = (d.recorders && d.recorders.held) || [];
+  if (!held.length) {
+    $("held").innerHTML = `<div class="empty">No PC is holding a recording.</div>`;
+    return;
+  }
+  $("held").innerHTML = `<table><thead><tr><th>Machine</th><th>Clinic</th><th>Reason</th>
+      <th>Since</th><th>Recording</th></tr></thead><tbody>`
+    + held.map((h) => `<tr><td>${esc(h.machine_name || "")}</td><td>${esc(h.hospital_id || "")}</td>`
+        + `<td><span class="tag bad">${esc(h.code || "?")}</span></td>`
+        + `<td>${esc(h.since ? new Date(h.since).toLocaleString() : "—")}</td>`
+        + `<td>${esc(String(h.session_id || "").slice(-8))}</td></tr>`).join("")
+    + `</tbody></table>`;
 }
 
 /* What a recorder did while it could not reach the server, from its own log. */
@@ -267,21 +323,38 @@ function confirmTag(v) {
   return `<span class="tag ${map[v] || "quiet"}">${esc(v || "—")}</span>`;
 }
 
+/* The patient files a recording became: one, or one per patient when it was cut. */
+function filesText(r) {
+  const files = r.files || [];
+  if (!files.length) return `<span class="hint">${esc(r.patient_id || "—")}</span>`;
+  return files.map((f) => {
+    const when = files.length > 1
+      ? ` <span class="hint">from ${num(Math.round(f.start_seconds || 0))} s</span>` : "";
+    const flag = f.needs_review ? ` <span class="tag warn">review</span>` : "";
+    return `${esc(f.patient_id)} · <span class="tag quiet">${esc(f.rule || "")}</span>`
+      + when + flag;
+  }).join("<br>");
+}
+
 function recordingsTable(list) {
   if (!list.length) return `<div class="empty">No recordings match.</div>`;
   return `<table><thead><tr><th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th>
-      <th class="num">Length</th><th>Confirmation</th><th>Archived</th>
-      <th>Folder on the server</th></tr></thead><tbody>`
+      <th>Files and rule</th><th class="num">Length</th><th>Ended</th><th>Confirmation</th>
+      <th>Archived</th><th>Folder on the server</th></tr></thead><tbody>`
     + list.map((r) => {
-        const mins = Math.round((r.total_duration_seconds || 0) / 60);
+        // The server sends date / minutes / archived; this read session_date,
+        // total_duration_seconds and archived_at, so every row showed no date,
+        // 0 min and "no" - even for recordings that were archived.
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
-        return `<tr><td>${esc(r.session_date || "")}</td>`
+        return `<tr><td>${esc(r.date || "")}</td>`
           + `<td>${esc(r.hospital_id)}</td><td>${esc(r.doctor_id)}</td>`
-          + `<td>${esc(r.patient_id)}</td><td class="num">${mins} min</td>`
+          + `<td>${esc(r.patient_id)}</td><td>${filesText(r)}</td>`
+          + `<td class="num">${num(r.minutes || 0)} min</td>`
+          + `<td>${esc(r.close_reason || "—")}</td>`
           + `<td>${confirmTag(r.confirmation)}</td>`
-          + `<td>${r.archived_at ? `<span class="tag good">yes</span>`
-                                 : `<span class="tag warn">no</span>`}</td>`
+          + `<td>${r.archived ? `<span class="tag good">yes</span>`
+                              : `<span class="tag warn">no</span>`}</td>`
           + `<td class="path" title="${esc(folder)}">${esc(folder || "—")}`
           + (folder ? ` <button class="copy" data-copy="${esc(folder)}">copy</button>` : "")
           + `</td></tr>`;
@@ -347,6 +420,8 @@ async function refresh() {
     drawClinics(d);
     drawAttention(d);
     drawRooms(d);
+    drawReview(d);
+    drawHeld(d);
     barChart($("byDay"), d.volume.by_day || [],
       { label: (r) => String(r.date || "").slice(5), value: (r) => r.recordings,
         unit: "recordings" });

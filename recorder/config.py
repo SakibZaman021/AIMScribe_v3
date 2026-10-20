@@ -1,8 +1,17 @@
 """
 AIMScribe Recorder Configuration
 
-Loaded once at startup from .env next to the executable, then from the process
-environment (environment wins, so a service definition can override a file).
+Loaded once at startup from .env next to the executable.
+
+Run from source (development, tests, the bench), the process environment wins
+over the file, so a test or a bench script can override anything.
+
+Installed (the frozen executable), the .env under Program Files is the only
+source of AIMS_* settings: every AIMS_* variable in the environment is
+discarded first. That file is writable only by an administrator, whereas any
+program running as the doctor can set environment variables - and those used
+to be able to switch off grant checking, point uploads at another server, or
+swap the trusted public keys, all without administrator rights.
 
 Deliberately dependency-free: no pydantic, no python-dotenv. The .env parser is
 30 lines and keeps the packaged executable small and fast to start.
@@ -20,10 +29,10 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 APP_NAME = "AIMScribe Recorder"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.5.0"
 
 # Wire format version. The server rejects a mismatched agent rather than guessing.
 PROTOCOL_VERSION = 2
@@ -32,6 +41,11 @@ PROTOCOL_VERSION = 2
 # ============================================================
 # Location helpers
 # ============================================================
+
+def installed_build() -> bool:
+    """The packaged executable on a clinic PC, as opposed to a source run."""
+    return bool(getattr(sys, "frozen", False))
+
 
 def app_dir() -> Path:
     """Directory holding the executable (or this file when run from source)."""
@@ -53,22 +67,55 @@ def data_dir() -> Path:
     override = os.getenv("AIMS_DATA_DIR", "").strip()
     if override:
         return Path(override)
-    base = os.getenv("PROGRAMDATA") or os.getenv("LOCALAPPDATA") or str(Path.home())
+    base = _program_data() or os.getenv("LOCALAPPDATA") or str(Path.home())
     return Path(base) / "AIMScribe"
+
+
+def _program_data() -> str:
+    """
+    The machine-wide data folder. Installed, it is asked of Windows itself:
+    %PROGRAMDATA% is an environment variable the signed-in user can change, and
+    pointing it at a folder of their own would hand the recorder their keys.
+    """
+    if installed_build() and sys.platform == "win32":
+        try:
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(260)
+            # CSIDL_COMMON_APPDATA (0x23): the real ProgramData folder.
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x23, None, 0, buffer) == 0 \
+                    and buffer.value:
+                return buffer.value
+        except Exception:
+            pass
+    return os.getenv("PROGRAMDATA", "")
+
+
+def pinned_key_path(name: str) -> Path:
+    """
+    Where a server public key is trusted from. Installed, the installer puts
+    them beside the executable, under Program Files, where the doctor's account
+    cannot replace them; ProgramData is writable by every user. A source run
+    keeps them with the rest of its state.
+    """
+    beside = app_dir() / "keys" / name
+    if installed_build() and beside.is_file():
+        return beside
+    return data_dir() / "keys" / name
 
 
 # ============================================================
 # .env parsing
 # ============================================================
 
-def load_env_file(path: Path) -> None:
-    """Populate os.environ from a .env file. Existing variables are never replaced."""
+def read_env_file(path: Path) -> Dict[str, str]:
+    """The KEY=value pairs of a .env file; empty when it is missing or unreadable."""
+    values: Dict[str, str] = {}
     if not path.is_file():
-        return
+        return values
     try:
         text = path.read_text(encoding="utf-8-sig")
     except OSError:
-        return
+        return values
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -76,8 +123,29 @@ def load_env_file(path: Path) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if key:
+            values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def load_env_file(path: Path, *, installed: Optional[bool] = None) -> None:
+    """
+    Populate os.environ from a .env file.
+
+    From source, existing variables are never replaced. Installed, the file is
+    the only source of AIMS_* settings: every AIMS_* variable already in the
+    environment is discarded first, so nothing set by the doctor's account -
+    or by any program running as it - reaches the configuration.
+    """
+    installed = installed_build() if installed is None else installed
+    values = read_env_file(path)
+    if installed:
+        for key in [k for k in os.environ if k.upper().startswith("AIMS_")]:
+            del os.environ[key]
+        os.environ.update(values)
+        return
+    for key, value in values.items():
+        if key not in os.environ:
             os.environ[key] = value
 
 
@@ -221,6 +289,9 @@ class BackendConfig:
     client_cert_path: Optional[Path] = None
     client_key_path: Optional[Path] = None
     ca_bundle_path: Optional[Path] = None
+    # Base64 SHA-256 hashes of the server's public key (current and spare).
+    # Set, any other key is refused: an antivirus re-signing HTTPS is not let in.
+    tls_pins: tuple = ()
 
     def url(self, endpoint: str) -> str:
         return f"{self.base_url.rstrip('/')}{self.api_prefix}{endpoint}"
@@ -248,7 +319,7 @@ class SecurityConfig:
     enable_docs: bool = False
     grant_issuer: str = "aimslab"
     grant_audience: str = "aimscribe-recorder"
-    grant_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "aimslab_grant_pub.pem")
+    grant_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_grant_pub.pem"))
     # How long `start` waits for the server's answer before replying 202
     # RECORDING_PROVISIONAL. Capture never waits (SRS-GRT-07).
     authorise_wait_seconds: float = 1.5
@@ -272,9 +343,14 @@ class SecurityConfig:
     counselling_limit_seconds: float = 120.0
     end_grace_seconds: float = 10.0
     no_activity_limit_seconds: float = 900.0
-    receipt_public_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "aimslab_receipt_pub.pem")
+    receipt_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_receipt_pub.pem"))
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
+    # Development and bench only: lets the unsafe switches (no grant check,
+    # plaintext keys, the API browser) be used. Always on from source; an
+    # installed recorder takes it only from its Program Files .env, so only an
+    # administrator can turn it on, and it still shows as a warning.
+    developer_mode: bool = True
 
     def origin_allowed(self, origin: Optional[str]) -> bool:
         # A missing or literal "null" Origin is rejected: sandboxed iframes and
@@ -330,6 +406,7 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         load_env_file(app_dir() / ".env")
+        installed = installed_build()
 
         keys = data_dir() / "keys"
 
@@ -369,6 +446,7 @@ class Config:
             client_cert_path=Path(_str("AIMS_CLIENT_CERT_PATH")) if _str("AIMS_CLIENT_CERT_PATH") else None,
             client_key_path=Path(_str("AIMS_CLIENT_KEY_PATH")) if _str("AIMS_CLIENT_KEY_PATH") else None,
             ca_bundle_path=Path(_str("AIMS_CA_BUNDLE_PATH")) if _str("AIMS_CA_BUNDLE_PATH") else None,
+            tls_pins=tuple(_list("AIMS_TLS_PINS")),
         )
 
         security = SecurityConfig(
@@ -382,10 +460,13 @@ class Config:
             enable_docs=_bool("AIMS_ENABLE_DOCS", False),
             grant_issuer=_str("AIMS_GRANT_ISSUER", "aimslab"),
             grant_audience=_str("AIMS_GRANT_AUDIENCE", "aimscribe-recorder"),
-            grant_public_key_path=_path("AIMS_GRANT_PUBLIC_KEY_PATH", keys / "aimslab_grant_pub.pem"),
-            receipt_public_key_path=_path("AIMS_RECEIPT_PUBLIC_KEY_PATH", keys / "aimslab_receipt_pub.pem"),
+            grant_public_key_path=_path("AIMS_GRANT_PUBLIC_KEY_PATH",
+                                        pinned_key_path("aimslab_grant_pub.pem")),
+            receipt_public_key_path=_path("AIMS_RECEIPT_PUBLIC_KEY_PATH",
+                                          pinned_key_path("aimslab_receipt_pub.pem")),
             device_key_path=keys / "device_ed25519.dpapi",
             allow_plaintext_keystore=_bool("AIMS_ALLOW_PLAINTEXT_KEYSTORE", False),
+            developer_mode=(not installed) or _bool("AIMS_DEVELOPER_MODE", False),
             counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
             end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),
             no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 900.0),
@@ -444,8 +525,32 @@ class Config:
             problems.append("AIMS_SEGMENT_MAX_SECONDS must exceed AIMS_SEGMENT_MIN_SECONDS.")
         if self.audio.sample_width != 2:
             problems.append("Only 16-bit PCM is supported (AIMS_SAMPLE_WIDTH=2).")
+        problems.extend(self.unsafe_switches())
 
         return problems
+
+    def unsafe_switches(self) -> List[str]:
+        """
+        Switches that turn a protection off. Allowed only in developer mode; on
+        a clinical install any one of them blocks recording outright, with the
+        reason in the tray, rather than running quietly unprotected.
+        """
+        if self.security.developer_mode:
+            return []
+        found: List[str] = []
+        if not self.security.require_grant:
+            found.append("AIMS_REQUIRE_GRANT is false - recording without the server's "
+                         "permission is for development only. Reinstall AIMScribe.")
+        if self.security.allow_plaintext_keystore:
+            found.append("AIMS_ALLOW_PLAINTEXT_KEYSTORE is true - private keys would sit "
+                         "unprotected. Reinstall AIMScribe.")
+        if self.security.enable_docs:
+            found.append("AIMS_ENABLE_DOCS is true - the local control API would be "
+                         "browsable. Reinstall AIMScribe.")
+        if self.security.bind_host not in ("127.0.0.1", "::1", "localhost"):
+            found.append(f"AIMS_BIND_HOST is {self.security.bind_host} - the recorder's "
+                         "control port must listen on this PC only.")
+        return found
 
     def production_warnings(self) -> List[str]:
         """Settings that are legal but must not ship to a clinical PC."""
@@ -458,6 +563,8 @@ class Config:
             warnings.append("AIMS_REQUIRE_GRANT is false - any allowed origin can start a recording.")
         if self.security.allow_plaintext_keystore:
             warnings.append("AIMS_ALLOW_PLAINTEXT_KEYSTORE is true - private keys are not DPAPI-wrapped.")
+        if self.security.developer_mode and installed_build():
+            warnings.append("AIMS_DEVELOPER_MODE is on in an installed recorder.")
         if not self.backend.client_cert_path:
             warnings.append("No client certificate configured - mTLS is not in use.")
         return warnings

@@ -348,14 +348,15 @@ class BenchServer:
             status, reply = await post_json(
                 f"{self.url}/api/v2/clinical/patient-information", {},
                 headers={"X-CMED-Key": self.cmed_key})
-            if reply.get("code") == "INVALID_KEY":
+            if reply.get("code") in ("INVALID_KEY", "KEY_NOT_BOUND"):
                 say("the CMED key from last time is not in this database; "
                     "issuing a new one")
                 self.cmed_key = ""
 
         if not self.cmed_key:
             status, reply = await post_json(f"{self.url}/api/v2/admin/cmed-key", {
-                "label": "cmed-bench", "created_by": "bench"}, headers=self.admin)
+                "label": "cmed-bench", "created_by": "bench",
+                "cmed_hospital_ids": [CMED_CLINIC]}, headers=self.admin)
             if status >= 300:
                 raise RuntimeError(f"no CMED key ({status})")
             self.cmed_key = reply["cmed_key"]

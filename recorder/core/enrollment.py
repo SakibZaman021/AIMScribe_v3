@@ -8,7 +8,7 @@ and the archive tree was built from it.
 
 The flow is designed so a doctor never sees it:
 
-    install.ps1 -EnrollmentToken <one-time token from an administrator>
+    AIMScribeSetup.exe /TOKEN=<one-time token from an administrator>
         writes  %PROGRAMDATA%\\AIMScribe\\state\\enrollment.token
 
     first agent start

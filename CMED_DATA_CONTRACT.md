@@ -2,7 +2,8 @@
 
 The contract for Channel B — CMED's server to the AIMS LAB server. Every rule
 below is the one the server actually applies (`backend/src/clinical.py`,
-`backend/src/clinical_model.py`), not a restatement of the SRS.
+`backend/src/clinical_model.py`, and for the FHIR form `backend/src/fhir.py`),
+not a restatement of the SRS.
 
 Audio never reaches CMED, and nothing clinical is ever sent back.
 
@@ -12,17 +13,103 @@ Audio never reaches CMED, and nothing clinical is ever sent back.
 
 | | API 2 — patient information | API 3 — prescription |
 |---|---|---|
-| Endpoint | `POST /api/v2/clinical/patient-information` | `POST /api/v2/clinical/prescription` |
+| Endpoint | `POST /fhir/r4/$process-message`, event `patient-information` | same, event `prescription` |
 | Sent when | The patient is opened, at the same moment as the recorder trigger | The doctor builds the prescription |
-| Header | `X-CMED-Key: <the key AIMS LAB issued>` | same |
+| Header | `Authorization: Bearer <that hospital's 5-minute token>` (§1a) | same |
 | Body limit | 1 MB | 1 MB |
-| Success | `202 ACCEPTED` — stored before the reply is sent | same |
+| Success | HTTP `200`, code `ACCEPTED` in `Parameters` — stored before the reply is sent (interim JSON form: `202 ACCEPTED`) | same |
 
-Both are **server to server**. The key must never reach a browser.
+Both are **server to server**. The private key and the token must never reach a
+browser. The bodies in §2–§4 are the logical content: the FHIR message carries
+exactly them (§1a).
 
 **Neither message may delay the doctor.** Send them from an outbox and retry on
 failure; a recording is never held up by a clinical message, and a late message
 is reconciled afterwards.
+
+---
+
+## 1a. Who may send — one client per hospital, and FHIR R4
+
+CMED runs the software for many hospitals, so **each hospital has its own
+identity here**, not one key for all of them (HL7 SMART Backend Services:
+OAuth 2.0 client credentials with a signed JWT assertion, RFC 7523).
+Implemented in `backend/src/cmed_auth.py` and `backend/src/fhir.py`.
+
+1. **CMED makes a key pair per hospital** (ES384 recommended; ES256 and RS384
+   with 2048+ bits also accepted) and sends AIMS LAB only the **public** key as
+   a JWK. The private key never leaves CMED's server; ours refuses a private key.
+2. **AIMS LAB registers it** for that hospital's CMED id
+   (`POST /api/v2/admin/cmed-client`), optionally with CMED's server addresses,
+   and returns the `client_id` and `kid`. A client lives up to a year; we renew
+   it in one call (`POST /api/v2/admin/cmed-client/{id}/renew`) and are alerted
+   30 days before it expires. Revoking a key also ends every live token it
+   issued.
+3. **To send, CMED signs an assertion** — `iss` = `sub` = client id,
+   `aud` = `https://<aims-host>/api/v2/oauth/token`, a fresh `jti` (8–256
+   characters, accepted once), `exp` at most 5 minutes ahead, header `kid` — and
+   posts it to `POST /api/v2/oauth/token` with
+   `grant_type=client_credentials`,
+   `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+   and `scope=system/Bundle.c system/Encounter.rs` (SMART v2; the earlier
+   `system/clinical.write`, `system/Encounter.read` and SMART v1 spellings are
+   still accepted). **CMED's server clock must be on NTP**: we allow ±60 s, and
+   a clock outside that gets `400 invalid_client` "clock skew", never a lockout.
+4. **It receives a 5-minute access token** for that hospital only
+   (`"hospital_ids": [...]` in the reply). Reuse it until ~30 s before expiry.
+5. **Every call carries `Authorization: Bearer <token>`.** A message whose
+   `hospital_id` the token does not speak for is refused with
+   `403 HOSPITAL_NOT_ALLOWED` and raises an alert here.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v2/oauth/token` | the token (form-encoded, signed assertion) |
+| `POST /fhir/r4/$process-message` | API 2 and API 3 as a FHIR message Bundle, `application/fhir+json` |
+| `GET /fhir/r4/Encounter?patient.identifier=<id>&_count=50` | the visits held (§3), as a searchset Bundle |
+| `GET /fhir/r4/Encounter/<id>` | one visit, only if it is at a hospital the token speaks for |
+| `GET /fhir/r4/metadata`, `GET /fhir/r4/.well-known/smart-configuration` | CapabilityStatement and discovery; no token needed |
+| `GET /fhir/r4/MessageDefinition/aimscribe-patient-information` (and `aimscribe-prescription`) | the two message definitions; no token needed |
+
+**The message.** A Bundle of `"type": "message"` whose first entry is a
+MessageHeader with `eventCoding.code` `patient-information` (API 2) or
+`prescription` (API 3), and `focus` → this visit's Encounter. The five fields:
+`Encounter.subject` → Patient.identifier (patient_id),
+`Encounter.participant.individual` → Practitioner.identifier (doctor_id),
+`Encounter.serviceProvider` → Organization.identifier (hospital_id),
+`Encounter.period.start` (start_time, with offset; `date` is its clinic-local
+date). Any spelling of the same moment matches — `04:14:32.000Z` and
+`10:14:32+06:00` are one visit; we store clinic time, whole seconds, `+06:00`.
+Identifier systems: we **propose** `urn:aimscribe:cmed:patient`,
+`urn:aimscribe:cmed:practitioner`, `urn:aimscribe:cmed:hospital`, and would
+rather register CMED's own per hospital. A resource may carry several
+identifiers; we take, in order, the one with that hospital's registered system,
+the one with the proposed system, the one marked `use: official`, or the only
+one. Several with none of these is refused, naming the element.
+Demographics come from Patient; paramedic values from LOINC Observations
+(29463-7 weight, 8302-2 height, 85354-9 with 8480-6/8462-4 blood pressure,
+8867-4 pulse, 8310-5 temperature, 59408-5 SpO2, 30525-0 age); a second
+Encounter is `previous_visit`; MedicationRequest → `items`, Condition →
+`diagnoses`, ServiceRequest → `investigations`, CarePlan → `advice`
+(description), `follow_up` (period.start), `notes` (note). The server turns the
+Bundle into **exactly the body described in §2–§4 below** and applies the same
+rules. The full mapping, complete example messages and replies are in
+CMED_1_SOFTWARE_INTEGRATION.pdf, Part H; working clients are
+`tools/cmed_fhir_client.py` (Python) and `cmed-web/src/lib/cmed-fhir.ts`
+(TypeScript).
+
+**The reply** is a FHIR response message: MessageHeader (`response.code` `ok`
+or `fatal-error`), an OperationOutcome, and a Parameters resource carrying
+`code`, `record_id`, `version`, `previous_visit` and `received_at` — the same
+facts as the JSON replies in §6. A message that cannot be read or is not
+authorised gets an OperationOutcome alone, the code in
+`issue[0].details.coding[0].code` and the element in `issue[0].expression`.
+
+**The interim static key.** `X-CMED-Key` with plain JSON to the
+`/api/v2/clinical/...` endpoints still works during the switch-over, but only
+with a key issued for named hospitals (expiring after at most 90 days); a key
+naming none gets `403 KEY_NOT_BOUND`. AIMS LAB switches static keys off
+(`AIMS_CMED_LEGACY_KEYS=off`) once CMED is on tokens. **Move to tokens and FHIR
+before the first clinic goes live.**
 
 ---
 
@@ -109,6 +196,11 @@ brought — and never file it under today's doctor.
 | `previous_visit` was `null` | — | `NOT_SENT` |
 | The body is safe but has not loaded yet | — (the sweep finishes it) | `PENDING` |
 
+**History from another hospital may fill a gap, never change that hospital's
+record.** If the earlier visit was at another CMED hospital and we already hold
+it with a different prescription, nothing is stored and the reply says
+`NOT_PERMITTED`; only that hospital's own client can correct it.
+
 The rest of API 2 — today's demographics and measurements — is stored as usual
 whatever happens to `previous_visit`, because it is today's visit we need.
 
@@ -128,9 +220,15 @@ that is this visit, or later than it, is also refused. These come back as
 #### Ask before sending: what do you already hold?
 
 ```
-GET /api/v2/clinical/patient/{patient_id}/visits?limit=50&cursor=...
-X-CMED-Key: <the same key>
+GET /fhir/r4/Encounter?patient.identifier={patient_id}&_count=50
+Authorization: Bearer <token>
 ```
+
+Returned as a FHIR searchset Bundle of Encounters (prescription version and
+fingerprint in extensions; the `next` link pages on). **Only visits at the
+hospital(s) the token speaks for are listed.** The same content, in the JSON
+form of the switch-over endpoint
+`GET /api/v2/clinical/patient/{patient_id}/visits?limit=50&cursor=...`:
 
 ```json
 { "status": 200, "code": "OK", "patient_id": "P0012345",
@@ -328,22 +426,34 @@ built from the other.
 
 | Code | Meaning | What CMED should do |
 |---|---|---|
-| `202 ACCEPTED` | Stored | Remove it from the outbox. For API 2, read `previous_visit.status` (§3) |
-| `200 ALREADY_RECEIVED` | Already held: this exact body, or (API 3) a prescription with the same fingerprint as the newest version | **Remove it from the outbox and never send it again.** Retrying was safe |
+| `ACCEPTED` (FHIR: HTTP 200; interim JSON: 202) | Stored | Remove it from the outbox. For API 2, read `previous_visit.status` (§3) |
+| `ALREADY_RECEIVED` (HTTP 200) | Already held: this exact body, or (API 3) a prescription with the same fingerprint as the newest version | **Remove it from the outbox and never send it again.** Retrying was safe |
 | `400 MALFORMED_JSON` | Not a JSON object | Fix and resend; do not retry unchanged |
 | `400 MISSING_FIELD` | A required field is missing or malformed | Fix and resend |
 | `400 INVALID_IDENTIFIER` | An id has characters outside `A-Z a-z 0-9 _ -` | Fix and resend |
-| `401 INVALID_KEY` | Key missing or wrong | Stop and tell us |
+| `400 MALFORMED_FHIR` | The Bundle cannot be read; the element is named | Fix and resend |
+| `401 INVALID_TOKEN` | Token missing, unknown, expired or revoked | Get a new token once and resend; if the token request itself is refused (`401 invalid_client`), stop and tell us |
+| `403 INSUFFICIENT_SCOPE` | The token lacks the scope | Ask for both scopes |
+| `403 HOSPITAL_NOT_ALLOWED` | The message is for a hospital this token does not speak for | Use that hospital's own client. Do not retry; it raises an alert here |
+| `401 INVALID_KEY`, `403 KEY_NOT_BOUND` | Interim static key wrong, or naming no hospital | Stop and tell us |
 | `413 TOO_LARGE` | Over 1 MB | Split or trim; a body this large is usually a mistake |
 | `422 SCHEMA_INVALID` | **Stored in quarantine**, with the fields listed | Not lost. Fix the shape and resend |
-| `429`, `5xx`, a timeout, no connection | Busy, a problem on our side, or no internet | **Keep it in the outbox** and retry with growing delay. Never drop it |
+| `429 RATE_LIMITED`, `5xx`, a timeout, no connection | Too fast (1,200 requests/min and 60 token requests/min per address, shared by every server process), a locked-out credential (10 wrong tries with the same credential in 5 minutes lock that credential — not the address — for 15 minutes), busy, or no internet. Honour `Retry-After` | **Keep it in the outbox** and retry with growing delay. Never drop it |
 
 **Send from an outbox.** Each Aalo branch keeps working on its local CMED server
 through an internet or power cut, and while it is cut off neither message can
 reach us. Write each one to a table on that server at the moment of the click,
 send in order (a visit's API 2 before its API 3), retry while we cannot be
-reached, and remove a message only on `202` or `200`. A message that arrives a
+reached, and remove a message only on code `ACCEPTED` or `ALREADY_RECEIVED`
+(HTTP 200; 202 in the interim JSON form). A message that arrives a
 day late attaches to its recording; a message never sent is the only failure.
+
+**Every reply carries a request id** (`X-Request-ID`, and `request_id` in
+the body; in FHIR replies in Parameters and `OperationOutcome.issue.diagnostics`).
+Quote it when reporting a problem. Errors outside FHIR and the token endpoint
+are RFC 9457 `application/problem+json`. Replies to the interim static key
+carry `Deprecation`, `Sunset` and `Link` headers. The machine-readable
+contract is `openapi/channel-b.json`.
 
 **Retries are safe.** The same body twice produces one row, and the reply says
 `ALREADY_RECEIVED` rather than failing. For API 2 the reply also carries
@@ -355,10 +465,13 @@ repeat of a body that stored it, the status is `ALREADY_STORED`.
 ## 7. What must not be sent
 
 - **No audio, ever**, in either direction.
-- **No consent field.** A patient's refusal is recorded on the recorder's Stop
-  button and erases the recording everywhere; CMED sends nothing about it.
+- **No consent field.** A patient's refusal is recorded on the recorder's own
+  on-screen control, signed by the PC, and erases the recording everywhere —
+  including the archive file and its cloud copy. CMED sends nothing about it,
+  and nothing CMED's page sends can erase a recording (recorder 3.5.0+).
 - **Nothing extra in the five fields.** They are matched exactly.
-- **Not from a browser.** The key is a server credential.
+- **Not from a browser.** The private key and the token are server credentials.
+- **No private key to AIMS LAB.** Send the public JWK only.
 
 ---
 
@@ -368,12 +481,15 @@ Both halves are already built:
 
 ```
 python tools/channel_b_test.py --local            # our rules, nothing running
-python tools/channel_b_test.py --server https://<host> --key <CMED key>
+python tools/channel_b_test.py --server https://<host> \
+    --client-id <client id> --kid <kid> --key-file <hospital>.private.pem \
+    --hospital <CMED hospital id>
 ```
 
-The second runs every case that matters — a good message, the same message
-twice, a broken one, a changed prescription, a wrong key, an oversized body —
-and checks each reply against this document. CMED's test page at
+The second runs every case that matters with a real token and FHIR — a token,
+a replayed assertion, a good message, the same message twice, a broken one, a
+changed prescription, a nameless medicine, another hospital's message, no
+token, an oversized body — and checks each reply against this document. CMED's test page at
 `/protocol-test` shows every message and reply side by side.
 
 Please run it against a test server and send us the output before the first

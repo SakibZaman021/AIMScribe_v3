@@ -113,6 +113,7 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
             "confirmation": await _confirmation(conn, start, end, clinic),
             "integrity": await _integrity(conn, start, end, clinic),
             "recorders": await _recorders(conn, clinic),
+            "review": await _review(conn, clinic),
             "reconciliation": await _reconciliation(conn, start, end, clinic),
             "copies": await _copies(conn),
         }
@@ -239,7 +240,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
     """
     rows = await conn.fetch("""
         SELECT device_id, hospital_id, machine_name, app_version,
-               last_seen_at, spool_bytes, pending_segments, revoked_at
+               last_seen_at, spool_bytes, pending_segments, revoked_at,
+               held_sessions, held_count, disk_encrypted, clock_offset_seconds
           FROM devices
          WHERE ($1::text IS NULL OR hospital_id = $1)
          ORDER BY hospital_id, machine_name
@@ -249,7 +251,15 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     rooms, silent, holding = [], 0, 0
+    held_all: List[Dict[str, Any]] = []
     for row in rows:
+        held = row["held_sessions"]
+        if isinstance(held, str):
+            held = json.loads(held)
+        held = held or []
+        held_all += [{**h, "machine_name": row["machine_name"],
+                      "hospital_id": row["hospital_id"]} for h in held]
+        offset = row["clock_offset_seconds"]
         seen = row["last_seen_at"]
         is_silent = (row["revoked_at"] is None and
                      (seen is None or now - seen > SILENT_AFTER))
@@ -267,13 +277,77 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             "revoked": row["revoked_at"] is not None,
             "silent": is_silent,
             "offline_periods": offline.get(row["device_id"], []),
+            # U3: what this PC is holding because the server said no, and why.
+            "held_count": row["held_count"] or 0,
+            "held": held,
+            # X1: BitLocker on the drive holding its audio (None: not reported).
+            "disk_encrypted": row["disk_encrypted"],
+            # U1: server time minus the PC's time.
+            "clock_offset_seconds": round(float(offset), 1) if offset is not None else None,
+            # V2: below the build every PC should run.
+            "outdated": api_v2.recorder_outdated(row["app_version"]),
         })
         if is_silent:
             silent += 1
         if pending:
             holding += 1
     return {"rooms": rooms, "silent": silent, "holding_audio": holding,
-            "enrolled": len([r for r in rows if r["revoked_at"] is None])}
+            "enrolled": len([r for r in rows if r["revoked_at"] is None]),
+            "held": held_all,
+            "minimum_version": api_v2.min_recorder_version(),
+            "outdated": sum(1 for r in rooms if r["outdated"] and not r["revoked"]),
+            "unencrypted": sum(1 for r in rooms
+                               if r["disk_encrypted"] is False and not r["revoked"])}
+
+
+REVIEW_ALERTS = ("labelling_review", "relabelled_after_archive")
+
+
+async def _review(conn, clinic: Optional[str]) -> Dict[str, Any]:
+    """
+    S10: recordings a person should look at - labels the rules could not
+    settle, and labels that changed after the files were written. Each with
+    its parts, the rule behind each, and the file names to open. Unresolved
+    alerts only, newest first.
+    """
+    rows = await conn.fetch("""
+        SELECT a.id, a.alert_type, a.raised_at, a.session_id, a.detail,
+               s.hospital_id, s.doctor_id, s.file_stem
+          FROM integrity_alerts a
+          LEFT JOIN sessions s ON s.session_id = a.session_id
+         WHERE a.alert_type = ANY($1::text[]) AND a.resolved_at IS NULL
+           AND ($2::text IS NULL OR s.hospital_id = $2)
+         ORDER BY a.raised_at DESC
+         LIMIT 100
+    """, list(REVIEW_ALERTS), clinic)
+    sessions = list({r["session_id"] for r in rows if r["session_id"]})
+    parts: Dict[str, List[Dict[str, Any]]] = {}
+    if sessions:
+        for p in await conn.fetch("""
+            SELECT session_id, part_no, start_seconds, end_seconds, patient_id, rule,
+                   needs_review, file_stem
+              FROM consultation_parts WHERE session_id = ANY($1::text[])
+             ORDER BY session_id, part_no
+        """, sessions):
+            parts.setdefault(p["session_id"], []).append({
+                "part_no": p["part_no"],
+                "from_seconds": round(float(p["start_seconds"]), 1),
+                "to_seconds": round(float(p["end_seconds"]), 1)
+                              if p["end_seconds"] is not None else None,
+                "patient_id": p["patient_id"], "rule": p["rule"],
+                "needs_review": p["needs_review"], "file_stem": p["file_stem"]})
+    items = []
+    for r in rows:
+        detail = r["detail"]
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        items.append({
+            "alert_id": r["id"], "alert_type": r["alert_type"],
+            "raised_at": r["raised_at"].isoformat() if r["raised_at"] else None,
+            "session_id": r["session_id"], "hospital_id": r["hospital_id"],
+            "doctor_id": r["doctor_id"], "file_stem": r["file_stem"],
+            "parts": parts.get(r["session_id"], []), "detail": detail or {}})
+    return {"items": items, "count": len(items)}
 
 
 # Lines a minute apart belong to one outage; a longer gap starts the next.
@@ -470,8 +544,26 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
              ORDER BY s.opened_at DESC NULLS LAST
              LIMIT ${len(args)}
         """, *args)
+        # The patient files each recording became, and the rule behind each, so
+        # a wrong pick or a follow-up cut can be checked from this table.
+        parts: Dict[str, List[Dict[str, Any]]] = {}
+        ids = [r["session_id"] for r in rows]
+        if ids:
+            for p in await conn.fetch("""
+                SELECT session_id, part_no, patient_id, file_stem, rule, needs_review,
+                       start_seconds, end_seconds
+                  FROM consultation_parts WHERE session_id = ANY($1::text[])
+                 ORDER BY session_id, part_no
+            """, ids):
+                parts.setdefault(p["session_id"], []).append({
+                    "part_no": p["part_no"], "patient_id": p["patient_id"],
+                    "file_stem": p["file_stem"], "rule": p["rule"],
+                    "needs_review": p["needs_review"],
+                    "start_seconds": p["start_seconds"], "end_seconds": p["end_seconds"]})
 
-    return {"count": len(rows), "recordings": [_recording_row(r) for r in rows]}
+    return {"count": len(rows),
+            "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], [])}
+                           for r in rows]}
 
 
 def _recording_row(row) -> Dict[str, Any]:

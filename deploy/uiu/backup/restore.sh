@@ -13,9 +13,19 @@
 # into aims_restore_test, count the sessions, and drop it again.
 # ================================================================
 set -eu
+# The decrypted dump is the whole database in the clear: owner-only.
+umask 077
 
 FILE="${1:?usage: restore.sh <backup file> <target database>}"
 TARGET="${2:?usage: restore.sh <backup file> <target database>}"
+
+# A database name goes into CREATE DATABASE unquoted: letters, digits and _.
+case "$TARGET" in
+    ''|[!a-z_]*|*[!a-z0-9_]*)
+        echo "Not a database name this restores into: $TARGET (a-z, 0-9, _)"
+        exit 2
+        ;;
+esac
 
 case "$TARGET" in
     aims_recordings|aims_clinical)
@@ -27,6 +37,20 @@ esac
 
 [ -f "$FILE" ] || { echo "No such backup: $FILE"; exit 1; }
 
+# The checksum written when the backup was made. A mismatch means the file
+# was damaged or changed since; nothing from it is restored.
+if [ -f "$FILE.sha256" ]; then
+    if (cd "$(dirname "$FILE")" && sha256sum -c "$(basename "$FILE").sha256" >/dev/null 2>&1); then
+        echo "Checksum of $(basename "$FILE") matches."
+    else
+        echo "REFUSED: $(basename "$FILE") does not match its checksum ($FILE.sha256)."
+        exit 1
+    fi
+else
+    echo "WARNING: no checksum beside $(basename "$FILE") (a backup made before checksums"
+    echo "         were written). The decryption and gunzip checks below still apply."
+fi
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 plain="$work/dump.sql"
@@ -35,7 +59,11 @@ case "$FILE" in
     *.enc)
         [ -n "${AIMS_BACKUP_KEY:-}" ] || { echo "AIMS_BACKUP_KEY is needed for $FILE"; exit 1; }
         openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:AIMS_BACKUP_KEY \
-            -in "$FILE" | gunzip > "$plain"
+            -in "$FILE" > "$work/dump.sql.gz" \
+            || { echo "Could not decrypt $FILE - wrong AIMS_BACKUP_KEY, or a damaged file."; exit 1; }
+        gunzip < "$work/dump.sql.gz" > "$plain" \
+            || { echo "The decrypted backup is not a whole gzip stream - damaged or truncated."; exit 1; }
+        rm -f "$work/dump.sql.gz"
         ;;
     *.gz)
         gunzip < "$FILE" > "$plain"

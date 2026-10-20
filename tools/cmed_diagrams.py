@@ -141,7 +141,7 @@ def architecture():
     cx, cy, cw, ch = 4, 128, 176, 56
     g.add(box(cx, cy, cw, ch, fill=WHITE, stroke=RULE, sw=1.1, radius=3))
     centred(g, cx, cy + ch - 18, cw, ["CMED's server"], size=8.8, font=FB)
-    centred(g, cx, cy + ch - 32, cw, ["holds the X-CMED-Key"], size=7,
+    centred(g, cx, cy + ch - 32, cw, ["one private key per hospital"], size=7,
             fill=MUTED)
 
     ax, ay, aw, ah = 300, 128, 190, 56
@@ -248,7 +248,7 @@ def sequence():
     arrow(g, C, y - 76, A - 4, y - 76, colour=TEAL, sw=1.3)
     label(g, (C + A) / 2.0, y - 72, "API 2   patient information", size=7.2,
           font=FB, fill=TEAL)
-    label(g, (C + A) / 2.0, y - 85, "202 ACCEPTED", size=6.4, font=FM, fill=GOOD)
+    label(g, (C + A) / 2.0, y - 85, "200 ACCEPTED", size=6.4, font=FM, fill=GOOD)
     y -= M1 + GAP
 
     # ---------------------------------------------------- the match
@@ -423,9 +423,9 @@ def five_fields():
     # the four messages
     mx, mw, mh = 268, 218, 40
     msgs = [("API 1", "start", "to the recorder, over loopback", TEAL),
-            ("API 2", "patient information", "to AIMS LAB, with the key", TEAL),
+            ("API 2", "patient information", "to AIMS LAB, FHIR + token", TEAL),
             ("API 3a", "prescription_built", "to the recorder, over loopback", TEAL),
-            ("API 3b", "the prescription", "to AIMS LAB, with the key", TEAL)]
+            ("API 3b", "the prescription", "to AIMS LAB, FHIR + token", TEAL)]
     tops = [H - 16, H - 70, H - 124, H - 178]
     for (a, b, c, col), t in zip(msgs, tops):
         yy = t - mh

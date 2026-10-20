@@ -115,6 +115,6 @@ async def test_the_heartbeat_reports_the_offset(monkeypatch, spool, device_key):
 
     ctl = make_controller(monkeypatch, spool, device_key,
                           Measured([AuthOutcome("granted", "", "")]))
-    ctl.cfg.app_version, ctl.cfg.protocol_version = "3.3.0", 2
+    ctl.cfg.app_version, ctl.cfg.protocol_version = "3.4.0", 2
     assert ctl.heartbeat_payload()["clock_offset_seconds"] == -7.3
     await ctl.close()

@@ -34,7 +34,7 @@ Dholpur machine.
       → a single-use, short-lived token for one hospital_id
 
 2. The token is installed with the agent
-      install.ps1 -EnrollmentToken <token>
+      AIMScribeSetup.exe /TOKEN=<token>   (signed installer; silent: add /VERYSILENT)
       → written to %PROGRAMDATA%\AIMScribe\state\enrollment.token
 
 3. The agent enrols itself on first start
@@ -71,7 +71,9 @@ ws://127.0.0.1:5050/ws
 
 ### How the page is authorised
 
-Not with a key. Three checks, all of them things a browser cannot forge:
+Not with a key. Three checks, all of them things a browser cannot forge (a
+program already running on the PC can — which is why nothing on the socket
+can erase a recording or decide anything; the server issues every permission):
 
 | Check | Rule |
 |---|---|
@@ -163,17 +165,25 @@ they belong to the on-screen control the doctor uses.
 
 ## 4. Channel B — CMED's server to the AIMS LAB server
 
-Two POSTs, server to server, authenticated with `X-CMED-Key`:
+Server to server, **one client per hospital**, FHIR R4. Each hospital's
+private key signs a 5-minute assertion that buys a 5-minute token for that
+hospital only (HL7 SMART Backend Services):
 
 ```
-POST https://<aims-lab-host>/api/v2/clinical/patient-information   (API 2)
-POST https://<aims-lab-host>/api/v2/clinical/prescription          (API 3)
+POST https://<aims-lab-host>/api/v2/oauth/token              signed assertion -> token
+POST https://<aims-lab-host>/fhir/r4/$process-message        API 2 and API 3, Bearer token
+GET  https://<aims-lab-host>/fhir/r4/Encounter?patient.identifier=<id>   visits held
 ```
 
-Every field, every accepted range and every reply code is in
-[`CMED_DATA_CONTRACT.md`](CMED_DATA_CONTRACT.md). Read that before writing code.
+Every field, every accepted range, the FHIR mapping and every reply code is in
+[`CMED_DATA_CONTRACT.md`](CMED_DATA_CONTRACT.md) (§1a for the token and FHIR)
+and in CMED_1_SOFTWARE_INTEGRATION.pdf, Part H. Read those before writing code.
+Working clients: `tools/cmed_fhir_client.py` and `cmed-web/src/lib/cmed-fhir.ts`.
 
-**The key is a server credential and must never reach a browser.**
+**The private key and the token are server credentials and must never reach a
+browser.** A token for one hospital is refused for another
+(`403 HOSPITAL_NOT_ALLOWED`). The interim `X-CMED-Key` works only if issued for
+named hospitals, and is switched off once CMED is on tokens.
 
 **Neither message may delay the doctor.** Send them from an outbox and retry;
 retries are safe and produce one row, never two.
@@ -195,7 +205,7 @@ late or missing. The reply rules are in
 | Item | Where it comes from |
 |---|---|
 | The AIMS LAB server URL | e.g. `https://aimscribe.uiu.ac.bd` |
-| The **CMED Channel B key** | `POST /api/v2/admin/cmed-key` — shown **once** |
+| For each hospital, its **client id and kid** | `POST /api/v2/admin/cmed-client`, after CMED sends that hospital's public key. Nothing secret |
 | The recorder's port and path | `ws://127.0.0.1:5050/ws` — the same on every PC |
 | The **local API key** for the HTTP routes | Generated per install, in that PC's `.env` |
 | The clinic identifiers | `AALO_KARAIL`, `AALO_MIRPUR`, `AALO_DHOLPUR`, `AALO_SHYAMPUR`, `AALO_NARAYANGANJ`, `AALO_ERSHADNAGAR`, `AMADER_SUSASTHO` |
@@ -207,7 +217,8 @@ late or missing. The reply rules are in
 |---|---|
 | **The exact origin(s) of its page** | Goes into `AIMS_ALLOWED_ORIGINS`. Without it the socket refuses to open |
 | **Its own clinic identifiers** | Mapped to ours as `cmed_hospital_id`. An unmapped clinic is **not** refused — worse, it is silently accepted: the clinical record is stored and CMED gets `202 ACCEPTED`, but it is **never attached to its recording**. The recording is kept; it simply has no clinical record |
-| A server IP or range, if we are to allow-list it | Optional, for Channel B |
+| **One public key (JWK) per hospital** | Without it that hospital cannot get a token. `python tools/cmed_fhir_client.py keygen` makes one; send the `.public.json` only |
+| A server IP or range, if we are to allow-list it | Optional; tokens are then issued and accepted only from there |
 
 ---
 
@@ -235,16 +246,18 @@ internally and 443 at the edge.
 2. **CMED** adds its origins to our allow-list and confirms the socket opens:
    the recorder sends a status event the moment it accepts.
 3. **CMED** implements `start` and `prescription_built`, acting on reply codes.
-4. **CMED** implements the two Channel B posts and runs the test harness we
-   already ship:
+4. **CMED** sends one public key per hospital, implements the token and the
+   two FHIR messages, and runs the test harness we already ship:
 
    ```
    python tools/channel_b_test.py --local
-   python tools/channel_b_test.py --server https://<host> --key <CMED key>
+   python tools/channel_b_test.py --server https://<host> --client-id <id> \
+       --kid <kid> --key-file <hospital>.private.pem --hospital <CMED id>
    ```
 
-   It exercises a good message, the same message twice, a broken one, a changed
-   prescription, a wrong key and an oversized body, and checks every reply
+   It gets a token, replays an assertion, sends a good message, the same
+   message twice, a broken one, a changed prescription, another hospital's
+   message, one with no token and an oversized body, and checks every reply
    against the contract. CMED's own test page at `/protocol-test` shows each
    message and reply side by side.
 5. **Both** record one consultation end to end before a patient is in the room.

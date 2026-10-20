@@ -446,7 +446,8 @@ class Server:
         # The key is returned once and stored only as a hash (SRS-CHB-02), so
         # the run keeps the one it is given.
         status, reply = await post_json(f"{self.url}/api/v2/admin/cmed-key", {
-            "label": "cmed-sim", "created_by": "simulate"}, headers=self.admin)
+            "label": "cmed-sim", "created_by": "simulate",
+            "cmed_hospital_ids": [CMED_CLINIC]}, headers=self.admin)
         if status >= 300 or not reply.get("cmed_key"):
             raise RuntimeError(f"no CMED key was issued ({status}) {reply}")
         self.cmed_key = reply["cmed_key"]

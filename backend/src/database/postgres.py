@@ -82,9 +82,21 @@ class PostgreSQLDatabase:
             logger.info("Connection pool closed")
     
     def _init_database(self):
-        """Initialize database tables."""
+        """
+        Initialize database tables - only where this login may create them.
+
+        Under the least-privilege login (migration 018) the tables come from
+        the migrations, run by the owner; asking for CREATE TABLE there fails
+        even when the table exists, because the schema privilege is checked
+        first. The same guard as database/postgres_async.py.
+        """
         with self.get_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT has_schema_privilege(current_user, 'public', 'CREATE')")
+                if not cur.fetchone()[0]:
+                    logger.info("Connected without CREATE rights; legacy tables are "
+                                "left to the migrations")
+                    return
                 
                 # Sessions table - session_id can be client-provided string or UUID
                 cur.execute('''

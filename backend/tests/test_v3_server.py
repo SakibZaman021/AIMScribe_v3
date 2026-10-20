@@ -213,6 +213,15 @@ class FakeRepo:
         key = self.keys.get(digest)
         return key["label"] if key and not key["revoked"] else None
 
+    async def cmed_key_lookup(self, digest):
+        key = self.keys.get(digest)
+        if not key or key["revoked"]:
+            return None
+        return {"label": key["label"], "cmed_hospital_ids": key.get("hospitals")}
+
+    async def cmed_token_lookup(self, digest):
+        return self.tokens.get(digest)
+
     async def record_notice(self, visit, *, hospital_id, clinical_record_id):
         nid = len(self.notices) + 1
         self.notices.append(dict(
@@ -282,13 +291,76 @@ class FakeRepo:
         self.sessions[session_id]["segments_deleted_at"] = NOW()
 
     async def mark_archived(self, session_id, *, relpath, sha256, byte_length):
-        self.sessions[session_id].update(
-            archive_relpath=relpath, archive_sha256=sha256, archive_bytes=byte_length,
-            archived_at=NOW(), status="archived")
+        s = self.sessions[session_id]
+        if s.get("confirmation") in ("refused", "expired") or s.get("quarantine_reason"):
+            return False
+        s.update(archive_relpath=relpath, archive_sha256=sha256, archive_bytes=byte_length,
+                 archived_at=NOW(), status="archived")
+        return True
 
-    async def mark_segments_archived(self, session_id):
+    async def mark_segments_archived(self, session_id, seq_nos=None):
         for segment in self.segments.get(session_id, []):
-            segment["state"] = "archived"
+            if seq_nos is None or segment["seq_no"] in seq_nos:
+                segment["state"] = "archived"
+
+    async def mark_late_alerted(self, session_id):
+        s = self.sessions[session_id]
+        if s.get("late_alerted_at"):
+            return False
+        s["late_alerted_at"] = NOW()
+        return True
+
+    async def quarantine_session(self, session_id, reason):
+        self.sessions[session_id].update(status="quarantined", quarantine_reason=reason)
+
+    async def chain_tip(self, session_id):
+        chain = self.chains.get(session_id) or []
+        return (chain[-1].entry_no, chain[-1].entry_hash) if chain else None
+
+    async def genesis_in_use(self, entry_hash, session_id):
+        return any(c and c[0].entry_hash == entry_hash
+                   for sid, c in self.chains.items() if sid != session_id)
+
+    async def commit_segment(self, *, session_id, seq_no, entry, object_key, byte_length,
+                             duration_seconds, sha256, rms_mean, captured_start_at,
+                             captured_end_at, is_final, clip_name=None):
+        segments = self.segments.setdefault(session_id, [])
+        for seg in segments:
+            if seg["seq_no"] == seq_no:
+                return "duplicate" if bytes(seg["sha256"]) == sha256 else "conflict"
+        chain = self.chains.setdefault(session_id, [])
+        if any(e.entry_no == entry.entry_no for e in chain):
+            return "conflict"
+        chain.append(entry)
+        segments.append({
+            "seq_no": seq_no, "entry_no": entry.entry_no, "object_key": object_key,
+            "bytes": byte_length, "duration_seconds": duration_seconds, "sha256": sha256,
+            "state": "committed", "clip_name": clip_name, "object_deleted_at": None,
+            "captured_start_at": captured_start_at, "captured_end_at": captured_end_at,
+            "is_final": is_final})
+        return "stored"
+
+    async def close_session(self, session_id, *, closed_at, segment_count, chain_head,
+                            **kw):
+        s = self.sessions[session_id]
+        if s.get("status") in ("quarantined", "archived", "refused", "expired") \
+                or s.get("quarantine_reason"):
+            return
+        s.update(closed_at=closed_at, segment_count=segment_count, status="closed")
+
+    async def refusals_since(self, device_id, since):
+        return sum(1 for r in self.refusals.values()
+                   if str(r.get("device_id")) == str(device_id))
+
+    async def use_device_nonce(self, device_id, nonce):
+        seen = self.__dict__.setdefault("nonces", set())
+        if (str(device_id), nonce) in seen:
+            return False
+        seen.add((str(device_id), nonce))
+        return True
+
+    async def mark_device_signs(self, device_id):
+        self.__dict__.setdefault("signing", set()).add(str(device_id))
 
     async def session_for_visit(self, visit):
         for grant in self.auths.values():
@@ -366,6 +438,48 @@ class FakeRepo:
     async def pending_recut(self, limit=5):
         return [dict(s) for s in self.sessions.values()
                 if s.get("parts_stale") and s.get("archived_at")][:limit]
+
+    # devices
+    async def touch_device(self, device_id, **kw):
+        self.devices = getattr(self, "devices", {})
+        state = self.devices.setdefault(str(device_id), {})
+        state.update({k: v for k, v in kw.items() if v is not None})
+
+    # a resumed recording continues the one before it (S4)
+    async def set_continuation(self, session_id, continues_session_id):
+        self.sessions[session_id].setdefault("continues_session_id", continues_session_id)
+        if self.sessions[session_id]["continues_session_id"] is None:
+            self.sessions[session_id]["continues_session_id"] = continues_session_id
+
+    async def continuation_links(self, session_id):
+        me = self.sessions.get(session_id) or {}
+        before = self.sessions.get(me.get("continues_session_id") or "")
+        after = next((s for s in self.sessions.values()
+                      if s.get("continues_session_id") == session_id), None)
+        pick = lambda s: {"session_id": s["session_id"], "file_stem": s.get("file_stem")}  # noqa
+        return {"continues": pick(before) if before else None,
+                "continued_by": pick(after) if after else None}
+
+    async def continuations_of(self, session_id):
+        return [k for k, s in self.sessions.items()
+                if s.get("continues_session_id") == session_id]
+
+    async def alert_raised_since(self, alert_type, device_id, since):
+        return any(a["alert_type"] == alert_type and a.get("device_id") == device_id
+                   for a in self.alerts)
+
+    async def group_alert(self, *, alert_type, group, session_id, window, severity="warning",
+                          device_id=None, detail=None):
+        for a in self.alerts:
+            if a["alert_type"] == alert_type and a["detail"].get("group") == group:
+                a["detail"]["count"] += 1
+                a["detail"]["session_ids"].append(session_id)
+                return False
+        self.alerts.append({"alert_type": alert_type, "severity": severity,
+                            "session_id": session_id, "device_id": device_id,
+                            "detail": {**(detail or {}), "group": group, "count": 1,
+                                       "session_ids": [session_id]}})
+        return True
 
     # audit and alerts
     async def raise_alert(self, **kw):
@@ -488,7 +602,10 @@ class FakeCopyBucket:
 @pytest.fixture
 def server():
     repo = FakeRepo()
-    repo.keys[clinical.key_digest(KEY)] = {"label": "cmed-prod", "revoked": False}
+    repo.keys[clinical.key_digest(KEY)] = {"label": "cmed-prod", "revoked": False,
+                                           "hospitals": [CMED_ID, "CMED-NEW-SITE",
+                                                         "CMED-MIRPUR-01"]}
+    repo.tokens = {}
     grant_key = Ed25519PrivateKey.generate()
     receipt_key = Ed25519PrivateKey.generate()
     # What one server remembers must not leak into the next test: the clinic
@@ -832,7 +949,8 @@ async def test_refusal_of_another_devices_session_is_forbidden(server):
 async def test_missing_or_wrong_key_stores_nothing(server, key):
     """AT-68."""
     status, reply = await send("patient_information", api2(), key=key)
-    assert (status, reply["code"]) == (401, "INVALID_KEY")
+    # No credential at all is answered as a missing token, the method CMED moves to.
+    assert (status, reply["code"]) == (401, "INVALID_KEY" if key else "INVALID_TOKEN")
     assert server.clinical.records == []
 
 
@@ -959,8 +1077,14 @@ async def archived(server, *, segments=3, stem=STEM):
         file_stem=stem, closed_at=NOW(), total_duration_seconds=855.0)
     await api_v2.archive_complete(api_v2.ArchiveCompleteRequest(
         session_id=sid, archive_relpath=f"HOSP003/DR0042/2026-09-13/{stem}/{stem}.wav",
-        sha256="ab" * 32, bytes=1_500_044))
+        sha256="ab" * 32, bytes=1_500_044, segments=joined(server, sid)))
     return sid
+
+
+def joined(server, sid):
+    """The pieces the archive worker joined: every one the server holds."""
+    return [api_v2.JoinedSegment(seq_no=s["seq_no"], sha256=bytes(s["sha256"]).hex())
+            for s in server.repo.segments.get(sid, [])]
 
 
 def copy_of(server, kind, key, *, version=1, bytes_=900_000, md5="ab" * 16,
@@ -1089,7 +1213,8 @@ async def test_the_json_beside_the_audio_carries_both_halves(server):
 async def test_a_refused_consultation_leaves_nothing_for_the_json(server):
     """SRS-CNS-06: no patient, no name, nothing to write."""
     sid = await archived(server)
-    await api_v2.refuse_session(api_v2.RefuseRequest(session_id=sid), device=DEVICE)
+    # Archived, so past what an unsigned refusal may erase: a person does it.
+    await api_v2.admin_erase_session(sid, actor="tests")
     document = await api_v2.archive_clinical_document(sid)
     assert "patient" not in document
     assert document["recording"]["session_id"] == sid

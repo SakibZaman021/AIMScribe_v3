@@ -91,18 +91,28 @@ Right after `start.bat`:
 
 | Link | From another PC too? | |
 |---|---|---|
-| http://localhost:6060 | yes | the front page: what this is, and where everything else is |
-| http://localhost:6060/health | yes | one line saying the server, database, Redis and storage are up |
-| http://localhost:6060/api/v2/dashboard | yes | the day as UIU sees it - **it asks for the administrator key** printed at startup |
-| http://localhost:9001 | yes | the storage console - user `aimslocal`, password in `.env` |
-| http://localhost:3000 | yes | CMED's test site, **only** if you started with `--cmed` |
+| http://localhost:6060 | only with `--lan` | the front page: what this is, and where everything else is |
+| http://localhost:6060/health | only with `--lan` | one line saying the server, database, Redis and storage are up |
+| http://localhost:6060/api/v2/dashboard | only with `--lan` | the day as UIU sees it - **it asks for the administrator key** printed at startup |
+| http://localhost:9001 | **no** | the storage console - user `aimslocal`, password in `.env` |
+| http://localhost:3000 | only with `--lan` | CMED's test site, **only** if you started with `--cmed` |
 | http://localhost:8080 | **no** | the database viewer, **only** with `--profile db`, and **only from this machine** |
+| localhost:5433 | **no** | PostgreSQL, for psql on this machine |
 
-From another PC, swap `localhost` for this machine's name - `http://<machine>:6060`
-and so on. The database viewer is the exception: it holds the administrator's
-credentials for both databases, so it listens on this machine alone. Set
-`AIMS_DBVIEWER_BIND=0.0.0.0` in `.env` if you want it from elsewhere, knowing
-what that opens.
+**This machine only, by default.** Every port is published on 127.0.0.1. On a
+campus or clinic Wi-Fi anyone could otherwise reach the database, the storage,
+the server and CMED's test page - which holds a CMED key. For a bench where
+other PCs record against this one, start with `python bootstrap.py --lan`: the
+server (6060), the storage (9000) and CMED's page (3000) then answer the whole
+network and the upload links name this machine (`AIMS_BIND=0.0.0.0` in
+`.env`). The database, the storage console and the viewer stay on this machine
+even then. Set `AIMS_DBVIEWER_BIND=0.0.0.0` in `.env` if you want the viewer
+from elsewhere, knowing what that opens.
+
+**The server logs in as `aims_api`,** not as the owner of its tables: it reads
+and writes rows, and cannot alter a table or switch off the audit log's
+protection (`018_v3_least_privilege.sql`). `bootstrap.py` moves a database made
+before that over by itself.
 
 ### "Connection refused"
 
@@ -139,8 +149,9 @@ which puts each file where the agent looks for it. Start
 
 ### A PC in another room
 
-The agent's `.env` points at this machine's address on the network, not at
-`localhost`, so a second PC works with no further changes:
+Start with `python bootstrap.py --lan` (see above). The agent's `.env` then
+points at this machine's address on the network, not at `localhost`, so a
+second PC works with no further changes:
 
 1. Copy `out\recorder\` and the agent folder to that PC.
 2. There, run `python bootstrap.py --agent "<the agent folder>"`, or place the

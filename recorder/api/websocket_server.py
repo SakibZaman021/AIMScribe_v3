@@ -17,6 +17,12 @@ until `prescription_built` (API 3) has armed the gate.
 
 Every command gets exactly one reply carrying `request_id`, `status` and `code`
 (api/protocol.py). Pages act on `code`, never on `message`.
+
+The socket can never erase anything. Origin is a header any local program can
+write, so whatever connects is treated as no more trusted than a web page: the
+patient's refusal - the one action that deletes a consultation - exists only on
+the recorder's own on-screen control, which calls the controller directly. A
+`stop` arriving here closes the recording and keeps every second of it.
 """
 from __future__ import annotations
 
@@ -34,7 +40,7 @@ from api.protocol import ProtocolError, Trigger
 from core import crypto
 # GrantGuard lives with the other grant code now; re-exported for older imports.
 from core.crypto import GrantError, GrantGuard  # noqa: F401
-from core.session_controller import SessionError
+from core.session_controller import REFUSAL_REASON, SessionError
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,47 @@ CLOSE_POLICY = 4403
 CLOSE_INTERNAL = 4500
 
 MAX_MESSAGE_BYTES = 64 * 1024
+
+# A CMED page sends a handful of messages per patient. Far beyond that is a
+# runaway script or a local program hammering the recorder: answered "not
+# ready" until it slows down, without touching the recording.
+MESSAGES_PER_SECOND = 10.0
+MESSAGE_BURST = 30
+# One CMED tab, perhaps two, plus a test page. A flood of sockets is refused.
+MAX_CONNECTIONS = 16
+
+# What a `stop` over the socket may say. None of them deletes anything; any
+# other reason - the refusal above all - is recorded as an ordinary stop.
+SOCKET_STOP_REASONS = frozenset({"doctor_stopped", "consultation_finished",
+                                 "patient_left", "urgent_interruption",
+                                 "technical_problem", "software_update"})
+
+
+class _Bucket:
+    """Token bucket: `rate` messages a second on average, `burst` at once."""
+
+    def __init__(self, rate: float = MESSAGES_PER_SECOND, burst: int = MESSAGE_BURST):
+        self.rate, self.burst = rate, float(burst)
+        self.tokens, self.at = float(burst), time.monotonic()
+
+    def take(self) -> bool:
+        now = time.monotonic()
+        self.tokens = min(self.burst, self.tokens + (now - self.at) * self.rate)
+        self.at = now
+        if self.tokens < 1.0:
+            return False
+        self.tokens -= 1.0
+        return True
+
+
+def _same_windows_session(conn) -> bool:
+    """A page in another signed-in user's session must not drive this recorder."""
+    from core.peer_session import same_session
+    client = getattr(conn, "client", None)
+    server = (getattr(conn, "scope", None) or {}).get("server") or (None, None)
+    return same_session(getattr(client, "host", "") or "", getattr(client, "port", 0) or 0,
+                        server[1] or 0)
+
 
 class WebSocketManager:
     """Tracks connected CMED pages and answers their commands."""
@@ -55,6 +102,7 @@ class WebSocketManager:
         self._lock = asyncio.Lock()
         self._uploader = None
         self._hospital_id = ""
+        self._buckets: Dict[int, _Bucket] = {}
 
     # ---- wiring ----
 
@@ -94,6 +142,16 @@ class WebSocketManager:
             await websocket.close(code=CLOSE_POLICY, reason="loopback only")
             return False
 
+        if not _same_windows_session(websocket):
+            logger.warning("Rejected WebSocket from another Windows user's session")
+            await websocket.close(code=CLOSE_POLICY, reason="other windows session")
+            return False
+
+        if len(self._connections) >= MAX_CONNECTIONS:
+            logger.warning("Rejected WebSocket: already %s connections", len(self._connections))
+            await websocket.close(code=CLOSE_POLICY, reason="too many connections")
+            return False
+
         await websocket.accept()
         async with self._lock:
             self._connections.add(websocket)
@@ -105,11 +163,16 @@ class WebSocketManager:
     async def disconnect(self, websocket: WebSocket) -> None:
         async with self._lock:
             self._connections.discard(websocket)
+            self._buckets.pop(id(websocket), None)
         logger.info("CMED disconnected (%s client(s) remain)", len(self._connections))
 
     # ---- dispatch ----
 
     async def handle_message(self, websocket: WebSocket, raw: str) -> Dict[str, Any]:
+        bucket = self._buckets.setdefault(id(websocket), _Bucket())
+        if not bucket.take():
+            return self._stamp(protocol.reply("", "AGENT_NOT_READY",
+                                              message="Too many messages. Slow down."))
         if len(raw) > MAX_MESSAGE_BYTES:
             return self._stamp(protocol.reply("", "MALFORMED_MESSAGE",
                                               message="The message is too large."))
@@ -234,9 +297,19 @@ class WebSocketManager:
     # ---- commands CMED does not use ----
 
     async def _stop(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        # The on-screen control sends the reason; "patient_did_not_consent"
-        # erases the consultation (SRS 3.2 §7.8a).
-        reason = str(message.get("reason") or "doctor_stopped")[:64]
+        """
+        Ends the recording and keeps it. The patient's refusal, which erases a
+        consultation (SRS 3.2 §7.8a), is taken only from the on-screen control:
+        a local program can forge this socket's Origin, and used to be able to
+        delete a consultation by sending that one reason.
+        """
+        asked = str(message.get("reason") or "doctor_stopped")[:64]
+        reason = asked if asked in SOCKET_STOP_REASONS else "doctor_stopped"
+        if asked == REFUSAL_REASON:
+            logger.warning("A refusal sent over the socket was recorded as an ordinary "
+                           "stop; only the on-screen control can erase a consultation")
+        elif reason != asked:
+            logger.info("Stop reason %r over the socket recorded as %r", asked, reason)
         return "OK", await self._controller.stop_session(reason=reason)
 
     async def _pause(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -314,4 +387,5 @@ class WebSocketManager:
         return payload
 
 
-__all__ = ["WebSocketManager", "GrantGuard", "CLOSE_POLICY"]
+__all__ = ["WebSocketManager", "GrantGuard", "CLOSE_POLICY", "SOCKET_STOP_REASONS",
+           "MAX_CONNECTIONS"]

@@ -39,7 +39,7 @@ services:
     container_name: aimscribe-minio
     environment:
       MINIO_ROOT_USER: aimscribe
-      MINIO_ROOT_PASSWORD: aimscribe123
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
     ports:
       - "9000:9000" # API
       - "9001:9001" # Console
@@ -64,7 +64,7 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set aimscribe http://minio:9000 aimscribe aimscribe123;
+      mc alias set aimscribe http://minio:9000 aimscribe ${MINIO_SECRET_KEY};
       mc mb --ignore-existing aimscribe/aimscribe-audio;
       mc anonymous set download aimscribe/aimscribe-audio;
       echo 'Bucket created successfully';
@@ -118,7 +118,7 @@ services:
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
       MINIO_SECURE: ${MINIO_SECURE:-false}
       # Cloudflare R2 requires "auto". Part of the SigV4 signature, so a
@@ -184,7 +184,7 @@ services:
       # MinIO (container hostname)
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
       MINIO_SECURE: ${MINIO_SECURE:-false}
       MINIO_REGION: ${MINIO_REGION:-us-east-1}
