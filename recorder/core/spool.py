@@ -20,10 +20,12 @@ session after a restart naturally idempotent.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import secrets
+import shutil
 import struct
 import time
 from dataclasses import dataclass, field
@@ -187,11 +189,14 @@ class SessionSpool:
         self.authorisation = "granted"        # pending | granted
         self.hold_code = ""                   # why the server last said no
         self.held_at: Optional[float] = None  # in memory: a restart asks at once
+        self.held_since: Optional[float] = None  # when the server first said no
         self.grant_jti: Optional[str] = None
         self.confirmation = ""                # as the grant or the server last said
         # The patient did not consent (SRS §7.8a): nothing is uploaded, local
         # pieces are deleted, and the server is told until it acknowledges.
         self.refused = False
+        # When the patient refused (epoch seconds), named in the signed refusal.
+        self.refused_at: Optional[float] = None
         self.refusal_reported = False
         # Set by the controller while this is the consultation being recorded.
         # In memory only: after a restart nothing is live.
@@ -217,6 +222,7 @@ class SessionSpool:
         session_id: Optional[str] = None,
         opened_at: Optional[datetime] = None,
         trigger: Optional[Dict[str, str]] = None,
+        continues_session_id: Optional[str] = None,
     ) -> "SessionSpool":
         session_id = session_id or new_ulid()
         directory = root / session_id
@@ -237,6 +243,9 @@ class SessionSpool:
             # a restart or an outage (SRS-UPL-06).
             spool.meta["trigger"] = dict(trigger)
             spool.authorisation = "pending"
+        if continues_session_id:
+            # The same consultation, carried on after the recorder restarted.
+            spool.meta["continues_session_id"] = continues_session_id
 
         spool._append_journal({
             "rec": "session",
@@ -285,6 +294,14 @@ class SessionSpool:
                     logger.warning("Ignoring truncated journal line %s in %s", line_no, directory)
                     continue
 
+                if "sealed" in record:
+                    try:
+                        record = _unseal_record(spool_key, directory.name, record)
+                    except ValueError:
+                        logger.warning("Journal line %s in %s failed authentication; skipped",
+                                       line_no, directory)
+                        continue
+
                 kind = record.get("rec")
 
                 if kind == "session":
@@ -300,6 +317,8 @@ class SessionSpool:
                     if record.get("trigger"):
                         spool.meta["trigger"] = record["trigger"]
                         spool.authorisation = "pending"
+                    if record.get("continues_session_id"):
+                        spool.meta["continues_session_id"] = record["continues_session_id"]
                 elif spool is None:
                     continue
                 elif kind == "chain":
@@ -352,12 +371,16 @@ class SessionSpool:
                     # "refused" is what earlier versions wrote just before
                     # deleting; anything still on disk under it is held now.
                     spool.hold_code = record.get("code", "")
+                    if spool.held_since is None and record.get("at"):
+                        spool.held_since = float(record["at"])
                 elif kind == "reassigned":
                     spool.meta["reassigned_to"] = record.get("to") or {}
                 elif kind == "confirmation":
                     spool.confirmation = record.get("state", "")
                 elif kind == "refused":
                     spool.refused = True
+                    if isinstance(record.get("at"), (int, float)):
+                        spool.refused_at = float(record["at"])
                 elif kind == "refusal_reported":
                     spool.refusal_reported = True
 
@@ -382,12 +405,16 @@ class SessionSpool:
                 prev_hash=self.head_hash,
                 signer=self._device_key,
             )
-            self.chain.append(entry)
+            # Journal first: if the disk is full the write fails, and nothing -
+            # not even the in-memory chain - has moved, so the same entry can be
+            # appended again once there is room.
             self._append_journal({"rec": "chain", "entry": entry.to_wire()})
+            self.chain.append(entry)
             return entry
 
     def verify_chain(self) -> crypto.ChainVerdict:
-        return crypto.verify_chain(self.chain, device_public_key=self._device_key.public_key())
+        return crypto.verify_chain(self.chain_list(),
+                                   device_public_key=self._device_key.public_key())
 
     # ---- segments ----
 
@@ -419,23 +446,58 @@ class SessionSpool:
             duration = len(pcm) / max(1, self.audio["sample_rate"]
                                       * self.audio["channels"] * self.audio["sample_width"])
 
-            entry = self.append_chain_entry("segment", crypto.segment_payload(
-                seq_no=seq_no,
-                audio_sha256=audio_hash,
-                byte_length=len(audio),
-                duration_seconds=duration,
-                captured_start_at=captured_start_at,
-                captured_end_at=captured_end_at,
-                rms_mean=rms_mean,
-                is_final=is_final,
-            ))
+            entry = crypto.build_entry(
+                entry_no=self.next_entry_no,
+                entry_type="segment",
+                payload=crypto.segment_payload(
+                    seq_no=seq_no,
+                    audio_sha256=audio_hash,
+                    byte_length=len(audio),
+                    duration_seconds=duration,
+                    captured_start_at=captured_start_at,
+                    captured_end_at=captured_end_at,
+                    rms_mean=rms_mean,
+                    is_final=is_final,
+                ),
+                prev_hash=self.head_hash,
+                signer=self._device_key,
+            )
 
+            # All or nothing, so a full disk can be retried without breaking the
+            # chain: the clip file first, then its chain entry and its journal
+            # line in one write, and only then the in-memory state. A failure at
+            # any step leaves nothing behind that names a clip which is not there.
             filename = f"seg-{seq_no:05d}{SEGMENT_SUFFIX}"
             blob = crypto.encrypt_spool_blob(
                 self._spool_key, audio,
                 associated=f"{self.session_id}:{seq_no}".encode("ascii"),
             )
-            _atomic_write(self.directory / filename, blob)
+            target = self.directory / filename
+            _atomic_write(target, blob)
+            try:
+                self._append_journal_records([
+                    {"rec": "chain", "entry": entry.to_wire()},
+                    {
+                        "rec": "segment",
+                        "seq_no": seq_no,
+                        "file": filename,
+                        "sha256": audio_hash.hex(),
+                        "bytes": len(audio),
+                        "duration_seconds": round(duration, 3),
+                        "captured_start_at": crypto.iso_utc(captured_start_at),
+                        "captured_end_at": crypto.iso_utc(captured_end_at),
+                        "rms_mean": round(rms_mean, 2),
+                        "is_final": is_final,
+                        "entry_no": entry.entry_no,
+                    },
+                ])
+            except Exception:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                raise
+            self.chain.append(entry)
 
             segment = SpoolSegment(
                 seq_no=seq_no,
@@ -450,20 +512,6 @@ class SessionSpool:
                 entry_no=entry.entry_no,
             )
             self.segments[seq_no] = segment
-
-            self._append_journal({
-                "rec": "segment",
-                "seq_no": seq_no,
-                "file": filename,
-                "sha256": audio_hash.hex(),
-                "bytes": len(audio),
-                "duration_seconds": round(duration, 3),
-                "captured_start_at": crypto.iso_utc(captured_start_at),
-                "captured_end_at": crypto.iso_utc(captured_end_at),
-                "rms_mean": round(rms_mean, 2),
-                "is_final": is_final,
-                "entry_no": entry.entry_no,
-            })
 
             logger.info("Sealed segment %s of session %s (%.1f s, %s bytes)",
                         seq_no, self.session_id, duration, len(audio))
@@ -574,14 +622,25 @@ class SessionSpool:
                 f"segment {seq_no} of {self.session_id} does not match its recorded hash")
         return audio
 
+    def segment_list(self) -> List[SpoolSegment]:
+        """
+        Every segment, in order, as one consistent snapshot. The segmenter
+        thread adds segments while the upload loop reads them; iterating the
+        live dict from the loop could fail mid-way or see half an update.
+        """
+        with self._lock:
+            return sorted(self.segments.values(), key=lambda x: x.seq_no)
+
+    def chain_list(self) -> List[ChainEntry]:
+        with self._lock:
+            return list(self.chain)
+
     def quarantined_segments(self) -> List[SpoolSegment]:
         """Segments the backend or a local hash check rejected."""
-        return [s for s in sorted(self.segments.values(), key=lambda x: x.seq_no)
-                if s.state == QUARANTINED]
+        return [s for s in self.segment_list() if s.state == QUARANTINED]
 
     def pending_segments(self) -> List[SpoolSegment]:
-        return [s for s in sorted(self.segments.values(), key=lambda x: x.seq_no)
-                if s.state == PENDING]
+        return [s for s in self.segment_list() if s.state == PENDING]
 
     def set_state(self, seq_no: int, state: str, *, object_key: Optional[str] = None) -> None:
         with self._lock:
@@ -652,6 +711,8 @@ class SessionSpool:
             first = self.hold_code != code
             self.hold_code = code
             self.held_at = time.time()
+            if self.held_since is None:
+                self.held_since = self.held_at
             if first:
                 self._append_journal({"rec": "authorisation_held", "code": code,
                                       "at": self.held_at})
@@ -701,7 +762,8 @@ class SessionSpool:
         with self._lock:
             if not self.refused:
                 self.refused = True
-                self._append_journal({"rec": "refused", "at": time.time()})
+                self.refused_at = time.time()
+                self._append_journal({"rec": "refused", "at": self.refused_at})
             return self.delete_all_pieces()
 
     def delete_all_pieces(self) -> int:
@@ -726,7 +788,7 @@ class SessionSpool:
 
     def oldest_pending_at(self) -> Optional[datetime]:
         """When the oldest piece still waiting to be delivered was captured."""
-        waiting = [s.captured_end_at for s in self.segments.values()
+        waiting = [s.captured_end_at for s in self.segment_list()
                    if s.state == PENDING and s.captured_end_at is not None]
         return min(waiting) if waiting else None
 
@@ -812,7 +874,7 @@ class SessionSpool:
             self.server_acknowledged
             and self.closed_at is not None
             and self.close_reported
-            and all(segment.state == PURGED for segment in self.segments.values())
+            and all(segment.state == PURGED for segment in self.segment_list())
         )
 
     def bytes_on_disk(self) -> int:
@@ -826,6 +888,10 @@ class SessionSpool:
 
     def manifest(self) -> Dict[str, Any]:
         """Self-describing record shipped with the session, so the archive verifies alone."""
+        with self._lock:
+            return self._manifest()
+
+    def _manifest(self) -> Dict[str, Any]:
         return {
             "session_id": self.session_id,
             "protocol_version": 2,
@@ -861,7 +927,13 @@ class SessionSpool:
         The fsync is the whole point: without it a power cut can leave the journal
         describing a segment file that was never written, or vice versa.
         """
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._append_journal_records([record])
+
+    def _append_journal_records(self, records: List[Dict[str, Any]]) -> None:
+        """Several records in one write and one fsync."""
+        line = "".join(json.dumps(self._sealed(record), ensure_ascii=False,
+                                  separators=(",", ":")) + "\n"
+                       for record in records)
         # After a power cut the last line can be half written, with no newline.
         # Appended straight after it, this record would be glued to the torn
         # fragment and both skipped on the next load - and the first thing
@@ -872,6 +944,52 @@ class SessionSpool:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+
+
+    def _sealed(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return _seal_record(self._spool_key, self.directory.name, record)
+
+
+# ============================================================
+# Journal records that name a patient
+# ============================================================
+
+# The records that carry who the consultation was with: the opening fields and
+# CMED's trigger, every chain entry (the open entry, markers, reassigns), a
+# reassignment, and the doctor's own words when stopping. They are written
+# encrypted with the spool key, like the audio, so the journal on disk names no
+# patient. Segment states, receipts and the rest stay readable, which is all
+# the support tools need. A journal from an earlier version is plain JSON
+# throughout and still loads.
+SEALED_RECORDS = frozenset({"session", "chain", "reassigned", "closed"})
+
+
+def _journal_aad(session_dir: str, kind: str) -> bytes:
+    # Bound to its session and its kind: a sealed line cannot be moved to
+    # another consultation's journal, or passed off as another kind of record.
+    return b"journal|" + session_dir.encode("utf-8") + b"|" + kind.encode("utf-8")
+
+
+def _seal_record(key: bytes, session_dir: str, record: Dict[str, Any]) -> Dict[str, Any]:
+    kind = record.get("rec")
+    if kind not in SEALED_RECORDS or not key:
+        return record
+    plain = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    blob = crypto.encrypt_spool_blob(key, plain, _journal_aad(session_dir, kind))
+    return {"rec": kind, "sealed": base64.b64encode(blob).decode("ascii")}
+
+
+def _unseal_record(key: bytes, session_dir: str, record: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        blob = base64.b64decode(record["sealed"], validate=True)
+        plain = crypto.decrypt_spool_blob(key, blob,
+                                          _journal_aad(session_dir, str(record.get("rec"))))
+        inner = json.loads(plain.decode("utf-8"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(inner, dict) or inner.get("rec") != record.get("rec"):
+        raise ValueError("sealed record does not match its kind")
+    return inner
 
 
 # ============================================================
@@ -943,6 +1061,13 @@ class Spool:
             logger.warning("Recovered %s spooled session(s) from a previous run", len(recovered))
         return recovered
 
+    def free_disk_bytes(self) -> Optional[int]:
+        """Free space on the drive that holds the spool; None if it cannot be read."""
+        try:
+            return shutil.disk_usage(self.root).free
+        except OSError:
+            return None
+
     # How long a measured spool size is reused. Status is asked several times a
     # second - by the overlay and by CMED's page - and each answer used to walk
     # every session folder on disk twice; with a day of uploads waiting, that is
@@ -1013,11 +1138,20 @@ def ends_open(path: Path) -> str:
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write to a temporary file, fsync it, then rename into place."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # A full disk leaves a half-written temporary behind; it holds nothing
+        # anyone needs and takes the very space that is short.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _remove_tree(directory: Path) -> None:

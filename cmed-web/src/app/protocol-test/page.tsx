@@ -6,8 +6,11 @@
  * Every message either channel carries, one button each, with the exact
  * request and the exact reply shown side by side. It exists because the
  * integration is judged on codes, not on wording: a page has to act on
- * `RECORDING_PROVISIONAL` the same way it acts on `RECORDING_STARTED`, and
- * on `GATE_NOT_ARMED` by finishing the current consultation first.
+ * `RECORDING_PROVISIONAL` the same way it acts on `RECORDING_STARTED`, and a
+ * patient opened while the last one has no prescription yet is accepted too
+ * (`continued`), with the running session id - which is the one to send with
+ * that patient's `prescription_built`. Every scenario, step by step, is on
+ * /manual-test.
  *
  * Nothing here needs a patient. The identifiers say TEST out loud, because a
  * test that has to be run against real patients never gets run.
@@ -43,6 +46,8 @@ export default function ProtocolTestPage() {
   const [doctorId, setDoctorId] = useState('TESTDR01');
   const [hospitalId, setHospitalId] = useState('CMED-TEST-01');
   const [visit, setVisit] = useState<Trigger | null>(null);
+  // The session the last accepted start named: the one its prescription goes to.
+  const [visitSession, setVisitSession] = useState<string>('');
 
   useEffect(() => {
     const client = new AimscribeClient();
@@ -109,7 +114,10 @@ export default function ProtocolTestPage() {
     const fields = trigger;
     return run('API 1 — start (five fields)', fields, async () => {
       const reply = await clientRef.current!.start(fields);
-      if (RECORDING_CODES.includes(reply.code)) setVisit(fields);
+      if (RECORDING_CODES.includes(reply.code)) {
+        setVisit(fields);
+        setVisitSession(String(reply.data?.session_id ?? ''));
+      }
       return reply;
     })();
   };
@@ -141,17 +149,24 @@ export default function ProtocolTestPage() {
 
   const armGate = () => {
     const fields = visit ?? trigger;
+    const session = visitSession || status?.sessionId || '';
     return run('API 3 — prescription_built (Channel A)',
-               { patient_id: fields.patient_id, session_id: status?.sessionId ?? '' },
-               () => clientRef.current!.prescriptionBuilt(
-                 fields.patient_id, status?.sessionId ?? ''))();
+               { patient_id: fields.patient_id, session_id: session },
+               () => clientRef.current!.prescriptionBuilt(fields.patient_id, session))();
   };
 
-  const openSecondPatient = () =>
-    run('Open the next patient before the prescription is built',
-        { ...trigger, patient_id: `${patientId.trim()}B` },
-        () => clientRef.current!.start({ ...trigger,
-                                         patient_id: `${patientId.trim()}B` }))();
+  const openSecondPatient = () => {
+    const fields = { ...trigger, patient_id: `${patientId.trim()}B` };
+    return run('Open another patient before the prescription is built', fields,
+               async () => {
+                 const reply = await clientRef.current!.start(fields);
+                 if (RECORDING_CODES.includes(reply.code)) {
+                   setVisit(fields);
+                   setVisitSession(String(reply.data?.session_id ?? ''));
+                 }
+                 return reply;
+               })();
+  };
 
   const missingField = () =>
     run('A trigger with no start_time (should be refused)',
@@ -174,11 +189,13 @@ export default function ProtocolTestPage() {
     { label: '3. Send API 2 again', tone: 'bg-blue-500',
       hint: '200 ALREADY_RECEIVED — a retry after a timeout is safe.',
       go: sendApi2 },
-    { label: '4. Open the next patient too early', tone: 'bg-amber-600',
-      hint: '409 GATE_NOT_ARMED — finish this consultation first (§7.7).',
+    { label: '4. Open another patient before the prescription', tone: 'bg-amber-600',
+      hint: '200 RECORDING_STARTED (or 202) with continued: true and the same ' +
+            'session id — the recording carries on; send this patient\'s API 2 too.',
       go: openSecondPatient },
     { label: '5. Prescription built', tone: 'bg-blue-700',
-      hint: '200 GATE_ARMED — the next patient may now be opened.',
+      hint: '200 GATE_ARMED — the next different patient starts a new recording; ' +
+            'with nobody opened, this one ends 2 minutes later.',
       go: armGate },
     { label: '6. Send the prescription', tone: 'bg-blue-600',
       hint: '202 ACCEPTED, with the version.', go: sendApi3 },
@@ -199,7 +216,9 @@ export default function ProtocolTestPage() {
           </h1>
           <p className="text-sm text-gray-600 mt-1">
             Every message CMED sends, one button each, with the reply code beside
-            it. For integration work; not for a clinic.
+            it. For integration work; not for a clinic. For every scenario step
+            by step, see <a href="/manual-test" className="text-blue-700 underline">the
+            manual test page</a>.
           </p>
         </header>
 

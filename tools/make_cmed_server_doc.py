@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reportlab.lib.units import mm
-from reportlab.platypus import KeepTogether, Spacer, Paragraph, HRFlowable, PageBreak, Preformatted
+from reportlab.platypus import CondPageBreak, KeepTogether, Spacer, Paragraph, HRFlowable, PageBreak, Preformatted
 
 import cmed_doc_style as st
 from cmed_doc_style import (H1, SUB, H2, H3, BODY, NOTE, BAD, GOOD, CODE,
@@ -34,11 +34,12 @@ S = []
 S.append(Paragraph("AIMScribe v3 &mdash; Server Deployment", H1))
 S.append(Paragraph("<b>Document 2 of 2 &mdash; for CMED's server and infrastructure team</b> "
                    "&middot; The machine, the gateway, the storage and the monitoring &middot; "
-                   "AIMS LAB, United International University &middot; 16 October 2026", SUB))
+                   "AIMS LAB, United International University &middot; second edition, 20 October 2026",
+                   SUB))
 S.append(HRFlowable(width="100%", thickness=1, color=st.RULE, spaceAfter=8))
 S.append(tbl([["", "The two documents"],
-              ["1. The other", "<b>Software integration</b> &mdash; the four APIs, the key, the "
-                               "fields, the data model. <b>For the team writing the code</b>"],
+              ["1. The other", "<b>Software integration</b> &mdash; the four APIs, the per-hospital "
+                               "tokens, FHIR R4, the fields, the data model. <b>For the team writing the code</b>"],
               ["<b>2. This one</b>", "<b>Server deployment</b> &mdash; where the server runs, how "
                                      "it is exposed, how to tell it is healthy, where the audio "
                                      "lives, and what changes on CMED's side. <b>For the team "
@@ -58,7 +59,9 @@ S.append(tbl([["The three things this document exists to tell you"],
                "deployment &mdash; section 1, so nobody waits on the wrong thing."],
               ["<b>2.</b> <b>CMED changes exactly one line</b> when we go live: "
                "<font face='Courier'>AIMS_SERVER_URL</font> in your own server environment. Your "
-               "web page changes nothing, because it never knew our address &mdash; section 10."],
+               "web page changes nothing, because it never knew our address &mdash; section 12. "
+               "Separately, and once: <b>one key pair per hospital</b> on your server (you make "
+               "it; we hold only the public half)."],
               ["<b>3.</b> <b>The clinic PCs need no inbound port, no port forward and no firewall "
                "change</b>, on CMED's side or the clinic's &mdash; section 9."]],
              [156 * mm], bold_first=False))
@@ -90,11 +93,15 @@ S.append(tbl([["", "Endpoint", "Today", "After", "Why"],
                "Needs a public name and a certificate. Both arrive with the droplet"],
               ["<b>2</b>", "<font face='Courier'>GET https://&lt;host&gt;/</font>",
                "<b>NO</b>", "<b>YES</b>", "same"],
-              ["<b>3</b>", "<font face='Courier'>POST &hellip;/api/v2/clinical/patient-information"
-                           "</font><br/><i>API 2</i>", "<b>NO</b>", "<b>YES</b>",
-               "<b>The code is finished and tested.</b> It has had no address to answer on"],
-              ["<b>4</b>", "<font face='Courier'>POST &hellip;/api/v2/clinical/prescription</font>"
-                           "<br/><i>API 3, Channel B</i>", "<b>NO</b>", "<b>YES</b>", "same as 3"],
+              ["<b>3</b>", "<font face='Courier'>POST &hellip;/api/v2/oauth/token</font>, then "
+                           "<font face='Courier'>POST &hellip;/fhir/r4/$process-message</font>"
+                           "<br/><i>API 2 (FHIR, event patient-information)</i>", "<b>NO</b>",
+               "<b>YES</b>",
+               "<b>The code is finished and tested</b> (11 of 11 on the lab server). It has had "
+               "no public address to answer on. Without a token: <b>401</b>"],
+              ["<b>4</b>", "<font face='Courier'>POST &hellip;/fhir/r4/$process-message</font>"
+                           "<br/><i>API 3, Channel B (FHIR, event prescription)</i>", "<b>NO</b>",
+               "<b>YES</b>", "same as 3"],
               ["<b>5</b>", "<font face='Courier'>ws://127.0.0.1:5050/ws</font> &rarr; "
                            "<font face='Courier'>start</font><br/><i>API 1</i>",
                "<b>YES</b>", "<b>YES</b>",
@@ -108,9 +115,10 @@ S.append(tbl([["", "Endpoint", "Today", "After", "Why"],
               ["<b>8</b>", "<font face='Courier'>ws://&hellip;</font> &rarr; "
                            "<font face='Courier'>status</font>", "<b>YES</b>", "<b>YES</b>",
                "unaffected"],
-              ["<b>9</b>", "<font face='Courier'>GET &hellip;/api/v2/clinical/patient/{id}/visits"
-                           "</font><br/><i>ask what we hold &mdash; new</i>", "<b>NO</b>",
-               "<b>YES</b>", "same as 3. Without the key: <b>401</b>"],
+              ["<b>9</b>", "<font face='Courier'>GET &hellip;/fhir/r4/Encounter?"
+                           "patient.identifier=&hellip;</font><br/><i>ask what we hold</i>",
+               "<b>NO</b>", "<b>YES</b>", "same as 3; only that hospital's visits. Without a "
+               "token: <b>401</b>"],
               ["<b>10</b>", "<font face='Courier'>POST &hellip;/api/v2/session/reassign</font>"
                             "<br/><i>recorders only &mdash; new</i>", "&mdash;", "<b>YES</b>",
                "<b>Not CMED's.</b> Kept for older recorders. Without a device credential: "
@@ -206,13 +214,14 @@ S.append(tbl([["Measure", "Value", "Note"],
               ["Consultations per clinic day", "277", "across all rooms"],
               ["Requests per second, all rooms", "<b>about 1.2</b>", "measured. This is very light"],
               ["<b>Messages per second from CMED, at peak</b>", "<b>about 0.5</b>",
-               "<b>no rate limit applies to CMED</b>"],
+               "<b>far below the limits</b>: 1,200 requests a minute per address; CMED's "
+               "allow-listed addresses are never limited or locked out"],
               ["Audio uploaded per clinic day", "32.5 GB", "277 recordings at ~120 MB"],
               ["Audio uploaded per month", "<b>844 GB</b>",
                "<b>inside the droplet's 6 TB allowance, so free</b>"]],
              [56 * mm, 32 * mm, 68 * mm], highlight=[6]))
 
-S.append(PageBreak())
+S.append(CondPageBreak(200 * mm))
 
 # ============================================================ PART C
 S.append(part("PART C", "How it is exposed",
@@ -274,7 +283,7 @@ S.append(tbl([["Does CMED need to allow anything outbound?"],
                "&mdash; the traffic is one-directional, CMED to AIMS LAB."]],
              [156 * mm], bold_first=False))
 
-S.append(PageBreak())
+S.append(CondPageBreak(120 * mm))
 S.append(Paragraph("9 &middot; The nine services, and the clinic PCs", H2))
 S.append(tbl([["Service", "What it does", "Exposed?"],
               ["<b>gateway</b> (Caddy)", "HTTPS, the certificate, the security headers, the 2 MB cap",
@@ -375,7 +384,10 @@ S.append(Paragraph("<b>The cloud layout mirrors the server layout deliberately</
 S.append(Spacer(1, 4))
 S.append(tbl([["<b>Every file is encrypted before it leaves our server</b>"],
               ["AES-GCM, and <b>the key never leaves AIMS LAB</b>. Cloudflare can see the folder "
-               "names and the file names; <b>it cannot read the audio or the clinical record</b>. "
+               "names and the file names, <b>which contain the clinic, doctor and patient "
+               "ids</b> (CMED's pseudonymous ids, never names). Replacing the patient id in "
+               "object names with a keyed hash is open work. <b>It cannot read the audio or "
+               "the clinical record</b>. "
                "Cloudflare stores bytes it cannot interpret, and so would any future provider "
                "&mdash; which is what makes putting patient recordings on commodity object storage "
                "acceptable at all.<br/><br/>"
@@ -397,11 +409,14 @@ S.append(tbl([["", "Who", "Setting", "Changes?"],
                                                  "machine", "<b>no</b>"],
               ["<b>3</b>", "<b>CMED's server</b>", "<b><font face='Courier'>AIMS_SERVER_URL</font>"
                                                    "</b>", "<b>YES &mdash; this is your one line</b>"],
+              ["<b>3a</b>", "CMED's server, once", "each hospital's client id, key id and private "
+                                                  "key (document 1, Part H)",
+               "set once at staging; the same at production"],
               ["<b>4</b>", "Every clinic recorder", "<font face='Courier'>AIMS_BACKEND_URL</font>",
                "<b>yes</b> &mdash; ours to do, per PC"],
               ["&mdash;", "<b>CMED's web page</b>", "<b>nothing &mdash; it never knew our address</b>",
                "<b>no</b>"]],
-             [8 * mm, 40 * mm, 68 * mm, 40 * mm], req=[3], highlight=[5]))
+             [8 * mm, 40 * mm, 68 * mm, 40 * mm], req=[3], highlight=[6]))
 S.append(Spacer(1, 4))
 S.append(Paragraph("<b>That is the whole of CMED's change: one environment variable on your "
                    "server.</b> Your page is unaffected because it talks to the recorder on "
@@ -413,8 +428,9 @@ S.append(Paragraph("13 &middot; The sequence, so nothing is sent into a void", H
 S.append(tbl([["", "Step", "Who", "Note"],
               ["<b>1</b>", "We deploy the droplet and verify it from outside", "AIMS LAB",
                "nothing of CMED's is pointed at it yet"],
-              ["<b>2</b>", "<b>We send you the hostname and the key</b>", "AIMS LAB",
-               "staging first, production later"],
+              ["<b>2</b>", "<b>You send each hospital's public key and your server's "
+                           "addresses; we send the hostname and each hospital's client id and "
+                           "key id</b>", "both", "nothing secret changes hands; staging first"],
               ["<b>3</b>", "<b>You set <font face='Courier'>AIMS_SERVER_URL</font> to staging and "
                            "run the test script</b>", "<b>CMED</b>",
                "section 15. Send us the output"],
@@ -445,15 +461,19 @@ S.append(KeepTogether([Paragraph("13A &middot; The outbox lives on your servers"
                            "database that survives a power cut, and it is in that server's "
                            "backups"],
               ["<b>2</b>", "<b>Whichever server sends to us can reach it outbound</b>: HTTPS 443 "
-                           "to our hostname, and the key in its secret store. If each branch "
-                           "server sends directly, every branch needs both; if branches sync to "
-                           "a central CMED server that sends, only that one does"],
+                           "to our hostname, each hospital's private key in its secret store, "
+                           "and its clock on NTP (we allow &plusmn;60 s). If each branch server "
+                           "sends directly, every branch needs these; if branches sync to a "
+                           "central CMED server that sends, only that one does"],
               ["<b>3</b>", "<b>It is watched</b>: the number waiting and the age of the oldest. "
                            "Alert if the oldest is more than an hour old while the internet is "
                            "up &mdash; that is a stuck outbox, not an outage"],
-              ["<b>4</b>", "<b>A 401 stops it</b> and pages someone: the key is wrong or revoked"],
+              ["<b>4</b>", "<b>A 401 is retried once with a fresh token; a second 401, or a "
+                           "403, stops it</b> and pages someone: the hospital's client is "
+                           "revoked or expired, or the message names another hospital"],
               ["<b>5</b>", "<b>Nothing is purged unsent.</b> A message is removed only on our "
-                           "202 or 200"]],
+                           "200 (FHIR) or 202/200 (interim JSON), with code ACCEPTED or "
+                           "ALREADY_RECEIVED"]],
              [8 * mm, 148 * mm], bold_first=False, highlight=[1])]))
 
 S.append(PageBreak())
@@ -530,22 +550,30 @@ S.append(tbl([["", "Check", "Expected", "Proves"],
               ["<b>4</b>", "the same reply", "<font face='Courier'>system</font> starts with "
                "<font face='Courier'>AIMScribe v3</font>",
                "the right system"],
-              ["<b>5</b>", "POST API 2 with no key", "<b>401</b>", "auth is enforced"],
-              ["<b>6</b>", "POST API 2 with the key", "<b>202</b>", "<b>the key works</b>"],
-              ["<b>7</b>", "POST the identical body again", "<b>200</b> ALREADY_RECEIVED",
-               "<b>retries are safe</b>"],
-              ["<b>8</b>", "POST a deliberately invalid body", "<b>422</b>, naming the bad fields",
-               "validation works, and a bad record is <b>quarantined, not lost</b>"],
-              ["<b>9</b>", "POST a body over 1 MB", "<b>413</b>", "the limit is real"],
-              ["<b>10</b>", "GET the visits list for a test patient, with and without the key",
-               "<b>200</b>, then <b>401</b>", "the read is authenticated too"]],
+              ["<b>5</b>", "<font face='Courier'>GET /fhir/r4/metadata</font>",
+               "a CapabilityStatement naming the token URL", "FHIR discovery"],
+              ["<b>6</b>", "A token for one hospital", "<b>200</b>, token_type bearer",
+               "<b>that hospital's key is registered</b>"],
+              ["<b>7</b>", "API 2 as FHIR with that token, then the same message again",
+               "<b>200</b> ACCEPTED, then <b>200</b> ALREADY_RECEIVED",
+               "<b>stored, and retries are safe</b>"],
+              ["<b>8</b>", "API 2 with no token / for another hospital",
+               "<b>401</b> INVALID_TOKEN / <b>403</b> HOSPITAL_NOT_ALLOWED",
+               "<b>each token speaks for one hospital</b>"],
+              ["<b>9</b>", "A medicine with no name; a body over 1 MB",
+               "<b>422</b> naming the field (quarantined, not lost); <b>413</b>",
+               "validation and limits"],
+              ["<b>10</b>", "The same signed assertion twice", "<b>401</b> invalid_client",
+               "each assertion works once"]],
              [8 * mm, 54 * mm, 46 * mm, 44 * mm], highlight=[3, 6, 7]))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Our script does checks 3 to 8 in one command</b> &mdash; "
+S.append(Paragraph("<b>Our script does checks 6 to 10 in one command</b> (11 cases) &mdash; "
                    "<font face='Courier'>python tools/channel_b_test.py --server https://&lt;host&gt; "
-                   "--key &lt;key&gt;</font>. We will send it with the key. <b>Run it and send us "
-                   "the output</b> &mdash; it is the evidence both sides need that the gateway is "
-                   "ready.", GOOD))
+                   "--client-id &lt;id&gt; --kid &lt;kid&gt; --key-file &lt;hospital&gt;.private.pem "
+                   "--hospital &lt;CMED hospital id&gt;</font>. <b>Run it once per hospital and send "
+                   "us the output</b> &mdash; 11 of 11 is the evidence both sides need. Every "
+                   "reply carries a <font face='Courier'>request_id</font>; quote it when "
+                   "something is wrong.", GOOD))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>And then the one check that actually matters.</b> Checks 1 to 8 prove the "
                    "gateway works; <b>they do not prove the integration works</b>. A 202 means "
@@ -553,9 +581,10 @@ S.append(Paragraph("<b>And then the one check that actually matters.</b> Checks 
                    "<b>ask us to confirm it was matched and archived</b>.", BAD))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Our side, for completeness:</b> an existing database is not migrated by "
-                   "itself. When we deploy this version we apply the two new schema scripts "
-                   "(013 and 014) by hand before the recorders are updated; a new server builds "
-                   "them on first start. Nothing for CMED to do.", NOTE))
+                   "itself. When we deploy this version we apply the schema scripts 013 to 020 "
+                   "in order, as the database owner, and upgrade the archive worker together "
+                   "with the server; a new server builds them on first start. Nothing for CMED "
+                   "to do.", NOTE))
 
 S.append(PageBreak())
 S.append(Paragraph("16 &middot; When it is down", H2))
@@ -603,10 +632,10 @@ S.append(tbl([["", "What", "Who", "How long", "Blocks CMED?"],
                "1 hour", "no"],
               ["<b>3</b>", "R2 buckets created, settings filled in, services verified", "AIMS LAB",
                "1 hour", "no"],
-              ["<b>4</b>", "<b>Clinics and doctors registered, CMED key issued</b>", "AIMS LAB",
-               "30 min", "<b>needs CMED's clinic codes</b>"],
-              ["<b>5</b>", "<b>Hostname and key sent to CMED</b>", "AIMS LAB", "&mdash;",
-               "<b>unblocks your backend testing</b>"],
+              ["<b>4</b>", "<b>Clinics registered; each hospital's public key registered</b>",
+               "AIMS LAB", "30 min", "<b>needs CMED's clinic codes and public keys</b>"],
+              ["<b>5</b>", "<b>Hostname, client ids and key ids sent to CMED</b>", "AIMS LAB",
+               "&mdash;", "<b>unblocks your backend testing</b>"],
               ["<b>6</b>", "CMED points <font face='Courier'>AIMS_SERVER_URL</font> at staging and "
                            "runs the script", "<b>CMED</b>", "30 min", "&mdash;"],
               ["<b>7</b>", "Recorders moved onto the new address, one clinic first", "AIMS LAB",
@@ -623,7 +652,8 @@ S.append(Paragraph("<b>Steps 1 to 3 are a single afternoon and need nothing from
 
 S.append(Paragraph("17A &middot; Go-live checklist", H2))
 S.append(tbl([["", "Item", "Owner"],
-              ["&#9744;", "Production hostname and key issued, and stored in CMED's secret store",
+              ["&#9744;", "One key pair per hospital made by CMED; public keys registered; "
+                          "private keys only in CMED's secret store; CMED's clock on NTP",
                "both"],
               ["&#9744;", "<b>CMED's page addresses registered</b> (production, staging, preview)",
                "<b>CMED &rarr; AIMS LAB</b>"],
@@ -646,8 +676,8 @@ S.append(tbl([["", "Item", "Owner"],
                           "archived by AIMS LAB</b>", "both"],
               ["&#9744;", "Droplet live in BLR1, backups enabled, both R2 buckets created",
                "AIMS LAB"],
-              ["&#9744;", "Schema scripts 013 and 014 applied, if the database already existed",
-               "AIMS LAB"],
+              ["&#9744;", "Schema scripts 013 to 020 applied in order, if the database already "
+                          "existed; archive worker upgraded with the server", "AIMS LAB"],
               ["&#9744;", "Database backup <b>restored once</b> and row counts checked",
                "AIMS LAB"],
               ["&#9744;", "Alerting on unconfirmed recordings and on disk above 80%", "AIMS LAB"],
@@ -669,7 +699,9 @@ S.append(tbl([["Question", "Answer"],
               ["Does latency affect recording?", "<b>No.</b> The microphone is driven locally over "
                                                  "loopback"],
               ["How do I know it is up?", "<b><font face='Courier'>GET /health</font></b> &mdash; "
-                                          "no key. Expect "
+                                          "no credential. From outside it answers only "
+                                          "<font face='Courier'>status</font> and "
+                                          "<font face='Courier'>system</font>. Expect "
                                           "<font face='Courier'>status: healthy</font>"],
               ["<b>What else must I assert on?</b>", "<b><font face='Courier'>system</font> starts with "
                                                      "<font face='Courier'>AIMScribe v3</font></b> &mdash; "
@@ -684,9 +716,13 @@ S.append(tbl([["Question", "Answer"],
               ["Do I open a port for the clinic PCs?", "<b>No.</b> The recorder is loopback-only"],
               ["Does CMED need an inbound rule?", "<b>No.</b> We never call you"],
               ["Outbound from CMED?", "HTTPS 443 to our hostname, from your server"],
-              ["<b>What changes on CMED's side?</b>", "<b>One line &mdash; "
+              ["<b>What changes on CMED's side?</b>", "<b>One line at go-live &mdash; "
                                                       "<font face='Courier'>AIMS_SERVER_URL</font>."
-                                                      "</b> Your page changes nothing"],
+                                                      "</b> Once beforehand: a key pair per "
+                                                      "hospital. Your page changes nothing"],
+              ["How accurate must CMED's clock be?", "<b>NTP-synchronised</b>; &plusmn;60 s is "
+                                                    "tolerated. Outside that, the token request "
+                                                    "answers 400 \"clock skew\""],
               ["Where does the audio live?", "<b>Cloudflare R2, 3 TB</b>, as encrypted WAV. "
                                              "<b>Not on the droplet's 320 GB</b>, which is working "
                                              "space"],
@@ -704,8 +740,9 @@ S.append(tbl([["Question", "Answer"],
                                                   "confirm a test recording archived"],
               ["Total cost?", "<b>$161/month</b> &mdash; $96 droplet, $19.20 backups, $45 "
                               "storage, ~$1 domain"],
-              ["What do you need from us?", "<b>Your clinic codes</b> (step 4) and <b>your page's "
-                                            "exact web addresses</b>"]],
+              ["What do you need from us?", "<b>Your clinic codes</b> (step 4), <b>your page's "
+                                            "exact web addresses</b>, <b>each hospital's public "
+                                            "key</b> and <b>your server's addresses</b>"]],
              [54 * mm, 102 * mm], highlight=[5, 12, 18, 19]))
 S.append(Spacer(1, 6))
 S.append(Paragraph("Prepared by AIMS LAB, United International University. <b>Document 2 of 2</b>; "

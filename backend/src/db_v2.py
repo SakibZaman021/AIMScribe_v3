@@ -8,9 +8,12 @@ pool, because Neon's connection budget is small.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +33,28 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# The connection of the session transaction this task is inside, if any:
+# (pool, connection, task). Every query this repository makes from that task
+# runs on that connection, so a request's steps commit or roll back together
+# and see each other's writes. Bound to the task, not merely the context: a
+# task started from inside the transaction copies the context, and must not
+# borrow a connection that another task is using.
+_SESSION_TX: ContextVar[Optional[tuple]] = ContextVar("aims_session_tx", default=None)
+
+
+class _Borrowed:
+    """The transaction's connection, lent without being released."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 def hash_token(token: str) -> bytes:
     return integrity.sha256_bytes(token.encode("utf-8"))
 
@@ -38,11 +63,71 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _erase_row(row) -> Dict[str, Any]:
+    out = dict(row)
+    for key in ("files", "cloud_keys"):
+        if isinstance(out.get(key), str):
+            out[key] = json.loads(out[key])
+    return out
+
+
 class V2Repository:
-    """All v2 queries. Every method takes and releases one pooled connection."""
+    """All v2 queries. Every method takes and releases one pooled connection,
+    or - inside session_tx - uses that transaction's."""
 
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
+
+    def _acquire(self):
+        held = _SESSION_TX.get()
+        if held is not None and held[0] is self._pool:
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if held[2] is current:
+                return _Borrowed(held[1])
+        return self._pool.acquire()
+
+    @asynccontextmanager
+    async def session_tx(self, session_id: str):
+        """
+        One recording, one writer at a time.
+
+        Commit, close, refuse, archive and every chain entry take this before
+        they read the chain head or the session's state, and do their writes
+        inside it: two of them for the same recording can no longer both read
+        the same head, or one decide on a state the other is changing. A
+        per-session advisory lock, so a session not yet stored (a refusal made
+        offline) is locked too; and the row itself FOR NO KEY UPDATE, so
+        writers that do not take the lock still wait for this one, while
+        inserts into tables that reference the row are not blocked.
+        Re-entrant within one task.
+        """
+        held = _SESSION_TX.get()
+        if held is not None and held[0] is self._pool:
+            try:
+                same_task = held[2] is asyncio.current_task()
+            except RuntimeError:
+                same_task = False
+            if same_task:
+                yield held[1]
+                return
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                                   "aims-session:" + session_id)
+                await conn.execute("SELECT 1 FROM sessions WHERE session_id = $1 "
+                                   "FOR NO KEY UPDATE", session_id)
+                try:
+                    task = asyncio.current_task()
+                except RuntimeError:
+                    task = None
+                token = _SESSION_TX.set((self._pool, conn, task))
+                try:
+                    yield conn
+                finally:
+                    _SESSION_TX.reset(token)
 
     # ============================================================
     # Hospitals
@@ -55,13 +140,13 @@ class V2Repository:
         exist without overwriting a name and timezone an administrator set.
         """
         if only_if_new:
-            async with self._pool.acquire() as conn:
+            async with self._acquire() as conn:
                 await conn.execute("""
                     INSERT INTO hospitals (hospital_id, name, timezone)
                     VALUES ($1, $2, $3) ON CONFLICT (hospital_id) DO NOTHING
                 """, hospital_id, name, timezone_name)
             return
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO hospitals (hospital_id, name, timezone)
                 VALUES ($1, $2, $3)
@@ -70,7 +155,7 @@ class V2Repository:
             """, hospital_id, name, timezone_name)
 
     async def hospital_timezone(self, hospital_id: str) -> str:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             tz = await conn.fetchval(
                 "SELECT timezone FROM hospitals WHERE hospital_id = $1", hospital_id)
         return tz or "Asia/Dhaka"
@@ -91,7 +176,7 @@ class V2Repository:
         at which a doctor is named, and an administrator does it.
         """
         token = new_token()
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO enrollment_tokens
                     (token_sha256, hospital_id, doctor_id, created_by, expires_at)
@@ -119,7 +204,7 @@ class V2Repository:
         """
         device_token = new_token()
 
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("""
                     SELECT hospital_id, doctor_id, expires_at, used_at
@@ -202,9 +287,10 @@ class V2Repository:
         }
 
     async def device_by_token(self, token: str) -> Optional[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow("""
-                SELECT device_id, hospital_id, tpm_pubkey, app_version, revoked_at
+                SELECT device_id, hospital_id, tpm_pubkey, app_version, revoked_at,
+                       signs_requests
                 FROM devices WHERE token_sha256 = $1
             """, hash_token(token))
         return dict(row) if row else None
@@ -212,19 +298,58 @@ class V2Repository:
     async def touch_device(
         self, device_id, *, spool_bytes: Optional[int] = None,
         pending_segments: Optional[int] = None, app_version: Optional[str] = None,
+        held_sessions: Optional[List[Dict[str, Any]]] = None,
+        held_count: Optional[int] = None, disk_encrypted: Optional[bool] = None,
+        clock_offset_seconds: Optional[float] = None,
     ) -> None:
-        async with self._pool.acquire() as conn:
+        """
+        One heartbeat. Fields an older recorder does not send are left as
+        they were; held_sessions is replaced whole, so a list that empties
+        clears the dashboard.
+        """
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE devices
                    SET last_seen_at = now(),
+                       last_heartbeat_at = now(),
                        spool_bytes = COALESCE($2, spool_bytes),
                        pending_segments = COALESCE($3, pending_segments),
-                       app_version = COALESCE($4, app_version)
+                       app_version = COALESCE($4, app_version),
+                       held_sessions = COALESCE($5::jsonb, held_sessions),
+                       held_count = COALESCE($6, held_count),
+                       disk_encrypted = COALESCE($7, disk_encrypted),
+                       clock_offset_seconds = COALESCE($8, clock_offset_seconds)
                  WHERE device_id = $1
-            """, device_id, spool_bytes, pending_segments, app_version)
+            """, device_id, spool_bytes, pending_segments, app_version,
+                 json.dumps(held_sessions) if held_sessions is not None else None,
+                 held_count, disk_encrypted, clock_offset_seconds)
+
+    async def use_device_nonce(self, device_id, nonce: str) -> bool:
+        """
+        True the first time this device sends this nonce. Nonces older than
+        the signature window are swept a few hundred at a time, so the table
+        stays the size of fifteen minutes of traffic.
+        """
+        async with self._acquire() as conn:
+            fresh = await conn.fetchval("""
+                INSERT INTO device_nonces (device_id, nonce) VALUES ($1, $2)
+                ON CONFLICT DO NOTHING RETURNING 1
+            """, device_id, nonce)
+            await conn.execute("""
+                DELETE FROM device_nonces WHERE (device_id, nonce) IN (
+                    SELECT device_id, nonce FROM device_nonces
+                     WHERE seen_at < now() - interval '15 minutes' LIMIT 200)
+            """)
+        return bool(fresh)
+
+    async def mark_device_signs(self, device_id) -> None:
+        """From now on this PC's requests must be signed: it has shown it can."""
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE devices SET signs_requests = true "
+                               "WHERE device_id = $1 AND NOT signs_requests", device_id)
 
     async def revoke_device(self, device_id, reason: str) -> bool:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             result = await conn.execute("""
                 UPDATE devices SET revoked_at = now(), revoked_reason = $2,
                                    token_sha256 = NULL
@@ -257,7 +382,7 @@ class V2Repository:
         Idempotent: an agent that retries after a network failure gets True again
         rather than a duplicate-key error.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 existing = await conn.fetchval(
                     "SELECT session_id FROM sessions WHERE session_id = $1", session_id)
@@ -282,7 +407,7 @@ class V2Repository:
         return True
 
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT session_id, patient_id, doctor_id, hospital_id, device_id,
                        protocol_version, status, session_date, opened_at, closed_at,
@@ -291,7 +416,7 @@ class V2Repository:
                        quarantine_reason, sample_rate, channels, sample_width,
                        object_prefix, confirmation, grant_jti, file_stem,
                        local_start, local_end, copied_at, segments_deleted_at,
-                       json_stale, parts_count, parts_stale
+                       json_stale, parts_count, parts_stale, continues_session_id
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -315,7 +440,7 @@ class V2Repository:
         the other for arithmetic, and conflating them is how evening
         consultations end up filed under the previous day.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions
                    SET closed_at = $2, total_duration_seconds = $3,
@@ -327,12 +452,17 @@ class V2Repository:
                        start_time     = COALESCE($10::time, start_time),
                        end_time       = COALESCE($11::time, end_time)
                  WHERE session_id = $1
+                   -- A quarantined, archived, refused or erased recording is
+                   -- never turned back into a closed one by a late or
+                   -- repeated close.
+                   AND status NOT IN ('quarantined', 'archived', 'refused', 'expired')
+                   AND quarantine_reason IS NULL
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
                  close_reason or None, local_date, local_start, local_end)
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions
                    SET status = 'quarantined', quarantine_reason = $2, updated_at = now()
@@ -344,21 +474,54 @@ class V2Repository:
     # ============================================================
 
     @staticmethod
-    async def _insert_chain_entry(conn, session_id: str, entry: ChainEntry) -> None:
-        await conn.execute("""
-            INSERT INTO chain_entries
-                (session_id, entry_no, entry_type, payload, payload_sha256,
-                 prev_hash, entry_hash, device_signature, occurred_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            ON CONFLICT (session_id, entry_no) DO NOTHING
-        """, session_id, entry.entry_no, entry.entry_type,
-             json.dumps(entry.payload, ensure_ascii=False),
-             entry.payload_sha256, entry.prev_hash, entry.entry_hash,
-             entry.signature, entry.occurred_at)
+    async def _insert_chain_entry(conn, session_id: str, entry: ChainEntry) -> str:
+        """
+        'stored', 'duplicate' (this exact entry is already there) or 'conflict'
+        (another entry holds its number). It used to be ON CONFLICT DO NOTHING,
+        which threw a rival entry away in silence while the segment row that
+        pointed at it was kept: audio archived without ever being chained.
+        """
+        try:
+            async with conn.transaction():
+                await conn.execute("""
+                    INSERT INTO chain_entries
+                        (session_id, entry_no, entry_type, payload, payload_sha256,
+                         prev_hash, entry_hash, device_signature, occurred_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                """, session_id, entry.entry_no, entry.entry_type,
+                     json.dumps(entry.payload, ensure_ascii=False),
+                     entry.payload_sha256, entry.prev_hash, entry.entry_hash,
+                     entry.signature, entry.occurred_at)
+        except asyncpg.UniqueViolationError:
+            stored = await conn.fetchval("""
+                SELECT entry_hash FROM chain_entries
+                 WHERE session_id = $1 AND entry_no = $2
+            """, session_id, entry.entry_no)
+            if stored is not None and bytes(stored) == entry.entry_hash:
+                return "duplicate"
+            return "conflict"
+        return "stored"
 
-    async def append_chain_entry(self, session_id: str, entry: ChainEntry) -> None:
-        async with self._pool.acquire() as conn:
-            await self._insert_chain_entry(conn, session_id, entry)
+    async def append_chain_entry(self, session_id: str, entry: ChainEntry) -> str:
+        async with self._acquire() as conn:
+            return await self._insert_chain_entry(conn, session_id, entry)
+
+    async def chain_tip(self, session_id: str) -> Optional[Tuple[int, bytes]]:
+        """(entry_no, entry_hash) of the newest entry, or None for an empty chain."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT entry_no, entry_hash FROM chain_entries
+                 WHERE session_id = $1 ORDER BY entry_no DESC LIMIT 1
+            """, session_id)
+        return (int(row["entry_no"]), bytes(row["entry_hash"])) if row else None
+
+    async def genesis_in_use(self, entry_hash: bytes, session_id: str) -> bool:
+        """Another recording already opened with this exact genesis entry."""
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM chain_entries
+                 WHERE entry_no = 0 AND entry_hash = $1 AND session_id <> $2
+            """, entry_hash, session_id))
 
     async def entry_already_stored(self, session_id: str, entry: ChainEntry) -> bool:
         """
@@ -371,7 +534,7 @@ class V2Repository:
         the hash tells a duplicate from a forgery: only the original entry
         hashes to the original value.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             stored = await conn.fetchval("""
                 SELECT entry_hash FROM chain_entries
                  WHERE session_id = $1 AND entry_no = $2
@@ -380,7 +543,7 @@ class V2Repository:
 
     async def chain_head(self, session_id: str) -> Optional[bytes]:
         """Hash of the highest-numbered entry, or None for an empty chain."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return await conn.fetchval("""
                 SELECT entry_hash FROM chain_entries
                  WHERE session_id = $1
@@ -388,7 +551,7 @@ class V2Repository:
             """, session_id)
 
     async def next_entry_no(self, session_id: str) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             highest = await conn.fetchval("""
                 SELECT max(entry_no) FROM chain_entries WHERE session_id = $1
             """, session_id)
@@ -396,7 +559,7 @@ class V2Repository:
 
     async def load_chain(self, session_id: str) -> List[ChainEntry]:
         """Ordered by entry_no; verify_chain requires entries in sequence."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT entry_no, entry_type, payload, payload_sha256,
                        prev_hash, entry_hash, device_signature
@@ -443,7 +606,7 @@ class V2Repository:
         Returns 'stored', or 'duplicate' when the same seq_no arrives again with
         an identical hash - a retry, which must succeed rather than error.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             try:
                 async with conn.transaction():
                     existing = await conn.fetchrow(
@@ -454,7 +617,9 @@ class V2Repository:
                         return ("duplicate" if bytes(existing["sha256"]) == sha256
                                 else "conflict")
 
-                    await self._insert_chain_entry(conn, session_id, entry)
+                    chained = await self._insert_chain_entry(conn, session_id, entry)
+                    if chained == "conflict":
+                        return "conflict"
                     await conn.execute("""
                         INSERT INTO segments
                             (session_id, seq_no, entry_no, object_key, bytes,
@@ -487,7 +652,7 @@ class V2Repository:
         return "stored"
 
     async def segments_for(self, session_id: str) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT seq_no, object_key, clip_name, bytes, duration_seconds,
                        sha256, captured_start_at, captured_end_at, is_final, state,
@@ -505,7 +670,7 @@ class V2Repository:
         again, and the browser is not trusted. The register is what makes a
         rotating doctor safe and DR_TEST_001 impossible.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return bool(await conn.fetchval("""
                 SELECT 1 FROM doctors
                  WHERE doctor_id = $1 AND hospital_id = $2 AND active
@@ -513,7 +678,7 @@ class V2Repository:
 
     async def doctors_at(self, hospital_id: str) -> List[Dict[str, Any]]:
         """The register for one hospital, for the CMED selector."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT doctor_id, full_name FROM doctors
                  WHERE hospital_id = $1 AND active
@@ -532,7 +697,7 @@ class V2Repository:
         who entered "Dr Kamrul Hasan" should not have it flattened back to
         "DR003" the next time that doctor records.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             if only_if_new:
                 await conn.execute("""
                     INSERT INTO doctors (doctor_id, hospital_id, full_name, active)
@@ -556,7 +721,7 @@ class V2Repository:
         Taken from chain_entries rather than a summary column so the reason handed
         to the archive is the one the device signed at the time.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT entry_no, entry_type, occurred_at, payload
                 FROM chain_entries
@@ -582,18 +747,22 @@ class V2Repository:
 
     async def mark_object_deleted(self, session_id: str, seq_no: int) -> None:
         """Record that the bucket copy is gone. The archive copy is unaffected."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE segments SET object_deleted_at = now()
                  WHERE session_id = $1 AND seq_no = $2
             """, session_id, seq_no)
 
-    async def mark_segments_archived(self, session_id: str) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute("""
+    async def mark_segments_archived(self, session_id: str,
+                                     seq_nos: Optional[List[int]] = None) -> int:
+        """The pieces the worker joined, and only those, are now in the archive."""
+        async with self._acquire() as conn:
+            result = await conn.execute("""
                 UPDATE segments SET state = 'archived', archived_at = now()
                  WHERE session_id = $1 AND state = 'committed'
-            """, session_id)
+                   AND ($2::int[] IS NULL OR seq_no = ANY($2::int[]))
+            """, session_id, seq_nos)
+        return int(result.split()[-1]) if result else 0
 
     # ============================================================
     # Archive (Option B: the AIMS LAB worker pulls)
@@ -617,7 +786,7 @@ class V2Repository:
         fetch, so they can never succeed, and leaving them here meant the worker
         retried them on every pass forever.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id,
                        s.session_date, s.opened_at, s.closed_at,
@@ -627,7 +796,7 @@ class V2Repository:
                        -- (SRS-SES-05). The worker uses it as it stands, so the
                        -- audio, the JSON and the clinical database agree.
                        s.file_stem, s.local_start, s.local_end, s.confirmation,
-                       s.parts_count
+                       s.parts_count, s.continues_session_id
                 FROM sessions s
                 WHERE s.closed_at IS NOT NULL
                   AND s.archived_at IS NULL
@@ -648,15 +817,20 @@ class V2Repository:
 
     async def mark_archived(
         self, session_id: str, *, relpath: str, sha256: bytes, byte_length: int
-    ) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute("""
+    ) -> bool:
+        """False when the recording was refused, erased or quarantined meanwhile."""
+        async with self._acquire() as conn:
+            result = await conn.execute("""
                 UPDATE sessions
                    SET archive_relpath = $2, archive_sha256 = $3,
                        archive_bytes = $4, archived_at = now(),
                        status = 'archived', updated_at = now()
                  WHERE session_id = $1
+                   AND confirmation NOT IN ('refused', 'expired')
+                   AND quarantine_reason IS NULL
+                   AND status NOT IN ('quarantined', 'refused', 'expired')
             """, session_id, relpath, sha256, byte_length)
+        return bool(result) and result.split()[-1] != "0"
 
     # ============================================================
     # The cloud copy (SRS-ARC-08..13)
@@ -669,7 +843,7 @@ class V2Repository:
         Until that copy exists and is verified, the pieces stay in the segment
         bucket: they are the only other copy of the audio (SRS-ARC-08).
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
                        file_stem, archive_relpath, archive_sha256, archive_bytes,
@@ -680,6 +854,7 @@ class V2Repository:
                    AND NOT parts_stale
                    AND quarantine_reason IS NULL
                    AND archive_relpath IS NOT NULL
+                   AND confirmation NOT IN ('refused', 'expired')
                  ORDER BY archived_at
                  LIMIT $1
             """, limit)
@@ -690,7 +865,7 @@ class V2Repository:
         Archived recordings whose JSON has to be written again, because CMED
         sent the prescription after the recording was archived (SRS-ARC-13).
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, hospital_id, doctor_id, session_date, file_stem,
                        archive_relpath, grant_jti, parts_count
@@ -698,6 +873,7 @@ class V2Repository:
                  WHERE json_stale
                    AND archived_at IS NOT NULL
                    AND archive_relpath IS NOT NULL
+                   AND confirmation NOT IN ('refused', 'expired')
                  ORDER BY archived_at
                  LIMIT $1
             """, limit)
@@ -708,7 +884,7 @@ class V2Repository:
         Archived this long ago and still not copied (SRS-ARC-14). Something is
         failing every pass, so it is raised rather than retried in silence.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, archived_at FROM sessions
                  WHERE archived_at < now() - make_interval(hours => $1)
@@ -721,7 +897,7 @@ class V2Repository:
 
     async def mark_json_stale(self, session_id: str) -> bool:
         """A prescription arrived for a recording already archived."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             updated = await conn.fetchval("""
                 UPDATE sessions SET json_stale = true, updated_at = now()
                  WHERE session_id = $1 AND archived_at IS NOT NULL
@@ -730,7 +906,7 @@ class V2Repository:
         return updated is not None
 
     async def next_copy_version(self, session_id: str, kind: str) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return int(await conn.fetchval("""
                 SELECT COALESCE(MAX(version), 0) + 1 FROM cloud_copies
                  WHERE session_id = $1 AND kind = $2
@@ -748,7 +924,7 @@ class V2Repository:
         and this call - updates the row instead of failing, so the retry
         finishes rather than blocking on its own earlier attempt (AT-65).
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return int(await conn.fetchval("""
                 INSERT INTO cloud_copies
                     (session_id, kind, object_key, version, bytes, sha256,
@@ -763,7 +939,7 @@ class V2Repository:
                  plain_sha256))
 
     async def copies_for(self, session_id: str) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT kind, object_key, version, bytes, sha256, plain_sha256,
                        uploaded_at, verified_at
@@ -774,7 +950,7 @@ class V2Repository:
 
     async def mark_copied(self, session_id: str) -> None:
         """The cloud copy is complete: the audio and its JSON are both verified."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions SET copied_at = now(), json_stale = false,
                                     updated_at = now()
@@ -782,13 +958,13 @@ class V2Repository:
             """, session_id)
 
     async def clear_json_stale(self, session_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE sessions SET json_stale = false, updated_at = now() "
                 "WHERE session_id = $1", session_id)
 
     async def mark_segments_deleted(self, session_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE sessions SET segments_deleted_at = now(), updated_at = now() "
                 "WHERE session_id = $1", session_id)
@@ -803,7 +979,7 @@ class V2Repository:
         patient the prescription was built for, and the wrong patient's late
         records must not be attached to it.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT s.session_id, s.archived_at, s.copied_at
                   FROM grant_authorisations g
@@ -841,7 +1017,7 @@ class V2Repository:
         self, *, session_id: str, scope: str, seq_no: Optional[int],
         sha256: bytes, payload: Dict[str, Any], signature: bytes,
     ) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO purge_receipts
                     (session_id, scope, seq_no, sha256, payload, signature)
@@ -851,7 +1027,7 @@ class V2Repository:
                  json.dumps(payload, ensure_ascii=False), signature)
 
     async def receipts_for(self, session_id: str) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT payload, signature FROM purge_receipts
                  WHERE session_id = $1 ORDER BY COALESCE(seq_no, 0)
@@ -908,12 +1084,92 @@ class V2Repository:
                      session_id, json.dumps(detail, ensure_ascii=False),
                      prev, entry_hash)
 
+    # ---- a resumed recording continues the one before it (S4) ----
+
+    async def set_continuation(self, session_id: str, continues_session_id: str) -> None:
+        async with self._acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions SET continues_session_id = $2, updated_at = now()
+                 WHERE session_id = $1 AND continues_session_id IS NULL
+            """, session_id, continues_session_id)
+
+    async def continuation_links(self, session_id: str) -> Dict[str, Any]:
+        """The recording this one continues, and the one that continues it."""
+        async with self._acquire() as conn:
+            before = await conn.fetchrow("""
+                SELECT p.session_id, p.file_stem FROM sessions s
+                  JOIN sessions p ON p.session_id = s.continues_session_id
+                 WHERE s.session_id = $1
+            """, session_id)
+            after = await conn.fetchrow("""
+                SELECT session_id, file_stem FROM sessions
+                 WHERE continues_session_id = $1 ORDER BY opened_at LIMIT 1
+            """, session_id)
+        return {"continues": dict(before) if before else None,
+                "continued_by": dict(after) if after else None}
+
+    async def continuations_of(self, session_id: str) -> List[str]:
+        async with self._acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT session_id FROM sessions WHERE continues_session_id = $1", session_id)
+        return [r["session_id"] for r in rows]
+
+    # ---- alerts that must not repeat ----
+
+    async def alert_raised_since(self, alert_type: str, device_id, since: datetime) -> bool:
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT EXISTS (SELECT 1 FROM integrity_alerts
+                                WHERE alert_type = $1 AND device_id = $2 AND raised_at >= $3)
+            """, alert_type, device_id, since))
+
+    async def group_alert(self, *, alert_type: str, group: str, session_id: str,
+                          window: timedelta, severity: str = "warning", device_id=None,
+                          detail: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        One open alert per group and window, counting what it covers, rather
+        than one per recording: a CMED outage made one unconfirmed_recording
+        alert for every consultation and buried everything else (D4). Returns
+        True when a new alert was raised.
+        """
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                    SELECT id FROM integrity_alerts
+                     WHERE alert_type = $1 AND detail->>'group' = $2
+                       AND resolved_at IS NULL AND raised_at > now() - $3::interval
+                     ORDER BY id DESC LIMIT 1 FOR UPDATE
+                """, alert_type, group, window)
+                if row is not None:
+                    await conn.execute("""
+                        UPDATE integrity_alerts
+                           SET detail = jsonb_set(
+                                 jsonb_set(detail, '{count}',
+                                           to_jsonb(COALESCE((detail->>'count')::int, 0) + 1)),
+                                 '{session_ids}',
+                                 CASE WHEN jsonb_array_length(COALESCE(detail->'session_ids',
+                                                                       '[]')) < 200
+                                      THEN COALESCE(detail->'session_ids', '[]') || to_jsonb($2::text)
+                                      ELSE detail->'session_ids' END)
+                         WHERE id = $1
+                    """, row["id"], session_id)
+                    return False
+                await conn.execute("""
+                    INSERT INTO integrity_alerts (session_id, device_id, alert_type, severity,
+                                                  detail)
+                    VALUES ($1,$2,$3,$4,$5)
+                """, session_id, device_id, alert_type, severity,
+                     json.dumps({**(detail or {}), "group": group, "count": 1,
+                                 "session_ids": [session_id]}, ensure_ascii=False))
+        logger.warning("Integrity alert [%s/%s] group=%s", severity, alert_type, group)
+        return True
+
     async def raise_alert(
         self, *, alert_type: str, severity: str = "warning",
         session_id: Optional[str] = None, device_id=None,
         detail: Optional[Dict[str, Any]] = None,
     ) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO integrity_alerts
                     (session_id, device_id, alert_type, severity, detail)
@@ -929,7 +1185,7 @@ class V2Repository:
         stored for the first time: a resent batch stores nothing twice, and
         only new alerts are raised.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 new = []
                 for e in entries:
@@ -951,12 +1207,13 @@ class V2Repository:
     async def consume_grant(self, jti: str, expires_at: datetime,
                             session_id: Optional[str] = None) -> bool:
         """Record a grant as used. Returns False if it was already spent."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             try:
-                await conn.execute("""
-                    INSERT INTO used_grants (jti, session_id, expires_at)
-                    VALUES ($1, $2, $3)
-                """, jti, session_id, expires_at)
+                async with conn.transaction():      # a savepoint inside a session_tx
+                    await conn.execute("""
+                        INSERT INTO used_grants (jti, session_id, expires_at)
+                        VALUES ($1, $2, $3)
+                    """, jti, session_id, expires_at)
                 return True
             except asyncpg.UniqueViolationError:
                 return False
@@ -968,26 +1225,26 @@ class V2Repository:
     # ============================================================
 
     async def hospital_for_cmed_id(self, cmed_hospital_id: str) -> Optional[str]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return await conn.fetchval(
                 "SELECT hospital_id FROM hospitals WHERE cmed_hospital_id = $1",
                 cmed_hospital_id)
 
     async def hospital_exists(self, hospital_id: str) -> bool:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return bool(await conn.fetchval(
                 "SELECT 1 FROM hospitals WHERE hospital_id = $1", hospital_id))
 
     async def set_cmed_hospital_id(self, hospital_id: str,
                                    cmed_hospital_id: Optional[str]) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE hospitals SET cmed_hospital_id = $2 WHERE hospital_id = $1",
                 hospital_id, cmed_hospital_id or None)
 
     async def create_authorisation(self, *, jti: str, device_id, hospital_id: str,
                                    visit, expires_at: datetime) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO grant_authorisations
                     (jti, device_id, hospital_id, cmed_hospital_id, patient_id,
@@ -997,14 +1254,14 @@ class V2Repository:
                  visit.doctor_id, visit.start_time, visit.day, expires_at)
 
     async def get_authorisation(self, jti: str) -> Optional[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM grant_authorisations WHERE jti = $1", jti)
         return dict(row) if row else None
 
     async def grants_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         """Every grant linked to this recording, oldest first."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM grant_authorisations WHERE session_id = $1
                  ORDER BY issued_at
@@ -1014,14 +1271,14 @@ class V2Repository:
     async def reassign_session(self, session_id: str, *, patient_id: str,
                                doctor_id: str) -> None:
         """The recording now belongs to the patient its prescription was built for."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions SET patient_id = $2, doctor_id = $3, updated_at = now()
                  WHERE session_id = $1
             """, session_id, patient_id, doctor_id)
 
     async def link_authorisation(self, jti: str, session_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE grant_authorisations SET session_id = $2
                  WHERE jti = $1 AND (session_id IS NULL OR session_id = $2)
@@ -1033,7 +1290,7 @@ class V2Repository:
     async def find_unclaimed_notice(self, visit, *, hospital_id: str,
                                     since: datetime) -> Optional[int]:
         """The most recent unused API 2 for this visit and clinic (SRS-CNF-04, -05)."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return await conn.fetchval(f"""
                 SELECT id FROM confirmation_notices
                  WHERE claimed_by_jti IS NULL
@@ -1045,7 +1302,7 @@ class V2Repository:
     async def find_waiting_authorisation(self, visit, *, hospital_id: str,
                                          since: datetime) -> Optional[Dict[str, Any]]:
         """The most recent grant for this visit that no API 2 has confirmed yet."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow(f"""
                 SELECT jti, session_id FROM grant_authorisations
                  WHERE notice_id IS NULL AND {self._VISIT_MATCH} AND issued_at >= $7
@@ -1056,7 +1313,7 @@ class V2Repository:
 
     async def claim_notice(self, notice_id: int, jti: str) -> bool:
         """One API 2 confirms one grant, once (SRS-CNF-04). All or nothing."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 grant = await conn.fetchval("""
                     SELECT jti FROM grant_authorisations
@@ -1077,7 +1334,7 @@ class V2Repository:
 
     async def set_session_confirmation(self, session_id: str, state: str, *,
                                        grant_jti: Optional[str] = None) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions
                    SET confirmation = $2::text,
@@ -1090,7 +1347,7 @@ class V2Repository:
             """, session_id, state, grant_jti)
 
     async def session_confirmation(self, session_id: str) -> Optional[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT session_id, confirmation, opened_at, grant_jti, unconfirmed_at,
                        refused_at, device_id, doctor_id, hospital_id, session_date
@@ -1107,7 +1364,7 @@ class V2Repository:
         the notice at the same moment the recording opens - and it is cheap
         enough to run on every sweep.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 UPDATE sessions s
                    SET confirmation = 'confirmed', unconfirmed_at = NULL,
@@ -1127,7 +1384,7 @@ class V2Repository:
 
     async def sessions_in_confirmation(self, states: List[str], *,
                                        opened_before: datetime) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, confirmation, opened_at, device_id
                   FROM sessions
@@ -1138,32 +1395,80 @@ class V2Repository:
 
     async def record_refusal(self, *, session_id: str, device_id, hospital_id: str,
                              doctor_id: Optional[str],
-                             visit_sha256: Optional[bytes]) -> bool:
+                             visit_sha256: Optional[bytes],
+                             signed: Optional[bool] = None) -> bool:
         """True the first time a session is refused; a retry changes nothing."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             inserted = await conn.fetchval("""
                 INSERT INTO session_refusals
-                    (session_id, device_id, hospital_id, doctor_id, visit_sha256)
-                VALUES ($1,$2,$3,$4,$5)
+                    (session_id, device_id, hospital_id, doctor_id, visit_sha256, signed)
+                VALUES ($1,$2,$3,$4,$5,$6)
                 ON CONFLICT (session_id) DO NOTHING RETURNING session_id
-            """, session_id, device_id, hospital_id, doctor_id, visit_sha256)
+            """, session_id, device_id, hospital_id, doctor_id, visit_sha256, signed)
         return inserted is not None
 
+    async def refusals_since(self, device_id, since: datetime) -> int:
+        async with self._acquire() as conn:
+            return int(await conn.fetchval("""
+                SELECT count(*) FROM session_refusals
+                 WHERE device_id = $1 AND refused_at >= $2
+            """, device_id, since))
+
+    async def mark_late_alerted(self, session_id: str) -> bool:
+        """True once per recording: the missing-clips alert is raised one time."""
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                UPDATE sessions SET late_alerted_at = now()
+                 WHERE session_id = $1 AND late_alerted_at IS NULL
+                RETURNING 1
+            """, session_id))
+
+    # ---- the files an erased recording leaves behind ----
+
+    async def erase_task(self, session_id: str) -> Optional[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM erase_tasks WHERE session_id = $1",
+                                      session_id)
+        return _erase_row(row) if row else None
+
+    async def pending_erase(self, limit: int = 20) -> List[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM erase_tasks WHERE completed_at IS NULL
+                 ORDER BY created_at LIMIT $1
+            """, limit)
+        return [_erase_row(r) for r in rows]
+
+    async def set_erase_cloud_keys(self, session_id: str, keys: List[Dict[str, Any]]) -> None:
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE erase_tasks SET cloud_keys = $2 WHERE session_id = $1",
+                               session_id, json.dumps(keys))
+
+    async def complete_erase(self, session_id: str) -> bool:
+        """The files are gone: nothing naming the patient is left in the task."""
+        async with self._acquire() as conn:
+            result = await conn.execute("""
+                UPDATE erase_tasks SET completed_at = now(), files = '[]'
+                 WHERE session_id = $1 AND completed_at IS NULL
+                   AND jsonb_array_length(cloud_keys) = 0
+            """, session_id)
+        return bool(result) and result.split()[-1] != "0"
+
     async def refusal(self, session_id: str) -> Optional[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM session_refusals WHERE session_id = $1", session_id)
         return dict(row) if row else None
 
     async def complete_refusal(self, session_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE session_refusals SET completed_at = COALESCE(completed_at, now())
                  WHERE session_id = $1
             """, session_id)
 
     async def refused_visit(self, visit_sha256: bytes) -> bool:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return bool(await conn.fetchval(
                 "SELECT 1 FROM session_refusals WHERE visit_sha256 = $1", visit_sha256))
 
@@ -1173,12 +1478,45 @@ class V2Repository:
         patient, so the audit log still resolves (SRS-CNS-06, SRS-CNF-09).
         The caller has already removed the objects from storage.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
+                # An archived recording has files on the server and copies in
+                # the cloud. Their names are written to an erase task for the
+                # archive worker (and the cloud keys for this server), and then
+                # everything else that names the patient goes from the row.
+                session = await conn.fetchrow(
+                    "SELECT archive_relpath FROM sessions WHERE session_id = $1", session_id)
+                files = []
+                if session is not None and session["archive_relpath"]:
+                    files.append(session["archive_relpath"])
+                for part in await conn.fetch(
+                        "SELECT archive_relpath FROM consultation_parts "
+                        " WHERE session_id = $1 AND archive_relpath IS NOT NULL", session_id):
+                    files.append(part["archive_relpath"])
+                cloud = [{"kind": r["kind"], "object_key": r["object_key"]}
+                         for r in await conn.fetch(
+                             "SELECT kind, object_key FROM cloud_copies WHERE session_id = $1",
+                             session_id)]
+                if files or cloud:
+                    await conn.execute("""
+                        INSERT INTO erase_tasks (session_id, files, cloud_keys)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (session_id) DO UPDATE
+                           SET files = (SELECT jsonb_agg(DISTINCT f) FROM jsonb_array_elements(
+                                            erase_tasks.files || EXCLUDED.files) f),
+                               cloud_keys = erase_tasks.cloud_keys || EXCLUDED.cloud_keys,
+                               completed_at = NULL
+                    """, session_id, json.dumps(sorted(set(files))), json.dumps(cloud))
                 await conn.execute("DELETE FROM purge_receipts WHERE session_id = $1",
                                    session_id)
                 await conn.execute("DELETE FROM segments WHERE session_id = $1", session_id)
                 await conn.execute("DELETE FROM chain_entries WHERE session_id = $1",
+                                   session_id)
+                await conn.execute("DELETE FROM session_clicks WHERE session_id = $1",
+                                   session_id)
+                await conn.execute("DELETE FROM consultation_parts WHERE session_id = $1",
+                                   session_id)
+                await conn.execute("DELETE FROM cloud_copies WHERE session_id = $1",
                                    session_id)
                 await conn.execute("""
                     UPDATE grant_authorisations SET patient_id = 'REDACTED'
@@ -1187,6 +1525,7 @@ class V2Repository:
                 await conn.execute("""
                     UPDATE sessions
                        SET patient_id = 'REDACTED', object_prefix = NULL, manifest = NULL,
+                           file_stem = NULL, archive_relpath = NULL, parts_count = 1,
                            status = $2::text, confirmation = $2::text,
                            refused_at = CASE WHEN $2::text = 'refused' THEN now()
                                              ELSE refused_at END,
@@ -1195,16 +1534,19 @@ class V2Repository:
                 """, session_id, state)
             # The old transcription tables may hold text of this consultation.
             # Not every database has all of them, so each is best effort.
+            # Each in a savepoint: inside a recording's transaction a failed
+            # statement would otherwise abort everything after it.
             for table in ("ner_results", "transcripts", "clips"):
                 try:
-                    await conn.execute(f"DELETE FROM {table} WHERE session_id = $1",
-                                       session_id)
+                    async with conn.transaction():
+                        await conn.execute(f"DELETE FROM {table} WHERE session_id = $1",
+                                           session_id)
                 except Exception as exc:
                     logger.warning("Could not clear %s for %s: %s", table, session_id, exc)
 
     async def delete_notices_for(self, visit) -> int:
         """A refused visit's API 2 notices go too (SRS-CNS-04)."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             result = await conn.execute("""
                 DELETE FROM confirmation_notices
                  WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
@@ -1216,27 +1558,46 @@ class V2Repository:
     # ---- Channel B ----
 
     async def cmed_key_valid(self, key_sha256: bytes) -> Optional[str]:
-        async with self._pool.acquire() as conn:
-            return await conn.fetchval("""
+        found = await self.cmed_key_lookup(key_sha256)
+        return found["label"] if found else None
+
+    async def cmed_key_lookup(self, key_sha256: bytes) -> Optional[Dict[str, Any]]:
+        """A live static CMED key: its label and the hospitals it may speak for."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
                 UPDATE api_keys SET last_used_at = now()
                  WHERE key_sha256 = $1 AND scope = 'cmed' AND revoked_at IS NULL
                    AND (expires_at IS NULL OR expires_at > now())
-                RETURNING label
+                RETURNING label, cmed_hospital_ids
             """, key_sha256)
+        return dict(row) if row else None
+
+    async def cmed_token_lookup(self, token_sha256: bytes) -> Optional[Dict[str, Any]]:
+        """A live access token, with its client's address list."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT t.client_id, t.cmed_hospital_ids, t.scopes, c.allowed_cidrs
+                  FROM cmed_access_tokens t JOIN cmed_clients c USING (client_id)
+                 WHERE t.token_sha256 = $1 AND t.revoked_at IS NULL AND t.expires_at > now()
+                   AND c.revoked_at IS NULL AND c.expires_at > now()
+            """, token_sha256)
+        return dict(row) if row else None
 
     async def create_cmed_key(self, *, label: str, created_by: str,
-                              expires_at: Optional[datetime]) -> str:
+                              expires_at: Optional[datetime],
+                              cmed_hospital_ids: Optional[List[str]] = None) -> str:
         """Returned once. Only the hash is stored (SRS-CHB-02)."""
         key = "cmed_" + new_token()
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
-                INSERT INTO api_keys (key_sha256, label, scope, created_by, expires_at)
-                VALUES ($1, $2, 'cmed', $3, $4)
-            """, hash_token(key), label, created_by, expires_at)
+                INSERT INTO api_keys (key_sha256, label, scope, created_by, expires_at,
+                                      cmed_hospital_ids)
+                VALUES ($1, $2, 'cmed', $3, $4, $5)
+            """, hash_token(key), label, created_by, expires_at, cmed_hospital_ids)
         return key
 
     async def revoke_cmed_keys(self, label: str) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             result = await conn.execute("""
                 UPDATE api_keys SET revoked_at = now()
                  WHERE scope = 'cmed' AND label = $1 AND revoked_at IS NULL
@@ -1249,7 +1610,7 @@ class V2Repository:
         API 2's five fields, kept for matching (SRS-CNF-03). The body is not
         here: it is in aims_clinical, which this database never reads.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             return int(await conn.fetchval("""
                 INSERT INTO confirmation_notices
                     (cmed_hospital_id, hospital_id, patient_id, doctor_id, start_time,
@@ -1266,7 +1627,7 @@ class V2Repository:
                            audio_seconds: float, occurred_at: datetime, visit,
                            grant_jti: Optional[str]) -> None:
         """One marker from the chain. A redelivered marker is stored once."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO session_clicks
                     (session_id, entry_no, event, audio_seconds, occurred_at,
@@ -1280,7 +1641,7 @@ class V2Repository:
                  visit.start_time, visit.day, grant_jti)
 
     async def clicks_for(self, session_id: str) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT entry_no, event, audio_seconds, occurred_at, patient_id,
                        doctor_id, cmed_hospital_id, start_time, visit_date, grant_jti
@@ -1290,7 +1651,7 @@ class V2Repository:
         return [dict(r) for r in rows]
 
     async def parts_for(self, session_id: str) -> List[Dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT * FROM consultation_parts WHERE session_id = $1 ORDER BY part_no
             """, session_id)
@@ -1302,7 +1663,7 @@ class V2Repository:
         The verdict for one recording. `keep_archive`: the cut is unchanged, so
         the files already archived still stand and only the labels move.
         """
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             async with conn.transaction():
                 kept = {}
                 if keep_archive:
@@ -1340,7 +1701,7 @@ class V2Repository:
                 """, session_id, len(parts))
 
     async def set_parts_stale(self, session_id: str, stale: bool) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute(
                 "UPDATE sessions SET parts_stale = $2, updated_at = now() "
                 "WHERE session_id = $1", session_id, stale)
@@ -1348,7 +1709,7 @@ class V2Repository:
     async def label_session(self, session_id: str, *, patient_id: str, doctor_id: str,
                             grant_jti: Optional[str]) -> None:
         """A recording that is one patient's, after the rules: name it theirs."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE sessions SET patient_id = $2, doctor_id = $3,
                                     grant_jti = COALESCE($4, grant_jti),
@@ -1358,7 +1719,7 @@ class V2Repository:
 
     async def mark_part_archived(self, session_id: str, part_no: int, *, relpath: str,
                                  sha256: bytes, byte_length: int) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE consultation_parts
                    SET archive_relpath = $3, archive_sha256 = $4, archive_bytes = $5
@@ -1367,7 +1728,7 @@ class V2Repository:
 
     async def mark_part_copied(self, session_id: str, part_no: int) -> bool:
         """Returns True once every part of the recording is copied."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             await conn.execute("""
                 UPDATE consultation_parts SET copied_at = now()
                  WHERE session_id = $1 AND part_no = $2
@@ -1380,7 +1741,7 @@ class V2Repository:
 
     async def archived_parts_for(self, session_id: str) -> List[Dict[str, Any]]:
         """The part files a recut will rebuild the recording from."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT part_no, archive_relpath FROM consultation_parts
                  WHERE session_id = $1 AND archive_relpath IS NOT NULL
@@ -1390,7 +1751,7 @@ class V2Repository:
 
     async def pending_recut(self, limit: int = 5) -> List[Dict[str, Any]]:
         """Archived recordings whose labels changed where the files are cut."""
-        async with self._pool.acquire() as conn:
+        async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
                        opened_at, closed_at, sample_rate, channels, sample_width,
@@ -1412,11 +1773,13 @@ class V2Repository:
         """
         for candidate in (file_stem, f"{file_stem}_{session_id[-5:]}"):
             try:
-                async with self._pool.acquire() as conn:
-                    await conn.execute("""
-                        UPDATE sessions SET file_stem = $2, local_start = $3, local_end = $4
-                         WHERE session_id = $1
-                    """, session_id, candidate, local_start, local_end)
+                async with self._acquire() as conn:
+                    async with conn.transaction():  # a savepoint inside a session_tx
+                        await conn.execute("""
+                            UPDATE sessions SET file_stem = $2, local_start = $3,
+                                   local_end = $4
+                             WHERE session_id = $1
+                        """, session_id, candidate, local_start, local_end)
                 return candidate
             except asyncpg.UniqueViolationError:
                 continue

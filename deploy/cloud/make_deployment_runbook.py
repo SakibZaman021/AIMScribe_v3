@@ -149,7 +149,7 @@ S = []
 S.append(Paragraph("Deploying the AIMScribe Server to DigitalOcean", H1))
 S.append(Paragraph("The complete manual: accounts, droplet, storage, the stack, the endpoints, "
                    "the clinic PCs, and keeping it running &middot; AIMS LAB &middot; "
-                   "15 October 2026", SUB))
+                   "20 October 2026 (server and recorder 3.5.0)", SUB))
 S.append(HRFlowable(width="100%", thickness=1, color=RULE, spaceAfter=8))
 S.append(Paragraph("This manual moves the <b>whole AIMScribe v3 server</b> &mdash; nine services, "
                    "both databases, the gateway, the archive worker, the backups and the monitor "
@@ -163,7 +163,7 @@ S.append(tbl([["", "Stage", "Time", "Who"],
                            "email, with two-factor login", "30 min", "the owner"],
               ["<b>A</b>", "<b>The endpoint status table</b> &mdash; what works before and after. "
                            "Give this to CMED", "read it now", "you &rarr; CMED"],
-              ["<b>B</b>", "Before you start: the checklist, the two R2 buckets, the plan", "45 min",
+              ["<b>B</b>", "Before you start: the checklist, the three R2 buckets, the plan", "45 min",
                "AIMS LAB"],
               ["<b>C</b>", "<b>The deployment, twelve steps</b>", "<b>3&ndash;4 hours</b>",
                "AIMS LAB"],
@@ -279,12 +279,13 @@ S.append(tbl([["", "Endpoint", "Today", "After", "Why"],
                "Needs a public name and a certificate. Both arrive with the droplet. No key"],
               ["<b>2</b>", c("GET https://&lt;host&gt;/"),
                "<b>NO</b>", "<b>YES</b>", "same"],
-              ["<b>3</b>", c("POST https://&lt;host&gt;") + "<br/>" + c("/api/v2/clinical/patient-information")
-               + "<br/><i>API 2</i>",
+              ["<b>3</b>", c("POST https://&lt;host&gt;") + "<br/>" + c("/fhir/r4/$process-message")
+               + "<br/><i>API 2 (after a token from /api/v2/oauth/token)</i>",
                "<b>NO</b>", "<b>YES</b>",
                "<b>The one CMED is waiting for.</b> Finished and tested; it has had no public "
-               "address to answer on. Header " + c("X-CMED-Key")],
-              ["<b>4</b>", c("POST https://&lt;host&gt;") + "<br/>" + c("/api/v2/clinical/prescription")
+               "address to answer on. A FHIR message with a 5-minute token for one "
+               "hospital. No token: <b>401</b>"],
+              ["<b>4</b>", c("POST https://&lt;host&gt;") + "<br/>" + c("/fhir/r4/$process-message")
                + "<br/><i>API 3, Channel B</i>",
                "<b>NO</b>", "<b>YES</b>", "same as 3"],
               ["<b>5</b>", c("ws://127.0.0.1:5050/ws") + " &mdash; " + c("start")
@@ -298,8 +299,8 @@ S.append(tbl([["", "Endpoint", "Today", "After", "Why"],
               ["<b>8</b>", c("ws://127.0.0.1:5050/ws") + " &mdash; " + c("status"),
                "<b>YES</b>", "<b>YES</b>", "Unaffected"],
               ["<b>9</b>", c("GET https://&lt;host&gt;") + "<br/>"
-               + c("/api/v2/clinical/patient/{id}/visits") + "<br/><i>new: what we hold</i>",
-               "<b>NO</b>", "<b>YES</b>", "same as 3. No key: <b>401</b> " + c("INVALID_KEY")],
+               + c("/fhir/r4/Encounter?patient.identifier=&lt;id&gt;") + "<br/><i>what we hold</i>",
+               "<b>NO</b>", "<b>YES</b>", "same as 3. No token: <b>401</b> " + c("INVALID_TOKEN")],
               ["<b>10</b>", c("POST https://&lt;host&gt;") + "<br/>" + c("/api/v2/session/reassign")
                + "<br/><i>new: recorders only</i>", "&mdash;", "<b>YES</b>",
                "Not CMED's. Needs schema script 013. No device token: <b>401</b>"],
@@ -366,9 +367,9 @@ S.append(code(
     'The endpoints your server uses are finished and tested, and will answer\n'
     'as soon as our DigitalOcean deployment is done:\n'
     '\n'
-    '    POST  https://<host>/api/v2/clinical/patient-information   (API 2)\n'
-    '    POST  https://<host>/api/v2/clinical/prescription          (API 3, Channel B)\n'
-    '    GET   https://<host>/api/v2/clinical/patient/{id}/visits - what we hold\n'
+    '    POST  https://<host>/api/v2/oauth/token        - a 5-minute token per hospital\n'
+    '    POST  https://<host>/fhir/r4/$process-message  (API 2 and API 3, Channel B)\n'
+    '    GET   https://<host>/fhir/r4/Encounter?patient.identifier=<id> - what we hold\n'
     '    GET   https://<host>/health              - no key, to check we are up\n'
     '\n'
     'While a branch has no internet, keep both POSTs in an outbox on its\n'
@@ -391,7 +392,7 @@ S.append(tbl([["", "What", "Where from", "Note"],
               ["&#9744;", "<b>A domain name you control</b>", "a UIU subdomain from UIU IT, "
                                                              "or a registrar",
                "<b>Required.</b> A certificate cannot be issued for a bare IP address"],
-              ["&#9744;", "The two R2 buckets and their tokens", "section 6 below",
+              ["&#9744;", "The three R2 buckets and their tokens", "section 6 below",
                "four values, each shown once"],
               ["&#9744;", "An SSH key pair", "your laptop, step 1",
                "password login will be turned off"],
@@ -429,10 +430,11 @@ S.append(Paragraph("<b>Only the gateway is reachable from outside, on ports 80 a
                    "Every other service talks on a private Docker network that has no route "
                    "to the internet except through the gateway.", GOOD))
 
-S.append(Paragraph("6 &middot; Cloudflare R2: two buckets, two tokens", H2))
-S.append(Paragraph("<b>The stack needs two separate buckets, not one.</b> The server refuses to "
-                   "make cloud copies if both settings name the same bucket (it logs a critical "
-                   "error and makes none).", BAD))
+S.append(Paragraph("6 &middot; Cloudflare R2: three buckets, three tokens", H2))
+S.append(Paragraph("<b>The stack needs three separate buckets, not one.</b> The server refuses to "
+                   "make cloud copies if the first two settings name the same bucket (it logs a "
+                   "critical error and makes none), and the database backups must not share a "
+                   "token with anything else.", BAD))
 S.append(Spacer(1, 3))
 S.append(tbl([["Bucket", "What goes in it", "Setting it fills"],
               ["<b>" + c("aimscribe-segments") + "</b>",
@@ -441,23 +443,29 @@ S.append(tbl([["Bucket", "What goes in it", "Setting it fills"],
                c("MINIO_BUCKET")],
               ["<b>" + c("aimscribe-archive") + "</b>",
                "One encrypted copy of each finished consultation &mdash; the permanent "
-               "cloud archive (the 3 TB)", c("AIMS_COPY_BUCKET")]],
+               "cloud archive (the 3 TB)", c("AIMS_COPY_BUCKET")],
+              ["<b>" + c("aimscribe-backups") + "</b>",
+               "Each night's encrypted database backup, so a lost droplet does not take the "
+               "backups with it. Kept 90 days; a few MB a night", c("AIMS_OFFSITE_BUCKET")]],
              [38 * mm, 82 * mm, 36 * mm]))
 S.append(Spacer(1, 4))
 S.append(tbl([["", "Do this in Cloudflare", "Result"],
               ["1", "R2 Object Storage &rarr; <b>Create bucket</b> &rarr; name "
                     + c("aimscribe-segments") + " &rarr; Location: <b>Automatic</b>, with the "
                     "hint <b>Asia-Pacific</b> if offered &rarr; Create", "bucket 1"],
-              ["2", "Same again for " + c("aimscribe-archive"), "bucket 2"],
-              ["3", "Leave <b>Public access off</b> on both. Never enable a public r2.dev address",
-               "private"],
+              ["2", "Same again for " + c("aimscribe-archive") + " and for "
+                    + c("aimscribe-backups"), "buckets 2 and 3"],
+              ["3", "Leave <b>Public access off</b> on all three. Never enable a public r2.dev "
+                    "address", "private"],
               ["4", "R2 &rarr; <b>Manage R2 API Tokens</b> &rarr; Create API token &rarr; name "
                     + c("aimscribe-segments-rw") + " &rarr; permission <b>Object Read &amp; "
                     "Write</b> &rarr; <b>Apply to specific buckets only</b>: "
                     + c("aimscribe-segments") + " &rarr; Create",
                "<b>Access Key ID</b> and <b>Secret Access Key</b> &mdash; shown once"],
               ["5", "Same again, named " + c("aimscribe-archive-rw") + ", for "
-                    + c("aimscribe-archive") + " only", "a second pair &mdash; shown once"],
+                    + c("aimscribe-archive") + " only, and " + c("aimscribe-backups-rw")
+                    + " for " + c("aimscribe-backups") + " only",
+               "a second and a third pair &mdash; each shown once"],
               ["6", "Copy the <b>S3 endpoint</b> shown with the token. It looks like "
                     + c("https://&lt;account-id&gt;.r2.cloudflarestorage.com"),
                "you will use it <b>without</b> the " + c("https://")]],
@@ -473,8 +481,10 @@ S.append(trouble([
      "permanent copies. Never on the segments bucket, which the server empties as it works."),
 ]))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Keep the two pairs apart.</b> The segments token can delete; the archive "
-                   "token must never be given to anything except this server's settings.", NOTE))
+S.append(Paragraph("<b>Keep the three pairs apart.</b> The segments token can delete; the "
+                   "archive and backup tokens must never be given to anything except this "
+                   "server's settings. A leaked segments token then cannot reach the backups.",
+                   NOTE))
 
 S.append(Paragraph("7 &middot; What the 16 GB droplet needs that the default does not", H2))
 S.append(Paragraph("The stack's defaults were written for a 64 GB machine at UIU. On the "
@@ -692,8 +702,9 @@ S.append(code(
     '# setv NAME VALUE - replaces the line NAME=... in .env, or adds it\n'
     'setv() { sed -i "s|^$1=.*|$1=$2|" .env; grep -q "^$1=" .env || echo "$1=$2" >> .env; }\n'
     '\n'
-    '# passwords and service keys: random, 64 hex characters each\n'
-    'for v in POSTGRES_SUPERUSER_PASSWORD AIMS_RECORDINGS_PASSWORD \\\n'
+    '# passwords and service keys: random, 64 hex characters each, from the\n'
+    '# system\'s secure random source. Nothing is ever left at a default.\n'
+    'for v in POSTGRES_SUPERUSER_PASSWORD AIMS_API_DB_PASSWORD \\\n'
     '         AIMS_CLINICAL_PASSWORD AIMS_MONITOR_PASSWORD REDIS_PASSWORD \\\n'
     '         AIMS_ADMIN_KEY AIMS_WORKER_KEY AIMSCRIBE_WEBHOOK_SECRET; do\n'
     '  setv $v "$(openssl rand -hex 32)"\n'
@@ -719,9 +730,19 @@ S.append(code(
     '\n'
     '# the exact address CMED\'s dashboard is served from (no wildcards);\n'
     '# ask CMED - a placeholder is harmless, it only governs browser access\n'
-    'setv AIMS_ALLOWED_ORIGINS https://<cmed-dashboard-host>'))
+    'setv AIMS_ALLOWED_ORIGINS https://<cmed-dashboard-host>\n'
+    '\n'
+    '# OPTIONAL: the lab\'s fixed public address, if it has one. The dashboard\n'
+    '# and /api/v2/admin then also open from there. Left empty they open ONLY\n'
+    '# through the SSH tunnel (section 13) - the safer default.\n'
+    '# setv AIMS_ADMIN_ALLOW <lab public IP>/32'))
+S.append(Paragraph("<b>The admin routes have two locks.</b> The admin key, and where the request "
+                   "comes from: from the internet " + c("/api/v2/admin") + " and the dashboard "
+                   "answer " + c("403") + " unless the address is in " + c("AIMS_ADMIN_ALLOW")
+                   + ". On the droplet itself they are on " + c("http://127.0.0.1:6001")
+                   + ", which is how step 10 and section 10 reach them.", NOTE))
 
-S.append(Paragraph("6c &middot; The two R2 buckets from Part B, section 6", H3))
+S.append(Paragraph("6c &middot; The three R2 buckets from Part B, section 6", H3))
 S.append(code(
     '# the endpoint is the HOST NAME ONLY - no https:// in front\n'
     'R2=<account-id>.r2.cloudflarestorage.com\n'
@@ -740,7 +761,13 @@ S.append(code(
     'setv AIMS_COPY_REGION     auto\n'
     'setv AIMS_COPY_SECURE     true\n'
     'setv AIMS_COPY_ACCESS_KEY <archive token Access Key ID>\n'
-    'setv AIMS_COPY_SECRET_KEY <archive token Secret Access Key>'))
+    'setv AIMS_COPY_SECRET_KEY <archive token Secret Access Key>\n'
+    '\n'
+    '# each night\'s encrypted database backup, off the droplet (this one WITH https://)\n'
+    'setv AIMS_OFFSITE_ENDPOINT   https://$R2\n'
+    'setv AIMS_OFFSITE_BUCKET     aimscribe-backups\n'
+    'setv AIMS_OFFSITE_ACCESS_KEY <backups token Access Key ID>\n'
+    'setv AIMS_OFFSITE_SECRET_KEY <backups token Secret Access Key>'))
 S.append(Paragraph("<b>" + c(".env.example") + " suggests Amazon for the copy store "
                    "(" + c("s3.ap-south-1.amazonaws.com") + ").</b> The lines above replace that "
                    "with R2, which is the policy for this deployment.", NOTE))
@@ -833,7 +860,7 @@ S.append(code(
 
 S.append(Paragraph("6g &middot; Check, then put six secrets somewhere safe", H3))
 S.append(code(
-    'for v in POSTGRES_SUPERUSER_PASSWORD AIMS_RECORDINGS_PASSWORD AIMS_CLINICAL_PASSWORD \\\n'
+    'for v in POSTGRES_SUPERUSER_PASSWORD AIMS_API_DB_PASSWORD AIMS_CLINICAL_PASSWORD \\\n'
     '  AIMS_MONITOR_PASSWORD REDIS_PASSWORD AIMS_WORKER_KEY AIMS_ADMIN_KEY AIMS_PUBLIC_HOST \\\n'
     '  AIMS_ACME_EMAIL AIMS_DB_PATH AIMS_ARCHIVE_PATH AIMS_BACKUP_PATH AIMS_BACKUP_KEY \\\n'
     '  AIMS_COPY_KEY AIMS_GRANT_PRIVATE_KEY AIMS_RECEIPT_PRIVATE_KEY MINIO_ENDPOINT \\\n'
@@ -850,7 +877,9 @@ S.append(trouble([
     (c("MISSING  &lt;name&gt;"), "Set it with " + c("setv") + " as above, then run the check "
                                  "again."),
     (c("required variable ... is missing a value"),
-     "One of the eleven the stack refuses to start without is empty. The message names it."),
+     "One of the eighteen the stack refuses to start without is empty - now including "
+     + c("AIMS_BACKUP_KEY") + ", both signing keys and the segment store's. The message "
+     "names it."),
     (c("setv: command not found"), "The session was closed. Paste the " + c("setv()")
                                     + " line from 6a again."),
 ]))
@@ -870,7 +899,19 @@ S.append(Paragraph("To read a value to copy it into the password manager, withou
                    "in the shell history: " + c("grep ^AIMS_COPY_KEY= .env") + ". Do this on "
                    "your own screen, never in a screen share.", NOTE))
 
-S += step("Step 7 &middot; The folders",
+S += step("Step 7 &middot; The folders, on an encrypted volume",
+          Paragraph("<b>First, the data volume.</b> In the DigitalOcean panel: Volumes &rarr; "
+                    "Create Volume, 400 GB, same region as the droplet, attach it to the "
+                    "droplet, <b>Manually format &amp; mount</b>. DigitalOcean encrypts volume "
+                    "data at rest. The databases, the archive and the backups then live on it, "
+                    "not on the droplet's own disk:", BODY),
+          code('ls /dev/disk/by-id/ | grep DO_Volume          # the new volume\n'
+               'V=/dev/disk/by-id/scsi-0DO_Volume_<name>\n'
+               'sudo mkfs.ext4 -L aimsdata "$V"               # once, on a NEW volume only\n'
+               'sudo mkdir -p /srv/aimscribe\n'
+               'echo "$V /srv/aimscribe ext4 defaults,nofail,discard,noatime 0 2" \\\n'
+               '  | sudo tee -a /etc/fstab\n'
+               'sudo mount -a && df -h /srv/aimscribe'),
           code('sudo mkdir -p /srv/aimscribe/{db,archive,backup}\n'
                '# the archive worker runs as user 10001 inside its container, and must\n'
                '# be able to write the archive; the database and backup containers\n'
@@ -879,7 +920,8 @@ S += step("Step 7 &middot; The folders",
                '# the nightly backup in step 12 runs as you\n'
                'sudo chown aims:aims /srv/aimscribe/backup\n'
                'df -h /srv'))
-S.append(expect("about " + c("310G") + " available on " + c("/") + "."))
+S.append(expect("the volume mounted on " + c("/srv/aimscribe") + " with about "
+                + c("390G") + " available."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Do not " + c("chown") + " the archive folder to " + c("aims")
                    + ".</b> The archive worker would then fail to write any recording, with "
@@ -923,7 +965,20 @@ S.append(trouble([
 ]))
 
 S += step("Step 9 &middot; Prove it answers &mdash; from your laptop, not the server",
-          code('PS> curl.exe -s https://' + HOST + '/health'))
+          code('PS> curl.exe -s https://' + HOST + '/health\n'
+               '\n'
+               '# and that what must stay closed is closed: 404, 404, 404, 403\n'
+               'PS> foreach ($p in "/api/v1/transcript/x", "/docs", "/api/v2/archive/pending",\n'
+               '                    "/api/v2/admin/alerts") {\n'
+               '      curl.exe -s -o NUL -w "%{http_code}  $p`n" https://' + HOST + '$p }'))
+S.append(expect("first " + c('{"status":"healthy","system":"AIMScribe v3 ..."}') + " - "
+                "from outside, /health shows only those two (the detail is for the "
+                "server's own checks), then " + c("404") + " for the old v1 API, the API map "
+                "and the archive "
+                "worker's route, and " + c("403") + " for admin - unless your laptop's "
+                "address is in " + c("AIMS_ADMIN_ALLOW") + ". Any " + c("200") + " there is "
+                "a door left open: stop and check the Caddyfile is the one from this "
+                "release."))
 S.append(expect(c('"status":"healthy"') + ", " + c('"database":"connected"') + ", "
                 + c('"redis":"connected"') + ", " + c('"minio":"connected"') + ", "
                 + c('"copy_bucket":"connected"') + ", and " + c('"system"') + " starting with "
@@ -952,11 +1007,13 @@ S.append(Paragraph("<b>Run it from somewhere else, not from the droplet.</b> Tes
 S += step("Step 10 &middot; Register the clinics, the doctors and CMED's key",
           Paragraph("These are admin API calls, authenticated with " + c("X-Admin-Key")
                     + ". Run them on the droplet; the key is read from " + c(".env")
-                    + " into a variable and never typed.", BODY))
+                    + " into a variable and never typed. They go to the gateway's "
+                    "loopback-only door, " + c("127.0.0.1:6001") + ": from the internet the "
+                    "admin routes answer " + c("403") + ".", BODY))
 S.append(code(
     'cd ~/AIMScribe_v3/deploy/uiu\n'
     'A=$(grep ^AIMS_ADMIN_KEY= .env | cut -d= -f2)\n'
-    'H=https://' + HOST + '/api/v2\n'
+    'H=http://127.0.0.1:6001/api/v2          # the lab door, this machine only\n'
     '\n'
     '# one clinic. cmed_hospital_id is CMED\'s code for it - the mapping that\n'
     '# lets CMED\'s visits be matched to this clinic\'s recordings\n'
@@ -977,13 +1034,16 @@ S.append(code(
     '  -d \'{ "doctor_id": "DR0042", "hospital_id": "AALO_DHOLPUR",\n'
     '        "full_name": "Dr Rahman", "active": true }\'\n'
     '\n'
-    '# CMED\'s Channel B key - PRINTED ONCE, NEVER RECOVERABLE\n'
-    'curl -s -X POST $H/admin/cmed-key -H "X-Admin-Key: $A" \\\n'
-    '  -H "Content-Type: application/json" \\\n'
-    '  -d \'{ "label": "cmed-production", "created_by": "AIMS LAB" }\''))
+    '# CMED, one client per hospital. CMED makes each key pair and sends only\n'
+    '# the PUBLIC key file; the private key never leaves CMED\'s server.\n'
+    'export AIMS_ADMIN_KEY="$A"\n'
+    'python3 ../../tools/cmed_fhir_client.py register --server http://127.0.0.1:6001 \\\n'
+    '  --client-id cmed-aalo-dholpur --hospital "<CMED code for this clinic>" \\\n'
+    '  --jwk cmed-aalo-dholpur.public.json --cidr "<CMED server address>/32"\n'
+    '# repeat for each clinic; send CMED each client_id and kid'))
 S.append(expect("each clinic: " + c('{"status":"ok","hospital_id":"AALO_DHOLPUR",'
                                     '"cmed_hospital_id":"..."}') + ". The key call: "
-                + c('{"cmed_key":"...","label":"cmed-production",...}') + "."))
+                + c('{"client_id":"cmed-aalo-dholpur","kid":"...",...}') + "."))
 S.append(Spacer(1, 3))
 S.append(trouble([
     (c("401") + " " + c("invalid admin key"), "The " + c("A=") + " line was run in another "
@@ -995,11 +1055,12 @@ S.append(trouble([
                                                                     + " exactly."),
 ]))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>Capture the CMED key the moment it prints</b> and send it to CMED over a "
-                   "channel that is not plain email if you can. It cannot be shown again. To "
-                   "replace it: issue a new one with a new label, let CMED switch, then revoke "
-                   "the old label with " + c("POST $H/admin/cmed-key/revoke") + " and body "
-                   + c('{"label": "cmed-production"}') + ".", BAD))
+S.append(Paragraph("<b>Nothing secret changes hands here.</b> CMED sends public keys; we send "
+                   "back client ids and key ids. To rotate a hospital's key, register the new "
+                   "public key with " + c("POST $H/admin/cmed-client/&lt;id&gt;/key") + ", let "
+                   "CMED switch, then revoke the old one. To cut a hospital off at once: "
+                   + c("POST $H/admin/cmed-client/&lt;id&gt;/revoke") + ". The old static key "
+                   "stays off (" + c("AIMS_CMED_LEGACY_KEYS") + " empty).", GOOD))
 S.append(Spacer(1, 4))
 S.append(box("<b>" + c("cmed_hospital_id") + " is the blocking prerequisite</b>",
              "Without it, a visit CMED describes cannot be tied to the clinic it happened in: "
@@ -1026,6 +1087,7 @@ S.append(code(
     '\n'
     'cd ~/AIMScribe_v3/backend\n'
     'AIMS_BACKEND_URL=https://' + HOST + ' \\\n'
+    'AIMS_ADMIN_URL=http://127.0.0.1:6001 \\\n'
     'AIMS_ADMIN_KEY=$(grep ^AIMS_ADMIN_KEY= ../deploy/uiu/.env | cut -d= -f2) \\\n'
     '  python3 scripts/mint_enrolment_tokens.py scripts/laptops.csv'))
 S.append(expect(c("backend  https://" + HOST) + ", one " + c("hospital ... ready")
@@ -1068,8 +1130,30 @@ S.append(Paragraph("<b>2. On your laptop</b>, with the two files from 6d in "
 S.append(code('PS> cd <your AIMScribe_v3 folder>\n'
               'PS> python tools\\check_key_pair.py --show --keys recorder\\keys'))
 S.append(expect("the same two fingerprints as on the droplet. <b>If either differs, stop</b>: "
-                "copy the files from 6d again. Then build " + c("AIMScribeSetup.exe")
-                + " as usual; the installer copies these keys to every PC it runs on."))
+                "copy the files from 6d again. The installer copies these keys to every PC "
+                "it runs on."))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Build the signed installer once, with this server's address in "
+                   "it</b>, so nobody types it on twenty PCs. Inno Setup 6 and the Windows SDK's "
+                   "signtool must be on your laptop, and the code-signing certificate set up "
+                   "as in " + c("recorder/INSTALL_FOR_IT.md") + ". An unsigned installer is "
+                   "what makes clinic laptops block it; never ask a clinic to switch Windows "
+                   "security off. Ask CMED for the exact address their doctor page is opened "
+                   "from:", BODY))
+S.append(code('C:\\> cd <your AIMScribe_v3 folder>\\recorder\n'
+              'C:\\> set AIMS_SIGN_PROVIDER=thumbprint     (or azure / signpath)\n'
+              'C:\\> set AIMS_SIGN_THUMBPRINT=<certificate thumbprint>\n'
+              'C:\\> set AIMS_BACKEND=https://' + HOST + '\n'
+              'C:\\> set AIMS_ORIGIN=https://<cmed-doctor-page-host>\n'
+              'C:\\> BUILD.bat        # tests, build, sign every file, signed installer'))
+S.append(expect(c("dist\\AIMScribeSetup.exe") + ", version 3.5.0, signed by AIMS LAB, "
+                "with " + c("AIMScribeSetup.exe.sha256") + " beside it. BUILD.bat stops if any "
+                "shipped file is unsigned. That one file goes on every clinic PC; an upgrade "
+                "keeps each PC's own settings and key. IT can install it silently: "
+                + c("AIMScribeSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "
+                    "/BACKEND=https://" + HOST + " /ORIGIN=https://&lt;cmed page&gt; "
+                    "/TOKEN=&lt;this PC's token&gt;") + ". Then run "
+                + c("AIMScribe - check this PC") + " from the Start menu: every row PASS."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>3. On the first clinic PC</b>, after 11c: "
                    + c("python tools\\check_key_pair.py --show --keys "
@@ -1086,9 +1170,10 @@ S.append(tbl([["", "Do this", "Note"],
                "<b>Without this the PC stays enrolled to the old server</b> and ignores the new "
                "token. A brand-new PC skips this row"],
               ["2", "Run " + c("AIMScribeSetup.exe") + " as administrator", ""],
-              ["3", "<b>Backend URL:</b> " + c("https://" + HOST), "exactly, with https"],
-              ["4", "<b>CMED web address:</b> the address the CMED dashboard is opened from",
-               "the page's origin"],
+              ["3", "<b>Backend URL:</b> already filled in &mdash; check it reads "
+                    + c("https://" + HOST), "built in by 11b"],
+              ["4", "<b>CMED web address:</b> already filled in &mdash; the address CMED's "
+                    "doctor page is opened from", "built in by 11b"],
               ["5", "<b>Enrolment token:</b> that PC's token from its sheet", "one PC, one token"],
               ["6", "Finish. The agent starts and enrols itself on first start",
                "needs the internet once"]],
@@ -1164,10 +1249,29 @@ S.append(trouble([
 ]))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>A backup nobody has restored is not a backup.</b> Do this drill today, "
-                   "then once a month. The backups live on the droplet's own disk, which the "
-                   "weekly DigitalOcean backup also copies; for a copy off the droplet, download "
-                   "the newest " + c(".enc") + " files with " + c("scp") + " once a week "
-                   "(Part E).", BAD))
+                   "then once a month.", BAD))
+S.append(Paragraph("12b2 &middot; The copy off the droplet", H3))
+S.append(Paragraph("Each night, after the dump, the same job copies every encrypted backup to "
+                   + c("aimscribe-backups") + ", checks the size of each copy, and keeps them 90 "
+                   "days. A night that cannot reach R2 is caught up the next night. Only "
+                   "encrypted backups ever leave the droplet. Check it now:", BODY))
+S.append(code(
+    'docker compose run --rm backup list-offsite\n'
+    '# the drill, from the off-site copy - as if the droplet were gone\n'
+    'docker compose run --rm backup fetch latest aims_recordings\n'
+    'docker compose run --rm backup restore /backups/<the file it printed> aims_restore_test'))
+S.append(expect("the two files from 12a, each with its size, and the log line "
+                + c("off-site: aims_recordings_... (size checked)") + ". The monitor alerts if "
+                "no copy has reached the bucket for 36 hours."))
+S.append(Spacer(1, 3))
+S.append(trouble([
+    (c("no off-site copy is configured"), "The four " + c("AIMS_OFFSITE_") + " lines from 6c are "
+                                          "missing. Add them, then " + c("docker compose up -d backup") + "."),
+    (c("off-site copy refused - the backups are not encrypted"),
+     c("AIMS_BACKUP_KEY") + " is empty. Backups hold patients' names and never leave unencrypted."),
+    (c("AccessDenied") + " or " + c("403"), "The backups token is not limited to, or not allowed "
+                                            "to write, " + c("aimscribe-backups") + "."),
+]))
 
 S.append(Paragraph("12c &middot; Email alerts from DigitalOcean", H3))
 S.append(tbl([["", "Do this in DigitalOcean", "Emails the owner when"],
@@ -1195,11 +1299,14 @@ S.append(tbl([["", "Check", "Command or action", "Pass"],
                c("HTTP/1.1 200") + ", no TLS error"],
               ["<b>3</b>", "<b>Health, from outside</b>", c("curl.exe -s https://&lt;host&gt;/health"),
                "<b>" + c('"status":"healthy"') + "</b>"],
-              ["<b>3b</b>", "Every migration is applied", "the same reply",
-               "<b>" + c('"schema":"ok"') + "</b>, not " + c('"missing ..."')],
+              ["<b>3b</b>", "Every migration is applied (on the droplet)",
+               c("docker compose exec -T api curl -s localhost:6000/health"),
+               "<b>" + c('"schema":"ok"') + "</b>, not " + c('"missing ..."')
+               + "; and " + c("/health/ready") + " answers 200"],
               ["<b>4</b>", "It is the right system", "the same reply",
                "<b>" + c("system") + " starts with " + c("AIMScribe v3") + "</b>"],
-              ["<b>5</b>", "The key is enforced", "POST API 2 with no key", "<b>401</b>"],
+              ["<b>5</b>", "A token is required", "POST " + c("/fhir/r4/$process-message")
+               + " with no token", "<b>401</b> " + c("INVALID_TOKEN")],
               ["<b>6</b>", "<b>API 2 accepts</b>", "POST API 2 with the key", "<b>202</b> "
                                                                              + c("ACCEPTED")],
               ["<b>7</b>", "<b>A repeat is recognised</b>", "POST the identical body again",
@@ -1208,10 +1315,11 @@ S.append(tbl([["", "Check", "Command or action", "Pass"],
                "<b>202</b> " + c("ACCEPTED")],
               ["<b>9</b>", "Only 80 and 443 are open", "from your laptop: "
                + c("Test-NetConnection &lt;host&gt; -Port 5432"), c("TcpTestSucceeded : False")],
-              ["<b>10</b>", "The visits list answers, and only with the key",
-               c("curl.exe -s https://&lt;host&gt;/api/v2/clinical/patient/TESTP0001/visits")
-               + ", then with " + c("-H \"X-CMED-Key: ...\""),
-               "<b>401</b>, then <b>200</b> " + c('"code":"OK"')],
+              ["<b>10</b>", "CMED's door answers, and only with a token",
+               c("curl.exe -s https://&lt;host&gt;/fhir/r4/metadata") + ", then "
+               + c("python tools/channel_b_test.py --server https://&lt;host&gt; "
+                   "--client-id ... --kid ... --key-file ..."),
+               "a CapabilityStatement, then <b>11/11 as expected</b>"],
               ["<b>11</b>", "The recorders' new endpoints exist and are guarded",
                c("curl.exe -s -X POST https://&lt;host&gt;/api/v2/device/health -H "
                  "\"Content-Type: application/json\" -d \"{}\""),
@@ -1263,7 +1371,7 @@ S.append(Paragraph("10 &middot; Every clinic day (5 minutes)", H2))
 S.append(code(
     'ssh aims@<droplet-ip>\n'
     'cd ~/AIMScribe_v3/deploy/uiu\n'
-    'A=$(grep ^AIMS_ADMIN_KEY= .env | cut -d= -f2); H=https://' + HOST + '/api/v2\n'
+    'A=$(grep ^AIMS_ADMIN_KEY= .env | cut -d= -f2); H=http://127.0.0.1:6001/api/v2\n'
     '\n'
     'docker compose ps                    # nine Up, four (healthy)\n'
     'df -h /srv | tail -1                       # Use% below 80\n'
@@ -1295,9 +1403,8 @@ S.append(tbl([["Look at", "Healthy", "Act when"],
 S.append(Paragraph("11 &middot; Every week (20 minutes)", H2))
 S.append(tbl([["", "Check", "How"],
               ["1", "Last night's backup exists", c("ls -lt /srv/aimscribe/backup | head -3")],
-              ["2", "A copy of the backups off the droplet",
-               c("PS&gt; scp aims@&lt;droplet-ip&gt;:/srv/aimscribe/backup/*.enc .")
-               + " to a UIU machine; delete copies older than 30 days"],
+              ["2", "The backups reached R2", c("docker compose run --rm backup list-offsite")
+               + ": last night's two files are there"],
               ["3", "Cloud copies are arriving", "Cloudflare &rarr; R2 &rarr; "
                                                  + c("aimscribe-archive") + ": object count grew"],
               ["4", "Security updates applied", c("cat /var/run/reboot-required")
@@ -1313,8 +1420,14 @@ S.append(Paragraph("The restore drill (step 12b). Then write the date and the ro
                    "list until it is fixed.", BODY))
 
 S.append(Paragraph("13 &middot; The dashboard page", H2))
-S.append(Paragraph("The dashboard is " + c("https://&lt;host&gt;/api/v2/dashboard/") + " and "
-                   "asks for the admin key, which it keeps in memory for that tab only. The "
+S.append(Paragraph("<b>From your laptop, through an SSH tunnel</b> (the internet gets "
+                   + c("403") + " for this page unless your address is in "
+                   + c("AIMS_ADMIN_ALLOW") + "):", BODY))
+S.append(code(
+    'PS> ssh -N -L 6001:127.0.0.1:6001 aims@<droplet-ip>     # leave it open\n'
+    '#   then open  http://localhost:6001/api/v2/dashboard/  in the browser'))
+S.append(Paragraph("The dashboard asks for the admin key, which it keeps in memory for that "
+                   "tab only. The "
                    "gateway gives this one path a policy that allows the page's own script and "
                    "style files and its own API calls, and nothing else; every other path stays "
                    "closed to browsers. The JSON calls in section 10 carry the same numbers.",
@@ -1342,19 +1455,24 @@ S.append(Spacer(1, 3))
 S.append(Paragraph("<b>A new migration is not applied by itself.</b> The schema scripts run only "
                    "on the very first start of an empty database; a new droplet built with this "
                    "manual already has every one. <b>A database created before this release needs "
-                   "three applied by hand</b>, in order, as the role that owns the tables &mdash; "
+                   "four applied by hand</b>, in order, as the role that owns the tables &mdash; "
                    + c("013_v3_reassign.sql") + " (recordings from older recorders that move to "
                    "the patient their prescription named), " + c("014_v3_device_health.sql")
-                   + " (the recorders' offline log) and " + c("015_v3_consultation_parts.sql")
+                   + " (the recorders' offline log), " + c("015_v3_consultation_parts.sql")
                    + " (which patient was opened at which second of a recording, and the "
-                   "per-patient files cut from it). Without 015, every recording that has a "
+                   "per-patient files cut from it) and " + c("016_v3_device_state.sql")
+                   + " (what each PC reports: held recordings, disk encryption, clock, version, "
+                   "and a resumed recording's link to its first part), then every later file in "
+                   + c("backend/scripts") + " the same way &mdash; including "
+                   + c("018_v3_least_privilege.sql") + ", which needs the step after this one "
+                   "first. Without 015, every recording that has a "
                    "second patient click or a prescription signal stops at that step and never "
                    "completes; without 014, the offline log is refused and stays on the "
                    "laptops.", BAD))
 S.append(code(
     'U=$(docker compose exec -T postgres printenv POSTGRES_USER)\n'
     'for f in 013_v3_reassign.sql 014_v3_device_health.sql \\\n'
-    '         015_v3_consultation_parts.sql; do\n'
+    '         015_v3_consultation_parts.sql 016_v3_device_state.sql; do\n'
     '  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" \\\n'
     '    -d aims_recordings -c "SET ROLE aims_recordings" -f /aims/scripts/$f\n'
     'done\n'
@@ -1366,17 +1484,56 @@ S.append(code(
 S.append(expect(c("device_health_log") + ", " + c("consultation_parts") + " and a CHECK that "
                 "lists " + c("'reassign'") + " and " + c("'marker'")
                 + ". Run the scripts again and nothing changes: all three are safe to repeat. "
-                "Within a minute " + c("https://" + HOST + "/health") + " shows "
+                "Within a minute the server's own /health (step 9, row 3b) shows "
                 + c('"schema":"ok"') + "; until then it names the file still missing, and the "
                 "monitor alerts."))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>A server set up before 018: give the API its own login.</b> Until 018 the "
+                   "API logged in as " + c("aims_recordings") + ", the owner of every table "
+                   "&mdash; which could switch off the audit log's protection. From 018 it logs "
+                   "in as " + c("aims_api") + ", which reads and writes rows and nothing more, "
+                   "and the owner has no login at all. Once, on the droplet:", BAD))
+S.append(code(
+    'cd ~/AIMScribe_v3/deploy/uiu\n'
+    'setv() { sed -i "s|^$1=.*|$1=$2|" .env; grep -q "^$1=" .env || echo "$1=$2" >> .env; }\n'
+    'setv AIMS_API_DB_PASSWORD "$(openssl rand -hex 32)"\n'
+    'U=$(docker compose exec -T postgres printenv POSTGRES_USER)\n'
+    'P=$(grep ^AIMS_API_DB_PASSWORD= .env | cut -d= -f2)\n'
+    'docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" -d postgres \\\n'
+    '  -c "CREATE ROLE aims_api LOGIN PASSWORD \'$P\'"\n'
+    'unset P\n'
+    'for f in $(cd ../../backend/scripts && ls 017_*.sql 018_*.sql 019_*.sql 020_*.sql); do\n'
+    '  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" \\\n'
+    '    -d aims_recordings -c "SET ROLE aims_recordings" -f /aims/scripts/$f\n'
+    'done\n'
+    'docker compose exec -T postgres psql -U "$U" -d postgres \\\n'
+    '  -c "ALTER ROLE aims_recordings NOLOGIN"\n'
+    '# the internal network gained a fixed range: recreate the networks once\n'
+    'docker compose down && docker compose up -d --build'))
+S.append(expect(c("CREATE ROLE") + ", the four scripts without an error, " + c("ALTER ROLE")
+                + ", and every service back " + c("Up") + ". " + c("/health") + " says "
+                + c('"database":"connected"') + " - now as " + c("aims_api") + ". If the API "
+                "log says " + c("password authentication failed for user \"aims_api\"")
+                + ", the password in " + c(".env") + " and the role differ: set it again with "
+                + c("ALTER ROLE aims_api PASSWORD ...") + " the same way."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Order: the server first, then the recorders.</b> A new recorder sends "
                    "each patient click and prescription signal to " + c("/session/marker")
                    + ", and its offline log; an old server answers 404, and a new one without "
                    "015 answers 500. The recorder keeps them waiting until the server is ready "
                    "&mdash; nothing is lost &mdash; but nothing after that step in the recording "
-                   "uploads until then. So update the server, apply 013, 014 and 015, then "
-                   "roll the installer out to the clinic PCs.", NOTE))
+                   "uploads until then. So update the server, apply 013 to 020 in order (017 to "
+                   "020 with the block above), then roll the installer out to the clinic PCs. "
+                   "<b>Upgrade the archive worker together with the server:</b> the server now "
+                   "receipts only the pieces the worker says it joined, so an old worker gets "
+                   "409 and archives nothing until it is upgraded. <b>Once every PC runs "
+                   "3.5.0</b> (dashboard, Recorders panel), set "
+                   + c("AIMS_REQUIRE_DEVICE_SIGNATURES=on") + ", "
+                   + c("AIMS_REQUIRE_SIGNED_REFUSAL=on") + " and "
+                   + c("AIMS_MIN_RECORDER_VERSION=3.5.0") + " in " + c(".env") + " and "
+                   + c("docker compose up -d api") + "; before that they would refuse the 3.4 "
+                   "PCs. Every request then carries an " + c("X-Request-ID") + " that the "
+                   "gateway sets; quote it when reading the API log.", NOTE))
 
 S.append(Paragraph("15 &middot; If it has to be undone", H2))
 S.append(tbl([["", "Situation", "What to do"],
@@ -1463,9 +1620,10 @@ S.append(tbl([["", "Item", "Where"],
               ["&#9744;", "First backup made with " + c("--now") + ", and <b>restored</b>",
                "step 12"],
               ["&#9744;", "Email alerts and the uptime check active; webhook set", "12c, 6f"],
-              ["&#9744;", c("/health") + " shows both buckets " + c("connected"), "step 9"],
-              ["&#9744;", "Schema scripts 013 and 014 present (automatic on a new database; "
-                          "by hand on an old one)", "14"],
+              ["&#9744;", c("/health") + " on the droplet shows both buckets "
+                          + c("connected"), "step 9"],
+              ["&#9744;", "Schema scripts 013 to 020 present (automatic on a new database; "
+                          "by hand, in order, on an old one)", "14"],
               ["&#9744;", "Checks 10 and 11 answer 401, not 404", "Part D"],
               ["&#9744;", "channel_b_test output sent to CMED", "Part D"]],
              [10 * mm, 116 * mm, 30 * mm], req=[9, 14, 16, 17, 19, 21]))

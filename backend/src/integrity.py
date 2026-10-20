@@ -294,6 +294,55 @@ def verify_chain(
     return Verdict(True)
 
 
+def segment_binding_problem(entry: ChainEntry, *, seq_no: int, sha256_hex: str,
+                            byte_length: Optional[int] = None) -> Optional[str]:
+    """
+    Does this signed entry describe this piece of audio? None when it does.
+
+    A signature proves the PC made the entry; only these comparisons prove the
+    entry is about the bytes it arrived with. Without them a signed entry from
+    one upload could vouch for any other upload.
+    """
+    payload = entry.payload if isinstance(entry.payload, dict) else {}
+    if entry.entry_type != "segment" or payload.get("type") != "segment":
+        return f"entry {entry.entry_no} is a {entry.entry_type} entry, not a segment"
+    if payload.get("seq_no") != seq_no:
+        return f"entry {entry.entry_no} is for segment {payload.get('seq_no')}, not {seq_no}"
+    if str(payload.get("audio_sha256", "")).lower() != str(sha256_hex).lower():
+        return f"entry {entry.entry_no} names different audio than segment {seq_no}"
+    if byte_length is not None and payload.get("bytes") not in (None, byte_length):
+        return f"entry {entry.entry_no} names {payload.get('bytes')} bytes, not {byte_length}"
+    return None
+
+
+DEVICE_SIGNATURE_DOMAIN = b"AIMS-DEVICE-SIG-V1\n"
+
+
+def device_request_message(*, method: str, path, timestamp: str, nonce: str,
+                           body: bytes) -> bytes:
+    """
+    What a PC signs for each request (recorder 3.5 and later), one field a line:
+
+        AIMS-DEVICE-SIG-V1 / METHOD / path?query / timestamp / nonce /
+        hex(sha256(body))
+    """
+    return b"".join([
+        DEVICE_SIGNATURE_DOMAIN, method.upper().encode("ascii"), b"\n",
+        path if isinstance(path, bytes) else path.encode("utf-8"), b"\n",
+        str(timestamp).encode("ascii"), b"\n",
+        nonce.encode("ascii"), b"\n",
+        hashlib.sha256(body or b"").hexdigest().encode("ascii"),
+    ])
+
+
+def verify_device_signature(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
 def chain_summary(entries: Sequence[ChainEntry]) -> Dict[str, Any]:
     """Counts an operator cares about: how many segments, how many pauses."""
     counts: Dict[str, int] = {}
@@ -453,5 +502,6 @@ __all__ = [
     "ChainEntry", "ChainError", "ReceiptSigner", "Verdict",
     "audit_entry_hash", "canonical_json", "chain_summary", "digest", "entry_hash",
     "iso_utc", "parse_entry", "safe_identifier", "safe_session_id",
-    "sha256_bytes", "verify_chain", "verify_entry",
+    "sha256_bytes", "verify_chain", "verify_entry", "segment_binding_problem",
+    "device_request_message", "verify_device_signature", "DEVICE_SIGNATURE_DOMAIN",
 ]

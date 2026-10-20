@@ -6,6 +6,7 @@
 # environment, never from a file in the repository.
 #
 #   aims_recordings   sessions, chains, receipts, the five-field notices
+#                     (owned by aims_recordings, used by aims_api)
 #   aims_clinical     everything CMED sends about a patient
 #
 # No application role can write to both, and neither can even connect to
@@ -19,8 +20,13 @@ run() { psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$1"; }
 echo "Creating the two databases and their roles"
 
 run postgres <<SQL
--- The recordings service: owns its database and reads and writes it.
-CREATE ROLE aims_recordings LOGIN PASSWORD '${AIMS_RECORDINGS_PASSWORD}';
+-- The recordings side has an owner nobody logs in as, and a separate login
+-- for the server. Migrations run as the superuser under SET ROLE
+-- aims_recordings; the server and the transcription worker log in as
+-- aims_api, which reads and writes rows but cannot alter a table, drop one,
+-- or disable the audit log's triggers (018_v3_least_privilege.sql).
+CREATE ROLE aims_recordings NOLOGIN;
+CREATE ROLE aims_api LOGIN PASSWORD '${AIMS_API_DB_PASSWORD}';
 
 -- The clinical side keeps its owner apart from the account that runs:
 -- nothing connects as the owner, so a mistake in the application cannot
@@ -39,7 +45,7 @@ CREATE DATABASE aims_clinical   OWNER aims_clinical_owner;
 REVOKE ALL ON DATABASE aims_recordings FROM PUBLIC;
 REVOKE ALL ON DATABASE aims_clinical   FROM PUBLIC;
 
-GRANT CONNECT ON DATABASE aims_recordings TO aims_recordings, aims_monitor;
+GRANT CONNECT ON DATABASE aims_recordings TO aims_api, aims_monitor;
 GRANT CONNECT ON DATABASE aims_clinical   TO aims_clinical_writer;
 SQL
 

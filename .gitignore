@@ -86,3 +86,6 @@ deploy/cloud/*.v2.pdf
 
 deploy/cloud/*.staged.pdf
 *.staged.pdf
+
+# Every password of the local system, filled in. Local only.
+LOCAL_MANUAL.pdf

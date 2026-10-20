@@ -401,7 +401,9 @@ def test_a_proven_old_copy_releases_the_wav_and_keeps_everything_else(setup, tmp
 
     assert worker.release_pass(now=later(7.1)) == 1
     assert not audio.exists()
-    assert audio.with_suffix(".json").exists()
+    # The JSON names the patient: it leaves with the audio. The copy bucket and
+    # the clinical database still hold it.
+    assert not audio.with_suffix(".json").exists()
 
     manifest = json.loads(audio.with_suffix(".manifest.json").read_text(encoding="utf-8"))
     assert manifest["local_audio"]["status"] == "released"
@@ -443,8 +445,12 @@ def test_a_late_prescription_after_release_still_rewrites_the_json(setup):
     backend.pending_json.append({"session_id": SESSION, "file_stem": STEM,
                                  "archive_relpath": RELPATH})
     assert worker.copy_pass() == 1
-    beside = json.loads(audio.with_suffix(".json").read_text(encoding="utf-8"))
-    assert beside["prescription"]["version"] == 2
+    # Written again and copied, then gone from this disk like the audio.
+    assert not audio.with_suffix(".json").exists()
+    sealed = audio.parent.parent / "late.json.enc"
+    sealed.write_bytes(backend.stored("json"))
+    back = cloudcopy.decrypt_file(sealed, audio.parent.parent / "late.json", KEY)
+    assert json.loads(back.read_text(encoding="utf-8"))["prescription"]["version"] == 2
     assert not audio.exists()
 
 

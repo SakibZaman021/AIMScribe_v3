@@ -310,8 +310,27 @@ class AudioRecorder:
         referenced so the garbage collector cannot close it under that reader.
         """
         if self._stream is not None:
-            self._abandoned.append((self._stream, self._pyaudio))
+            self._abandoned.append((self._stream, self._pyaudio, self._thread))
         self._stream, self._pyaudio = None, None
+
+    def _reap_abandoned(self) -> None:
+        """
+        Close abandoned streams whose stuck reader has finally returned. Without
+        this every hiccup of a Bluetooth headset left a device handle open for
+        the rest of the day.
+        """
+        keep = []
+        for stream, handle, thread in self._abandoned:
+            if thread is not None and thread.is_alive():
+                keep.append((stream, handle, thread))
+                continue
+            for close in (getattr(stream, "close", None), getattr(handle, "terminate", None)):
+                try:
+                    if close is not None:
+                        close()
+                except Exception as exc:
+                    logger.debug("Closing an abandoned stream: %s", exc)
+        self._abandoned = keep
 
     def _teardown_stream(self) -> None:
         stream, handle = self._stream, self._pyaudio
@@ -395,6 +414,9 @@ class AudioRecorder:
             time.sleep(self.WATCH_INTERVAL)
             if not self._running.is_set():
                 return
+            if self._abandoned:
+                with self._state_lock:
+                    self._reap_abandoned()
             stalled = time.monotonic() - self._last_read > self.stall_seconds
             if self._failed or stalled:
                 self._failover("reads failed" if self._failed else

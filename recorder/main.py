@@ -383,6 +383,16 @@ class AgentTray:
             logger.info("Diagnostics:\n%s", report)
             self.notify("Diagnostics written to the log", "Clipboard was unavailable.")
 
+    def quit_for_update(self) -> None:
+        """The installer asked: end the agent the normal way, no administrator needed."""
+        self._stop.set()
+        self.server.should_exit = True
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception as exc:
+                logger.debug("Tray icon stop: %s", exc)
+
     def on_exit(self, icon, item):
         if not is_administrator():
             self.notify("Not permitted",
@@ -512,15 +522,49 @@ def _format_duration(seconds: float) -> str:
 
 
 def _copy_to_clipboard(text: str) -> bool:
+    """
+    The Win32 clipboard, in-process. It used to run clip.exe in a hidden
+    window, and a recorder starting hidden child processes is what antivirus
+    behaviour rules look for.
+    """
     if sys.platform != "win32":
         return False
+    import ctypes
+    from ctypes import wintypes
+    CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    data = (text + "\0").encode("utf-16-le")
+    if not user32.OpenClipboard(None):
+        return False
     try:
-        import subprocess
-        subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True,
-                       creationflags=0x08000000)
+        user32.EmptyClipboard()
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not handle:
+            return False
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            return False
+        ctypes.memmove(pointer, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)       # still ours if it was not accepted
+            return False
         return True
     except Exception:
         return False
+    finally:
+        user32.CloseClipboard()
 
 
 # ============================================================
@@ -631,6 +675,9 @@ def main() -> int:
         # Only ever loopback; a wider bind would expose the control plane.
         server_header=False,
         date_header=False,
+        # A frame larger than this is dropped by the server before it is read
+        # into memory; the manager refuses anything over 64 KB anyway.
+        ws_max_size=128 * 1024,
     ))
 
     server_thread = threading.Thread(
@@ -648,13 +695,20 @@ def main() -> int:
                      config.security.bind_host, config.security.bind_port)
 
     tray = AgentTray(runtime, server)
+    # The installer stops the agent by signalling a named event, not by killing
+    # it: the open recording is closed and kept, then the agent exits.
+    from core.stop_event import StopListener, stop_for_update
+    stop_listener = StopListener(lambda: stop_for_update(runtime, tray.quit_for_update))
+    stop_listener.start()
     try:
         tray.run()
     except KeyboardInterrupt:
         logger.info("Interrupted")
     finally:
         server.should_exit = True
-        server_thread.join(timeout=10)
+        # Long enough for the last delivery (10 s), closing the recording and
+        # the controller: cut short, the daemon thread died mid-write.
+        server_thread.join(timeout=30)
         logger.info("AIMScribe Agent stopped")
 
     return 0

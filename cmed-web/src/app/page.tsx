@@ -312,6 +312,16 @@ export default function EntryPage() {
               </button>
             </div>
           </form>
+          {/* Test tools. Every scenario discussed for the gate, step by step,
+              with the replies the recorder and the server actually give. */}
+          <div className="mt-6 pt-4 border-t text-sm text-gray-600 flex flex-wrap gap-4">
+            <a href="/manual-test" className="text-blue-700 underline">
+              Manual test: every scenario, step by step
+            </a>
+            <a href="/protocol-test" className="text-blue-700 underline">
+              Protocol bench (one button per message)
+            </a>
+          </div>
         </div>
       </div>
     </div>

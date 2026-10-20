@@ -264,6 +264,14 @@ class Catalogue:
                       part.get("start_frame"), part.get("end_frame"), part.get("rule"),
                       1 if part.get("needs_review") else 0, now))
 
+    def forget(self, session_id: str) -> None:
+        """A refused recording leaves nothing here that names the patient."""
+        with closing(self._connect()) as conn:
+            for table in ("archived_parts", "archived_pauses", "archived_clips",
+                          "archived_sessions"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+            conn.commit()
+
     def session_row(self, session_id: str) -> Optional[Dict[str, Any]]:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM archived_sessions WHERE session_id = ?",

@@ -252,6 +252,51 @@ def certificate(not_after: Optional[datetime], now: datetime) -> Finding:
 
 
 # ============================================================
+# Backups
+# ============================================================
+
+def backups(last_local: Optional[datetime], last_offsite: Optional[datetime],
+            offsite_configured: bool, now: datetime, *,
+            max_age_hours: int = 36) -> List[Finding]:
+    """
+    A nightly backup that stopped is found the day it is needed. Two
+    questions: did last night's backup happen, and did it leave the server?
+    A copy kept only on the machine it protects is lost with that machine
+    (failure review A3). 36 hours allows one late or slow night.
+    """
+    def age(moment: Optional[datetime]) -> Optional[float]:
+        return None if moment is None else (now - moment).total_seconds() / 3600
+
+    found = []
+    local = age(last_local)
+    if local is None:
+        found.append(Finding("backup:local", CRITICAL,
+                             "no database backup has ever finished on this server", {}))
+    elif local > max_age_hours:
+        found.append(Finding("backup:local", CRITICAL,
+                             f"the last database backup finished {local:.0f} h ago",
+                             {"hours": round(local, 1)}))
+    else:
+        found.append(Finding("backup:local", OK, f"database backed up {local:.0f} h ago", {}))
+
+    if not offsite_configured:
+        found.append(Finding("backup:offsite", WARNING,
+                             "backups are kept only on this server; set AIMS_OFFSITE_BUCKET "
+                             "so a lost server does not take them with it", {}))
+        return found
+    off = age(last_offsite)
+    if off is None or off > max_age_hours:
+        found.append(Finding("backup:offsite", CRITICAL,
+                             "the backups have not reached the off-site bucket"
+                             + ("" if off is None else f" for {off:.0f} h"),
+                             {} if off is None else {"hours": round(off, 1)}))
+    else:
+        found.append(Finding("backup:offsite", OK, f"backups copied off-site {off:.0f} h ago",
+                             {}))
+    return found
+
+
+# ============================================================
 # The database schema
 # ============================================================
 
@@ -305,6 +350,6 @@ def summary(findings: Sequence[Finding]) -> Dict[str, Any]:
 
 
 __all__ = ["CRITICAL", "Finding", "OK", "WARNING", "archive_backlog", "certificate",
-           "schema",
+           "backups", "schema",
            "copies_behind", "disk_space", "failed_jobs", "in_clinic_hours",
            "should_send", "silent_recorders", "summary", "worst"]

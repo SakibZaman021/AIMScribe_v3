@@ -22,7 +22,8 @@ import api_v2                                   # noqa: E402
 from core import crypto as agent                # noqa: E402
 
 from test_v3_server import (                    # noqa: E402,F401
-    DEVICE, FIELDS, NOW, api2, mint, open_session, prescription, send, server, visit_of)
+    DEVICE, FIELDS, NOW, api2, joined, mint, open_session, prescription, send, server,
+    visit_of)
 
 pytestmark = pytest.mark.asyncio
 
@@ -219,7 +220,7 @@ async def test_the_archive_gets_the_cut_and_a_json_per_part(server, device_key, 
 
     await api_v2.archive_complete(api_v2.ArchiveCompleteRequest(
         session_id=sid, archive_relpath="H/D/2026-09-13/a/a.wav", sha256="ab" * 32,
-        bytes=58_212_044,
+        bytes=58_212_044, segments=joined(server, sid),
         parts=[api_v2.ArchivedPart(part_no=1, archive_relpath="H/D/2026-09-13/a/a.wav",
                                    sha256="11" * 32, bytes=31_752_044,
                                    start_seconds=0.0, end_seconds=360.0),

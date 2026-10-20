@@ -26,7 +26,11 @@ redis>=5.0.0
 
 # Grants, receipts, the hash chain.
 cryptography>=42.0.0
-pyjwt[crypto]>=2.8.0
+# 2.10+: rejects non-string jti/sub and unknown crit headers itself.
+pyjwt[crypto]>=2.10.0
+
+# The clinic's time zone, also where the OS has no zone database.
+tzdata>=2024.1
 
 # Outbound calls: webhooks, and anything the API fetches.
 httpx>=0.26.0

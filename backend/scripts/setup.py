@@ -107,7 +107,7 @@ def setup_minio():
         client = Minio(
             os.getenv("MINIO_ENDPOINT", "localhost:9000"),
             access_key=os.getenv("MINIO_ACCESS_KEY", "aimscribe"),
-            secret_key=os.getenv("MINIO_SECRET_KEY", "aimscribe123"),
+            secret_key=os.environ["MINIO_SECRET_KEY"],
             secure=os.getenv("MINIO_SECURE", "false").lower() == "true"
         )
 

@@ -58,7 +58,7 @@ def fresh(monkeypatch):
 
 
 def health():
-    return asyncio.run(app_module.health())
+    return asyncio.run(app_module._details())
 
 
 def test_a_reachable_bucket_is_healthy(monkeypatch):

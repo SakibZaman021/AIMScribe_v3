@@ -14,6 +14,11 @@
 # not the API (SRS-TOP-02, SRS-SRV-07). Workers make outbound connections
 # only.
 #
+# **Each service gets only its own secrets.** No service reads .env
+# whole: every variable is listed under the service that uses it, so a
+# break-in to the API does not also hand over the cloud-copy key, the
+# backup key or the database superuser's password.
+#
 # **Three kinds of disk**, as §10.3 requires, mounted here from the paths in
 # .env: the database on power-loss-protected NVMe, the working disks for
 # pieces being checked and merged, and the archive array. They are separate
@@ -48,9 +53,16 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp"          # HTTP/3
+      # The lab's door: admin routes and the dashboard, on this machine's
+      # loopback only - reached from the server itself or an SSH tunnel.
+      - "127.0.0.1:6001:6001"
     environment:
       AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST:?set AIMS_PUBLIC_HOST in .env}
       AIMS_ACME_EMAIL: ${AIMS_ACME_EMAIL:?set AIMS_ACME_EMAIL in .env}
+      # Who may open the dashboard and /api/v2/admin: addresses or CIDR
+      # ranges, separated by spaces. Unset means nobody from outside - the
+      # gateway answers 403 - which is the safe way for this to fail.
+      AIMS_ADMIN_ALLOW: ${AIMS_ADMIN_ALLOW:-127.0.0.1/32}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data           # certificates and their renewals
@@ -58,7 +70,12 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    networks: [edge, internal]
+    networks:
+      edge: {}
+      internal:
+        # A fixed address, so the API can trust X-Forwarded-For from this
+        # one sender and from nobody else (AIMS_TRUSTED_PROXIES).
+        ipv4_address: ${AIMS_GATEWAY_IP:-172.30.10.2}
 
   # ------------------------------------------------------------
   # PostgreSQL 16: both databases, on the database disks
@@ -74,7 +91,9 @@ services:
       POSTGRES_DB: postgres
       # Read by the init scripts, which create the two databases and the
       # roles that reach them (SRS-DBA-20).
-      AIMS_RECORDINGS_PASSWORD: ${AIMS_RECORDINGS_PASSWORD:?set AIMS_RECORDINGS_PASSWORD in .env}
+      # aims_api: the server's login. The tables' owner, aims_recordings,
+      # has none (018_v3_least_privilege.sql).
+      AIMS_API_DB_PASSWORD: ${AIMS_API_DB_PASSWORD:?set AIMS_API_DB_PASSWORD in .env}
       AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD:?set AIMS_CLINICAL_PASSWORD in .env}
       AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD:?set AIMS_MONITOR_PASSWORD in .env}
       # initdb runs before the config file is read, so the collation and
@@ -110,7 +129,7 @@ services:
   # ------------------------------------------------------------
   pgbouncer:
     build: ./pgbouncer
-    image: aimscribe/pgbouncer:3.3
+    image: aimscribe/pgbouncer:3.5.0
     container_name: aims-pgbouncer
     mem_limit: ${AIMS_PGBOUNCER_MEMORY:-128m}
     <<: *hardening
@@ -122,14 +141,14 @@ services:
       DEFAULT_POOL_SIZE: 25
       # The application users it may pass through, with the passwords it
       # needs to authenticate them. Nothing else may connect.
-      AIMS_RECORDINGS_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      AIMS_API_DB_PASSWORD: ${AIMS_API_DB_PASSWORD}
       AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD}
       AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U aims_recordings -d aims_recordings"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U aims_api -d aims_recordings"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -171,11 +190,11 @@ services:
     build:
       context: ../../backend
       dockerfile: docker/Dockerfile
-    image: aimscribe/api:3.3
+    image: aimscribe/api:3.5.0
     container_name: aims-api
     mem_limit: ${AIMS_API_MEMORY:-2g}
     <<: *hardening
-    env_file: [.env]
+    # No env_file: only what the API reads is passed to it.
     environment:
       # Each worker is a whole Python process with its own connection
       # pool: four is about 1.2 GB, two about 600 MB. Two on a 4 GB
@@ -186,8 +205,10 @@ services:
       POSTGRES_HOST: pgbouncer
       POSTGRES_PORT: 6432
       POSTGRES_DB: aims_recordings
-      POSTGRES_USER: aims_recordings
-      POSTGRES_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      # Not the owner of the tables: rows only, no DDL, no triggers, and the
+      # audit log can be added to but never changed (018).
+      POSTGRES_USER: aims_api
+      POSTGRES_PASSWORD: ${AIMS_API_DB_PASSWORD}
       POSTGRES_SSLMODE: disable        # one machine, one private network
       POSTGRES_POOL_MIN: 4
       POSTGRES_POOL_MAX: 20
@@ -200,13 +221,72 @@ services:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 6000
       PROMPTS_DIR: /app/src/prompts
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: ${TZ:-Asia/Dhaka}
+      # Where the API is reached from outside, and the one address whose
+      # X-Forwarded-For it believes: the gateway's, fixed above.
+      AIMS_PUBLIC_BASE_URL: https://${AIMS_PUBLIC_HOST}
+      AIMS_TRUSTED_PROXIES: ${AIMS_GATEWAY_IP:-172.30.10.2}
+      # Signing keys: grants and purge receipts.
+      AIMS_GRANT_PRIVATE_KEY: ${AIMS_GRANT_PRIVATE_KEY:?set AIMS_GRANT_PRIVATE_KEY in .env}
+      AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:?set AIMS_RECEIPT_PRIVATE_KEY in .env}
+      # Credentials the API checks.
+      AIMS_ADMIN_KEY: ${AIMS_ADMIN_KEY:?set AIMS_ADMIN_KEY in .env}
+      AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
+      AIMS_CMED_WEBHOOK_ENABLED: ${AIMS_CMED_WEBHOOK_ENABLED:-false}
+      AIMS_ALLOWED_ORIGINS: ${AIMS_ALLOWED_ORIGINS:-}
+      AIMS_DEFAULT_TIMEZONE: ${AIMS_DEFAULT_TIMEZONE:-Asia/Dhaka}
+      AIMS_MAX_SEGMENT_BYTES: ${AIMS_MAX_SEGMENT_BYTES:-67108864}
+      AIMS_MIN_RECORDER_VERSION: ${AIMS_MIN_RECORDER_VERSION:-3.4.0}
+      AIMS_SCHEMA_STRICT: ${AIMS_SCHEMA_STRICT:-false}
+      # The segment store. MINIO_EXTERNAL_ENDPOINT empty means "the same as
+      # MINIO_ENDPOINT": R2 has one public name. Left unset, the server's
+      # own default (localhost:9000) was signed into every upload link and
+      # no doctor's PC could upload anything.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:?set MINIO_ENDPOINT in .env}
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-true}
+      MINIO_REGION: ${MINIO_REGION:-auto}
+      # The copy store: the API signs the upload links, the archive worker
+      # (which alone holds AIMS_COPY_KEY) encrypts what goes up them.
+      AIMS_COPY_BUCKET: ${AIMS_COPY_BUCKET:-}
+      AIMS_COPY_ENDPOINT: ${AIMS_COPY_ENDPOINT:-}
+      AIMS_COPY_ACCESS_KEY: ${AIMS_COPY_ACCESS_KEY:-}
+      AIMS_COPY_SECRET_KEY: ${AIMS_COPY_SECRET_KEY:-}
+      AIMS_COPY_REGION: ${AIMS_COPY_REGION:-auto}
+      AIMS_COPY_SECURE: ${AIMS_COPY_SECURE:-true}
+      AIMS_JSON_BUCKET: ${AIMS_JSON_BUCKET:-}
+      AIMS_JSON_ENDPOINT: ${AIMS_JSON_ENDPOINT:-}
+      AIMS_JSON_ACCESS_KEY: ${AIMS_JSON_ACCESS_KEY:-}
+      AIMS_JSON_SECRET_KEY: ${AIMS_JSON_SECRET_KEY:-}
+      AIMS_JSON_REGION: ${AIMS_JSON_REGION:-auto}
+      AIMS_JSON_SECURE: ${AIMS_JSON_SECURE:-true}
+      # Channel B: CMED's servers. Their token method and the transition
+      # from the old shared key (see the CMED integration document).
+      AIMS_CMED_LEGACY_KEYS: ${AIMS_CMED_LEGACY_KEYS:-off}
+      AIMS_ANON_FAILURE_LIMIT: ${AIMS_ANON_FAILURE_LIMIT:-100}
+      AIMS_CMED_LEGACY_SUNSET: ${AIMS_CMED_LEGACY_SUNSET:-2027-01-31}
+      # On once every PC runs recorder 3.5 (signed requests, signed refusals).
+      AIMS_REQUIRE_DEVICE_SIGNATURES: ${AIMS_REQUIRE_DEVICE_SIGNATURES:-off}
+      AIMS_REQUIRE_SIGNED_REFUSAL: ${AIMS_REQUIRE_SIGNED_REFUSAL:-off}
+      AIMS_RATE_PER_IP_PER_MINUTE: ${AIMS_RATE_PER_IP_PER_MINUTE:-1200}
+      AIMS_TOKEN_RATE_PER_MINUTE: ${AIMS_TOKEN_RATE_PER_MINUTE:-60}
+      AIMS_AUTH_FAILURE_LIMIT: ${AIMS_AUTH_FAILURE_LIMIT:-10}
+      # The identifier systems agreed with CMED for FHIR (fhir.py).
+      AIMS_FHIR_SYSTEM_PATIENT: ${AIMS_FHIR_SYSTEM_PATIENT:-urn:aimscribe:cmed:patient}
+      AIMS_FHIR_SYSTEM_PRACTITIONER: ${AIMS_FHIR_SYSTEM_PRACTITIONER:-urn:aimscribe:cmed:practitioner}
+      AIMS_FHIR_SYSTEM_ORGANIZATION: ${AIMS_FHIR_SYSTEM_ORGANIZATION:-urn:aimscribe:cmed:hospital}
     depends_on:
       pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health/live"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -214,7 +294,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=512m
-    networks: [internal]
+    # internal: the database, Redis and the gateway. egress: out to the
+    # segment and copy buckets (R2). It publishes no port on either.
+    networks: [internal, egress]
 
   # ------------------------------------------------------------
   # Transcription and NER
@@ -223,37 +305,59 @@ services:
     build:
       context: ../../backend
       dockerfile: docker/Dockerfile.worker
-    image: aimscribe/worker:3.3
+    image: aimscribe/worker:3.5.0
     container_name: aims-worker
     mem_limit: ${AIMS_TRANSCRIBE_MEMORY:-1g}
     <<: *hardening
-    env_file: [.env]
+    # No env_file: Azure, the pieces it reads, the database. No signing key,
+    # no admin or worker key, nothing from the copy store.
     environment:
       POSTGRES_HOST: pgbouncer
       POSTGRES_PORT: 6432
       POSTGRES_DB: aims_recordings
-      POSTGRES_USER: aims_recordings
-      POSTGRES_PASSWORD: ${AIMS_RECORDINGS_PASSWORD}
+      POSTGRES_USER: aims_api
+      POSTGRES_PASSWORD: ${AIMS_API_DB_PASSWORD}
       POSTGRES_SSLMODE: disable
       AIMS_DB_POOLER: transaction
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       PROMPTS_DIR: /app/src/prompts
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: ${TZ:-Asia/Dhaka}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      AZURE_TRANSCRIBE_ENDPOINT: ${AZURE_TRANSCRIBE_ENDPOINT:-}
+      AZURE_TRANSCRIBE_API_KEY: ${AZURE_TRANSCRIBE_API_KEY:-}
+      AZURE_TRANSCRIBE_DEPLOYMENT: ${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe-diarize}
+      AZURE_TRANSCRIBE_API_VERSION: ${AZURE_TRANSCRIBE_API_VERSION:-2025-03-01-preview}
+      AZURE_NER_ENDPOINT: ${AZURE_NER_ENDPOINT:-}
+      AZURE_NER_API_KEY: ${AZURE_NER_API_KEY:-}
+      AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-}
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-true}
+      MINIO_REGION: ${MINIO_REGION:-auto}
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
+      AIMS_CMED_WEBHOOK_ENABLED: ${AIMS_CMED_WEBHOOK_ENABLED:-false}
     depends_on:
       api:
         condition: service_healthy
     read_only: true
     tmpfs:
       - /tmp:size=2g
-    networks: [internal]
+    # egress: Azure and the segment store.
+    networks: [internal, egress]
 
   # ------------------------------------------------------------
   # The archive worker: pulls pieces, merges, copies to cold storage
   # ------------------------------------------------------------
   archive-worker:
     build: ../../backend/archive_worker
-    image: aimscribe/archive-worker:3.3
+    image: aimscribe/archive-worker:3.5.0
     container_name: aims-archive-worker
     # A ceiling and a share of the machine: merging a 150 MB
     # consultation and encrypting it is heavy, and it runs beside
@@ -277,6 +381,7 @@ services:
       # this the disk fills at the full day's audio, every day. Negative keeps
       # everything here. Nothing is ever released without a proven copy.
       AIMS_ARCHIVE_LOCAL_RETENTION_DAYS: ${AIMS_ARCHIVE_LOCAL_RETENTION_DAYS:-7}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TZ: ${TZ:-Asia/Dhaka}
     volumes:
       - ${AIMS_ARCHIVE_PATH:?set AIMS_ARCHIVE_PATH in .env}:/archive
@@ -291,7 +396,10 @@ services:
       # as large as the WAV, so it is written on the archive disk instead
       # (/archive/.copywork), not here.
       - /tmp:size=${AIMS_WORK_TMPFS:-6g}
-    networks: [internal]
+    # internal: the API. egress: the pieces it downloads and the copies it
+    # uploads, both in R2. With `internal` alone - an internal network has no
+    # route out - not one piece could be fetched and no copy made.
+    networks: [internal, egress]
 
   # ------------------------------------------------------------
   # Nightly backups of both databases (SRS-STO-06, SRS-DAT-16)
@@ -300,7 +408,7 @@ services:
     # postgres:16-alpine plus openssl and tzdata (backup/Dockerfile): the
     # plain image could not encrypt a backup or restore one.
     build: ./backup
-    image: aimscribe/backup:3.3
+    image: aimscribe/backup:3.5.0
     container_name: aims-backup
     mem_limit: ${AIMS_BACKUP_MEMORY:-512m}
     <<: *hardening
@@ -313,9 +421,18 @@ services:
       AIMS_BACKUP_DIR: /backups
       AIMS_BACKUP_AT: ${AIMS_BACKUP_AT:-02:30}
       AIMS_BACKUP_KEEP_DAYS: ${AIMS_BACKUP_KEEP_DAYS:-30}
-      # Backups hold patient names. Without this they are written in the
-      # clear and the script says so on every run.
-      AIMS_BACKUP_KEY: ${AIMS_BACKUP_KEY:-}
+      # Backups hold patient names. Without this key the job refuses to
+      # run: an unencrypted dump of both databases is never written.
+      AIMS_BACKUP_KEY: ${AIMS_BACKUP_KEY:?set AIMS_BACKUP_KEY in .env}
+      # A copy of every encrypted backup off this server, in its own bucket
+      # with its own token (failure review A3). Unset: backups stay only here,
+      # and the log and the monitor say so.
+      AIMS_OFFSITE_BUCKET: ${AIMS_OFFSITE_BUCKET:-}
+      AIMS_OFFSITE_ENDPOINT: ${AIMS_OFFSITE_ENDPOINT:-}
+      AIMS_OFFSITE_ACCESS_KEY: ${AIMS_OFFSITE_ACCESS_KEY:-}
+      AIMS_OFFSITE_SECRET_KEY: ${AIMS_OFFSITE_SECRET_KEY:-}
+      AIMS_OFFSITE_PROVIDER: ${AIMS_OFFSITE_PROVIDER:-Cloudflare}
+      AIMS_OFFSITE_KEEP_DAYS: ${AIMS_OFFSITE_KEEP_DAYS:-90}
       TZ: ${TZ:-Asia/Dhaka}
     volumes:
       - ./backup:/opt/aims:ro
@@ -323,7 +440,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    networks: [internal]
+    # edge: the off-site bucket is on the internet; internal: the database.
+    networks: [internal, edge]
 
   # ------------------------------------------------------------
   # Watching the things a doctor would otherwise notice first
@@ -331,7 +449,7 @@ services:
   # ------------------------------------------------------------
   monitor:
     build: ./monitor
-    image: aimscribe/monitor:3.3
+    image: aimscribe/monitor:3.5.0
     container_name: aims-monitor
     mem_limit: ${AIMS_MONITOR_MEMORY:-256m}
     <<: *hardening
@@ -342,6 +460,8 @@ services:
       AIMS_MONITOR_EVERY: ${AIMS_MONITOR_EVERY:-300}
       # The API's own health, for the schema check (migrations applied?).
       AIMS_API_HEALTH_URL: ${AIMS_API_HEALTH_URL:-http://api:6000/health}
+      # Whether the backup job is expected to copy off the server.
+      AIMS_OFFSITE_BUCKET: ${AIMS_OFFSITE_BUCKET:-}
       AIMS_CLINIC_HOURS: ${AIMS_CLINIC_HOURS:-08:00-22:00}
       # Free space each volume must keep, in GB. Left empty, each is its
       # default (500 / 100 / 50) capped at 15% of that volume, which suits
@@ -371,10 +491,19 @@ volumes:
   monitor_state:
 
 networks:
-  # Only the gateway and the monitor sit on `edge`: the gateway to answer
-  # the internet, the monitor to check the certificate from outside.
+  # `edge`: the gateway, to answer the internet; the monitor, to check the
+  # certificate from outside; the backup job, for the off-site bucket.
   edge:
     name: aims-edge
+  # `egress`: outbound only, for the services that must reach R2 or Azure.
+  # Nothing on it publishes a port, so nothing on it can be reached from
+  # outside; it exists because an internal network has no route out.
+  egress:
+    name: aims-egress
+  # `internal`: the database, PgBouncer and Redis live here and nowhere else.
   internal:
     name: aims-internal
     internal: true
+    ipam:
+      config:
+        - subnet: ${AIMS_INTERNAL_SUBNET:-172.30.10.0/24}

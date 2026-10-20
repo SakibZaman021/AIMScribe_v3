@@ -117,7 +117,7 @@ class Settings(BaseSettings):
         description="External MinIO endpoint for presigned URLs (accessible from clients)"
     )
     minio_access_key: str = Field(default="aimscribe")
-    minio_secret_key: str = Field(default="aimscribe123")
+    minio_secret_key: str = Field(default="")
     minio_bucket: str = Field(default="aimscribe-audio")
     minio_secure: bool = Field(default=False)
     # Signing region. Cloudflare R2 requires "auto"; MinIO accepts anything

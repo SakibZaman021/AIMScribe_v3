@@ -151,6 +151,8 @@ class Runtime:
             on_event=self._on_event,
         )
         self.uploader.set_device_token(load_device_token(self.cfg))
+        if self.identity is not None:
+            self.uploader.device_id = self.identity.device_id
         self.uploader.set_grant_key(grant_key)
         from core.health_log import FILE_NAME as HEALTH_LOG, HealthLog
         self.uploader.health = HealthLog(self.cfg.paths.state_dir / HEALTH_LOG)
@@ -225,6 +227,7 @@ class Runtime:
         self.identity = identity
         if self.uploader is not None:
             self.uploader.set_device_token(device_token)
+            self.uploader.device_id = identity.device_id
         if self.controller is not None:
             self.controller.device_id = identity.device_id
             self.controller.hospital_id = identity.hospital_id
@@ -265,15 +268,28 @@ class Runtime:
         if event == "integrity_alert" and uploader is not None and uploader.health is not None:
             uploader.health.alert(data)
             try:
-                self._loop.call_soon_threadsafe(
-                    lambda: self._loop.create_task(uploader.deliver_health()))
+                self._loop.call_soon_threadsafe(self._keep, uploader.deliver_health)
             except RuntimeError:
                 pass
         try:
-            self._loop.call_soon_threadsafe(
-                lambda: self._loop.create_task(self.ws.send_event(event, data)))
+            self._loop.call_soon_threadsafe(self._keep, lambda: self.ws.send_event(event, data))
         except RuntimeError:
             pass
+
+    def _keep(self, make) -> None:
+        """
+        Start a task on the loop and hold it until it finishes. A task nobody
+        references can be collected mid-flight, and its error is never seen.
+        """
+        task = self._loop.create_task(make())
+        tasks = self.__dict__.setdefault("_tasks", set())
+        tasks.add(task)
+
+        def done(t) -> None:
+            tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("Background event delivery failed: %s", t.exception())
+        task.add_done_callback(done)
 
     # ---- status ----
 
@@ -339,6 +355,13 @@ def create_app(runtime: Runtime) -> FastAPI:
         if origin is not None and not cfg.security.origin_allowed(origin):
             logger.warning("Rejected request from origin %r", origin)
             return _error_response(403, "FORBIDDEN_ORIGIN", "Origin not allowed")
+
+        from api.websocket_server import _same_windows_session
+        if not _same_windows_session(request):
+            logger.warning("Rejected request from another Windows user's session")
+            return _error_response(403, "OTHER_WINDOWS_SESSION",
+                                   "This recorder belongs to the user signed in on this "
+                                   "screen. Sign in as that user, or switch to their session.")
 
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"

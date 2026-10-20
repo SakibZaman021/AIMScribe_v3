@@ -616,6 +616,11 @@ class GrantGuard:
 
     A grant is a bearer token: without replay protection, a copy of one could
     open sessions until it expired. Entries are pruned lazily.
+
+    With a `path`, what was used is also written to disk and read back at
+    start, so a restart of the recorder - or a crash forced to make it forget -
+    cannot take the same grant twice. A file that cannot be read or written
+    never stops a recording: the memory copy still holds for this run.
     """
 
     # Long past any grant's life, on any clock: a used grant is remembered by
@@ -623,8 +628,50 @@ class GrantGuard:
     # laptop running fast forgot a grant before it expired, and took it twice.
     REMEMBER_SECONDS = 3600
 
-    def __init__(self) -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
         self._seen: Dict[str, float] = {}
+        self._path = path
+        # jti -> wall-clock time seen, for the file only. Monotonic time does
+        # not survive a restart; the wall clock does, near enough for an hour.
+        self._seen_wall: Dict[str, float] = {}
+        if path is not None:
+            self._load()
+
+    def _load(self) -> None:
+        import time as _time
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("Used-grant record unreadable (%s); starting a new one", exc)
+            return
+        now_wall, now = _time.time(), _time.monotonic()
+        for jti, seen in (data.get("used") or {}).items():
+            try:
+                age = now_wall - float(seen)
+            except (TypeError, ValueError):
+                continue
+            if age < self.REMEMBER_SECONDS:
+                self._seen_wall[str(jti)] = float(seen)
+                # A clock set back makes the age negative: remembered in full.
+                self._seen[str(jti)] = now - max(0.0, age)
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            # Flushed to disk before the rename: after a power cut the file is
+            # either the old list or the new one, never empty.
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"used": self._seen_wall}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            logger.warning("Could not record a used grant on disk: %s", exc)
 
     def consume(self, grant: "Grant") -> None:
         import time as _time
@@ -632,9 +679,13 @@ class GrantGuard:
         if len(self._seen) > 512:
             self._seen = {jti: at for jti, at in self._seen.items()
                           if now - at < self.REMEMBER_SECONDS}
+            self._seen_wall = {jti: at for jti, at in self._seen_wall.items()
+                               if jti in self._seen}
         if grant.jti in self._seen:
             raise GrantError("grant has already been used")
         self._seen[grant.jti] = now
+        self._seen_wall[grant.jti] = _time.time()
+        self._save()
 
 
 def verify_grant(

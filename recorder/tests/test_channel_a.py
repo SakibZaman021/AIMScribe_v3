@@ -252,11 +252,42 @@ async def test_prescription_built_for_another_patient(make_security):
 
 
 async def test_stop_carries_its_reason(make_security):
-    """The refusal reason reaches the controller (SRS 3.2 §7.8a)."""
+    """An ordinary reason reaches the controller as sent."""
     manager, controller = _manager(make_security)
-    await _send(manager, {"command": "stop", "reason": "patient_did_not_consent"})
+    await _send(manager, {"command": "stop", "reason": "patient_left"})
     await _send(manager, {"command": "stop"})
-    assert controller.stopped == ["patient_did_not_consent", "doctor_stopped"]
+    assert controller.stopped == ["patient_left", "doctor_stopped"]
+
+
+async def test_the_socket_can_never_erase_a_consultation(make_security):
+    """
+    Origin is a header any local program can write. The refusal - which deletes
+    the consultation - is taken only from the on-screen control; over the
+    socket it is an ordinary stop, and the recording is kept.
+    """
+    from core.session_controller import REFUSAL_REASON
+    manager, controller = _manager(make_security)
+    reply = await _send(manager, {"command": "stop", "reason": REFUSAL_REASON})
+    await _send(manager, {"command": "stop", "reason": "anything; made up"})
+    assert reply["code"] == "OK"
+    assert REFUSAL_REASON not in controller.stopped
+    assert controller.stopped == ["doctor_stopped", "doctor_stopped"]
+
+
+async def test_a_flood_of_messages_is_slowed_not_obeyed(make_security):
+    """A runaway or hostile local client gets "not ready", and nothing reaches
+    the controller past the burst."""
+    from api.websocket_server import MESSAGE_BURST
+    manager, controller = _manager(make_security)
+    socket = object()
+    codes = [(await manager.handle_message(socket, json.dumps({"command": "stop"})))["code"]
+             for _ in range(MESSAGE_BURST + 20)]
+    assert codes[:MESSAGE_BURST] == ["OK"] * MESSAGE_BURST
+    assert set(codes[MESSAGE_BURST:]) == {"AGENT_NOT_READY"}
+    assert len(controller.stopped) == MESSAGE_BURST
+    # Another connection is not held back by this one.
+    other = await manager.handle_message(object(), json.dumps({"command": "stop"}))
+    assert other["code"] == "OK"
 
 
 async def test_oversized_and_malformed_frames(make_security):

@@ -105,6 +105,21 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
     ]
 
 
+def _stamp(path: Path) -> Optional[datetime]:
+    """The time the backup job wrote into one of its marker files."""
+    try:
+        return datetime.strptime(path.read_text(encoding="utf-8").strip(),
+                                 "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return None
+
+
+def backup_findings(now: datetime) -> List[Finding]:
+    folder = WATCHED["backups"][0]
+    return checks.backups(_stamp(folder / ".last_success"), _stamp(folder / ".last_offsite"),
+                          bool(os.getenv("AIMS_OFFSITE_BUCKET", "").strip()), now)
+
+
 def schema_finding(url: str) -> Finding:
     """Ask the API's /health, the way Docker does, and read its schema answer."""
     try:
@@ -184,6 +199,7 @@ async def one_pass(dsn: str, host: str, webhook: str) -> str:
         findings.append(Finding("database:reachable", checks.CRITICAL,
                                 f"the recordings database cannot be read: {exc}", {}))
     findings.append(certificate_finding(host, now))
+    findings += backup_findings(now)
     findings.append(schema_finding(os.getenv("AIMS_API_HEALTH_URL", "http://api:6000/health")))
 
     state = load_state()

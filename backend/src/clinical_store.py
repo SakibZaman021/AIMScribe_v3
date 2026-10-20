@@ -343,6 +343,11 @@ class ClinicalStore:
                 cm.previous_start_time(pv.visit_date, row["start_time"]), None)
 
     @staticmethod
+    def foreign(row, pv: cm.PreviousVisit) -> bool:
+        """The earlier visit named in this API 2 was at another CMED hospital."""
+        return bool(pv.identified and pv.cmed_hospital_id != row["cmed_hospital_id"])
+
+    @staticmethod
     async def _find_encounter(conn, patient_id: str, doctor: str, clinic: str, start: str,
                               visit_date) -> Any:
         """A visit by its five fields: live if recorded, else one an earlier API 2 brought."""
@@ -388,6 +393,14 @@ class ClinicalStore:
         latest = await self._latest_of_encounter(conn, encounter)
         if latest is not None and latest["fingerprint"] == fp:
             return
+        if latest is not None and self.foreign(row, pv):
+            # Another hospital's visit, already held: history sent by this
+            # hospital may fill a gap but never rewrite that hospital's own
+            # prescription. A stolen credential for one clinic cannot alter
+            # another clinic's records this way.
+            logger.warning("previous_visit from %s would change a prescription held for %s;"
+                           " not stored", row["cmed_hospital_id"], pv.cmed_hospital_id)
+            return
         received = await conn.fetchval("""
             SELECT COALESCE(MAX(version), 0) FROM intake_records
              WHERE kind = 'prescription' AND patient_id = $1 AND doctor_id = $2
@@ -428,6 +441,11 @@ class ClinicalStore:
             encounter = await self._find_encounter(conn, row["patient_id"], doctor, clinic,
                                                    start, pv.visit_date)
             latest = await self._latest_of_encounter(conn, encounter) if encounter else None
+            if latest is not None and self.foreign(row, pv) \
+                    and latest["fingerprint"] != cm.fingerprint(pv.prescription):
+                return {"status": "NOT_PERMITTED", "version": latest["version"],
+                        "reason": "that visit belongs to another hospital and is held "
+                                  "already; only that hospital may change it"}
             return {"status": "ALREADY_STORED",
                     "version": latest["version"] if latest else None,
                     "record_id": str(latest["record_id"])
@@ -529,7 +547,8 @@ class ClinicalStore:
     # ------------------------------------------------------------ reading
 
     async def visits_for(self, patient_id: str, *, actor: str, limit: int = 50,
-                         before=None, after_key=None) -> List[Dict[str, Any]]:
+                         before=None, after_key=None,
+                         hospitals: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         The visits held for one patient, newest first, each with the
         fingerprint of its newest prescription - identifiers only, never
@@ -550,30 +569,51 @@ class ClinicalStore:
                    AND ($4::date IS NULL
                         OR (visit_date, start_time, encounter_id)
                            < ($4::date, $5::text, $6::uuid))
+                   AND ($7::text[] IS NULL OR cmed_hospital_id = ANY($7::text[]))
                  ORDER BY visit_date DESC, start_time DESC, encounter_id DESC
                  LIMIT $3
-            """, patient_id, before, limit, *key)
-            visits = []
-            for r in rows:
-                latest = await conn.fetchrow(
-                    "SELECT prescription_id, version, created_at FROM prescriptions "
-                    "WHERE encounter_id = $1 ORDER BY version DESC LIMIT 1",
-                    r["encounter_id"])
-                visits.append({
-                    "_key": (r["visit_date"], r["start_time"], r["encounter_id"]),
-                    "patient_id": r["patient_id"], "doctor_id": r["doctor_id"],
-                    "hospital_id": r["cmed_hospital_id"], "start_time": r["start_time"],
-                    "date": r["visit_date"].isoformat(), "source": r["source"],
-                    "prescription_version": int(latest["version"]) if latest else None,
-                    "prescription_fingerprint": (
-                        await self._fingerprint_of(conn, latest["prescription_id"])
-                        if latest else None),
-                    "received_at": _plain(latest["created_at"] if latest else r["created_at"]),
-                })
+            """, patient_id, before, limit, *key, hospitals)
+            visits = [await self._visit_summary(conn, r) for r in rows]
         await self.log_access(actor=actor, action="list_visits", patient_id=patient_id,
                               detail={"returned": len(visits), "limit": limit,
                                       "before": _plain(before)})
         return visits
+
+    async def _visit_summary(self, conn, r) -> Dict[str, Any]:
+        """One held visit, identifiers and its newest prescription's fingerprint only."""
+        latest = await conn.fetchrow(
+            "SELECT prescription_id, version, created_at FROM prescriptions "
+            "WHERE encounter_id = $1 ORDER BY version DESC LIMIT 1", r["encounter_id"])
+        return {
+            "_key": (r["visit_date"], r["start_time"], r["encounter_id"]),
+            "patient_id": r["patient_id"], "doctor_id": r["doctor_id"],
+            "hospital_id": r["cmed_hospital_id"], "start_time": r["start_time"],
+            "date": r["visit_date"].isoformat(), "source": r["source"],
+            "prescription_version": int(latest["version"]) if latest else None,
+            "prescription_fingerprint": (
+                await self._fingerprint_of(conn, latest["prescription_id"])
+                if latest else None),
+            "received_at": _plain(latest["created_at"] if latest else r["created_at"]),
+        }
+
+    async def encounter_by_id(self, encounter_id: str, *, actor: str,
+                              hospitals: Optional[List[str]] = None
+                              ) -> Optional[Dict[str, Any]]:
+        """One visit by its id, only if it was at one of `hospitals`. The read is logged."""
+        async with self._pool.acquire() as conn:
+            r = await conn.fetchrow("""
+                SELECT encounter_id, patient_id, doctor_id, cmed_hospital_id, start_time,
+                       visit_date, source, created_at
+                  FROM encounters
+                 WHERE encounter_id = $1::uuid
+                   AND ($2::text[] IS NULL OR cmed_hospital_id = ANY($2::text[]))
+            """, encounter_id, hospitals)
+            found = await self._visit_summary(conn, r) if r else None
+        if found:
+            await self.log_access(actor=actor, action="read_encounter",
+                                  patient_id=found["patient_id"],
+                                  detail={"encounter_id": encounter_id})
+        return found
 
     async def log_access(self, *, actor: str, action: str, patient_id: Optional[str],
                          detail: Optional[Dict[str, Any]] = None) -> None:

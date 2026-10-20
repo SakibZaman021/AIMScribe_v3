@@ -17,29 +17,21 @@ set -eu
 run() { psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$1"; }
 
 echo "Applying the recordings schema"
-run aims_recordings <<'SQL'
-SET ROLE aims_recordings;
-\i /aims/baseline/00_v1_baseline.sql
-\i /aims/scripts/002_v2_integrity.sql
-\i /aims/scripts/003_readable_names.sql
-\i /aims/scripts/004_transit_storage.sql
-\i /aims/scripts/005_wall_clock_times.sql
-\i /aims/scripts/006_doctor_from_device.sql
-\i /aims/scripts/007_readable_object_keys.sql
-\i /aims/scripts/008_doctors.sql
-\i /aims/scripts/009_close_reason.sql
-\i /aims/scripts/010_v3_confirmation_channel_b.sql
-\i /aims/scripts/011_v3_file_names.sql
-\i /aims/scripts/012_v3_cloud_copy.sql
-\i /aims/scripts/013_v3_reassign.sql
-\i /aims/scripts/014_v3_device_health.sql
-\i /aims/scripts/015_v3_consultation_parts.sql
-RESET ROLE;
--- The monitor reads what exists now, and whatever is added later.
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO aims_monitor;
-ALTER DEFAULT PRIVILEGES FOR ROLE aims_recordings IN SCHEMA public
-    GRANT SELECT ON TABLES TO aims_monitor;
-SQL
+# Every migration in backend/scripts, in file-name order - the glob, not a
+# list kept by hand, so a new migration can never be one a new server misses.
+# The same files, in the same order, are what test_db_integration.py applies.
+{
+    echo "SET ROLE aims_recordings;"
+    printf '%s\n' '\i /aims/baseline/00_v1_baseline.sql'
+    for script in /aims/scripts/0[0-9][0-9]_*.sql; do
+        printf '%s %s\n' '\i' "$script"
+    done
+    echo "RESET ROLE;"
+    # The monitor reads what exists now, and whatever is added later.
+    echo "GRANT SELECT ON ALL TABLES IN SCHEMA public TO aims_monitor;"
+    echo "ALTER DEFAULT PRIVILEGES FOR ROLE aims_recordings IN SCHEMA public"
+    echo "    GRANT SELECT ON TABLES TO aims_monitor;"
+} | run aims_recordings
 
 echo "Applying the clinical schema"
 run aims_clinical <<'SQL'

@@ -4,6 +4,18 @@
 # Caddy gets and renews the certificate by itself; port 80 exists for that
 # and for the redirect, and nothing is served on it. Everything else is
 # proxied to the API, which is reachable from nowhere else.
+#
+# What the internet may reach, and what it may not:
+#
+#   recorders      /api/v2/device, /session, /segment, /grant, /heartbeat ...
+#   CMED           /api/v2/oauth/token, /.well-known/smart-configuration,
+#                  /fhir/r4/*, /api/v2/clinical/*
+#   nobody         /api/v1/* (the old pipeline), /docs, /redoc,
+#                  /openapi.json, /api/v2/archive/*, /api/v2/maintenance/*
+#                  - 404 here; the workers reach them inside the machine
+#   the lab only   /api/v2/admin/*, /api/v2/dashboard* - from the addresses
+#                  in AIMS_ADMIN_ALLOW, or through the loopback-only door on
+#                  127.0.0.1:6001 (an SSH tunnel). Unset: 403 for everyone.
 # ================================================================
 
 {
@@ -44,7 +56,9 @@
 	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 	# Uploads never come through here - recorders upload pieces straight to
-	# the segment store - so a large body is a mistake or an attack.
+	# the segment store - so a large body is a mistake or an attack. CMED's
+	# largest message (an API 2 with a previous visit, or its FHIR Bundle)
+	# is refused by the API itself above 1 MB.
 	request_body {
 		max_size 2MB
 	}
@@ -53,9 +67,34 @@
 		reverse_proxy api:6000
 	}
 
+	# Never from the internet. The old v1 pipeline, the generated API
+	# documentation (a map of every route), and the archive worker's and the
+	# sweep's own routes, which they call on the internal network.
+	@never path /api/v1 /api/v1/* /docs /docs/* /redoc /redoc/* /openapi.json /api/v2/archive /api/v2/archive/* /api/v2/maintenance /api/v2/maintenance/*
+	handle @never {
+		respond 404
+	}
+
+	# The lab only. The admin key is still checked by the API; this is the
+	# second lock, so a leaked key is not enough from an unknown address.
+	@lab_only_denied {
+		path /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
+		not remote_ip {$AIMS_ADMIN_ALLOW:127.0.0.1/32}
+	}
+	handle @lab_only_denied {
+		respond 403
+	}
+
 	handle {
 		reverse_proxy api:6000 {
 			header_up X-Forwarded-Proto https
+			# The client's address, as this gateway saw it. A value the client
+			# sent itself is replaced, never appended to: the API trusts this
+			# header from the gateway's fixed address only (AIMS_TRUSTED_PROXIES)
+			# and uses it for rate limits and CMED's address allow-list.
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Request-ID {http.request.uuid}
+			header_up X-Real-IP {remote_host}
 			# A recorder waits on /grant/mint and /segment/commit; a slow
 			# upstream should keep the request rather than drop it, but not
 			# for ever.
@@ -89,6 +128,39 @@
 				request>headers>X-Device-Token delete
 				request>headers>X-Cmed-Key delete
 				request>headers>X-Worker-Key delete
+				request>headers>X-Admin-Key delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
+
+# ----------------------------------------------------------------
+# The lab's door: plain HTTP on the machine's own loopback only
+# (published as 127.0.0.1:6001 in docker-compose.yml). Reached from the
+# droplet itself, or from a laptop through
+#
+#     ssh -L 6001:127.0.0.1:6001 <user>@<server>
+#
+# Only the admin routes and the dashboard; nothing a recorder or CMED uses.
+# ----------------------------------------------------------------
+http://:6001 {
+	@lab path /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/* /health
+	handle @lab {
+		reverse_proxy api:6000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Request-ID {http.request.uuid}
+		}
+	}
+	handle {
+		respond 404
+	}
+	log {
+		output stdout
+		format filter {
+			wrap console
+			fields {
+				request>uri regexp "\?.*$" ""
 				request>headers>X-Admin-Key delete
 			}
 		}

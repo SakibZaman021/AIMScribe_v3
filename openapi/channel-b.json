@@ -1,0 +1,301 @@
+{
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "AIMScribe v3 - Channel B (CMED server to AIMS LAB)",
+    "version": "3.5.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/.well-known/smart-configuration": {
+      "get": {
+        "operationId": "smart_config_root__well_known_smart_configuration_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Smart Config Root",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/api/v2/clinical/patient-information": {
+      "post": {
+        "description": "API 2. Sent at the moment the patient is opened (SRS-CNF-01).",
+        "operationId": "patient_information_api_v2_clinical_patient_information_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Patient Information",
+        "tags": [
+          "clinical"
+        ]
+      }
+    },
+    "/api/v2/clinical/patient/{patient_id}/visits": {
+      "get": {
+        "description": "The visits held for one patient, with a fingerprint of each one's newest\nprescription. CMED asks before sending previous_visit, so its decision\nrests on what is held here rather than on its own memory of what it sent.",
+        "operationId": "patient_visits_api_v2_clinical_patient__patient_id__visits_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "patient_id",
+            "required": true,
+            "schema": {
+              "title": "Patient Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patient Visits",
+        "tags": [
+          "clinical"
+        ]
+      }
+    },
+    "/api/v2/clinical/prescription": {
+      "post": {
+        "description": "API 3, part two. Sent when the prescription is built (SRS-CRI-03).",
+        "operationId": "prescription_api_v2_clinical_prescription_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Prescription",
+        "tags": [
+          "clinical"
+        ]
+      }
+    },
+    "/api/v2/oauth/token": {
+      "post": {
+        "operationId": "token_api_v2_oauth_token_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Token",
+        "tags": [
+          "cmed-auth"
+        ]
+      }
+    },
+    "/fhir/r4/$process-message": {
+      "post": {
+        "operationId": "process_message_fhir_r4__process_message_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Process Message",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/fhir/r4/.well-known/smart-configuration": {
+      "get": {
+        "operationId": "smart_config_fhir_fhir_r4__well_known_smart_configuration_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Smart Config Fhir",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/fhir/r4/Encounter": {
+      "get": {
+        "operationId": "search_encounters_fhir_r4_Encounter_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Search Encounters",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/fhir/r4/Encounter/{encounter_id}": {
+      "get": {
+        "operationId": "read_encounter_fhir_r4_Encounter__encounter_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "encounter_id",
+            "required": true,
+            "schema": {
+              "title": "Encounter Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Encounter",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/fhir/r4/MessageDefinition/{ident}": {
+      "get": {
+        "operationId": "read_message_definition_fhir_r4_MessageDefinition__ident__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ident",
+            "required": true,
+            "schema": {
+              "title": "Ident",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Message Definition",
+        "tags": [
+          "fhir"
+        ]
+      }
+    },
+    "/fhir/r4/metadata": {
+      "get": {
+        "operationId": "metadata_fhir_r4_metadata_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metadata",
+        "tags": [
+          "fhir"
+        ]
+      }
+    }
+  }
+}

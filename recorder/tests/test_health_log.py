@@ -109,7 +109,7 @@ async def test_a_failed_heartbeat_is_logged_for_later(monkeypatch, spool, device
 
     up = Offline([AuthOutcome("pending", "AGENT_NOT_READY", "")])
     ctl = make_controller(monkeypatch, spool, device_key, up)
-    ctl.cfg.app_version, ctl.cfg.protocol_version = "3.3.0", 2
+    ctl.cfg.app_version, ctl.cfg.protocol_version = "3.4.0", 2
     await ctl.open_session(trigger("P1"))
     payload = ctl.heartbeat_payload()
     assert {"mic_level", "silent", "authorisation"} <= payload.keys()

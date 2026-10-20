@@ -27,18 +27,26 @@ grounds for deleting the only other copy of it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import email.utils
+import hashlib
+import json
 import logging
+import random
+import secrets
 import ssl
 import time
+from urllib.parse import urlsplit
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from core import crypto, spool as spool_mod
+from core.tls_check import TlsGuard
 from core.crypto import ReceiptError
 from core.spool import COMMITTED, PENDING, RECEIPTED, SessionSpool, Spool
 
@@ -47,6 +55,8 @@ logger = logging.getLogger(__name__)
 # A clock this far from the server's is reported: in the log, in the
 # heartbeat, and by the server as a clock_skew alert. Recording is unaffected.
 CLOCK_WARN_SECONDS = 60
+# Grants this PC has already taken, kept across restarts (crypto.GrantGuard).
+USED_GRANTS_FILE = "used_grants.json"
 
 # Returned by a grant lookup that must be tried again later.
 _RETRY = object()
@@ -95,6 +105,62 @@ def build_ssl_context(cfg) -> Optional[ssl.SSLContext]:
     return context
 
 
+# Device request signing (protocol shared with backend/src/device_auth.py).
+# Every call to our own server is signed with the PC's Ed25519 key, so a copied
+# device token alone is useless: it cannot sign.
+SIGNATURE_LABEL = b"AIMS-DEVICE-SIG-V1"
+# Never wait longer than this on a server's Retry-After.
+RETRY_AFTER_CAP_SECONDS = 300.0
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def signing_string(method: str, path_with_query: str, timestamp: str, nonce: str,
+                   body: bytes) -> bytes:
+    """The exact bytes a device signs for one request."""
+    return b"\n".join([SIGNATURE_LABEL, method.upper().encode("ascii"),
+                       path_with_query.encode("utf-8"), timestamp.encode("ascii"),
+                       nonce.encode("ascii"), hashlib.sha256(body).hexdigest().encode("ascii")])
+
+
+def sign_request(device_key, method: str, url: str, body: bytes, *,
+                 now: float) -> Dict[str, str]:
+    """X-Device-Timestamp, X-Device-Nonce and X-Device-Signature for one request."""
+    parts = urlsplit(url)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    timestamp = str(int(now))
+    nonce = secrets.token_urlsafe(16)              # 22 characters
+    signature = device_key.sign(signing_string(method, path, timestamp, nonce, body))
+    return {"X-Device-Timestamp": timestamp, "X-Device-Nonce": nonce,
+            "X-Device-Signature": b64url(signature)}
+
+
+def retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    """A Retry-After header (seconds or an HTTP date), capped; None if absent or bad."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    if seconds != seconds:                         # NaN
+        return None
+    return max(0.0, min(seconds, RETRY_AFTER_CAP_SECONDS))
+
+
+def jittered(seconds: float) -> float:
+    """Full jitter: a clinic's PCs must not all retry in the same second."""
+    return random.uniform(0.0, max(0.0, seconds))
+
+
 class UploadManager:
     """
     Owns the HTTP session and works through every spooled consultation.
@@ -139,10 +205,21 @@ class UploadManager:
         self.last_success_at: Optional[float] = None
         self.last_error: str = ""
         self.consecutive_failures = 0
+        # The server asked us to wait (429/503 with Retry-After): nothing is
+        # sent to it before this monotonic time.
+        self._quiet_until = 0.0
+        # This PC's id, named inside a signed refusal. Set with the token.
+        self.device_id = ""
+        # Checks the server's certificate before it is trusted (core.tls_check).
+        self._tls: Optional[TlsGuard] = None
+        self._tls_reported = ""
 
         # SRS 3.2: grants from the server, checked here.
         self._grant_key = None
-        self._grant_guard = crypto.GrantGuard()
+        # Remembered on disk beside the spool, so a restart cannot replay one.
+        root = getattr(spool, "root", None)
+        self._grant_guard = crypto.GrantGuard(
+            root / USED_GRANTS_FILE if isinstance(root, Path) else None)
         # (session, entry_no) -> the grant minted for a reassign, so a retried
         # delivery reuses it rather than minting another.
         self._reassign_grants: Dict[Tuple[str, int], str] = {}
@@ -184,6 +261,8 @@ class UploadManager:
                 "X-AIMScribe-Protocol": str(self.cfg.protocol_version),
             },
         )
+        self._tls = TlsGuard(self.cfg.backend.base_url, self._ssl_context(),
+                             tuple(getattr(self.cfg.backend, "tls_pins", ()) or ()))
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="UploadManager")
         logger.info("Upload manager started; backend %s", self.cfg.backend.base_url)
@@ -254,102 +333,112 @@ class UploadManager:
         for session in sessions:
             if not self._running:
                 return
-
-            if not await self._settle_before_upload(session):
-                continue
-
-            if not session.server_acknowledged:
-                if await self._open_remote(session):
-                    session.mark_acknowledged()
-                else:
-                    # Backend unreachable. Segments stay sealed on disk; try again
-                    # on the next tick. This is the normal outage path.
-                    continue
-
-            # A rejected clip stops this session dead, before anything else is
-            # sent. It used to only stop the close, which was far too late:
-            # quarantined segments drop out of the pending list, so the loop
-            # sailed past the gap and uploaded the clips after it. Those arrived
-            # with a prev_hash the backend could not follow, turning one rejected
-            # clip into a broken chain.
-            #
-            # Nothing is lost by stopping. The audio stays sealed on disk and is
-            # never purged without a receipt; it needs a human, not another
-            # request every ten seconds.
-            if session.quarantined_segments():
-                if session.session_id not in self._reported_quarantines:
-                    self._reported_quarantines.add(session.session_id)
-                    seqs = [s.seq_no for s in session.quarantined_segments()]
-                    logger.critical(
-                        "Session %s cannot be completed: segment(s) %s were "
-                        "rejected. Its audio is kept and will not be purged.",
-                        session.session_id, seqs)
-                    self._emit("integrity_alert", {
-                        "session_id": session.session_id,
-                        "alert_type": "session_needs_review",
-                        "detail": f"quarantined segment(s) {seqs}; close cannot complete",
-                    })
-                continue
-
-            # Strictly in chain order, and stop at the first failure.
-            #
-            # The chain is sequential: every entry's prev_hash is the previous
-            # entry's hash, so an entry that arrives before its predecessor
-            # cannot verify and the backend quarantines the whole session.
-            #
-            # Segments used to be the only thing retried here. Pause and resume
-            # were sent once, best-effort, on the theory that the chain copy
-            # would arrive at close - but the backend verifies each entry as it
-            # lands, so a dropped pause broke every segment after it. A real
-            # consultation was quarantined that way. Both kinds are delivered
-            # here now, interleaved by entry number, which is the order the
-            # chain was built in.
-            #
-            # Leaving the rest pending is free: everything is sealed on disk and
-            # the next tick retries from whichever entry failed.
-            work = [(s.entry_no, "segment", s) for s in session.pending_segments()]
-            work += [(e.entry_no, "notify", e) for e in session.pending_notifications()]
-
-            for entry_no, kind, item in sorted(work, key=lambda w: w[0]):
-                if not self._running:
-                    return
-                if kind == "segment":
-                    ok = (await self._send_segment(session, item)).ok
-                else:
-                    ok = await self._notify_chain_entry(session, item)
-                if not ok:
-                    logger.debug(
-                        "Chain entry %s of %s did not land; holding the rest of "
-                        "the session to preserve order", entry_no, session.session_id)
-                    break
-
-            # A session closed while the backend was unreachable still needs its
-            # close delivered, or it would sit in 'open' forever and never be
-            # archived. Retried here once every segment has landed.
-
-            if (session.closed_at is not None
-                    and not session.close_reported
-                    and not session.pending_segments()
-                    # Close verifies the whole chain, so it must not run while a
-                    # pause is still undelivered.
-                    and not session.pending_notifications()):
-                await self.close_remote(
-                    session,
-                    duration_seconds=session.duration_seconds,
-                    paused_seconds=session.paused_seconds,
-                )
-
-            await self._collect_receipts(session)
-            self._purge_expired(session)
-
-            if session.is_complete:
-                async with self._lock:
-                    self._sessions = [s for s in self._sessions
-                                      if s.session_id != session.session_id]
-                self.spool.discard(session)
-                logger.info("Session %s fully archived and purged locally", session.session_id)
+            try:
+                await self._drain_session(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One session's fault must not stop every other session's
+                # delivery; the next pass tries it again.
+                logger.error("Delivering %s failed: %s", session.session_id, exc,
+                             exc_info=True)
 
         self._check_stall()
+
+    async def _drain_session(self, session: SessionSpool) -> None:
+        if not await self._settle_before_upload(session):
+            return
+
+        if not session.server_acknowledged:
+            if await self._open_remote(session):
+                session.mark_acknowledged()
+            else:
+                # Backend unreachable. Segments stay sealed on disk; try again
+                # on the next tick. This is the normal outage path.
+                return
+
+        # A rejected clip stops this session dead, before anything else is
+        # sent. It used to only stop the close, which was far too late:
+        # quarantined segments drop out of the pending list, so the loop
+        # sailed past the gap and uploaded the clips after it. Those arrived
+        # with a prev_hash the backend could not follow, turning one rejected
+        # clip into a broken chain.
+        #
+        # Nothing is lost by stopping. The audio stays sealed on disk and is
+        # never purged without a receipt; it needs a human, not another
+        # request every ten seconds.
+        if session.quarantined_segments():
+            if session.session_id not in self._reported_quarantines:
+                self._reported_quarantines.add(session.session_id)
+                seqs = [s.seq_no for s in session.quarantined_segments()]
+                logger.critical(
+                    "Session %s cannot be completed: segment(s) %s were "
+                    "rejected. Its audio is kept and will not be purged.",
+                    session.session_id, seqs)
+                self._emit("integrity_alert", {
+                    "session_id": session.session_id,
+                    "alert_type": "session_needs_review",
+                    "detail": f"quarantined segment(s) {seqs}; close cannot complete",
+                })
+            return
+
+        # Strictly in chain order, and stop at the first failure.
+        #
+        # The chain is sequential: every entry's prev_hash is the previous
+        # entry's hash, so an entry that arrives before its predecessor
+        # cannot verify and the backend quarantines the whole session.
+        #
+        # Segments used to be the only thing retried here. Pause and resume
+        # were sent once, best-effort, on the theory that the chain copy
+        # would arrive at close - but the backend verifies each entry as it
+        # lands, so a dropped pause broke every segment after it. A real
+        # consultation was quarantined that way. Both kinds are delivered
+        # here now, interleaved by entry number, which is the order the
+        # chain was built in.
+        #
+        # Leaving the rest pending is free: everything is sealed on disk and
+        # the next tick retries from whichever entry failed.
+        work = [(s.entry_no, "segment", s) for s in session.pending_segments()]
+        work += [(e.entry_no, "notify", e) for e in session.pending_notifications()]
+
+        for entry_no, kind, item in sorted(work, key=lambda w: w[0]):
+            if not self._running or self._quiet():
+                return
+            if kind == "segment":
+                ok = (await self._send_segment(session, item)).ok
+            else:
+                ok = await self._notify_chain_entry(session, item)
+            if not ok:
+                logger.debug(
+                    "Chain entry %s of %s did not land; holding the rest of "
+                    "the session to preserve order", entry_no, session.session_id)
+                break
+
+        # A session closed while the backend was unreachable still needs its
+        # close delivered, or it would sit in 'open' forever and never be
+        # archived. Retried here once every segment has landed.
+
+        if (session.closed_at is not None
+                and not session.close_reported
+                and not session.pending_segments()
+                # Close verifies the whole chain, so it must not run while a
+                # pause is still undelivered.
+                and not session.pending_notifications()):
+            await self.close_remote(
+                session,
+                duration_seconds=session.duration_seconds,
+                paused_seconds=session.paused_seconds,
+            )
+
+        await self._collect_receipts(session)
+        self._purge_expired(session)
+
+        if session.is_complete:
+            async with self._lock:
+                self._sessions = [s for s in self._sessions
+                                  if s.session_id != session.session_id]
+            self.spool.discard(session)
+            logger.info("Session %s fully archived and purged locally", session.session_id)
 
     # ---- protocol steps ----
 
@@ -369,6 +458,9 @@ class UploadManager:
             "consent_method": session.meta.get("consent_method", ""),
             # Links the session to its grant, and so to CMED's API 2 (§5.6).
             "grant_jti": session.grant_jti,
+            # A recording carried on after the recorder restarted: the same
+            # consultation as this earlier session (failure review S4).
+            "continues_session_id": session.meta.get("continues_session_id"),
             "audio": session.audio,
             "device_pubkey": self._device_key.public_bytes_raw().hex(),
             "genesis": genesis.to_wire(),
@@ -430,7 +522,8 @@ class UploadManager:
             return UploadOutcome(session.session_id, seq_no, False, error=segment.last_error)
 
         chain_entry = next(
-            (entry for entry in session.chain if entry.entry_no == segment.entry_no), None)
+            (entry for entry in session.chain_list() if entry.entry_no == segment.entry_no),
+            None)
         commit = await self._post("/segment/commit", {
             "session_id": session.session_id,
             "seq_no": seq_no,
@@ -561,7 +654,7 @@ class UploadManager:
             return None
         if any(e.entry_type == "marker" and e.entry_no < entry.entry_no
                and (e.payload.get("patient") or {}).get("patient_id") == patient["patient_id"]
-               for e in session.chain):
+               for e in session.chain_list()):
             return None
         key = (session.session_id, entry.entry_no)
         if key in self._marker_grants:
@@ -693,7 +786,7 @@ class UploadManager:
 
     async def _collect_receipts(self, session: SessionSpool) -> None:
         """Fetch and verify purge receipts. A bad receipt is never acted on."""
-        awaiting = [s for s in session.segments.values() if s.state == COMMITTED]
+        awaiting = [s for s in session.segment_list() if s.state == COMMITTED]
         if not awaiting:
             return
 
@@ -743,7 +836,7 @@ class UploadManager:
         """Delete receipted segments. The window is zero by default (SRS-REC-16)."""
         grace = self.cfg.spool.purge_grace_hours * 3600
         now = time.time()
-        for segment in list(session.segments.values()):
+        for segment in session.segment_list():
             if segment.state != RECEIPTED:
                 continue
             if segment.receipt_at and (now - segment.receipt_at) < grace:
@@ -866,10 +959,25 @@ class UploadManager:
             return str(body["confirmation"])
         return None
 
+    def refusal_body(self, session_id: str, *, refused_at: Optional[datetime] = None
+                     ) -> Dict[str, Any]:
+        """
+        The refusal, signed with this PC's key: erasing a consultation is the
+        most destructive call there is, so the token alone does not do it.
+        """
+        refusal = {"session_id": session_id, "device_id": self.device_id or "",
+                   "refused_at": crypto.iso_utc(refused_at or datetime.now(timezone.utc))}
+        signature = self._device_key.sign(crypto.canonical_json(refusal))
+        return {"session_id": session_id, "refusal": refusal, "signature": b64url(signature)}
+
     async def refuse_remote(self, session: SessionSpool) -> bool:
         """Tell the server the patient refused, so it erases what it holds (SRS-CNS-04)."""
+        refused_at = getattr(session, "refused_at", None)
         status, _ = await self._request_raw(
-            "POST", "/session/refuse", {"session_id": session.session_id})
+            "POST", "/session/refuse",
+            self.refusal_body(session.session_id,
+                              refused_at=datetime.fromtimestamp(refused_at, timezone.utc)
+                              if isinstance(refused_at, (int, float)) else None))
         return status is not None and status < 300
 
     async def forget(self, session: SessionSpool) -> None:
@@ -932,13 +1040,13 @@ class UploadManager:
         One attempt, returning (status, body) so the caller can tell a refusal
         from an outage. (None, None) when the server could not be reached.
         """
-        if self._http is None:
+        if self._http is None or self._quiet() or not await self._tls_allowed():
             return None, None
         url = self.cfg.backend.url(endpoint)
         timeout = aiohttp.ClientTimeout(total=self.cfg.backend.request_timeout)
-        headers = {"X-Device-Token": self._device_token} if self._device_token else None
+        data, headers = self._prepare(method, url, json_body)
         try:
-            async with self._http.request(method, url, json=json_body, headers=headers,
+            async with self._http.request(method, url, data=data, headers=headers,
                                           timeout=timeout) as response:
                 try:
                     body = await response.json(content_type=None)
@@ -947,6 +1055,7 @@ class UploadManager:
                 if response.status < 300:
                     self.last_success_at = time.time()
                     self.consecutive_failures = 0
+                self._note_retry_after(response)
                 return response.status, body if isinstance(body, dict) else {}
         except asyncio.CancelledError:
             raise
@@ -1013,6 +1122,61 @@ class UploadManager:
         """The server's time now, as best this PC knows it."""
         return time.time() + (self.clock_offset or 0.0)
 
+    # ---- one request's headers ----
+
+    def _prepare(self, method: str, url: str,
+                 json_body: Optional[Dict[str, Any]]) -> Tuple[Optional[bytes], Dict[str, str]]:
+        """
+        The body exactly as it will be sent, and the headers that go with it:
+        the device token, and the signature over those same bytes.
+        """
+        data = None if json_body is None else json.dumps(
+            json_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        headers: Dict[str, str] = {}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self._device_token:
+            headers["X-Device-Token"] = self._device_token
+            if getattr(self._device_key, "sign", None) is not None:
+                try:
+                    headers.update(sign_request(self._device_key, method, url, data or b"",
+                                                now=self.server_now()))
+                except Exception as exc:          # never let signing stop delivery
+                    logger.error("Could not sign a request: %s", exc)
+        return data, headers
+
+    @property
+    def tls_problem(self) -> str:
+        return self._tls.problem if self._tls is not None else ""
+
+    async def _tls_allowed(self) -> bool:
+        """Nothing goes to a server whose certificate fails the pins."""
+        if self._tls is None:
+            return True
+        ok = await self._tls.allowed()
+        problem = self._tls.problem
+        if problem and problem != self._tls_reported:
+            self._tls_reported = problem
+            self.last_error = problem
+            self._emit("integrity_alert", {"session_id": None,
+                                           "alert_type": "tls_interception",
+                                           "detail": problem})
+        if not ok:
+            self.consecutive_failures += 1
+        return ok
+
+    def _quiet(self) -> bool:
+        return time.monotonic() < self._quiet_until
+
+    def _note_retry_after(self, response) -> Optional[float]:
+        if response.status not in (429, 503):
+            return None
+        wait = retry_after_seconds(response.headers.get("Retry-After"))
+        if wait:
+            self._quiet_until = max(self._quiet_until, time.monotonic() + wait)
+            logger.warning("The server asked us to wait %.0f s", wait)
+        return wait
+
     async def _post(
         self, endpoint: str, payload: Dict[str, Any], *, attempts: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
@@ -1038,7 +1202,7 @@ class UploadManager:
         later" and leave the segment sealed on disk - nothing is ever discarded
         because a request failed.
         """
-        if self._http is None:
+        if self._http is None or self._quiet() or not await self._tls_allowed():
             return None
 
         backoff = self.cfg.backend.retry_backoff
@@ -1046,16 +1210,18 @@ class UploadManager:
         url = self.cfg.backend.url(endpoint)
         timeout = aiohttp.ClientTimeout(total=self.cfg.backend.request_timeout)
 
-        # Attached here, and only here: these requests go to our own backend.
-        headers = {"X-Device-Token": self._device_token} if self._device_token else None
-
         for attempt in range(total):
+            wait = None
             try:
+                # Attached here, and only here: these requests go to our own
+                # backend. Signed afresh per attempt: a new nonce and time.
+                data, headers = self._prepare(method, url, json_body)
                 sent = time.time()
                 async with self._http.request(
-                    method, url, json=json_body, headers=headers, timeout=timeout
+                    method, url, data=data, headers=headers, timeout=timeout
                 ) as response:
                     self.note_server_date(response.headers.get("Date"), sent, time.time())
+                    wait = self._note_retry_after(response)
                     if response.status < 300:
                         if response.content_type == "application/json":
                             return await response.json()
@@ -1080,41 +1246,41 @@ class UploadManager:
                 logger.warning("%s %s error: %s", method, endpoint, self.last_error)
 
             if attempt < total - 1:
-                await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
+                await asyncio.sleep(wait if wait is not None
+                                    else jittered(backoff[min(attempt, len(backoff) - 1)]))
 
         self.consecutive_failures += 1
         return None
 
     async def _put_object(self, url: str, data: bytes) -> bool:
-        """PUT straight to object storage using the presigned URL."""
+        """
+        PUT straight to object storage using the presigned URL. One attempt:
+        the drain loop is the retry, every ten seconds. Retrying in here for
+        the full backoff (nearly 13 minutes) held every other session's
+        delivery behind one failing clip. Never signed, never given the device
+        token: the URL points at the storage provider, not at our server.
+        """
         if self._http is None:
             return False
 
-        backoff = self.cfg.backend.retry_backoff
         timeout = aiohttp.ClientTimeout(total=self.cfg.backend.upload_timeout)
-
-        for attempt in range(len(backoff) + 1):
-            try:
-                async with self._http.put(
-                    url, data=data,
-                    headers={"Content-Type": "audio/wav"},
-                    timeout=timeout,
-                ) as response:
-                    if response.status < 300:
-                        return True
-                    body = (await response.text())[:300]
-                    logger.warning("Object PUT failed: %s %s", response.status, body)
-                    # An expired presigned URL must be re-requested, not retried.
-                    if response.status in (400, 403):
-                        return False
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Object PUT error: %s", exc)
-
-            if attempt < len(backoff):
-                await asyncio.sleep(backoff[attempt])
-
+        try:
+            async with self._http.put(
+                url, data=data,
+                headers={"Content-Type": "audio/wav"},
+                timeout=timeout,
+            ) as response:
+                if response.status < 300:
+                    return True
+                body = (await response.text())[:300]
+                logger.warning("Object PUT failed: %s %s", response.status, body)
+                self.last_error = f"object store {response.status}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Object PUT error: %s", exc)
+            self.last_error = f"{type(exc).__name__}: {exc}"
+        self.consecutive_failures += 1
         return False
 
     # ---- events ----
@@ -1128,6 +1294,18 @@ class UploadManager:
 
     # ---- status ----
 
+    def held_sessions(self) -> List[Dict[str, Any]]:
+        """Recordings kept on this PC because the server said no, oldest first."""
+        held = []
+        for session in list(self._sessions):
+            if getattr(session, "hold_code", "") and session.authorisation != "granted":
+                since = getattr(session, "held_since", None) or session.held_at
+                held.append({"session_id": session.session_id, "code": session.hold_code,
+                             "since": (crypto.iso_utc(datetime.fromtimestamp(since, timezone.utc))
+                                       if since else None)})
+        held.sort(key=lambda h: h["since"] or "")
+        return held
+
     def status(self) -> Dict[str, Any]:
         pending = sum(len(s.pending_segments()) for s in self._sessions)
         return {
@@ -1137,6 +1315,7 @@ class UploadManager:
             "spool_pressure": self.spool.pressure(),
             "last_success_at": self.last_success_at,
             "consecutive_failures": self.consecutive_failures,
+            "tls_problem": self.tls_problem,
             "last_error": self.last_error,
             "online": self.consecutive_failures == 0 and self.last_success_at is not None,
             "oldest_pending_seconds": round(self.oldest_pending_seconds()),

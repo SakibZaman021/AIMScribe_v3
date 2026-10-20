@@ -84,6 +84,35 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("sessions", "parts_count")),
     ("015_v3_consultation_parts.sql", "recordings", "chain entry type 'marker' accepted",
      _check_allows("chain_entries", "entry_type", "marker")),
+    ("016_v3_device_state.sql", "recordings", "column devices.held_count",
+     _column("devices", "held_count")),
+    ("016_v3_device_state.sql", "recordings", "column devices.disk_encrypted",
+     _column("devices", "disk_encrypted")),
+    ("016_v3_device_state.sql", "recordings", "column sessions.continues_session_id",
+     _column("sessions", "continues_session_id")),
+    ("017_v3_cmed_clients.sql", "recordings", "table cmed_clients", _table("cmed_clients")),
+    ("017_v3_cmed_clients.sql", "recordings", "table cmed_access_tokens",
+     _table("cmed_access_tokens")),
+    ("017_v3_cmed_clients.sql", "recordings", "column api_keys.cmed_hospital_ids",
+     _column("api_keys", "cmed_hospital_ids")),
+    # Applied 017 as a login other than the owner, and 018 never re-run: the API
+    # cannot read the tables that prove who CMED is, so every token is refused.
+    ("018_v3_least_privilege.sql", "recordings", "the API's rights on cmed_access_tokens",
+     "SELECT to_regclass('public.cmed_access_tokens') IS NOT NULL AND "
+     "has_table_privilege(current_user, 'public.cmed_access_tokens', 'INSERT')"),
+    ("019_v3_integrity.sql", "recordings", "column devices.signs_requests",
+     _column("devices", "signs_requests")),
+    ("019_v3_integrity.sql", "recordings", "table device_nonces", _table("device_nonces")),
+    ("019_v3_integrity.sql", "recordings", "table erase_tasks", _table("erase_tasks")),
+    ("019_v3_integrity.sql", "recordings", "column sessions.late_alerted_at",
+     _column("sessions", "late_alerted_at")),
+    ("019_v3_integrity.sql", "recordings", "column session_refusals.signed",
+     _column("session_refusals", "signed")),
+    ("020_v3_cmed_hardening.sql", "recordings", "column cmed_access_tokens.kid",
+     _column("cmed_access_tokens", "kid")),
+    ("020_v3_cmed_hardening.sql", "recordings", "column cmed_clients.identifier_systems",
+     _column("cmed_clients", "identifier_systems")),
+    ("020_v3_cmed_hardening.sql", "recordings", "table fhir_messages", _table("fhir_messages")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
@@ -184,8 +213,30 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 015 present)")
+        logger.info("Database schema up to date (migrations up to 020 present)")
+    await _warn_if_owner(recordings_pool)
     return problems
+
+
+async def _warn_if_owner(pool) -> None:
+    """
+    The API should log in as aims_api (migration 018), which may add to the
+    audit log but never change it. Logged in as the tables' owner, it could
+    switch the audit log's protection off - say so at every start.
+    """
+    try:
+        async with pool.acquire() as conn:
+            owner = await conn.fetchval("""
+                SELECT pg_get_userbyid(relowner) = current_user
+                    OR (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                  FROM pg_class WHERE oid = to_regclass('public.audit_log')""")
+    except Exception as exc:
+        logger.warning("Could not check which database login this server uses: %s", exc)
+        return
+    if owner:
+        logger.critical("The API is logged in to the recordings database as the owner of "
+                        "its tables (or a superuser). The audit log is not protected from "
+                        "this server: connect as aims_api (migration 018).")
 
 
 __all__ = ["REQUIRED", "STATE", "at_startup", "describe", "missing", "strict"]

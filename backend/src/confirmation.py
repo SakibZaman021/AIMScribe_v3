@@ -15,12 +15,18 @@ five fields is, and the time limits.
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
+from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import integrity
+
+logger = logging.getLogger(__name__)
 
 # How far back either side looks for the other. The five fields name one
 # consultation to the second, so a long look-back cannot pair the wrong ones;
@@ -78,8 +84,59 @@ def _text(body: Dict[str, Any], name: str) -> str:
     return value.strip()
 
 
-def parse_visit(body: Any) -> Visit:
-    """Read the five fields from a trigger forwarded by a recorder, or from API 2/3."""
+@lru_cache(maxsize=4)
+def _zone(name: str):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        # No time-zone database on this machine (Windows without tzdata). The
+        # clinics are in Bangladesh, which has kept +06:00 all year since 2009.
+        logger.warning("Time zone %s is not available here; using +06:00", name)
+        return timezone(timedelta(hours=6))
+
+
+def clinic_zone():
+    return _zone(os.getenv("AIMS_DEFAULT_TIMEZONE", "Asia/Dhaka") or "Asia/Dhaka")
+
+
+def canonical_start(value: str) -> Tuple[str, str]:
+    """
+    One way to write one moment: the clinic's own offset, whole seconds.
+
+        2026-09-13T10:14:32+06:00        unchanged
+        2026-09-13T04:14:32.000Z         -> 2026-09-13T10:14:32+06:00
+        2026-09-13T05:14:32+07:00        -> 2026-09-13T10:14:32+06:00
+
+    The five fields are compared as text everywhere (they name the visit), so
+    a FHIR library that re-serialises the time must not make it another visit.
+    Values already in this form - every one stored so far - do not change.
+    Returns (start_time, the clinic-local date). ValueError if not a time with
+    an offset.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError("must be a date and time with its time zone")
+    if parsed.tzinfo is None:
+        raise ValueError("must be a date and time with its time zone")
+    local = parsed.astimezone(clinic_zone()).replace(microsecond=0)
+    return local.isoformat(timespec="seconds"), local.date().isoformat()
+
+
+def parse_visit(body: Any, *, strict_date: bool = False) -> Visit:
+    """
+    Read the five fields from a trigger forwarded by a recorder, or from API 2/3.
+
+    start_time is written in its canonical form (canonical_start), and the date
+    is the clinic-local day of that moment. A different date in the message is
+    refused when `strict_date` (CMED's server messages, where a wrong date is a
+    bug to fix) and corrected otherwise (the recorder's trigger: refusing it
+    would refuse the recording, and every message for this visit gets the same
+    derived date, so they still meet).
+    """
     if not isinstance(body, dict):
         raise FieldError("MISSING_FIELD", "body", "expected a JSON object")
 
@@ -93,12 +150,9 @@ def parse_visit(body: Any) -> Visit:
                              f"'{name}' may contain only letters, digits, '_' and '-', "
                              f"up to 64 characters")
 
-    start_time = _text(body, "start_time")
     try:
-        parsed: Optional[datetime] = datetime.fromisoformat(start_time)
+        start_time, local_day = canonical_start(_text(body, "start_time"))
     except ValueError:
-        parsed = None
-    if parsed is None or parsed.tzinfo is None:
         raise FieldError("MISSING_FIELD", "start_time",
                          "'start_time' must be a date and time with its time zone")
 
@@ -109,6 +163,14 @@ def parse_visit(body: Any) -> Visit:
         ok = False
     if not ok:
         raise FieldError("MISSING_FIELD", "date", "'date' must be YYYY-MM-DD")
+    if visit_date != local_day:
+        if strict_date:
+            raise FieldError("MISSING_FIELD", "date",
+                             f"'date' must be the clinic's local date of start_time "
+                             f"({local_day}), not {visit_date}")
+        logger.warning("A trigger's date %s is not the local day of its start_time; "
+                       "using %s", visit_date, local_day)
+        visit_date = local_day
 
     return Visit(patient_id=ids["patient_id"], doctor_id=ids["doctor_id"],
                  cmed_hospital_id=ids["hospital_id"], start_time=start_time,
@@ -122,7 +184,7 @@ def current_state(stored: str, opened_at: Optional[datetime], now: datetime) -> 
     return stored
 
 
-__all__ = ["Visit", "FieldError", "parse_visit", "current_state", "FIVE_FIELDS",
+__all__ = ["Visit", "FieldError", "parse_visit", "canonical_start", "clinic_zone", "current_state", "FIVE_FIELDS",
            "MATCH_LOOKBACK", "NOTICE_MATCH_WINDOW", "CONFIRM_DEADLINE",
            "UNCONFIRMED_LIFETIME",
            "ARCHIVABLE", "WAITING"]

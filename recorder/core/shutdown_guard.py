@@ -3,10 +3,15 @@ Close the consultation properly when Windows shuts down, restarts or signs out.
 
 Without this the agent is simply killed: the clip being assembled is lost and the
 recording is left open until the next boot. Windows tells every top-level window
-first (WM_QUERYENDSESSION); this module owns a hidden one, holds the shutdown for
-the second or so the close takes - with a reason Windows can show, "AIMScribe is
-saving the consultation" - and then lets it continue. It never refuses a
-shutdown: a doctor who presses Shut down gets one.
+first (WM_QUERYENDSESSION); this module owns a hidden one.
+
+Windows asks before it decides. The question (WM_QUERYENDSESSION) only pauses
+the recording: the microphone stops and the clip so far is written, with the
+reason "AIMScribe is saving the consultation" showing. The answer comes next
+(WM_ENDSESSION): if the session really ends, the recording is closed; if
+someone pressed Cancel - an unsaved document, "close apps" - the recording
+resumes as if nothing happened, and the next real shutdown is handled again.
+It never refuses a shutdown: a doctor who presses Shut down gets one.
 
 A forced power-off cannot be caught by any program. That case is covered by the
 clip in progress being kept on disk every few seconds (core.spool, PARTIAL_NAME).
@@ -42,44 +47,86 @@ class ShutdownHandler:
     can be tested without shutting a PC down.
 
     `close(timeout)` closes the recording and returns once it has (True) or the
-    timeout passed (False). `block(text)` / `unblock()` set and clear the reason
-    Windows shows while it waits.
+    timeout passed (False). `prepare(timeout)` pauses it while Windows decides,
+    and `cancelled(timeout)` resumes it when Windows does not shut down after
+    all. `block(text)` / `unblock()` set and clear the reason Windows shows.
     """
 
     def __init__(self, close: Callable[[float], bool],
                  block: Callable[[str], None] = lambda text: None,
                  unblock: Callable[[], None] = lambda: None,
-                 timeout: float = CLOSE_TIMEOUT_SECONDS):
+                 timeout: float = CLOSE_TIMEOUT_SECONDS,
+                 prepare: Optional[Callable[[float], bool]] = None,
+                 cancelled: Optional[Callable[[float], bool]] = None,
+                 recording: Callable[[], bool] = lambda: True):
         self._close = close
         self._block = block
         self._unblock = unblock
+        self._prepare = prepare
+        self._cancelled = cancelled
+        # Shutdown is held up only while a consultation is being recorded;
+        # otherwise there is nothing to save and no reason to show.
+        self._recording = recording
         self.timeout = timeout
         self.closed = False
+        self.prepared = False
         self._lock = threading.Lock()
 
     def handle(self, message: int, wparam: int = 0, lparam: int = 0) -> Optional[int]:
         """The window procedure's answer, or None to leave it to Windows."""
         if message == WM_QUERYENDSESSION:
-            self._finish()
+            if self._prepare is None:
+                self._finish()
+            else:
+                self._hold()
             return 1                      # TRUE: never stand in the way
         if message == WM_ENDSESSION:
             if wparam:                    # the session really is ending
                 self._finish()
+            else:                         # cancelled: carry on recording
+                self._resume()
             self._unblock()
             return 0
         return None
+
+    def _hold(self) -> None:
+        with self._lock:
+            if self.closed or self.prepared:
+                return
+            if self._recording():
+                self._block(REASON)
+            try:
+                self.prepared = bool(self._prepare(self.timeout))
+            except Exception as exc:
+                logger.error("Pausing the recording for shutdown failed: %s", exc)
+                self.prepared = False
+
+    def _resume(self) -> None:
+        with self._lock:
+            was_prepared, self.prepared = self.prepared, False
+            # Whatever happened, the next shutdown is handled again.
+            self.closed = False
+            if not was_prepared or self._cancelled is None:
+                return
+            try:
+                self._cancelled(self.timeout)
+                logger.warning("Windows cancelled the shutdown; recording resumed")
+            except Exception as exc:
+                logger.error("Resuming after a cancelled shutdown failed: %s", exc)
 
     def _finish(self) -> None:
         with self._lock:
             if self.closed:
                 return
-            self._block(REASON)
+            if self._recording():
+                self._block(REASON)
             try:
                 ok = self._close(self.timeout)
             except Exception as exc:
                 logger.error("Closing the recording for shutdown failed: %s", exc)
                 ok = False
             self.closed = True
+            self.prepared = False
         if ok:
             logger.warning("Windows is shutting down; the recording was closed properly")
         else:
@@ -194,19 +241,32 @@ def guard_runtime(runtime) -> ShutdownGuard:
     """Start a guard that closes `runtime`'s recording on shutdown."""
     import asyncio
 
-    def close(timeout: float) -> bool:
+    def run(make, timeout: float) -> bool:
         loop, controller = runtime.loop, runtime.controller
         if loop is None or controller is None:
             return True
-        future = asyncio.run_coroutine_threadsafe(
-            controller.stop_session(reason="pc_shutdown"), loop)
+        future = asyncio.run_coroutine_threadsafe(make(controller), loop)
         try:
             future.result(timeout)
             return True
         except Exception:
             return False
 
-    guard = ShutdownGuard(ShutdownHandler(close))
+    def close(timeout: float) -> bool:
+        return run(lambda c: c.stop_session(reason="pc_shutdown"), timeout)
+
+    def prepare(timeout: float) -> bool:
+        return run(lambda c: c.hold_for_shutdown(), timeout)
+
+    def cancelled(timeout: float) -> bool:
+        return run(lambda c: c.release_shutdown_hold(), timeout)
+
+    def recording() -> bool:
+        controller = runtime.controller
+        return controller is not None and getattr(controller, "_active", None) is not None
+
+    guard = ShutdownGuard(ShutdownHandler(close, prepare=prepare, cancelled=cancelled,
+                                          recording=recording))
     guard.start()
     return guard
 

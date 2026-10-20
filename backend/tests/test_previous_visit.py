@@ -141,7 +141,9 @@ async def _closed(server, *, archive=False):
     if archive:
         await api_v2.archive_complete(api_v2.ArchiveCompleteRequest(
             session_id=sid, archive_relpath="HOSP003/x.wav", sha256="ab" * 32,
-            bytes=1_000))
+            bytes=1_000, segments=[
+                api_v2.JoinedSegment(seq_no=s["seq_no"], sha256=bytes(s["sha256"]).hex())
+                for s in server.repo.segments.get(sid, [])]))
     return sid
 
 
@@ -223,7 +225,9 @@ def _api2_body(visit, previous=None):
 @pytest_asyncio.fixture
 async def live(dbs):
     """The real clinical store and repository behind the real endpoints."""
-    key = await dbs.repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None)
+    key = await dbs.repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None,
+                                         cmed_hospital_ids=["CMED-DHOLPUR", "CMED-OTHER",
+                                                            "CMED-1", "HOSP003"])
     await dbs.repo.upsert_hospital("HOSP003", "Dholpur", "Asia/Dhaka")
     await dbs.repo.set_cmed_hospital_id("HOSP003", "CMED-DHOLPUR")
     api_v2.forget_directory()

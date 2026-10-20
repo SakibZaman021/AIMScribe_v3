@@ -112,6 +112,13 @@ class AsyncPostgreSQLDatabase:
         constraint cannot be implemented" and nothing recorded at all.
         """
         async with self._pool.acquire() as conn:
+            if not await conn.fetchval(
+                    "SELECT has_schema_privilege(current_user, 'public', 'CREATE')"):
+                # The least-privilege login (migration 018): the tables come from
+                # the migrations, run by the owner, never from the API.
+                logger.info("Connected without CREATE rights; legacy tables are left "
+                            "to the migrations")
+                return
             # Sessions table - session_id can be client-provided or UUID string
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
