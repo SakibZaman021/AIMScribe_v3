@@ -209,11 +209,25 @@ def read_env() -> Dict[str, str]:
     values: Dict[str, str] = {}
     if not ENV.is_file():
         return values
-    for line in ENV.read_text(encoding="utf-8").splitlines():
+    lines = iter(ENV.read_text(encoding="utf-8").splitlines())
+    for line in lines:
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, value = line.partition("=")
-            values[key.strip()] = value.strip()
+            value = value.strip()
+            # A PEM pasted in quotes spans several lines. Read line by line it
+            # was cut to its first, and update_env then wrote the stump back -
+            # which Docker refuses to read, stopping the whole stack. Kept on
+            # one line with \n, the form every key in this file uses.
+            if value.startswith('"') and not (len(value) > 1 and value.endswith('"')):
+                parts = [value[1:]]
+                for more in lines:
+                    if more.rstrip().endswith('"'):
+                        parts.append(more.rstrip()[:-1])
+                        break
+                    parts.append(more)
+                value = "\\n".join(p.strip() for p in parts)
+            values[key.strip()] = value
     return values
 
 
