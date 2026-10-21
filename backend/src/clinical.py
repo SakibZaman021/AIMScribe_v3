@@ -339,7 +339,10 @@ async def process(kind: str, body: Dict[str, Any], raw: str,
         notice_id = await repo.record_notice(visit, hospital_id=hospital_id,
                                              clinical_record_id=record_id)
         await confirm_waiting(visit, hospital_id, notice_id)
-    await attach_to_recording(visit)
+    if hospital_id is not None:
+        # An unmapped clinic's records attach to nothing: which recording they
+        # belong to cannot be known without knowing whose clinic they came from.
+        await attach_to_recording(visit, hospital_id)
 
     logger.info("Stored %s %s from %s", kind, record_id, label)
     extra = {"version": version} if kind == "prescription" else {}
@@ -434,7 +437,8 @@ def _read_cursor(cursor: str):
                        fields=["cursor"])
 
 
-async def attach_to_recording(visit: Visit) -> Optional[str]:
+async def attach_to_recording(visit: Visit, hospital_id: Optional[str] = None
+                              ) -> Optional[str]:
     """
     API 2 and API 3 may arrive hours or days after the recording closed, or
     after it was archived; they enrich it, they never decide whether it is
@@ -444,7 +448,7 @@ async def attach_to_recording(visit: Visit) -> Optional[str]:
     """
     repo = api_v2._repo()
     try:
-        found = await repo.session_for_visit(visit)
+        found = await repo.session_for_visit(visit, hospital_id)
         if found is None:
             return None
         # A prescription arriving late is evidence of who was consulted: the
@@ -458,7 +462,7 @@ async def attach_to_recording(visit: Visit) -> Optional[str]:
             await clinical_store.link_session(visit, session_id=found["session_id"],
                                               file_stem=session["file_stem"],
                                               hospital_id=session.get("hospital_id"))
-        return await mark_json_for_rewrite(visit)
+        return await mark_json_for_rewrite(visit, hospital_id)
     except Exception as exc:
         logger.warning("Could not attach a late clinical record to its recording: %s", exc)
         return None
@@ -471,6 +475,8 @@ async def confirm_waiting(visit: Visit, hospital_id: str, notice_id: int) -> Opt
     """
     repo = api_v2._repo()
     since = datetime.now(timezone.utc) - conf.UNCONFIRMED_LIFETIME
+    if await api_v2._visit_contested(visit, hospital_id):
+        return None                         # two PCs claim it: an administrator decides
     grant = await repo.find_waiting_authorisation(visit, hospital_id=hospital_id, since=since)
     if grant is None:
         return None                         # a grant may still ask for it (5 minutes)
@@ -504,7 +510,8 @@ async def confirm_waiting(visit: Visit, hospital_id: str, notice_id: int) -> Opt
     return None
 
 
-async def mark_json_for_rewrite(visit: Visit) -> Optional[str]:
+async def mark_json_for_rewrite(visit: Visit, hospital_id: Optional[str] = None
+                                ) -> Optional[str]:
     """
     A prescription for a consultation that is already archived: the JSON file
     beside the audio is now out of date, so it is written again and uploaded to
@@ -512,7 +519,7 @@ async def mark_json_for_rewrite(visit: Visit) -> Optional[str]:
     up on its next pass.
     """
     repo = api_v2._repo()
-    session = await repo.session_for_visit(visit)
+    session = await repo.session_for_visit(visit, hospital_id)
     if session is None or session.get("archived_at") is None:
         return None                         # not archived yet: the JSON is written
     if await repo.mark_json_stale(session["session_id"]):    # with the audio anyway

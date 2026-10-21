@@ -362,9 +362,16 @@ class FakeRepo:
     async def mark_device_signs(self, device_id):
         self.__dict__.setdefault("signing", set()).add(str(device_id))
 
-    async def session_for_visit(self, visit):
+    async def visit_devices(self, visit, *, hospital_id):
+        return sorted({str(g["device_id"]) for g in self.auths.values()
+                       if self._match(g, visit, hospital_id)})
+
+    async def session_for_visit(self, visit, hospital_id=None):
         for grant in self.auths.values():
             sid = grant["session_id"]
+            if hospital_id is not None and sid and \
+                    (self.sessions.get(sid) or {}).get("hospital_id") != hospital_id:
+                continue
             current = (self.sessions.get(sid) or {}).get("grant_jti")
             clicked = any(c["grant_jti"] == grant["jti"] for c in self.clicks.get(sid, []))
             if sid and (current in (None, grant["jti"]) or clicked) and self._match(
@@ -860,14 +867,62 @@ async def test_pending_becomes_unconfirmed_after_two_minutes(server):
     assert server.repo.alerts[-1]["alert_type"] == "unconfirmed_recording"
 
 
-async def test_a_recording_without_api2_is_archived(server):
-    """API 2 is enrichment: the archive takes the recording without it."""
-    waiting = open_session(server, segments=2)
-    refused = open_session(server, segments=1)
-    for sid, state in ((waiting, "unconfirmed"), (refused, "refused")):
-        server.repo.sessions[sid].update(confirmation=state, closed_at=NOW())
+async def test_only_a_recording_cmed_confirmed_enters_the_dataset(server):
+    """
+    A PC's signature proves which PC recorded; only CMED's API 2 proves a real
+    consultation happened. Anything else is kept, but held out of the archive.
+    """
+    states = ("confirmed", "unconfirmed", "pending", "legacy", "refused")
+    sids = {}
+    for state in states:
+        sids[state] = open_session(server, segments=1)
+        server.repo.sessions[sids[state]].update(confirmation=state, closed_at=NOW())
     ready = {s["session_id"] for s in await server.repo.pending_archive()}
-    assert waiting in ready and refused not in ready
+    assert ready == {sids["confirmed"]}
+    # Held means kept: nothing was erased.
+    assert all(server.repo.sessions[sids[s]]["patient_id"] != "REDACTED"
+               for s in states if s != "refused")
+
+
+async def test_an_administrator_can_confirm_a_held_recording_by_name(server):
+    sid = open_session(server, segments=1)
+    server.repo.sessions[sid].update(confirmation="unconfirmed", closed_at=NOW())
+    reply = await api_v2.admin_confirm_session(sid, api_v2.ConfirmRequest(
+        confirmed_by="Dr Rahman, AIMS LAB", reason="CMED outage on 2026-10-20; checked"))
+    assert reply["status"] == "confirmed"
+    assert sid in {s["session_id"] for s in await server.repo.pending_archive()}
+    entry = next(a for a in server.repo.audits if a["event_type"] == "session.confirmed")
+    assert entry["actor_type"] == "admin" and entry["detail"]["by_hand"]
+
+
+async def test_two_pcs_claiming_one_consultation_confirms_neither(server):
+    """A copied key, or a PC that saw another's screen: an administrator decides."""
+    other = dict(DEVICE, device_id="dev-2")
+    assert (await mint())[1]["confirmation"] == "pending"
+    assert (await mint(device=other))[1]["confirmation"] == "pending"
+    await send("patient_information", api2())
+    assert all(g["notice_id"] is None for g in server.repo.auths.values())
+    assert any(a["alert_type"] == "consultation_claimed_by_two_pcs"
+               for a in server.repo.alerts)
+
+
+async def test_the_same_pc_asking_twice_is_not_a_contest(server):
+    await mint()
+    await mint()
+    await send("patient_information", api2())
+    assert sum(1 for g in server.repo.auths.values() if g["notice_id"]) == 1
+    assert not any(a["alert_type"] == "consultation_claimed_by_two_pcs"
+                   for a in server.repo.alerts)
+
+
+async def test_a_grant_does_not_open_a_recording_for_another_doctor(server):
+    await send("patient_information", api2())
+    _, reply = await mint()
+    sid = open_session(server, segments=1)
+    state = await api_v2._link_grant(sid, reply["jti"], "P0012345", DEVICE,
+                                     doctor_id="DR9999")
+    assert state == "unconfirmed"
+    assert any(a["alert_type"] == "grant_link_failed" for a in server.repo.alerts)
 
 
 async def test_sweep_never_erases_a_recording_without_api2(server):
@@ -1375,10 +1430,22 @@ async def test_the_sweep_confirms_what_the_crossing_left_behind(server):
                for a in server.repo.audits)
 
 
+def _wav_piece() -> bytes:
+    import io as _io
+    import wave as _wave
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x10\x00" * 1600)
+    return buf.getvalue()
+
+
 async def _commit(session_id, audio_sha: str):
     return await api_v2.commit_segment(api_v2.CommitRequest(
         session_id=session_id, seq_no=1, object_key=f"audio/{session_id}/1.wav",
-        sha256=audio_sha, bytes=15, duration_seconds=1.0,
+        sha256=audio_sha, bytes=len(_wav_piece()), duration_seconds=1.0,
         captured_start_at=NOW().isoformat(), captured_end_at=NOW().isoformat(),
         is_final=False, chain_entry={"entry_no": 1, "entry_type": "segment"}),
         device=DEVICE)
@@ -1390,7 +1457,7 @@ async def test_a_piece_that_reads_back_on_the_second_try_is_not_refused(server, 
     recorder upload the whole piece again, so a busy minute costs the network
     several times what it should (seen in the 28-room load test).
     """
-    audio = b"simulated audio"
+    audio = _wav_piece()
     attempts = {"n": 0}
 
     def flaky(object_key):
@@ -1437,7 +1504,7 @@ async def test_the_worker_is_told_the_name_the_recording_was_given(server):
     """
     sid = open_session(server, segments=2)
     server.repo.sessions[sid].update(
-        file_stem="P0012345_DR0042_HOSP003_101432_102847_20260913",
+        file_stem="P0012345_DR0042_HOSP003_101432_102847_20260913", confirmation="confirmed",
         closed_at=NOW(), sample_rate=44100, channels=1, sample_width=2,
         manifest={}, total_duration_seconds=855.0)
 

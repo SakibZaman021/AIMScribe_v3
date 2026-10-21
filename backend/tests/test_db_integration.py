@@ -658,6 +658,47 @@ async def test_a_late_prescription_marks_the_json_and_a_new_version_follows(dbs)
     assert [c["version"] for c in await dbs.repo.copies_for(sid)] == [1, 2]
 
 
+async def test_what_keeps_a_rogue_pc_out_of_the_dataset_runs_on_postgres(dbs):
+    """The three queries behind the dataset gate, on the real schema."""
+    repo = dbs.repo
+    first = await enrolled_device(repo)
+    second = await enrolled_device(repo)
+    v = visit(patient_id="PROGUE1")
+    sid = await _linked_session(dbs, first, v)
+
+    # One consultation, two PCs asking for it: both are named.
+    now = datetime.now(timezone.utc)
+    assert await repo.visit_devices(v, hospital_id="HOSP003") == [str(first["device_id"])]
+    await repo.create_authorisation(jti="rogue-1", device_id=second["device_id"],
+                                    hospital_id="HOSP003", visit=v, expires_at=now)
+    assert sorted(await repo.visit_devices(v, hospital_id="HOSP003")) == sorted(
+        [str(first["device_id"]), str(second["device_id"])])
+
+    # A clinic's records attach only to that clinic's recordings.
+    assert (await repo.session_for_visit(v, "HOSP003"))["session_id"] == sid
+    assert await repo.session_for_visit(v, "HOSP999") is None
+
+    # Only confirmed recordings are offered to the archive.
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
+    held = await a_session(repo, first)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET closed_at = now(), confirmation = "
+                           "'unconfirmed' WHERE session_id = $1", held)
+    ready = {p["session_id"] for p in await repo.pending_archive(50)}
+    assert held not in ready
+
+    # A PC revoked as untrusted: its recordings not yet archived are held.
+    assert await repo.quarantine_device_sessions(first["device_id"], "untrusted") >= 2
+    assert (await repo.get_session(held))["status"] == "quarantined"
+    assert sid not in {p["session_id"] for p in await repo.pending_archive(50)}
+
+    # Leave the shared day as it was for the dashboard's counts.
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET status = 'closed', quarantine_reason = NULL "
+                           "WHERE device_id = $1", first["device_id"])
+
+
 async def test_a_recording_never_archived_is_never_waiting_for_a_copy(dbs):
     """SRS-ARC-16: unconfirmed and refused recordings have nothing to copy."""
     device = await enrolled_device(dbs.repo)

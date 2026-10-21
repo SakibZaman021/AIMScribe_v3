@@ -55,7 +55,21 @@ def postgres(test):
         asyncio_mark(test))
 
 
-AUDIO = b"simulated audio, one piece"
+def wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1, width: int = 2,
+        fill: bytes = b"\x10\x00") -> bytes:
+    """A real WAV piece, as the recorder uploads them."""
+    import io as _io
+    import wave as _wave
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(fill * int(rate * seconds) * channels)
+    return buf.getvalue()
+
+
+AUDIO = wav(1.0)
 
 
 # ============================================================
@@ -109,13 +123,44 @@ async def test_an_entry_for_other_audio_cannot_carry_this_upload(server, device_
                                                                 monkeypatch):
     """Before: any valid signed entry let any bytes be committed under it."""
     sid = started(server, device_key)
-    entry = segment_entry(server, sid, device_key, audio=b"what was really recorded")
-    reply = await commit(sid, entry, device, audio=b"something else entirely",
+    entry = segment_entry(server, sid, device_key, audio=wav(1.0))
+    reply = await commit(sid, entry, device, audio=wav(1.0, fill=b"\x20\x00"),
                          monkeypatch=monkeypatch)
     assert reply["status"] == "quarantined"
     assert server.repo.segments.get(sid, []) == []
     assert receipts_for(server, sid) == []
     assert server.repo.alerts[-1]["alert_type"] == "segment_entry_mismatch"
+
+
+@asyncio_mark
+@pytest.mark.parametrize("piece,why", [
+    (b"not audio at all, just bytes", "not a WAV file"),
+    (wav(1.0, rate=8000), "sample_rate is 8000"),
+    (wav(1.0, channels=2), "channels is 2"),
+    (wav(0.0), "holds no audio"),
+], ids=["not-wav", "wrong-rate", "wrong-channels", "empty"])
+async def test_a_piece_that_is_not_the_declared_audio_is_held(server, device_key, device,
+                                                              monkeypatch, piece, why):
+    """Garbage that hashes correctly is still garbage: held, no receipt."""
+    sid = started(server, device_key)
+    server.repo.sessions[sid].update(sample_rate=16000, channels=1, sample_width=2)
+    entry = segment_entry(server, sid, device_key, audio=piece)
+    reply = await commit(sid, entry, device, audio=piece, monkeypatch=monkeypatch)
+    assert reply["status"] == "quarantined" and why in reply["reason"]
+    assert server.repo.segments.get(sid, []) == []
+    assert receipts_for(server, sid) == []
+    assert server.repo.alerts[-1]["alert_type"] == "segment_not_audio"
+
+
+@asyncio_mark
+async def test_the_duration_kept_is_the_servers_own_reading(server, device_key, device,
+                                                            monkeypatch):
+    sid = started(server, device_key)
+    piece = wav(2.5)
+    reply = await commit(sid, segment_entry(server, sid, device_key, audio=piece), device,
+                         audio=piece, monkeypatch=monkeypatch)
+    assert reply["status"] == "committed"
+    assert server.repo.segments[sid][0]["duration_seconds"] == 2.5
 
 
 @asyncio_mark

@@ -205,6 +205,7 @@ async def test_a_follow_up_and_the_next_patient_become_two_files(
 
 async def test_the_archive_gets_the_cut_and_a_json_per_part(server, device_key, device):
     sid, parts = await follow_up_then_salma(server, device_key, device)
+    server.repo.sessions[sid]["confirmation"] = "confirmed"     # only CMED-confirmed archive
     pending = (await api_v2.archive_pending())["sessions"]
     [entry] = [s for s in pending if s["session_id"] == sid]
     assert [(p["part_no"], p["start_seconds"], p["end_seconds"], p["file_stem"])
