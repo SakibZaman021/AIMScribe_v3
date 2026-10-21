@@ -1061,12 +1061,14 @@ S.append(Spacer(1, 4))
 S.append(tbl([["API 2 arrives...", "What happens to the recording"],
               ["within a second or two", "Its clinical record is attached at once"],
               ["late &mdash; minutes, hours or days, after an outage",
-               "<b>Attached when it arrives.</b> The recording was recorded, uploaded and archived "
-               "meanwhile; nothing has a deadline"],
-              ["<b>never</b>", "<b>The recording is still kept and archived</b>, marked "
-                               "<i>unconfirmed</i>, and AIMS LAB is alerted. It simply has no "
-                               "clinical record &mdash; which is why a message must never be "
-                               "dropped"]],
+               "<b>Confirms it when it arrives.</b> The recording was recorded and uploaded "
+               "meanwhile, and enters the dataset the moment API 2 matches it; nothing has a "
+               "deadline"],
+              ["<b>never</b>", "<b>The recording is kept but held out of the dataset</b>, marked "
+                               "<i>unconfirmed</i>, and AIMS LAB is alerted. Only API 2 - or an "
+                               "AIMS LAB administrator, by name - lets it in, because API 2 is "
+                               "what proves the consultation was real. So a message must never "
+                               "be dropped"]],
              [40 * mm, 116 * mm], highlight=[1, 2], req=[3]))
 S.append(Spacer(1, 4))
 S.append(Paragraph("<b>A message arriving a day late is completely fine. A message never sent is "

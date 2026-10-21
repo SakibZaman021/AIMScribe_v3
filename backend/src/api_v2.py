@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import hmac
 import logging
 import time
 import os
 import re
+import wave
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -738,7 +740,8 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         except Exception as exc:
             logger.debug("Legacy patient upsert skipped: %s", exc)
 
-    state = await _link_grant(session_id, body.grant_jti, patient_ref, device)
+    state = await _link_grant(session_id, body.grant_jti, patient_ref, device,
+                              doctor_id=doctor_id)
     if body.continues_session_id:
         state = await _link_continuation(session_id, body.continues_session_id,
                                          patient_ref, device, state)
@@ -863,6 +866,18 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     if len(stored) != body.bytes:
         raise HTTPException(status_code=400, detail="declared byte length does not match")
 
+    # The hash proves the bytes arrived intact, not that they are audio. A piece
+    # that is not the WAV this recording declared - its rate, channels and
+    # sample width - is held, never archived: it would stop the archive worker
+    # and could be anything at all. The duration is the server's own reading.
+    heard, wav_problem = _wav_check(stored, session)
+    if wav_problem is not None:
+        async with _session_lock(session_id):
+            await _quarantine(session_id, device, f"segment {body.seq_no} is not the "
+                              f"declared audio: {wav_problem}", alert="segment_not_audio",
+                              detail={"seq_no": body.seq_no})
+        return {"status": "quarantined", "reason": wav_problem}
+
     entry = await _entry_or_400(body.chain_entry)
     binding = integrity.segment_binding_problem(
         entry, seq_no=body.seq_no, sha256_hex=body.sha256, byte_length=body.bytes)
@@ -914,7 +929,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
                 entry=entry,
                 object_key=body.object_key,
                 byte_length=body.bytes,
-                duration_seconds=body.duration_seconds,
+                duration_seconds=heard,
                 sha256=claimed,
                 rms_mean=body.rms_mean,
                 captured_start_at=_parse_time(body.captured_start_at),
@@ -945,6 +960,29 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     await _issue_custody_receipt(session_id, body.seq_no, claimed)
     return {"status": "committed", "seq_no": body.seq_no, "object_key": body.object_key,
             "duplicate": outcome == "duplicate"}
+
+
+def _wav_check(data: bytes, session: Dict[str, Any]) -> Tuple[float, Optional[str]]:
+    """
+    (seconds of audio, None) for a WAV matching the recording's declared
+    format, else (0, why not). Read from the bytes already in hand.
+    """
+    try:
+        with wave.open(io.BytesIO(data), "rb") as w:
+            rate, channels, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+            frames = w.getnframes()
+    except (wave.Error, EOFError, ValueError) as exc:
+        return 0.0, f"not a WAV file ({exc})"
+    if rate <= 0 or frames <= 0:
+        return 0.0, "the WAV holds no audio"
+    if len(data) < 44 + frames * channels * width:
+        return 0.0, "the WAV is shorter than its header says"
+    for name, got in (("sample_rate", rate), ("channels", channels),
+                      ("sample_width", width)):
+        want = session.get(name)
+        if want is not None and int(want) != got:
+            return 0.0, f"{name} is {got}, the recording declared {want}"
+    return frames / rate, None
 
 
 def object_prefix(patient: str, doctor: str, hospital: str,
@@ -2528,9 +2566,11 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
     await repo.create_authorisation(
         jti=jti, device_id=device["device_id"], hospital_id=clinic, visit=visit,
         expires_at=now + timedelta(seconds=ctx.grants.lifetime))
-    notice_id = await repo.find_unclaimed_notice(
-        visit, hospital_id=clinic, since=now - conf.NOTICE_MATCH_WINDOW)
-    confirmed = notice_id is not None and await repo.claim_notice(notice_id, jti)
+    confirmed = False
+    if not await _visit_contested(visit, clinic):
+        notice_id = await repo.find_unclaimed_notice(
+            visit, hospital_id=clinic, since=now - conf.NOTICE_MATCH_WINDOW)
+        confirmed = notice_id is not None and await repo.claim_notice(notice_id, jti)
     state = "confirmed" if confirmed else "pending"
 
     token, _ = ctx.grants.issue(
@@ -2552,11 +2592,33 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
             "expires_in": ctx.grants.lifetime}
 
 
+async def _visit_contested(visit, clinic: str) -> bool:
+    """
+    One consultation is recorded by one PC. When a second PC asks for the same
+    five fields, one of them is not where it says it is - a copied key, or a
+    PC that saw another's screen - and which one cannot be told from here. API
+    2 confirms neither from then on; both recordings are kept and held, and an
+    administrator decides.
+    """
+    repo = _repo()
+    if not hasattr(repo, "visit_devices"):
+        return False
+    devices = await repo.visit_devices(visit, hospital_id=clinic)
+    if len(devices) < 2:
+        return False
+    await repo.raise_alert(
+        alert_type="consultation_claimed_by_two_pcs", severity="critical",
+        detail={"hospital_id": clinic, "devices": devices,
+                "start_time": visit.start_time, "date": visit.visit_date})
+    return True
+
+
 async def _link_grant(session_id: str, grant_jti: Optional[str], patient_ref: str,
-                      device: Dict[str, Any]) -> str:
+                      device: Dict[str, Any], *, doctor_id: Optional[str] = None) -> str:
     """
     Tie a session to the grant it was opened under, and so to CMED's API 2.
-    No grant means a protocol-2 recorder: 'legacy', archived as before.
+    No grant means a protocol-2 recorder: 'legacy', kept but held out of the
+    dataset, since nothing ties it to a consultation CMED knows of.
     """
     repo = _repo()
     row = await repo.session_confirmation(session_id)
@@ -2568,6 +2630,7 @@ async def _link_grant(session_id: str, grant_jti: Optional[str], patient_ref: st
         valid = (grant is not None
                  and str(grant["device_id"]) == str(device["device_id"])
                  and grant["patient_id"] == patient_ref
+                 and (doctor_id is None or grant.get("doctor_id") in (None, doctor_id))
                  and grant.get("session_id") in (None, session_id))
         if not valid:
             await repo.raise_alert(alert_type="grant_link_failed", severity="critical",
@@ -3324,15 +3387,55 @@ async def admin_enrollment_token(body: TokenRequest, _: None = Depends(require_a
 
 
 @router.post("/admin/device/{device_id}/revoke")
-async def admin_revoke_device(device_id: str, reason: str = "",
+async def admin_revoke_device(device_id: str, reason: str = "", hold: bool = False,
                               _: None = Depends(require_admin)):
-    """Cut off a lost or stolen machine. The token is cleared, not just flagged."""
+    """
+    Cut off a lost or stolen machine. The token is cleared, not just flagged.
+
+    hold=true is for a PC no longer trusted: every recording of it not yet in
+    the dataset is held for review as well, instead of being archived.
+    """
     revoked = await _repo().revoke_device(device_id, reason or "revoked by administrator")
     if not revoked:
         raise HTTPException(status_code=404, detail="device not found or already revoked")
+    held = 0
+    if hold:
+        held = await _repo().quarantine_device_sessions(
+            device_id, f"PC revoked as untrusted: {reason or 'no reason given'}")
     await _repo().audit(event_type="device.revoked", actor_type="admin",
-                        device_id=device_id, detail={"reason": reason})
-    return {"status": "revoked", "device_id": device_id}
+                        device_id=device_id, detail={"reason": reason, "held": held})
+    return {"status": "revoked", "device_id": device_id, "recordings_held": held}
+
+
+class ConfirmRequest(BaseModel):
+    confirmed_by: str = Field(..., min_length=2, max_length=128)
+    reason: str = Field(..., min_length=10, max_length=500)
+
+
+@router.post("/admin/session/{session_id}/confirm")
+async def admin_confirm_session(session_id: str, body: ConfirmRequest,
+                                _: None = Depends(require_admin)):
+    """
+    Let a held recording into the dataset when CMED never sent its API 2 - an
+    outage, a wrong clinic mapping - and a person has checked it is real. By
+    name and with a reason, in the audit log; never automatic.
+    """
+    session_id = _sid(session_id)
+    repo = _repo()
+    row = await repo.session_confirmation(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if row["confirmation"] == "confirmed":
+        return {"status": "confirmed", "session_id": session_id, "already": True}
+    if row["confirmation"] in ("refused", "expired"):
+        raise HTTPException(status_code=409, detail="this consultation has been erased")
+    await repo.set_session_confirmation(session_id, "confirmed")
+    await repo.audit(event_type="session.confirmed", actor_type="admin",
+                     actor_id=body.confirmed_by, session_id=session_id,
+                     detail={"by_hand": True, "was": row["confirmation"],
+                             "reason": body.reason})
+    await confirm_continuations(session_id)
+    return {"status": "confirmed", "session_id": session_id, "was": row["confirmation"]}
 
 
 class CmedKeyRequest(BaseModel):

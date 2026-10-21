@@ -348,6 +348,21 @@ class V2Repository:
             await conn.execute("UPDATE devices SET signs_requests = true "
                                "WHERE device_id = $1 AND NOT signs_requests", device_id)
 
+    async def quarantine_device_sessions(self, device_id, reason: str) -> int:
+        """
+        Hold every recording of this PC not yet in the dataset. Used when a PC
+        is revoked as untrustworthy rather than merely lost.
+        """
+        async with self._acquire() as conn:
+            result = await conn.execute("""
+                UPDATE sessions
+                   SET status = 'quarantined', quarantine_reason = $2, updated_at = now()
+                 WHERE device_id = $1 AND archived_at IS NULL
+                   AND quarantine_reason IS NULL
+                   AND status NOT IN ('quarantined', 'archived', 'refused', 'expired')
+            """, device_id, reason[:500])
+        return int(result.split()[-1]) if result else 0
+
     async def revoke_device(self, device_id, reason: str) -> bool:
         async with self._acquire() as conn:
             result = await conn.execute("""
@@ -803,10 +818,9 @@ class V2Repository:
                   AND s.quarantine_reason IS NULL
                   AND s.status <> 'quarantined'
                   AND s.protocol_version >= 2
-                  -- Every recording a CMED trigger started enters the dataset,
-                  -- with or without API 2 (which attaches later). Refused and
-                  -- erased sessions never do.
-                  AND s.confirmation IN ('confirmed', 'legacy', 'pending', 'unconfirmed')
+                  -- Only what CMED's API 2 confirmed enters the dataset
+                  -- (confirmation.ARCHIVABLE). The rest is held, not lost.
+                  AND s.confirmation = 'confirmed'
                   AND EXISTS (SELECT 1 FROM segments g
                                WHERE g.session_id = s.session_id
                                  AND g.state = 'committed')
@@ -969,7 +983,8 @@ class V2Repository:
                 "UPDATE sessions SET segments_deleted_at = now(), updated_at = now() "
                 "WHERE session_id = $1", session_id)
 
-    async def session_for_visit(self, visit) -> Optional[Dict[str, Any]]:
+    async def session_for_visit(self, visit, hospital_id: Optional[str] = None
+                                ) -> Optional[Dict[str, Any]]:
         """
         The recording of this visit, if one was granted and opened. Used when a
         prescription arrives late, to mark its JSON for writing again.
@@ -991,9 +1006,11 @@ class V2Repository:
                    AND g.patient_id = $1 AND g.doctor_id = $2
                    AND g.cmed_hospital_id = $3 AND g.start_time = $4
                    AND g.visit_date = $5
+                   -- A clinic's records attach only to that clinic's recordings.
+                   AND ($6::text IS NULL OR s.hospital_id = $6)
                  ORDER BY g.issued_at DESC LIMIT 1
             """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
-                 visit.start_time, visit.day)
+                 visit.start_time, visit.day, hospital_id)
             if row is None:
                 # Clicked during a recording whose grant never came (held, or
                 # the server was unreachable): the marker itself names the visit.
@@ -1004,9 +1021,10 @@ class V2Repository:
                      WHERE c.patient_id = $1 AND c.doctor_id = $2
                        AND c.cmed_hospital_id = $3 AND c.start_time = $4
                        AND c.visit_date = $5
+                       AND ($6::text IS NULL OR s.hospital_id = $6)
                      ORDER BY c.received_at DESC LIMIT 1
                 """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
-                     visit.start_time, visit.day)
+                     visit.start_time, visit.day, hospital_id)
         return dict(row) if row else None
 
     # ============================================================
@@ -1310,6 +1328,16 @@ class V2Repository:
             """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
                  visit.start_time, visit.day, hospital_id, since)
         return dict(row) if row else None
+
+    async def visit_devices(self, visit, *, hospital_id: str) -> List[str]:
+        """Every PC that asked to record this consultation."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT DISTINCT device_id::text AS device_id FROM grant_authorisations
+                 WHERE {self._VISIT_MATCH}
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                 visit.start_time, visit.day, hospital_id)
+        return [r["device_id"] for r in rows]
 
     async def claim_notice(self, notice_id: int, jti: str) -> bool:
         """One API 2 confirms one grant, once (SRS-CNF-04). All or nothing."""
