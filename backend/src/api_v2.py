@@ -252,7 +252,11 @@ class AudioSpec(BaseModel):
 
 class EnrollRequest(BaseModel):
     enrollment_token: str = Field(..., min_length=16, max_length=256)
-    device_pubkey: str = Field(..., min_length=64, max_length=64)
+    # 64 hex characters: an Ed25519 key in software (up to 3.5). 130: a P-256
+    # key inside the PC's TPM (3.6 on), which must also prove it holds it.
+    device_pubkey: str = Field(..., min_length=64, max_length=130)
+    key_proof: Optional[str] = Field(None, max_length=200)
+    key_storage: str = Field("software", max_length=16)
     machine_name: str = Field("", max_length=128)
     os_version: str = Field("", max_length=256)
     app_version: str = Field("", max_length=32)
@@ -597,8 +601,23 @@ async def enroll_device(body: EnrollRequest):
         pubkey = bytes.fromhex(body.device_pubkey)
     except ValueError:
         raise HTTPException(status_code=400, detail="device_pubkey must be hex")
-    if len(pubkey) != 32:
-        raise HTTPException(status_code=400, detail="device_pubkey must be 32 bytes")
+    problem = integrity.device_key_problem(pubkey)
+    if problem is not None:
+        raise HTTPException(status_code=400, detail=problem)
+    kind = integrity.device_key_kind(pubkey)
+    # A TPM key proves the PC holds it. Required for P-256 (every recorder that
+    # makes one also signs); checked for Ed25519 whenever it is sent.
+    if body.key_proof is not None or kind == "p256":
+        try:
+            proof = _b64url_decode(body.key_proof or "")
+        except Exception:
+            raise HTTPException(status_code=400, detail="key_proof is not base64url")
+        if not integrity.verify_by_device_key(
+                pubkey, proof, integrity.enrolment_proof_message(body.enrollment_token,
+                                                                 pubkey)):
+            raise HTTPException(status_code=400,
+                                detail="key_proof does not verify: this PC did not show it "
+                                       "holds the key it is registering")
 
     result = await _repo().enroll_device(
         token=body.enrollment_token,
@@ -613,10 +632,15 @@ async def enroll_device(body: EnrollRequest):
         # nothing about which it was.
         raise HTTPException(status_code=401, detail="enrollment token is not valid")
 
+    if kind == "p256":
+        # A key that cannot leave the PC signs from its first request, so its
+        # bearer token alone is worth nothing to anyone who copies it.
+        await _repo().mark_device_signs(result["device_id"])
     await _repo().audit(
         event_type="device.enrolled", actor_type="admin",
         device_id=result["device_id"],
-        detail={"machine_name": body.machine_name, "app_version": body.app_version},
+        detail={"machine_name": body.machine_name, "app_version": body.app_version,
+                "key": kind, "key_storage": body.key_storage[:16]},
     )
     logger.info("Enrolled device %s for doctor %s at hospital %s",
                 result["device_id"], result["doctor_id"], result["hospital_id"])

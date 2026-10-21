@@ -76,10 +76,7 @@ class Runtime:
     def __init__(self, cfg, *, log_salt: bytes):
         self.cfg = cfg
         self.log_salt = log_salt
-        self.device_key = crypto.DeviceKey.load_or_create(
-            cfg.security.device_key_path,
-            allow_plaintext=cfg.security.allow_plaintext_keystore,
-        )
+        self.device_key = crypto.load_device_key(cfg)
         self.spool = Spool.from_config(cfg)
         self.ws = WebSocketManager(cfg, grant_guard=GrantGuard())
         self.uploader: Optional[UploadManager] = None
