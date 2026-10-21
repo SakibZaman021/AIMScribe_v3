@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 APP_NAME = "AIMScribe Recorder"
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 
 # Wire format version. The server rejects a mismatched agent rather than guessing.
 PROTOCOL_VERSION = 2
@@ -346,6 +346,11 @@ class SecurityConfig:
     receipt_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_receipt_pub.pem"))
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
+    # Where a newly enrolled PC keeps its identity key: "tpm", inside the PC's
+    # security chip, where nothing can copy it (always, for an installed
+    # recorder); or "software", for development and the bench. A PC enrolled
+    # earlier keeps the key it enrolled with either way.
+    device_key_store: str = "software"
     # Development and bench only: lets the unsafe switches (no grant check,
     # plaintext keys, the API browser) be used. Always on from source; an
     # installed recorder takes it only from its Program Files .env, so only an
@@ -466,6 +471,8 @@ class Config:
                                           pinned_key_path("aimslab_receipt_pub.pem")),
             device_key_path=keys / "device_ed25519.dpapi",
             allow_plaintext_keystore=_bool("AIMS_ALLOW_PLAINTEXT_KEYSTORE", False),
+            device_key_store=("tpm" if installed
+                              else _str("AIMS_DEVICE_KEY_STORE", "software").lower()),
             developer_mode=(not installed) or _bool("AIMS_DEVELOPER_MODE", False),
             counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
             end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),

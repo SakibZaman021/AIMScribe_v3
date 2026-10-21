@@ -41,11 +41,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 logger = logging.getLogger(__name__)
 
@@ -247,13 +249,11 @@ def verify_entry(
     if device_pubkey is not None:
         if not entry.signature:
             return Verdict(False, "entry is unsigned", entry.entry_no)
-        try:
-            Ed25519PublicKey.from_public_bytes(device_pubkey).verify(
-                entry.signature, entry.entry_hash)
-        except InvalidSignature:
+        problem = device_key_problem(device_pubkey)
+        if problem is not None:
+            return Verdict(False, f"signature check failed: {problem}", entry.entry_no)
+        if not verify_by_device_key(device_pubkey, entry.signature, entry.entry_hash):
             return Verdict(False, "device signature is invalid", entry.entry_no)
-        except Exception as exc:
-            return Verdict(False, f"signature check failed: {exc}", entry.entry_no)
 
     return Verdict(True)
 
@@ -336,11 +336,67 @@ def device_request_message(*, method: str, path, timestamp: str, nonce: str,
 
 
 def verify_device_signature(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    return verify_by_device_key(public_key, signature, message)
+
+
+# A PC's key is one of two kinds, told apart by the public key's length:
+#   32 bytes            Ed25519, kept in software (recorders up to 3.5)
+#   65 bytes 0x04||X||Y ECDSA P-256, kept inside the PC's TPM chip (3.6 on);
+#                       signatures are the raw 64-byte r || s Windows returns
+P256_POINT_BYTES = 65
+
+
+def device_key_kind(public_key: bytes) -> Optional[str]:
+    if len(public_key) == 32:
+        return "ed25519"
+    if len(public_key) == P256_POINT_BYTES and public_key[:1] == b"\x04":
+        return "p256"
+    return None
+
+
+def device_key_problem(public_key: bytes) -> Optional[str]:
+    """None for a usable device public key, else why not."""
+    kind = device_key_kind(public_key)
+    if kind is None:
+        return "a device key is 32 bytes (Ed25519) or 65 bytes (P-256, 0x04 X Y)"
     try:
-        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
-        return True
+        if kind == "ed25519":
+            Ed25519PublicKey.from_public_bytes(public_key)
+        else:
+            ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public_key)
+    except ValueError:
+        return "the device key is not a valid point on its curve"
+    return None
+
+
+def verify_by_device_key(public_key: bytes, signature: bytes, message: bytes) -> bool:
+    try:
+        kind = device_key_kind(public_key)
+        if kind == "ed25519":
+            Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
+            return True
+        if kind == "p256" and len(signature) == 64:
+            der = encode_dss_signature(int.from_bytes(signature[:32], "big"),
+                                       int.from_bytes(signature[32:], "big"))
+            ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public_key).verify(
+                der, message, ec.ECDSA(hashes.SHA256()))
+            return True
     except (InvalidSignature, ValueError, TypeError):
-        return False
+        pass
+    return False
+
+
+ENROLMENT_PROOF_DOMAIN = b"AIMS-ENROL-V1\n"
+
+
+def enrolment_proof_message(token: str, public_key: bytes) -> bytes:
+    """
+    What a PC signs when it enrols: proof it holds the private half of the key
+    it is registering, bound to this one token. Without it, someone who read a
+    staged token could register a key held elsewhere.
+    """
+    return (ENROLMENT_PROOF_DOMAIN + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            .encode("ascii") + b"\n" + public_key.hex().encode("ascii"))
 
 
 def chain_summary(entries: Sequence[ChainEntry]) -> Dict[str, Any]:

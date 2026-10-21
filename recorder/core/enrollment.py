@@ -207,9 +207,16 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
     rather than proceeding with a guessed identity.
     """
     url = cfg.backend.url("/device/enroll")
+    public = device_key.public_bytes_raw()
+    # Proof this PC holds the private half of the key it registers, bound to
+    # this one token: a token read off the disk cannot register a key kept
+    # anywhere else.
+    proof = device_key.sign(crypto.enrolment_proof_message(token, public))
     payload = {
         "enrollment_token": token,
-        "device_pubkey": device_key.public_bytes_raw().hex(),
+        "device_pubkey": public.hex(),
+        "key_proof": crypto.b64url(proof),
+        "key_storage": "tpm" if getattr(device_key, "kind", "") == "p256-tpm" else "software",
         **_machine_facts(cfg),
     }
 

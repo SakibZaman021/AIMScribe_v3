@@ -34,7 +34,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.5.0"
+#define AppVersion     "3.6.0"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -170,6 +170,8 @@ var
   ConfigPage: TInputQueryWizardPage;
   KeptApiKey: String;
   InstallProblem: String;
+  { 9 when this PC has no TPM 2.0 chip to keep its identity key in. }
+  InstallExitCode: Integer;
 
 function OpenEvent(dwDesiredAccess: Longword; bInheritHandle: Boolean;
   lpName: String): Longword;
@@ -621,6 +623,33 @@ end;
 
 { ------------------------------------------------------------ after the copy }
 
+{ This PC's identity key is created inside its TPM chip, as administrator -
+  which only Setup is - so nothing on the PC can ever copy it. The agent, run
+  as whoever signs in, may use the key to sign but never export it. A PC
+  enrolled before 3.6 keeps the software key it enrolled with, so a missing
+  TPM does not stop its update; a new PC without one cannot be set up. }
+function ProvisionDeviceKey(): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  if not Exec(ExpandConstant('{app}\{#AppExe}'), '--provision-device-key', '',
+              SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := 10;
+  Log('Device key in the TPM: exit ' + IntToStr(ResultCode));
+  if (ResultCode = 0) or AlreadyEnrolled() then Exit;
+  if ResultCode = 9 then
+  begin
+    InstallExitCode := 9;
+    Result := 'This PC has no usable TPM 2.0 security chip, so AIMScribe cannot ' +
+              'keep its identity key safe here. Switch the TPM on in the PC''s ' +
+              'firmware (BIOS/UEFI) settings, or use another PC.';
+  end
+  else
+    Result := 'This PC''s identity key could not be created in its TPM chip ' +
+              '(code ' + IntToStr(ResultCode) + '). See the AIMScribe log.';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
@@ -628,7 +657,9 @@ begin
   if CurStep <> ssPostInstall then Exit;
   WriteEnvFile();
   StageEnrollmentToken();
-  InstallProblem := RegisterLogonTask();
+  InstallProblem := ProvisionDeviceKey();
+  if InstallProblem = '' then
+    InstallProblem := RegisterLogonTask();
   if InstallProblem <> '' then
   begin
     Log('INSTALL INCOMPLETE: ' + InstallProblem);
@@ -649,10 +680,12 @@ end;
   tool (Intune, PDQ, a script) reports the failure instead of a green tick. }
 function GetCustomSetupExitCode(): Integer;
 begin
-  if InstallProblem <> '' then
-    Result := 8
+  if InstallProblem = '' then
+    Result := 0
+  else if InstallExitCode <> 0 then
+    Result := InstallExitCode
   else
-    Result := 0;
+    Result := 8;
 end;
 
 procedure InitializeUninstallProgressForm();

@@ -603,6 +603,14 @@ def _ensure_std_streams() -> None:
 
 
 def main() -> int:
+    if "--provision-device-key" in sys.argv[1:]:
+        # The installer, as administrator: create this PC's key in its TPM.
+        config.ensure_directories()
+        _ensure_std_streams()
+        setup_logging()
+        from core.crypto import provision_tpm_key
+        return provision_tpm_key()
+
     config.ensure_directories()
     _ensure_std_streams()
     setup_logging()
@@ -651,7 +659,13 @@ def main() -> int:
     import uvicorn
     from api.trigger_server import Runtime, create_app
 
-    runtime = Runtime(config, log_salt=load_log_salt())
+    from core.crypto import DeviceKeyError
+    try:
+        runtime = Runtime(config, log_salt=load_log_salt())
+    except DeviceKeyError as exc:
+        tell_the_person("Cannot start", f"{exc}\n\nAIMScribe cannot record on this PC "
+                        "until this is fixed. Contact AIMS LAB.")
+        return 1
     app = create_app(runtime)
 
     # The on-screen Stop and Pause control (SRS 3.2 §7.8). AIMS_OVERLAY=false

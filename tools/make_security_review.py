@@ -103,7 +103,10 @@ def main():
                    "on-screen control can record a refusal",
                    "Does not leave the PC", "-"],
                   ["Recorder &rarr; AIMS LAB server",
-                   "Per-PC Ed25519 key, private half DPAPI-locked; single-use enrolment token. "
+                   "Per-PC key created inside the PC's TPM chip (P-256): usable on that PC, "
+                   "never copyable off it (3.6; earlier PCs keep a DPAPI-locked Ed25519 key "
+                   "until re-enrolled). Single-use enrolment token, plus proof the PC holds "
+                   "the key it registers. "
                    "Every recording needs a server-signed grant, 60 s life, single use - "
                    "remembered across restarts. Every request is signed with the PC's key "
                    "(single-use nonce, 5-minute window). A PC cannot open another PC's "
@@ -217,13 +220,20 @@ def main():
         ("LOW", "Default passwords left in the old development files", FIXED, "Removed"),
         ("LOW", "Gaps in the GitHub ignore list (local manual, keys)", FIXED,
          "Ignored; private keys live only in ignored folders"),
-        ("ACCEPTED", "DPAPI machine scope: any user of the PC can unwrap the PC's keys",
-         ACCEPT, "Needed because the recorder runs as whichever doctor signs in. The real "
-         "control is BitLocker, which the dashboard now reports per PC - require it"),
+        ("HIGH", "Any program on a PC could unwrap its identity key (DPAPI machine scope) "
+         "and act as that PC from anywhere", FIXED,
+         "3.6 creates the key inside the PC's TPM at install: programs may use it on that "
+         "PC, none can export or delete it (tested on real hardware). Earlier PCs keep "
+         "their key until re-enrolled"),
         ("ACCEPTED", "Any user of the PC can delete unsent audio from the spool", ACCEPT,
          "Needed for the same reason; a deletion breaks the signed chain and is reported"),
         ("ACCEPTED", "The enrolment token is readable on the PC until the first enrolment "
-         "uses it", ACCEPT, "Single use, and used within minutes of installation"),
+         "uses it", ACCEPT, "Single use, used within minutes of installation, and from 3.6 "
+         "it registers only a key the PC proves it holds - inside its own TPM"),
+        ("HIGH", "Recordings CMED never confirmed entered the dataset; any bytes were "
+         "accepted as audio", FIXED, "Only API-2-confirmed recordings are archived (others "
+         "kept and held); every piece must be WAV in the declared format; two PCs claiming "
+         "one consultation are both held"),
         ("OPEN", "The server's disk", OPEN, "The deployment manual now puts /srv/aimscribe "
          "on a DigitalOcean volume (encrypted at rest by the provider); not yet applied, as "
          "the server is not yet deployed"),

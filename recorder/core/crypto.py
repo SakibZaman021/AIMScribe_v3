@@ -407,9 +407,7 @@ def verify_chain(
         if device_public_key is not None:
             if not item.signature:
                 return ChainVerdict(False, "entry is unsigned", item.entry_no)
-            try:
-                device_public_key.verify(item.signature, item.entry_hash)
-            except InvalidSignature:
+            if not verify_device(device_public_key, item.signature, item.entry_hash):
                 return ChainVerdict(False, "device signature is invalid", item.entry_no)
 
         previous = item.entry_hash
@@ -506,6 +504,107 @@ def unwrap_secret(blob: bytes, *, allow_plaintext: bool) -> bytes:
 # ============================================================
 # Device signing key
 # ============================================================
+
+def verify_device(public_key, signature: bytes, message: bytes) -> bool:
+    """
+    A device signature under either kind of key: Ed25519 (software) or P-256
+    from the TPM, whose signatures are raw 64-byte r || s.
+    """
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    try:
+        if isinstance(public_key, _ec.EllipticCurvePublicKey):
+            if len(signature) != 64:
+                return False
+            public_key.verify(
+                encode_dss_signature(int.from_bytes(signature[:32], "big"),
+                                     int.from_bytes(signature[32:], "big")),
+                message, _ec.ECDSA(_hashes.SHA256()))
+        else:
+            public_key.verify(signature, message)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def b64url(data: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+# MUST match backend/src/integrity.py enrolment_proof_message exactly.
+ENROLMENT_PROOF_DOMAIN = b"AIMS-ENROL-V1\n"
+
+
+def enrolment_proof_message(token: str, public_key: bytes) -> bytes:
+    return (ENROLMENT_PROOF_DOMAIN + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            .encode("ascii") + b"\n" + public_key.hex().encode("ascii"))
+
+
+class DeviceKeyError(RuntimeError):
+    """This PC has no identity key it can use. Safe to show the person."""
+
+
+def load_device_key(cfg):
+    """
+    This PC's identity key: the TPM key for an installed recorder, unless the PC
+    enrolled earlier with a software key, which it keeps until re-enrolled
+    (its server record holds that key, and changing it would orphan the PC).
+    """
+    sec = cfg.security
+    enrolled_with = _enrolled_fingerprint(cfg)
+    software_file = sec.device_key_path
+
+    if enrolled_with and software_file.is_file():
+        soft = DeviceKey.load_or_create(software_file,
+                                        allow_plaintext=sec.allow_plaintext_keystore)
+        if soft.fingerprint() == enrolled_with:
+            return soft
+    if sec.device_key_store != "tpm":
+        return DeviceKey.load_or_create(software_file,
+                                        allow_plaintext=sec.allow_plaintext_keystore)
+
+    from core import tpm_key
+    try:
+        return tpm_key.TpmDeviceKey.open()
+    except tpm_key.TpmUnavailable as exc:
+        raise DeviceKeyError(str(exc))
+    except tpm_key.TpmKeyMissing:
+        try:
+            return tpm_key.TpmDeviceKey.create()       # works only as administrator
+        except Exception:
+            raise DeviceKeyError(
+                "This PC's security key has not been created. Run the AIMScribe "
+                "installer again (it creates the key inside the PC's TPM chip).")
+
+
+def _enrolled_fingerprint(cfg) -> Optional[str]:
+    try:
+        path = cfg.paths.state_dir / "device.json"
+        return json.loads(path.read_text(encoding="utf-8")).get("key_fingerprint") or None
+    except Exception:
+        return None
+
+
+def provision_tpm_key() -> int:
+    """
+    The installer's step, run as administrator: make this PC's key inside its
+    TPM and let the agent (any signed-in user) sign with it. 0 done (or already
+    there), 9 no usable TPM, 10 anything else.
+    """
+    from core import tpm_key
+    try:
+        key = tpm_key.TpmDeviceKey.create()
+        logger.info("TPM device key ready: %s", key.fingerprint())
+        return 0
+    except tpm_key.TpmUnavailable as exc:
+        logger.error("No usable TPM: %s", exc)
+        return 9
+    except Exception as exc:
+        logger.error("Could not create the TPM device key: %s", exc)
+        return 10
+
 
 class DeviceKey:
     """

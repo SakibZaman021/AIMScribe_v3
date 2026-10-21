@@ -21,6 +21,14 @@ setting for you to change — tell AIMS LAB.
 | An installer built without settings pointed PCs at an old server | The installer cannot be built without the server and CMED addresses |
 | Every PC had to be clicked through by hand | One silent command (section 3) |
 
+**The PC needs a TPM 2.0 security chip, switched on** (every Windows 11 PC
+has one; most Windows 10 PCs since 2016 do). From 3.6 the PC's identity key is
+created inside that chip during setup: programs on the PC can ask the chip to
+sign, but nothing - not an administrator, not malware - can copy the key off
+the PC. Check with `tpmtool getdeviceinformation` ("TPM Present: True",
+"TPM Version: 2.0"). A PC enrolled before 3.6 keeps its existing key and
+updates normally.
+
 ---
 
 ## 2. Before you install: check the file
@@ -77,6 +85,7 @@ Optional: `/PIN=<pin>[,<backup pin>]` (the server's TLS key pins, from AIMS LAB)
 | 0 | Installed, and the startup task exists |
 | 7 | Refused before copying anything — a value was missing or wrong (the log says which) |
 | 8 | Files installed but the startup task could not be registered — run again |
+| 9 | This PC has no usable TPM 2.0 chip — switch it on in the BIOS/UEFI settings, or use another PC (new PCs only; an enrolled PC still updates) |
 | other | Inno Setup's standard codes (e.g. 2 = cancelled, 5 = file in use) |
 
 An **upgrade** keeps the PC's own server, CMED address, local key and
@@ -90,8 +99,8 @@ delivered to the server are deliberately kept in `C:\ProgramData\AIMScribe`.
 - **Intune**: wrap with the Win32 Content Prep Tool
   (`IntuneWinAppUtil.exe -c . -s AIMScribeSetup.exe -o out`). Install command:
   the silent command above. Detection rule: file
-  `C:\Program Files\AIMScribe\AIMScribe_Agent.exe`, version ≥ 3.5.0.
-  Return code 8 = failed.
+  `C:\Program Files\AIMScribe\AIMScribe_Agent.exe`, version ≥ 3.6.0.
+  Return codes 8 and 9 = failed.
 - **PDQ / SCCM / GPO startup script**: the same command.
 - **winget**: a manifest pointing at the signed release with its SHA-256 can be
   published later; until then use the file from AIMS LAB.
