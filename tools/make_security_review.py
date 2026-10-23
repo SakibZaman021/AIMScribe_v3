@@ -230,10 +230,11 @@ def main():
         ("ACCEPTED", "The enrolment token is readable on the PC until the first enrolment "
          "uses it", ACCEPT, "Single use, used within minutes of installation, and from 3.6 "
          "it registers only a key the PC proves it holds - inside its own TPM"),
-        ("HIGH", "Recordings CMED never confirmed entered the dataset; any bytes were "
-         "accepted as audio", FIXED, "Only API-2-confirmed recordings are archived (others "
-         "kept and held); every piece must be WAV in the declared format; two PCs claiming "
-         "one consultation are both held"),
+        ("HIGH", "Recordings CMED never confirmed were indistinguishable from confirmed "
+         "ones; any bytes were accepted as audio", FIXED, "Every recording is stored and its "
+         "JSON is marked cmed_confirmed true/false, with the reason, kept current; only "
+         "confirmed ones count as the dataset. Every piece must be WAV in the declared "
+         "format; two PCs claiming one consultation are both held"),
         ("OPEN", "The server's disk", OPEN, "The deployment manual now puts /srv/aimscribe "
          "on a DigitalOcean volume (encrypted at rest by the provider); not yet applied, as "
          "the server is not yet deployed"),

@@ -113,6 +113,14 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     ("020_v3_cmed_hardening.sql", "recordings", "column cmed_clients.identifier_systems",
      _column("cmed_clients", "identifier_systems")),
     ("020_v3_cmed_hardening.sql", "recordings", "table fhir_messages", _table("fhir_messages")),
+    # Without it a PC whose key lives in its TPM (65 bytes) cannot enrol at all.
+    ("021_v3_tpm_device_keys.sql", "recordings", "devices accept a TPM (P-256) key",
+     "SELECT coalesce((SELECT pg_get_constraintdef(oid) LIKE '%65%' FROM pg_constraint "
+     "WHERE conname = 'devices_pubkey_len'), true)"),
+    # Not harmful if missed, but it says the migrations stopped short of 022.
+    ("022_v3_drop_v1_tables.sql", "recordings", "the v1 transcription tables are gone",
+     "SELECT to_regclass('public.ner_results') IS NULL "
+     "AND to_regclass('public.used_grants') IS NULL"),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
@@ -213,7 +221,7 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 020 present)")
+        logger.info("Database schema up to date (migrations up to 022 present)")
     await _warn_if_owner(recordings_pool)
     return problems
 

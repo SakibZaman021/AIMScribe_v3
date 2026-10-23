@@ -37,14 +37,16 @@ NOTICE_MATCH_WINDOW = MATCH_LOOKBACK           # SRS-CNF-03: API 2 first, record
 UNCONFIRMED_LIFETIME = MATCH_LOOKBACK          # SRS-CNF-09: recording first, API 2 later
 CONFIRM_DEADLINE = timedelta(minutes=2)        # SRS-CNF-08: then shown "unconfirmed"
 
-# What enters the dataset: a recording CMED's own server vouched for (API 2,
-# sent with that hospital's token, for the consultation this PC signed). A PC's
-# signature proves which PC recorded; only CMED proves a real consultation took
-# place. Everything else is kept - nothing is erased but a patient's refusal
-# (SRS-CNS-04) - and held in the segment store until API 2 arrives or an
-# administrator confirms it by name. "expired" remains for rows erased by
-# older servers.
-ARCHIVABLE = frozenset({"confirmed"})
+# Every recording reaches storage: a clinic's power or internet can be down
+# for hours, and API 2 and 3 then arrive late - audio must not wait on a
+# laptop for them. What decides whether a recording is in the DATASET is its
+# marking, written into the JSON beside the audio and kept current: confirmed
+# (CMED's own server vouched for this consultation, with that hospital's
+# token) or not yet. A PC's signature proves which PC recorded; only CMED
+# proves a consultation took place. Only a patient's refusal removes a
+# recording (SRS-CNS-04); "expired" remains for rows erased by older servers.
+ARCHIVABLE = frozenset({"confirmed", "legacy", "pending", "unconfirmed"})
+DATASET = frozenset({"confirmed"})
 WAITING = frozenset({"pending", "unconfirmed"})
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")

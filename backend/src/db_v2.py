@@ -818,9 +818,9 @@ class V2Repository:
                   AND s.quarantine_reason IS NULL
                   AND s.status <> 'quarantined'
                   AND s.protocol_version >= 2
-                  -- Only what CMED's API 2 confirmed enters the dataset
-                  -- (confirmation.ARCHIVABLE). The rest is held, not lost.
-                  AND s.confirmation = 'confirmed'
+                  -- Every recording is stored; its JSON marks whether CMED
+                  -- confirmed it (confirmation.ARCHIVABLE, .DATASET).
+                  AND s.confirmation IN ('confirmed', 'legacy', 'pending', 'unconfirmed')
                   AND EXISTS (SELECT 1 FROM segments g
                                WHERE g.session_id = s.session_id
                                  AND g.state = 'committed')
@@ -1219,25 +1219,6 @@ class V2Repository:
                 return new
 
     # ============================================================
-    # Grants
-    # ============================================================
-
-    async def consume_grant(self, jti: str, expires_at: datetime,
-                            session_id: Optional[str] = None) -> bool:
-        """Record a grant as used. Returns False if it was already spent."""
-        async with self._acquire() as conn:
-            try:
-                async with conn.transaction():      # a savepoint inside a session_tx
-                    await conn.execute("""
-                        INSERT INTO used_grants (jti, session_id, expires_at)
-                        VALUES ($1, $2, $3)
-                    """, jti, session_id, expires_at)
-                return True
-            except asyncpg.UniqueViolationError:
-                return False
-
-
-    # ============================================================
     # v3 (SRS 3.2): clinic mapping, grants, confirmation, refusals and
     # Channel B. Tables from scripts/010_v3_confirmation_channel_b.sql.
     # ============================================================
@@ -1366,6 +1347,10 @@ class V2Repository:
             await conn.execute("""
                 UPDATE sessions
                    SET confirmation = $2::text,
+                       -- An archived recording's JSON carries its marking:
+                       -- written again when the marking changes.
+                       json_stale = json_stale OR (archived_at IS NOT NULL
+                                                   AND confirmation IS DISTINCT FROM $2::text),
                        grant_jti = COALESCE($3, grant_jti),
                        unconfirmed_at = CASE WHEN $2::text = 'unconfirmed'
                                              THEN COALESCE(unconfirmed_at, now())
@@ -1560,11 +1545,12 @@ class V2Repository:
                            updated_at = now()
                      WHERE session_id = $1
                 """, session_id, state)
-            # The old transcription tables may hold text of this consultation.
-            # Not every database has all of them, so each is best effort.
-            # Each in a savepoint: inside a recording's transaction a failed
-            # statement would otherwise abort everything after it.
-            for table in ("ner_results", "transcripts", "clips"):
+            # The old clip table may still name this consultation's audio.
+            # Not every database has it, so this is best effort, in a
+            # savepoint: inside a recording's transaction a failed statement
+            # would otherwise abort everything after it. (ner_results and
+            # transcripts went in 022_v3_drop_v1_tables.sql.)
+            for table in ("clips",):
                 try:
                     async with conn.transaction():
                         await conn.execute(f"DELETE FROM {table} WHERE session_id = $1",

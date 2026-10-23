@@ -34,12 +34,23 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.6.0"
+#define AppVersion     "3.6.1"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
 #define AppPublisher   "AIMS LAB, United International University"
 #define AppExe         "AIMScribe_Agent.exe"
+
+; The AIMS LAB server's public keys the agent trusts. A development build for a
+; test server (the local stack) bundles that server's keys instead: BUILD.bat
+; with AIMS_KEYS_DIR set. A signed release always uses keys\.
+#ifndef KeysDir
+  #define KeysDir      "keys"
+#endif
+#ifdef SignedBuild
+  #undef KeysDir
+  #define KeysDir      "keys"
+#endif
 
 ; The server and the CMED page a NEW PC is pointed at. Required: an installer
 ; built without them used to fall back to the old v1 server on Render and a
@@ -118,8 +129,8 @@ Source: "dist\AIMScribe_Agent\*"; DestDir: "{app}"; Flags: ignoreversion recurse
 ; Beside the program, under Program Files, where only an administrator can
 ; change them. They used to sit in ProgramData, which every user may modify:
 ; replacing the grant key there let anyone on the PC sign their own grants.
-Source: "keys\aimslab_grant_pub.pem";   DestDir: "{app}\keys"; Flags: ignoreversion
-Source: "keys\aimslab_receipt_pub.pem"; DestDir: "{app}\keys"; Flags: ignoreversion
+Source: "{#KeysDir}\aimslab_grant_pub.pem";   DestDir: "{app}\keys"; Flags: ignoreversion
+Source: "{#KeysDir}\aimslab_receipt_pub.pem"; DestDir: "{app}\keys"; Flags: ignoreversion
 ; The check IT runs before and after installing, and the optional clinic
 ; policy step (both signed with everything else).
 Source: "policy\AIMScribe-Check.ps1";        DestDir: "{app}\tools"; Flags: ignoreversion
@@ -281,7 +292,13 @@ begin
   Token := Trim(ConfigPage.Values[2]);
   if Backend = '' then
     Result := 'A backend URL is required (/BACKEND=https://...).'
-  else if not StartsWith(Lowercase(Backend), 'https://') then
+  else if not StartsWith(Lowercase(Backend), 'https://')
+#ifndef SignedBuild
+    { An unsigned development build may point at a test server on this
+      network (the local stack). A signed release never accepts http. }
+    and not StartsWith(Lowercase(Backend), 'http://')
+#endif
+  then
     Result := 'The backend URL must start with https:// - recordings never travel ' +
               'unencrypted.'
   else if Origin = '' then

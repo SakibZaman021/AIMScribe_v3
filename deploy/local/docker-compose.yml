@@ -329,7 +329,10 @@ services:
   # with the administrator's credentials, and a clinic's server should not
   # carry a way in that nobody asked for.
   dbviewer:
-    image: adminer:4
+    # 5, not 4: Adminer 4 on PHP 8.4 crashes ("urlencode(): Argument #1 must
+    # be of type string, resource given") opening any table whose key is
+    # binary, e.g. cmed_access_tokens and purge_receipts.
+    image: adminer:5.5.1
     container_name: aimscribe-v3-dbviewer
     profiles: [db]
     restart: unless-stopped

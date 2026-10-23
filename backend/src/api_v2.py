@@ -275,7 +275,9 @@ class OpenSessionRequest(BaseModel):
     consent_obtained: bool = True
     consent_method: str = Field("", max_length=64)
     audio: AudioSpec
-    device_pubkey: str = Field("", max_length=64)
+    # For the record only: the key checked is always the one enrolled. 64 hex
+    # characters for Ed25519, 130 for a TPM P-256 key (3.6 on).
+    device_pubkey: str = Field("", max_length=130)
     genesis: Dict[str, Any]
     # The grant this recording was authorised under (v3 recorders). Links the
     # session to CMED's API 2; absent from protocol-2 recorders.
@@ -756,13 +758,6 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         consent_method=body.consent_method,
         genesis=genesis,
     )
-
-    # Keep the v1 patient row in step so the existing NER baseline lookup works.
-    if ctx.legacy_db is not None:
-        try:
-            await ctx.legacy_db.upsert_patient({"patient_id": patient_ref})
-        except Exception as exc:
-            logger.debug("Legacy patient upsert skipped: %s", exc)
 
     state = await _link_grant(session_id, body.grant_jti, patient_ref, device,
                               doctor_id=doctor_id)
@@ -2152,6 +2147,33 @@ async def archive_clinical_document(session_id: str, part: Optional[int] = None,
     return await _clinical_document(session, part=found)
 
 
+async def _marking(session: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Whether a stored recording is in the dataset, and if not, why not - in
+    words a person reading the JSON understands.
+    """
+    state = session.get("confirmation")
+    if state in conf.DATASET:
+        return {"cmed_confirmed": True, "reason": None}
+    reason = {"legacy": "recorded by an old recorder, outside CMED's confirmation",
+              "pending": "waiting for CMED's patient information (API 2)",
+              "unconfirmed": "CMED's patient information (API 2) has not arrived"}.get(
+                  state, f"not confirmed ({state})")
+    grant = None
+    if session.get("grant_jti"):
+        try:
+            grant = await _repo().get_authorisation(session["grant_jti"])
+        except Exception:
+            grant = None
+    if grant is not None and grant.get("cmed_hospital_id"):
+        cmed_id, own = grant["cmed_hospital_id"], grant.get("hospital_id")
+        mapped = await _cmed_clinic(cmed_id)
+        if not (mapped == own or (mapped is None and cmed_id == own)):
+            reason = (f"CMED named hospital {cmed_id!r}, which is not this PC's "
+                      f"hospital {own!r}")
+    return {"cmed_confirmed": False, "reason": reason}
+
+
 async def _clinical_document(session: Dict[str, Any],
                              part: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     repo = _repo()
@@ -2184,9 +2206,13 @@ async def _clinical_document(session: Dict[str, Any],
 
     archive_sha = session.get("archive_sha256")
     links = await _repo().continuation_links(session_id)
+    marking = await _marking(session)
     document["recording"] = {
         "session_id": session_id,
+        # The marking: whether this recording belongs in the dataset.
+        "cmed_confirmed": marking["cmed_confirmed"],
         "confirmation": session.get("confirmation"),
+        **({"unconfirmed_reason": marking["reason"]} if marking["reason"] else {}),
         "opened_at": started.isoformat() if started else None,
         "closed_at": ended.isoformat() if ended else None,
         "duration_seconds": float(session["total_duration_seconds"])
@@ -2564,15 +2590,21 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         return _coded(400, exc.code, str(exc), field=exc.field)
 
     clinic = await _clinic_for(visit.cmed_hospital_id, device)
-    if clinic is None:
+    mismatch = clinic is None
+    if mismatch:
+        # CMED named a hospital this PC is not enrolled at - a mistyped code, a
+        # mapping not yet made. Refusing left the audio on the laptop with no
+        # way off it. It is taken instead, filed under the PC's own clinic and
+        # marked unconfirmed: it cannot be matched to CMED's API 2 until the
+        # hospital is sorted out, so it never enters the dataset by itself.
         await repo.raise_alert(
             alert_type="clinic_mismatch", severity="critical",
             device_id=device["device_id"],
             detail={"device_hospital": device["hospital_id"],
                     "cmed_hospital_id": visit.cmed_hospital_id,
-                    "mapped_to": await repo.hospital_for_cmed_id(visit.cmed_hospital_id)})
-        return _coded(401, "CLINIC_MISMATCH",
-                      "This PC is registered to a different clinic.")
+                    "mapped_to": await repo.hospital_for_cmed_id(visit.cmed_hospital_id),
+                    "kept": "uploaded and marked unconfirmed"})
+        clinic = device["hospital_id"]
 
     # Decision D4: the doctor register is a directory, not a gate. CMED
     # authenticates its own doctors, and its API 2 now proves the consultation;
@@ -2591,7 +2623,7 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         jti=jti, device_id=device["device_id"], hospital_id=clinic, visit=visit,
         expires_at=now + timedelta(seconds=ctx.grants.lifetime))
     confirmed = False
-    if not await _visit_contested(visit, clinic):
+    if not mismatch and not await _visit_contested(visit, clinic):
         notice_id = await repo.find_unclaimed_notice(
             visit, hospital_id=clinic, since=now - conf.NOTICE_MATCH_WINDOW)
         confirmed = notice_id is not None and await repo.claim_notice(notice_id, jti)
@@ -2613,6 +2645,7 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
                   detail={"hospital_id": clinic, "confirmation": state})
     return {"status": 200, "code": "GRANTED", "grant": token, "jti": jti,
             "confirmation": state, "hospital_id": clinic,
+            **({"clinic_mismatch": True} if mismatch else {}),
             "expires_in": ctx.grants.lifetime}
 
 

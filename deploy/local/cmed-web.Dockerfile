@@ -8,7 +8,7 @@ COPY . .
 # these have to arrive here rather than at `docker run`. The clinic code
 # matters most: the page sends it with every visit, and a visit described
 # under a clinic the recorder does not belong to is never confirmed.
-ARG NEXT_PUBLIC_HOSPITAL_ID=CMED-LOCAL-01
+ARG NEXT_PUBLIC_HOSPITAL_ID=AALO_DHOLPUR
 ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:6060
 ARG NEXT_PUBLIC_RECORDER_WS=ws://localhost:5050/ws
 ENV NEXT_PUBLIC_HOSPITAL_ID=$NEXT_PUBLIC_HOSPITAL_ID

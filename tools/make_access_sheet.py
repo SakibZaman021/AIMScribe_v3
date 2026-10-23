@@ -125,7 +125,9 @@ def build(env: dict) -> None:
     S.append(tbl([["What it opens", "Username", "Password or key"],
                   ["Dashboard", "&mdash;", v("AIMS_ADMIN_KEY")],
                   ["Adminer, superuser", "aims_admin", v("POSTGRES_SUPERUSER_PASSWORD")],
-                  ["<b>aims_recordings</b>", "aims_recordings", v("AIMS_RECORDINGS_PASSWORD")],
+                  # aims_recordings owns the tables and cannot log in
+                  # (018_v3_least_privilege.sql); the server logs in as aims_api.
+                  ["Server's login", "aims_api", v("AIMS_API_DB_PASSWORD")],
                   ["<b>aims_clinical</b>", "aims_clinical_writer", v("AIMS_CLINICAL_PASSWORD")],
                   ["Monitor, read-only", "aims_monitor", v("AIMS_MONITOR_PASSWORD")],
                   ["Object storage", v("MINIO_ACCESS_KEY", "aimslocal"), v("MINIO_SECRET_KEY")],
@@ -136,7 +138,8 @@ def build(env: dict) -> None:
     S.append(Spacer(1, 3))
     S.append(Paragraph(f"All three database roles are on "
                        f"<font face='Courier'>localhost : {pg}</font>. "
-                       "<b>aims_recordings</b> holds sessions, integrity chains and receipts and "
+                       "To browse, log in as <b>aims_admin</b>. "
+                       "The <b>aims_recordings</b> database holds sessions, integrity chains and receipts and "
                        "contains no patient names by design; <b>aims_clinical</b> holds the "
                        "patient data. Neither role can reach the other's database.", BODY))
     S.append(Spacer(1, 3))

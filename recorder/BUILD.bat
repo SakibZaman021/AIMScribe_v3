@@ -139,7 +139,12 @@ if not defined ISCC (
     goto :fail
 )
 if "%DEV_UNSIGNED%"=="1" (
-    "%ISCC%" /Q "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
+    REM AIMS_KEYS_DIR: a test server's public keys, for dev builds only.
+    if "%AIMS_KEYS_DIR%"=="" (
+        "%ISCC%" /Q "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
+    ) else (
+        "%ISCC%" /Q "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" "/DKeysDir=%AIMS_KEYS_DIR%" installer.iss
+    )
 ) else (
     "%ISCC%" /Q /DSignedBuild "/Saimssign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File %~dp0signing\sign.ps1 -File $f" "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
 )

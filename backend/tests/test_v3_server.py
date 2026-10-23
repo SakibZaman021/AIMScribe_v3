@@ -767,29 +767,35 @@ async def test_start_time_must_match_character_for_character(server):
     assert (await mint())[1]["confirmation"] == "pending"
 
 
-async def test_clinic_mismatch_is_refused_and_alerted(server):
-    """AT-04 / decision D1: CMED's clinic maps to another PC's clinic."""
+async def test_a_clinic_mismatch_still_takes_the_audio_off_the_laptop(server):
+    """
+    On the bench a mistyped hospital code left fifteen minutes of audio on the
+    PC with no way off it. Now the recording is taken, filed under the PC's own
+    clinic (decision D1), alerted, and can never be confirmed by itself.
+    """
     server.repo.hospitals["HOSP001"] = "CMED-MIRPUR-01"
     status, reply = await mint({**FIELDS, "hospital_id": "CMED-MIRPUR-01"})
-    assert (status, reply["code"]) == (401, "CLINIC_MISMATCH")
-    assert server.repo.auths == {}
+    assert (status, reply["code"]) == (200, "GRANTED")
+    assert reply["hospital_id"] == "HOSP003" and reply["clinic_mismatch"] is True
+    assert reply["confirmation"] == "pending"
     assert server.repo.alerts[-1]["alert_type"] == "clinic_mismatch"
 
 
 async def test_api2_for_another_clinic_is_never_claimed(server):
-    """AT-63."""
+    """AT-63: the audio is taken, but another clinic's API 2 confirms nothing."""
     server.repo.hospitals["HOSP001"] = "CMED-MIRPUR-01"
     other = {**FIELDS, "hospital_id": "CMED-MIRPUR-01"}
     await send("patient_information", api2(**other))
-    assert (await mint(other))[1]["code"] == "CLINIC_MISMATCH"
+    _, reply = await mint(other)
+    assert reply["confirmation"] == "pending"
     assert server.repo.notices[0]["claimed_by_jti"] is None
 
 
-async def test_unmapped_clinic_works_only_when_it_is_our_own_code(server):
+async def test_an_unknown_clinic_code_is_taken_but_never_confirmed(server):
     server.repo.hospitals["HOSP003"] = None
-    assert (await mint({**FIELDS, "hospital_id": "HOSP003"}))[0] == 200
-    assert (await mint({**FIELDS, "hospital_id": "CMED-UNKNOWN"}))[1]["code"] == \
-        "CLINIC_MISMATCH"
+    assert "clinic_mismatch" not in (await mint({**FIELDS, "hospital_id": "HOSP003"}))[1]
+    _, reply = await mint({**FIELDS, "hospital_id": "CMED-UNKNOWN"})
+    assert reply["clinic_mismatch"] is True and reply["confirmation"] == "pending"
 
 
 @pytest.mark.parametrize("changes,code,field", [
@@ -867,10 +873,11 @@ async def test_pending_becomes_unconfirmed_after_two_minutes(server):
     assert server.repo.alerts[-1]["alert_type"] == "unconfirmed_recording"
 
 
-async def test_only_a_recording_cmed_confirmed_enters_the_dataset(server):
+async def test_every_recording_is_stored_and_marked(server):
     """
-    A PC's signature proves which PC recorded; only CMED's API 2 proves a real
-    consultation happened. Anything else is kept, but held out of the archive.
+    A clinic's power or internet can be down for hours and API 2 arrives late,
+    so audio never waits on a laptop for it: every recording but a refused one
+    is stored. Its JSON marks whether it is in the dataset, and why not.
     """
     states = ("confirmed", "unconfirmed", "pending", "legacy", "refused")
     sids = {}
@@ -878,10 +885,11 @@ async def test_only_a_recording_cmed_confirmed_enters_the_dataset(server):
         sids[state] = open_session(server, segments=1)
         server.repo.sessions[sids[state]].update(confirmation=state, closed_at=NOW())
     ready = {s["session_id"] for s in await server.repo.pending_archive()}
-    assert ready == {sids["confirmed"]}
-    # Held means kept: nothing was erased.
-    assert all(server.repo.sessions[sids[s]]["patient_id"] != "REDACTED"
-               for s in states if s != "refused")
+    assert ready == {sids[s] for s in states if s != "refused"}
+    for state, expected in (("confirmed", True), ("unconfirmed", False), ("legacy", False)):
+        marking = await api_v2._marking(server.repo.sessions[sids[state]])
+        assert marking["cmed_confirmed"] is expected
+        assert (marking["reason"] is None) is expected
 
 
 async def test_an_administrator_can_confirm_a_held_recording_by_name(server):

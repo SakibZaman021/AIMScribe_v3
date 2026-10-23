@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 APP_NAME = "AIMScribe Recorder"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 
 # Wire format version. The server rejects a mismatched agent rather than guessing.
 PROTOCOL_VERSION = 2
@@ -335,14 +335,15 @@ class SecurityConfig:
     # After a crash and restart, a consultation that was recording within this
     # long is recorded again by itself, under the same five fields.
     resume_within_seconds: float = 600.0
-    # A recording ends by itself this long after its prescription is built -
-    # the counselling after the print is kept, the doctor's own time before a
-    # late next patient is not - closing at the first quiet moment within the
-    # grace. And after this long with nothing from CMED while unarmed: a
-    # follow-up with no prescription and no next patient. 0 turns one off.
-    counselling_limit_seconds: float = 120.0
+    # Off (0): no recording is ever ended by a clock. A consultation lasts as
+    # long as it lasts - an hour's counselling, a long follow-up with no
+    # prescription - and cutting it on a timer lost real consultations on the
+    # bench. A recording ends when the doctor stops it, CMED starts the next
+    # patient, CMED's page sends stop, or the PC shuts down. A number here
+    # (seconds) brings a limit back, for a bench test only.
+    counselling_limit_seconds: float = 0.0
     end_grace_seconds: float = 10.0
-    no_activity_limit_seconds: float = 900.0
+    no_activity_limit_seconds: float = 0.0
     receipt_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_receipt_pub.pem"))
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
@@ -474,9 +475,9 @@ class Config:
             device_key_store=("tpm" if installed
                               else _str("AIMS_DEVICE_KEY_STORE", "software").lower()),
             developer_mode=(not installed) or _bool("AIMS_DEVELOPER_MODE", False),
-            counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
+            counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 0.0),
             end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),
-            no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 900.0),
+            no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 0.0),
         )
 
         pause = PauseConfig(
