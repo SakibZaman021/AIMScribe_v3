@@ -173,141 +173,14 @@ class AsyncPostgreSQLDatabase:
                 )
             ''')
 
-            # Transcripts table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS transcripts (
-                    id SERIAL PRIMARY KEY,
-                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    full_transcript TEXT,
-                    clip_count INTEGER NOT NULL,
-                    last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # NER results table (individual columns per medical field)
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS ner_results (
-                    id SERIAL PRIMARY KEY,
-                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    patient_id VARCHAR(100),
-                    version INTEGER NOT NULL,
-                    patient_name TEXT,
-                    age TEXT,
-                    gender TEXT,
-                    chief_complaints JSONB,
-                    drug_history JSONB,
-                    on_examination JSONB,
-                    systemic_examination JSONB,
-                    additional_notes JSONB,
-                    investigations JSONB,
-                    diagnosis JSONB,
-                    medications JSONB,
-                    advice JSONB,
-                    follow_up JSONB,
-                    health_screening JSONB,
-                    full_ner_json JSONB NOT NULL,
-                    is_final BOOLEAN DEFAULT FALSE,
-                    extraction_method VARCHAR(50) DEFAULT 'langchain_agent',
-                    prompt_version VARCHAR(20) DEFAULT '1.0.0',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Doctor reviews table (row-per-change tracking)
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS doctor_reviews (
-                    id SERIAL PRIMARY KEY,
-                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    doctor_id VARCHAR(100) NOT NULL,
-                    field_name VARCHAR(100) NOT NULL,
-                    original_value JSONB,
-                    edited_value JSONB,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Prescription data table (saved when doctor presses Print)
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS prescription_data (
-                    id SERIAL PRIMARY KEY,
-                    session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    patient_id VARCHAR(100),
-                    doctor_id VARCHAR(100) NOT NULL,
-                    patient_name TEXT,
-                    age TEXT,
-                    gender TEXT,
-                    chief_complaints JSONB,
-                    drug_history JSONB,
-                    on_examination JSONB,
-                    systemic_examination JSONB,
-                    additional_notes JSONB,
-                    investigations JSONB,
-                    diagnosis JSONB,
-                    medications JSONB,
-                    advice JSONB,
-                    follow_up JSONB,
-                    health_screening JSONB,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Patients table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS patients (
-                    patient_id VARCHAR(100) PRIMARY KEY,
-                    name VARCHAR(255),
-                    age VARCHAR(20),
-                    gender VARCHAR(20),
-                    blood_group VARCHAR(10),
-                    contact VARCHAR(50),
-                    address TEXT,
-                    medical_history JSONB,
-                    allergies JSONB,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Health screenings table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS health_screenings (
-                    id SERIAL PRIMARY KEY,
-                    patient_id VARCHAR(100) REFERENCES patients(patient_id) ON DELETE CASCADE,
-                    screening_date DATE NOT NULL,
-                    screening_type VARCHAR(100),
-                    results JSONB,
-                    notes TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Previous visits table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS previous_visits (
-                    id SERIAL PRIMARY KEY,
-                    patient_id VARCHAR(100) REFERENCES patients(patient_id) ON DELETE CASCADE,
-                    session_id VARCHAR(255),
-                    visit_date DATE NOT NULL,
-                    chief_complaints JSONB,
-                    diagnosis JSONB,
-                    medications JSONB,
-                    investigations JSONB,
-                    advice JSONB,
-                    follow_up JSONB,
-                    doctor_id VARCHAR(100),
-                    doctor_notes TEXT,
-                    full_ner_json JSONB,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+            # transcripts, ner_results, doctor_reviews, prescription_data, patients,
+            # health_screenings and previous_visits were dropped by
+            # 022_v3_drop_v1_tables.sql: never created here again.
 
             # Create indexes
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_patient ON sessions(patient_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_clips_session ON clips(session_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_ner_session ON ner_results(session_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_doctor_reviews_session ON doctor_reviews(session_id)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_prescription_session ON prescription_data(session_id)')
 
         logger.info("Async PostgreSQL database initialized")
 

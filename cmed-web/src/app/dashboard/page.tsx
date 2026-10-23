@@ -29,6 +29,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import axios from 'axios';
+import { HOSPITALS } from '@/lib/hospitals';
 import {
   AimscribeClient,
   AgentStatus,
@@ -128,6 +129,7 @@ export default function DashboardPage() {
   // Typed here because this stands in for CMED. On the real site these arrive
   // with the trigger from the doctor's own login, and are never chosen by hand.
   const [doctorId, setDoctorId] = useState('');
+  // Empty: this PC's own hospital, as the real CMED page would send it.
   const [hospitalId, setHospitalId] = useState('');
   const [showPause, setShowPause] = useState(false);
   // Explicitly widened: PAUSE_REASONS is `as const`, so inference would pin this
@@ -724,15 +726,30 @@ export default function DashboardPage() {
                         />
                       </label>
                       <label className="text-sm text-gray-700">
-                        Hospital ID
-                        <input
-                          value={hospitalId}
-                          onChange={(e) => setHospitalId(e.target.value.trim())}
-                          placeholder={status?.hospitalId ?? 'HOSP001'}
-                          className="mt-1 w-full border rounded-lg px-3 py-2 text-sm text-gray-800"
-                        />
+                        Hospital
+                        {/* CMED sends one of the agreed codes with every
+                            trigger, from the doctor's login; nobody types it.
+                            This PC's own hospital is the default. */}
+                        <select
+                          value={hospitalId || status?.hospitalId || ''}
+                          onChange={(e) => setHospitalId(e.target.value)}
+                          className="mt-1 w-full border rounded-lg px-3 py-2 text-sm text-gray-800 bg-white"
+                        >
+                          {!(hospitalId || status?.hospitalId) && (
+                            <option value="">this PC is not enrolled</option>
+                          )}
+                          {HOSPITALS.map((code) => (
+                            <option key={code} value={code}>{code}</option>
+                          ))}
+                        </select>
                       </label>
                     </div>
+                    {status?.hospitalId && hospitalId && hospitalId !== status.hospitalId && (
+                      <p className="text-xs text-amber-700 bg-amber-50 rounded px-2 py-1">
+                        This PC is enrolled at {status.hospitalId}. A recording for {hospitalId}
+                        is stored but marked unconfirmed, and CMED&apos;s API 2 for it is refused.
+                      </p>
+                    )}
                     {/* Suggestions only. Anything may be typed, because CMED is
                         the authority on who is on shift and where. */}
                     <datalist id="known-doctors">

@@ -766,11 +766,9 @@ class SessionController:
 
     async def _watch_limits(self, active: ActiveSession) -> None:
         """
-        End a recording nobody will end: two minutes after its prescription,
-        however long the next patient takes to arrive (the doctor's own time
-        between patients is not recorded), and after fifteen minutes in which
-        CMED said nothing about it (a follow-up with no prescription and no next
-        patient). Neither runs while paused: a paused recording is already
+        Time limits, for bench tests only: both are off (0) by default, because
+        a clock must never end a real consultation (security.*_limit_seconds).
+        When set, neither runs while paused: a paused recording is already
         silent, and the Stop form may be open with a reason that matters.
         """
         poll = self._knob("limit_poll_seconds", 1.0)
@@ -780,12 +778,12 @@ class SessionController:
                 continue
             now = time.monotonic()
             if active.armed_at is not None:
-                limit = self._knob("counselling_limit_seconds", 120.0)
+                limit = self._knob("counselling_limit_seconds", 0.0)
                 if limit > 0 and now - active.armed_at >= limit:
                     await self._end_at_a_pause(active, "counselling_limit")
                     return
             else:
-                limit = self._knob("no_activity_limit_seconds", 900.0)
+                limit = self._knob("no_activity_limit_seconds", 0.0)
                 if limit > 0 and now - active.last_cmed_at >= limit:
                     await self._close_by_limit(active, "no_activity_limit")
                     return

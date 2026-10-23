@@ -658,6 +658,32 @@ async def test_a_late_prescription_marks_the_json_and_a_new_version_follows(dbs)
     assert [c["version"] for c in await dbs.repo.copies_for(sid)] == [1, 2]
 
 
+async def test_a_pc_whose_key_lives_in_its_tpm_can_enrol(dbs):
+    """021: a 65-byte P-256 key (0x04 X Y) enrols; anything else is still refused."""
+    import asyncpg
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    repo = dbs.repo
+    await repo.upsert_hospital("HOSP003", "Dholpur", "Asia/Dhaka")
+    point = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint)
+    token = await repo.create_enrollment_token(hospital_id="HOSP003", doctor_id="",
+                                               created_by="tests")
+    enrolled = await repo.enroll_device(token=token, tpm_pubkey=point, machine_name="PC",
+                                        os_version="", app_version="3.6.0",
+                                        protocol_version=2)
+    device = await repo.device_by_token(enrolled["device_token"])
+    assert bytes(device["tpm_pubkey"]) == point
+
+    for bad in (b"" * 33, b"" + point[1:]):
+        token = await repo.create_enrollment_token(hospital_id="HOSP003", doctor_id="",
+                                                   created_by="tests")
+        with pytest.raises(asyncpg.CheckViolationError):
+            await repo.enroll_device(token=token, tpm_pubkey=bad, machine_name="PC",
+                                     os_version="", app_version="3.6.0",
+                                     protocol_version=2)
+
+
 async def test_what_keeps_a_rogue_pc_out_of_the_dataset_runs_on_postgres(dbs):
     """The three queries behind the dataset gate, on the real schema."""
     repo = dbs.repo
@@ -678,19 +704,43 @@ async def test_what_keeps_a_rogue_pc_out_of_the_dataset_runs_on_postgres(dbs):
     assert (await repo.session_for_visit(v, "HOSP003"))["session_id"] == sid
     assert await repo.session_for_visit(v, "HOSP999") is None
 
-    # Only confirmed recordings are offered to the archive.
+    # Every recording is stored, confirmed or not; the JSON carries the marking.
     async with dbs.rec.acquire() as conn:
         await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
     held = await a_session(repo, first)
+    digest = os.urandom(32)
     async with dbs.rec.acquire() as conn:
         await conn.execute("UPDATE sessions SET closed_at = now(), confirmation = "
                            "'unconfirmed' WHERE session_id = $1", held)
+        # One uploaded piece: the archive takes only recordings with audio.
+        await conn.execute("""
+            INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
+                                       payload_sha256, prev_hash, entry_hash,
+                                       device_signature, occurred_at)
+            VALUES ($1, 1, 'segment', '{}', $2, $2, $2, $2, now())
+        """, held, digest)
+        await conn.execute("""
+            INSERT INTO segments (session_id, seq_no, entry_no, object_key, sha256,
+                                  bytes, duration_seconds, state)
+            VALUES ($1, 1, 1, $2, $3, 100, 1.0, 'committed')
+        """, held, f"audio/{held}/seg_00001.wav", digest)
     ready = {p["session_id"] for p in await repo.pending_archive(50)}
-    assert held not in ready
+    assert held in ready
+
+    # Confirmed after it was stored: its JSON is written again with the marking.
+    await repo.mark_archived(held, relpath="x/held.wav", sha256=b"\x11" * 32,
+                             byte_length=44)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET json_stale = false WHERE session_id = $1",
+                           held)
+    await repo.set_session_confirmation(held, "confirmed")
+    assert held in [p["session_id"] for p in await repo.pending_json(50)]
 
     # A PC revoked as untrusted: its recordings not yet archived are held.
-    assert await repo.quarantine_device_sessions(first["device_id"], "untrusted") >= 2
-    assert (await repo.get_session(held))["status"] == "quarantined"
+    # Already archived (held, above) stays as it is, marked; the rest is held.
+    assert await repo.quarantine_device_sessions(first["device_id"], "untrusted") >= 1
+    assert (await repo.get_session(sid))["status"] == "quarantined"
+    assert (await repo.get_session(held))["status"] == "archived"
     assert sid not in {p["session_id"] for p in await repo.pending_archive(50)}
 
     # Leave the shared day as it was for the dashboard's counts.

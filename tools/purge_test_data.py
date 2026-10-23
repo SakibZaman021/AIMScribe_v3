@@ -42,7 +42,6 @@ DELETE FROM segments WHERE session_id IN (SELECT * FROM s);
 DELETE FROM chain_entries WHERE session_id IN (SELECT * FROM s);
 DELETE FROM purge_receipts WHERE session_id IN (SELECT * FROM s);
 DELETE FROM integrity_alerts WHERE session_id IN (SELECT * FROM s);
-DELETE FROM used_grants WHERE session_id IN (SELECT * FROM s);
 DELETE FROM session_refusals WHERE session_id IN (SELECT * FROM s);
 DELETE FROM confirmation_notices WHERE patient_id LIKE '{LIKE}';
 DELETE FROM grant_authorisations WHERE session_id IN (SELECT * FROM s) OR patient_id LIKE '{LIKE}';
@@ -93,8 +92,12 @@ def docker(*args, stdin=None):
 
 
 def owner(db: str) -> str:
+    # A table each database always has: the recordings database's patients
+    # table went in 022_v3_drop_v1_tables.sql.
+    table = "sessions" if db == "aims_recordings" else "patients"
     return docker("exec", PG, "psql", "-U", "aims_admin", "-d", db, "-tAc",
-                  "select tableowner from pg_tables where tablename='patients'").strip()
+                  f"select tableowner from pg_tables where schemaname='public' "
+                  f"and tablename='{table}'").strip()
 
 
 def run_sql(db: str, sql: str, apply: bool) -> str:

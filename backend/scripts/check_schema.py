@@ -31,12 +31,11 @@ except ImportError:
 V2_TABLES = [
     "hospitals", "devices", "enrollment_tokens", "chain_entries",
     "segments", "purge_receipts", "audit_log", "integrity_alerts",
-    "used_grants", "api_keys",
+    "api_keys",
 ]
 
 V1_TABLES = [
-    "sessions", "clips", "transcripts", "ner_results",
-    "doctor_reviews", "prescription_data", "patients",
+    "sessions", "clips",
 ]
 
 

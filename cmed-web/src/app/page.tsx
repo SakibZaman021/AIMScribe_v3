@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { HOSPITALS } from '@/lib/hospitals';
 
 interface HealthScreening {
   bp_systolic: string;
@@ -37,7 +38,7 @@ export default function EntryPage() {
     // deployment at build time; typing it per patient is how a visit ends
     // up described under a clinic the recorder does not belong to, and
     // then never confirmed.
-    hospital_id: process.env.NEXT_PUBLIC_HOSPITAL_ID || 'HOSP001',
+    hospital_id: process.env.NEXT_PUBLIC_HOSPITAL_ID || 'AALO_DHOLPUR',
     health_screening: {
       bp_systolic: '',
       bp_diastolic: '',
@@ -178,13 +179,16 @@ export default function EntryPage() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     Hospital ID
                   </label>
-                  <input
-                    type="text"
+                  <select
                     name="hospital_id"
                     value={formData.hospital_id}
                     onChange={handleChange}
-                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  />
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  >
+                    {HOSPITALS.map((code) => (
+                      <option key={code} value={code}>{code}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
             </div>

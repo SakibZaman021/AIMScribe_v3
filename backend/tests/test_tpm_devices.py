@@ -235,3 +235,25 @@ def test_the_real_chip_signs_what_the_server_accepts_and_keeps_its_key():
         assert status != 0
     finally:
         key.delete()
+
+
+def test_every_request_that_carries_a_device_key_takes_a_tpm_key(chip):
+    """
+    Found on the bench: enrolment took the 65-byte key, then opening a recording
+    refused it - that request still allowed 64 hex characters. Every request
+    model with a device key field must take the 130 of a P-256 key.
+    """
+    from pydantic import BaseModel
+    hex_key = chip.public_bytes_raw().hex()
+    assert len(hex_key) == 130
+    models = [m for m in vars(api_v2).values()
+              if isinstance(m, type) and issubclass(m, BaseModel) and m is not BaseModel]
+    carrying = [m for m in models if any("pubkey" in name for name in m.model_fields)]
+    assert {m.__name__ for m in carrying} >= {"EnrollRequest", "OpenSessionRequest"}
+    for model in carrying:
+        for name, field in model.model_fields.items():
+            if "pubkey" not in name:
+                continue
+            limits = [getattr(m, "max_length", None) for m in field.metadata]
+            longest = max([x for x in limits if x is not None], default=None)
+            assert longest is None or longest >= 130, f"{model.__name__}.{name}"

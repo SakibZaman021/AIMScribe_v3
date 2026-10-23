@@ -595,8 +595,8 @@ S.append(tbl([["How long", "What happens in the clinics", "What CMED should do"]
                           "logs what it saw for our dashboard", "Nothing. Keep them in the outbox"],
               ["most of a day", "Laptops begin to fill; new recordings eventually stop",
                "Keep them in the outbox. <b>Do not drop messages</b>"],
-              ["<b>a message is never sent</b>", "<b>The recording is kept but held out of the "
-                                                 "dataset</b>: API 2 is what proves it was real",
+              ["<b>a message is never sent</b>", "<b>The recording is stored but marked "
+                                                 "unconfirmed</b>: API 2 is what proves it was real",
                "<b>This is the only real failure.</b> A durable outbox prevents it"]],
              [30 * mm, 66 * mm, 60 * mm], req=[4]))
 S.append(Spacer(1, 4))
