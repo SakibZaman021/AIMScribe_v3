@@ -46,6 +46,7 @@ import logging
 import os
 import secrets
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -540,6 +541,25 @@ ENROLMENT_PROOF_DOMAIN = b"AIMS-ENROL-V1\n"
 def enrolment_proof_message(token: str, public_key: bytes) -> bytes:
     return (ENROLMENT_PROOF_DOMAIN + hashlib.sha256(token.encode("utf-8")).hexdigest()
             .encode("ascii") + b"\n" + public_key.hex().encode("ascii"))
+
+
+# MUST match backend/src/integrity.py registration_proof_message exactly.
+REGISTRATION_PROOF_DOMAIN = b"AIMS-REGISTER-V1\n"
+
+
+def registration_proof_message(cmed_hospital_id: str, public_key: bytes,
+                               timestamp: int) -> bytes:
+    """What a PC signs to register itself: CMED's clinic code, its key, the time."""
+    return (REGISTRATION_PROOF_DOMAIN + cmed_hospital_id.encode("utf-8") + b"\n"
+            + public_key.hex().encode("ascii") + b"\n" + str(int(timestamp)).encode("ascii"))
+
+
+# MUST match backend/src/integrity.py: a self-registered PC's id is its key's.
+DEVICE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://aimscribe/device-key/v1")
+
+
+def device_id_for_key(public_key: bytes) -> str:
+    return str(uuid.uuid5(DEVICE_ID_NAMESPACE, public_key.hex()))
 
 
 class DeviceKeyError(RuntimeError):

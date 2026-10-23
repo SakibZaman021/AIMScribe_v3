@@ -377,6 +377,16 @@ class SessionController:
             # patient's end time - so both must be stamped from the same value.
             boundary = datetime.now(timezone.utc)
 
+            # A new PC joins at its first consultation, at the clinic CMED's
+            # trigger named (3.7). The doctor waits a few seconds, once.
+            register = getattr(self, "register", None)
+            if not self.device_id and register is not None:
+                why = await register(trigger.hospital_id)
+                if why is not None and not self.device_id:
+                    raise SessionError(
+                        "This new PC could not join the AIMS LAB server yet "
+                        f"({why}). It tries again with the next patient.",
+                        code="DEVICE_NOT_ENROLLED")
             if not self.device_id:
                 raise SessionError(
                     "This PC is not enrolled with the AIMS LAB server. Contact IT - "

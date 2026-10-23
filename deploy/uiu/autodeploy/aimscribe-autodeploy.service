@@ -1,0 +1,20 @@
+# Deploys what is new on GitHub main (autodeploy.sh). Started by the timer.
+#   sudo cp aimscribe-autodeploy.service aimscribe-autodeploy.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aimscribe-autodeploy.timer
+# What it did:  journalctl -u aimscribe-autodeploy -n 50
+[Unit]
+Description=AIMScribe: deploy what is new on GitHub main
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=aims
+Group=aims
+# Optional settings (AIMS_DEPLOY_REQUIRE_SIGNED=true, ...), one per line.
+EnvironmentFile=-/etc/aimscribe/autodeploy.env
+ExecStart=/usr/bin/env bash /home/aims/AIMScribe_v3/deploy/uiu/autodeploy/autodeploy.sh
+# A build on a busy droplet can take several minutes.
+TimeoutStartSec=45min
+Nice=5

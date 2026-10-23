@@ -80,6 +80,8 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
               FROM sessions
              WHERE archived_at IS NOT NULL AND copied_at IS NULL
                AND quarantine_reason IS NULL
+               -- only a recording CMED confirmed is copied (025)
+               AND confirmation = 'confirmed'
         """)
         alerts = await conn.fetch("""
             SELECT alert_type, severity FROM integrity_alerts

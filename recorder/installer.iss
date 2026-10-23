@@ -34,7 +34,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.6.1"
+#define AppVersion     "3.7.0"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -250,15 +250,16 @@ begin
     ConfigPage := CreateInputQueryPage(wpSelectDir,
       'AIMScribe Configuration',
       'Which server, and which clinic is this PC for?',
-      'The enrolment token names the clinic this machine records for. Doctors' + #13#10 +
-      'need nothing: CMED names the doctor with every patient. One token per PC.');
+      'No enrolment token is needed: this PC joins AIMS LAB by itself the first' + #13#10 +
+      'time CMED opens a patient on it, at the clinic CMED names. A token from the' + #13#10 +
+      'administrator still works. Doctors need nothing: CMED names them.');
 
   ConfigPage.Add('Backend URL:', False);
   ConfigPage.Add('CMED web address:', False);
   if AlreadyEnrolled() then
     ConfigPage.Add('Enrolment token (leave empty - already enrolled):', False)
   else
-    ConfigPage.Add('Enrolment token:', False);
+    ConfigPage.Add('Enrolment token (optional):', False);
 
   ConfigPage.Values[0] := Choose('BACKEND', 'AIMS_BACKEND_URL', '{#DefaultBackend}');
   ConfigPage.Values[1] := Choose('ORIGIN', 'AIMS_ALLOWED_ORIGINS', '{#DefaultOrigin}');
@@ -313,7 +314,7 @@ begin
     // starts cleanly, and refuses to record.
     Result := 'That does not look like an enrolment token. A token is about 43 ' +
               'characters, issued by the AIMScribe administrator for this PC. Leave ' +
-              'it empty to enrol this machine later.';
+              'it empty and this PC joins by itself at its first consultation.';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -330,12 +331,8 @@ begin
     Result := WizardSilent();
     Exit;
   end;
-  if (Trim(ConfigPage.Values[2]) = '') and not AlreadyEnrolled() and not WizardSilent() then
-    if MsgBox('No enrolment token was entered.' + #13#10 + #13#10 +
-              'AIMScribe will install and start, but will refuse to record ' +
-              'until this PC is enrolled. Continue anyway?',
-              mbConfirmation, MB_YESNO) = IDNO then
-      Result := False;
+  { No token is fine from 3.7: the PC's key is in its TPM (setup stops on a PC
+    without one), and it registers itself at its first CMED consultation. }
 end;
 
 { ------------------------------------------------------------ the local key }

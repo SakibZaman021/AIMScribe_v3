@@ -32,6 +32,7 @@ import hmac
 import logging
 import time
 import os
+import uuid
 import re
 import wave
 from contextlib import asynccontextmanager
@@ -257,6 +258,21 @@ class EnrollRequest(BaseModel):
     device_pubkey: str = Field(..., min_length=64, max_length=130)
     key_proof: Optional[str] = Field(None, max_length=200)
     key_storage: str = Field("software", max_length=16)
+    machine_name: str = Field("", max_length=128)
+    os_version: str = Field("", max_length=256)
+    app_version: str = Field("", max_length=32)
+    protocol_version: int = Field(2, ge=2, le=9)
+    audio: Optional[AudioSpec] = None
+
+
+class RegisterRequest(BaseModel):
+    # Only a P-256 key inside the PC's TPM (65 bytes, 130 hex) may register
+    # itself: it cannot be copied off the PC. A software key needs a token.
+    device_pubkey: str = Field(..., min_length=130, max_length=130)
+    key_proof: str = Field(..., min_length=40, max_length=200)
+    # CMED's code for the clinic, from CMED's own trigger on this PC.
+    cmed_hospital_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    timestamp: int
     machine_name: str = Field("", max_length=128)
     os_version: str = Field("", max_length=256)
     app_version: str = Field("", max_length=32)
@@ -649,6 +665,125 @@ async def enroll_device(body: EnrollRequest):
     return result
 
 
+# A PC registered without a token is pending until CMED's server confirms
+# this many of its recordings (the trigger in 025 approves it; keep the two
+# equal).
+SELF_APPROVAL_CONFIRMATIONS = 2
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+
+
+def self_registration_enabled() -> bool:
+    return os.getenv("AIMS_SELF_REGISTRATION", "on").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+def pending_upload_quota() -> int:
+    return max(_env_int("AIMS_PENDING_UPLOAD_MB", 500), 0) * 1024 * 1024
+
+
+_REGISTER_REFUSALS = {
+    "revoked": (403, "DEVICE_REVOKED", "this PC was revoked or rejected; an administrator "
+                                       "has to enrol it again"),
+    "other_clinic": (409, "OTHER_CLINIC", "this PC is registered at another clinic; an "
+                                          "administrator has to move it"),
+    "already_registered": (409, "ALREADY_REGISTERED", "this PC is registered and has "
+                                                      "been heard from; it keeps its "
+                                                      "token"),
+    "key_mismatch": (409, "KEY_MISMATCH", "a different key is registered under this "
+                                          "PC's id"),
+    "too_many_pending": (429, "TOO_MANY_PENDING", "this clinic already has the most PCs "
+                                                  "waiting for approval; an "
+                                                  "administrator can approve or reject "
+                                                  "them on the dashboard"),
+    "too_many_from_address": (429, "TOO_MANY_REGISTRATIONS", "too many PCs registered "
+                                                             "from this address today"),
+}
+
+
+@router.post("/device/register")
+async def register_device(body: RegisterRequest, request: Request):
+    """
+    A clinic PC joins without an enrolment token.
+
+    It shows it holds a key that lives in its TPM, and names the clinic CMED's
+    own trigger named on it. It joins as *pending*: it records and uploads as
+    any PC does, up to AIMS_PENDING_UPLOAD_MB, and nothing it records is kept
+    unless CMED's server confirms that visit. Once CMED has confirmed two of
+    its recordings, it is approved - in the database, whatever confirmed them.
+    An outsider can register, but cannot get past pending: approval needs
+    CMED's server to name, to the second, visits that PC really recorded.
+    """
+    if not self_registration_enabled():
+        return _coded(403, "SELF_REGISTRATION_OFF",
+                      "this server enrols PCs with an enrolment token only")
+    try:
+        pubkey = bytes.fromhex(body.device_pubkey)
+    except ValueError:
+        return _coded(400, "BAD_KEY", "device_pubkey must be hex")
+    problem = integrity.device_key_problem(pubkey)
+    if problem is not None:
+        return _coded(400, "BAD_KEY", problem)
+    if integrity.device_key_kind(pubkey) != "p256":
+        return _coded(400, "TPM_KEY_REQUIRED",
+                      "only a key held in the PC's TPM may register without a token")
+    if abs(time.time() - body.timestamp) > DEVICE_SIGNATURE_WINDOW:
+        return _coded(401, "CLOCK", "the registration's time is more than five minutes "
+                                    "from the server's; check the PC's clock")
+    try:
+        proof = _b64url_decode(body.key_proof)
+    except Exception:
+        return _coded(400, "BAD_PROOF", "key_proof is not base64url")
+    if not integrity.verify_by_device_key(
+            pubkey, proof, integrity.registration_proof_message(
+                body.cmed_hospital_id, pubkey, body.timestamp)):
+        return _coded(401, "KEY_PROOF_INVALID",
+                      "key_proof does not verify: this PC did not show it holds the key")
+
+    repo = _repo()
+    hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
+    if hospital_id is None:
+        return _coded(403, "UNKNOWN_CLINIC",
+                      "CMED's clinic code is not a clinic this server runs")
+
+    import security
+    address = security.client_ip(request)
+    device_id = integrity.device_id_for_key(pubkey)
+    result = await repo.register_device(
+        device_id=device_id, tpm_pubkey=pubkey, hospital_id=hospital_id,
+        machine_name=body.machine_name, os_version=body.os_version,
+        app_version=body.app_version, protocol_version=body.protocol_version,
+        registered_ip=address,
+        pending_per_clinic=_env_int("AIMS_PENDING_DEVICES_PER_CLINIC", 5),
+        per_ip_per_day=_env_int("AIMS_REGISTRATIONS_PER_ADDRESS_PER_DAY", 10))
+    if "refused" in result:
+        status, code, message = _REGISTER_REFUSALS[result["refused"]]
+        logger.warning("Registration of %s at %s refused: %s", device_id, hospital_id, code)
+        return _coded(status, code, message)
+
+    await repo.audit(event_type="device.registered", actor_type="device",
+                     device_id=device_id,
+                     detail={"machine_name": body.machine_name, "hospital_id": hospital_id,
+                             "app_version": body.app_version, "address": address,
+                             "approval": result["approval"]})
+    await repo.alert_once(
+        alert_type="device_registered", group=f"device_registered:{device_id}",
+        window=timedelta(days=7), severity="info",
+        detail={"device_id": str(device_id), "hospital_id": hospital_id,
+                "machine_name": body.machine_name, "address": address,
+                "note": "a PC registered itself; it is approved when CMED confirms "
+                        f"{SELF_APPROVAL_CONFIRMATIONS} of its recordings, or by hand"})
+    logger.info("PC %s (%s) registered itself at %s: %s", device_id, body.machine_name,
+                hospital_id, result["approval"])
+    return {**result, "pending_upload_mb": pending_upload_quota() // (1024 * 1024),
+            "approved_after_confirmations": SELF_APPROVAL_CONFIRMATIONS}
+
+
 # ============================================================
 # Session lifecycle
 # ============================================================
@@ -784,6 +919,18 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
     max_bytes = int(os.getenv("AIMS_MAX_SEGMENT_BYTES", str(64 * 1024 * 1024)))
     if body.bytes > max_bytes:
         raise HTTPException(status_code=413, detail="segment exceeds the permitted size")
+
+    # A PC that registered itself uploads up to its allowance until CMED has
+    # confirmed its first recordings: an outsider who registers can never put
+    # more than this on the server, and none of it is kept.
+    if device.get("approval") == "pending":
+        quota = pending_upload_quota()
+        if await _repo().device_upload_bytes(device["device_id"]) + body.bytes > quota:
+            refusal = _coded(429, "AWAITING_APPROVAL",
+                             "this PC is waiting for CMED to confirm its first "
+                             "recordings; it uploads more once approved")
+            refusal.headers["Retry-After"] = "300"
+            return refusal
 
     # Keys are built from the opaque session ULID, never the patient reference:
     # object keys leak into access logs, metrics and error traces.
@@ -2654,8 +2801,9 @@ async def _visit_contested(visit, clinic: str) -> bool:
     One consultation is recorded by one PC. When a second PC asks for the same
     five fields, one of them is not where it says it is - a copied key, or a
     PC that saw another's screen - and which one cannot be told from here. API
-    2 confirms neither from then on; both recordings are kept and held, and an
-    administrator decides.
+    2 confirms neither from then on; both wait, and an administrator decides -
+    the admin confirm, or a legal hold - before their erase_after, or they are
+    erased as never confirmed.
     """
     repo = _repo()
     if not hasattr(repo, "visit_devices"):
@@ -2794,8 +2942,9 @@ async def _mark_unconfirmed(session_id: str, row: Dict[str, Any]) -> None:
         session_id=session_id, window=UNCONFIRMED_GROUP_WINDOW,
         device_id=row.get("device_id") or session.get("device_id"),
         detail={"hospital_id": hospital,
-                "reason": "no matching API 2 from CMED within two minutes; the "
-                          "recordings are kept and will be matched when it arrives"})
+                "reason": "no matching API 2 or API 3 from CMED within two minutes; "
+                          "the recordings wait on the server and are confirmed when it "
+                          "arrives, or erased on their erase_after if it never does"})
 
 
 async def _current_confirmation(session_id: str) -> str:
@@ -3267,12 +3416,17 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
     """
     Settle confirmation deadlines. The archive worker calls this every pass.
 
-        pending for two minutes         ->  unconfirmed, alert   (SRS-CNF-08)
+        pending for two minutes          ->  unconfirmed, alert   (SRS-CNF-08)
+        not confirmed: erase_after set   ->  opened + AIMS_UNCONFIRMED_ERASE_DAYS
+        erase_after passed, still not    ->  erased ("expired"), as a refusal is
+          confirmed by CMED
+        within 48 hours of erase_after   ->  one alert per clinic a day
+        a self-registered PC pending     ->  rejected
+          for AIMS_PENDING_DEVICE_DAYS
 
-    Nothing is erased here. A recording without CMED's API 2 used to be
-    deleted after 24 hours, which made every CMED outage a loss of real
-    consultations; it is now archived and kept, and API 2 attaches to it
-    whenever it arrives. Only a patient's refusal erases (SRS-CNS-04).
+    Only what CMED's server confirms is kept, but an outage never erases: a
+    clinic CMED has sent nothing for in a day has its erasures held, with an
+    alert, until CMED is heard from again. A legal hold is never erased.
     """
     repo = _repo()
     now = datetime.now(timezone.utc)
@@ -3316,9 +3470,87 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             detail={"archived_at": row["archived_at"].isoformat()
                                    if row["archived_at"] else None})
 
-    return {"status": "ok", "marked_unconfirmed": marked, "erased": 0,
-            "clinical_loaded": loaded, "copies_overdue": len(overdue),
-            "reconciled": len(reconciled)}
+    erased, held, rejected, approved = await _settle_unconfirmed()
+
+    return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
+            "erase_held_clinics": held, "devices_rejected": rejected,
+            "devices_approved": approved, "clinical_loaded": loaded,
+            "copies_overdue": len(overdue), "reconciled": len(reconciled)}
+
+
+ERASE_BATCH = 100                       # per sweep; the worker sweeps every 30 s
+ERASE_WARNING = timedelta(hours=48)
+
+
+async def _settle_unconfirmed() -> Tuple[int, int, int, int]:
+    """
+    Keep only what CMED confirms: give each waiting recording its date, erase
+    the ones past it, warn before, and settle self-registered PCs. Returns
+    (erased, clinics held back, PCs rejected, PCs approved).
+    """
+    repo = _repo()
+    if not hasattr(repo, "set_erase_deadlines"):
+        return 0, 0, 0, 0
+    days = conf.unconfirmed_erase_days()
+    await repo.set_erase_deadlines(days)
+
+    plan = await repo.sessions_due_for_erasure(limit=ERASE_BATCH,
+                                               silent_after=conf.CMED_SILENT_AFTER)
+    erased = 0
+    for row in plan["due"]:
+        sid = row["session_id"]
+        async with _session_lock(sid):
+            # Confirmed in the moment since it was listed: kept.
+            current = await repo.session_confirmation(sid)
+            if not current or current.get("confirmation") not in conf.ERASABLE:
+                continue
+            removed, _visit = await _erase_session(sid, state="expired")
+        await _finish_erase(sid)
+        await repo.audit(event_type="session.expired", actor_type="service",
+                         actor_id="sweep", session_id=sid,
+                         detail={"reason": "not confirmed by CMED", "was": row["confirmation"],
+                                 "days": days, "objects_deleted": removed})
+        erased += 1
+    if erased:
+        logger.info("Erased %s recording(s) CMED never confirmed in %s days", erased, days)
+
+    for clinic in plan["held"]:
+        await repo.alert_once(
+            alert_type="erase_held_cmed_silent", group=f"erase_held:{clinic['hospital_id']}",
+            window=timedelta(hours=24), severity="warning",
+            detail={"hospital_id": clinic["hospital_id"], "count": clinic["n"],
+                    "cmed_last_heard": clinic["last_heard"],
+                    "reason": "these recordings are past their date, but CMED has sent "
+                              "nothing for this clinic in a day: they are kept until it "
+                              "does, so an outage loses nothing"})
+
+    for clinic in await repo.erasing_soon(within=ERASE_WARNING):
+        await repo.alert_once(
+            alert_type="erase_soon", group=f"erase_soon:{clinic['hospital_id']}",
+            window=timedelta(hours=24), severity="warning",
+            detail={"hospital_id": clinic["hospital_id"], "count": clinic["n"],
+                    "first": clinic["first"],
+                    "reason": "will be erased within 48 hours unless CMED confirms them; "
+                              "v_audio_problems lists them. A legal hold or the admin "
+                              "confirm keeps one"})
+
+    rejected = await repo.expire_pending_devices(_env_int("AIMS_PENDING_DEVICE_DAYS", 7))
+    for pc in rejected:
+        await repo.audit(event_type="device.rejected", actor_type="service",
+                         actor_id="sweep", device_id=pc["device_id"],
+                         detail={"reason": "not confirmed by CMED in time"})
+        await repo.raise_alert(alert_type="device_rejected", severity="warning",
+                               device_id=pc["device_id"],
+                               detail={"hospital_id": pc["hospital_id"],
+                                       "machine_name": pc["machine_name"]})
+    approved = await repo.approvals_to_audit()
+    for pc in approved:
+        await repo.audit(event_type="device.approved", actor_type="service",
+                         actor_id=pc.get("approved_by") or "cmed", device_id=pc["device_id"],
+                         detail={"hospital_id": pc["hospital_id"],
+                                 "machine_name": pc["machine_name"],
+                                 "confirmations": SELF_APPROVAL_CONFIRMATIONS})
+    return erased, len(plan["held"]), len(rejected), len(approved)
 
 
 # ============================================================
@@ -3462,6 +3694,47 @@ async def admin_revoke_device(device_id: str, reason: str = "", hold: bool = Fal
     await _repo().audit(event_type="device.revoked", actor_type="admin",
                         device_id=device_id, detail={"reason": reason, "held": held})
     return {"status": "revoked", "device_id": device_id, "recordings_held": held}
+
+
+class DeviceDecision(BaseModel):
+    decided_by: str = Field(..., min_length=2, max_length=128)
+    reason: str = Field("", max_length=500)
+
+
+def _device_uuid(device_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(device_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="device not found")
+
+
+@router.post("/admin/device/{device_id}/approve")
+async def admin_approve_device(device_id: str, body: DeviceDecision,
+                               _: None = Depends(require_admin)):
+    """A PC that registered itself, approved by a person without waiting for CMED."""
+    did = _device_uuid(device_id)
+    if not await _repo().set_device_approval(did, "approved", by=body.decided_by):
+        raise HTTPException(status_code=404, detail="no pending PC with that id")
+    await _repo().audit(event_type="device.approved", actor_type="admin",
+                        actor_id=body.decided_by, device_id=did,
+                        detail={"reason": body.reason, "by_hand": True})
+    return {"status": "approved", "device_id": str(did)}
+
+
+@router.post("/admin/device/{device_id}/reject")
+async def admin_reject_device(device_id: str, body: DeviceDecision,
+                              _: None = Depends(require_admin)):
+    """
+    A PC that registered itself and is not ours: revoked at once. What it
+    uploaded is not confirmed by CMED, so it is erased on its date.
+    """
+    did = _device_uuid(device_id)
+    if not await _repo().set_device_approval(did, "rejected", by=body.decided_by):
+        raise HTTPException(status_code=404, detail="no pending PC with that id")
+    await _repo().audit(event_type="device.rejected", actor_type="admin",
+                        actor_id=body.decided_by, device_id=did,
+                        detail={"reason": body.reason})
+    return {"status": "rejected", "device_id": str(did)}
 
 
 class ConfirmRequest(BaseModel):

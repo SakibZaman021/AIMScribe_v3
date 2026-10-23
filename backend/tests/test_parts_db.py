@@ -132,7 +132,8 @@ async def test_a_moved_cut_is_listed_for_recutting_and_held_from_the_copy(dbs):
     async with repo._pool.acquire() as conn:
         await conn.execute("""
             UPDATE sessions SET closed_at = now(), archived_at = now(),
-                   archive_relpath = 'x.wav', archive_sha256 = $2, archive_bytes = 10
+                   archive_relpath = 'x.wav', archive_sha256 = $2, archive_bytes = 10,
+                   confirmation = 'confirmed'
              WHERE session_id = $1
         """, sid, b"\xab" * 32)
     assert sid in [s["session_id"] for s in await repo.pending_copy(50)]

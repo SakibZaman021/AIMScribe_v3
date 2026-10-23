@@ -246,8 +246,9 @@ ROWS = [
 
     # ---------------------------------------------------------------- CMED boundary
     ("CMED boundary", "B1", "CMED's server offline (power or internet)",
-     "API 2 and API 3 must wait in CMED's own queue; recordings are kept regardless and "
-     "matched whenever API 2 arrives, with no time limit.",
+     "API 2 and API 3 must wait in CMED's own queue; recordings wait on our server and "
+     "are confirmed whenever either arrives. A clinic CMED is silent for erases nothing; "
+     "only a recording CMED never confirms is erased, 7 days after it was made.",
      "Depends on CMED's queue", O,
      "Clinical data missing until CMED sends it",
      "Confirm CMED's outbox in the build session", "CMED"),

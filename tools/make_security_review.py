@@ -105,8 +105,10 @@ def main():
                   ["Recorder &rarr; AIMS LAB server",
                    "Per-PC key created inside the PC's TPM chip (P-256): usable on that PC, "
                    "never copyable off it (3.6; earlier PCs keep a DPAPI-locked Ed25519 key "
-                   "until re-enrolled). Single-use enrolment token, plus proof the PC holds "
-                   "the key it registers. "
+                   "until re-enrolled). Joins with a single-use enrolment token, or from 3.7 "
+                   "with none: it proves it holds a TPM key and is pending - uploading "
+                   "at most 500 MB, none of it kept unless CMED confirms it - until CMED's "
+                   "server confirms two of its recordings. "
                    "Every recording needs a server-signed grant, 60 s life, single use - "
                    "remembered across restarts. Every request is signed with the PC's key "
                    "(single-use nonce, 5-minute window). A PC cannot open another PC's "

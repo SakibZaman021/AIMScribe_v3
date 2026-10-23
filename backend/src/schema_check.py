@@ -121,6 +121,18 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     ("022_v3_drop_v1_tables.sql", "recordings", "the v1 transcription tables are gone",
      "SELECT to_regclass('public.ner_results') IS NULL "
      "AND to_regclass('public.used_grants') IS NULL"),
+    ("023_v3_audio_by_day_and_hospital.sql", "recordings", "view v_audio_daily",
+     _table("v_audio_daily")),
+    ("023_v3_audio_by_day_and_hospital.sql", "recordings", "view v_audio_problems",
+     _table("v_audio_problems")),
+    ("024_v3_readable_devices.sql", "recordings", "view v_devices", _table("v_devices")),
+    ("024_v3_readable_devices.sql", "recordings", "each nonce belongs to a known PC",
+     "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'device_nonces_device_fk')"),
+    # Without it nothing unconfirmed is ever erased, and no PC can register itself.
+    ("025_v3_confirmed_only_and_self_registration.sql", "recordings",
+     "column sessions.erase_after", _column("sessions", "erase_after")),
+    ("025_v3_confirmed_only_and_self_registration.sql", "recordings",
+     "column devices.approval", _column("devices", "approval")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
@@ -221,7 +233,7 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 022 present)")
+        logger.info("Database schema up to date (migrations up to 025 present)")
     await _warn_if_owner(recordings_pool)
     return problems
 

@@ -65,6 +65,10 @@ services:
       - ../uiu/postgres/init:/docker-entrypoint-initdb.d:ro
       - ../uiu/postgres/schema:/aims/baseline:ro
       - ../../backend/scripts:/aims/scripts:ro
+      # Builds a new server's schema (init/02_schema.sh). An update pipes the
+      # current file in instead: a mounted single file keeps its old contents
+      # after git replaces it.
+      - ../uiu/postgres/migrate.sh:/aims/migrate.sh:ro
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"   # for psql from this machine only
     healthcheck:
@@ -341,7 +345,15 @@ services:
       com.aimslab.system: "aimscribe-v3"
     environment:
       ADMINER_DEFAULT_SERVER: postgres
-      ADMINER_DESIGN: dracula
+    # The Dracula design, always, as on Adminer 4. Adminer 5 ships it only as
+    # a dark-mode file (designs/dracula/adminer-dark.css), so ADMINER_DESIGN
+    # finds nothing and a PC in dark mode gets Adminer's own navy theme.
+    # Linked as adminer.css it is the one look in both modes.
+    entrypoint: ["sh", "-c", "ln -sf designs/dracula/adminer-dark.css adminer.css && exec entrypoint.sh docker-php-entrypoint \"$$@\"", "--"]
+    command: ["php", "-S", "[::]:8080", "-t", "/var/www/html"]
+    volumes:
+      # The login form offers PostgreSQL only; it opened on MySQL.
+      - ./adminer/postgres-only.php:/var/www/html/plugins-enabled/900-postgres-only.php:ro
     depends_on:
       postgres:
         condition: service_healthy

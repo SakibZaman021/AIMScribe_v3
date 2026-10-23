@@ -115,6 +115,10 @@ services:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - ./postgres/schema:/aims/baseline:ro
       - ../../backend/scripts:/aims/scripts:ro
+      # Builds a new server's schema (init/02_schema.sh). An update pipes the
+      # current file in instead: a mounted single file keeps its old contents
+      # after git replaces it.
+      - ./postgres/migrate.sh:/aims/migrate.sh:ro
     shm_size: ${AIMS_PG_SHM:-1gb}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
@@ -276,6 +280,18 @@ services:
       AIMS_RATE_PER_IP_PER_MINUTE: ${AIMS_RATE_PER_IP_PER_MINUTE:-1200}
       AIMS_TOKEN_RATE_PER_MINUTE: ${AIMS_TOKEN_RATE_PER_MINUTE:-60}
       AIMS_AUTH_FAILURE_LIMIT: ${AIMS_AUTH_FAILURE_LIMIT:-10}
+      # Only what CMED's server confirms is kept (025): a recording it has not
+      # confirmed this many days after it was made is erased - never while CMED
+      # has been silent for that clinic for a day.
+      AIMS_UNCONFIRMED_ERASE_DAYS: ${AIMS_UNCONFIRMED_ERASE_DAYS:-7}
+      # A PC whose key is in its TPM joins without a token (recorder 3.7). It
+      # is pending, and uploads up to its allowance, until CMED confirms two
+      # of its recordings; never confirmed in this many days, it is rejected.
+      AIMS_SELF_REGISTRATION: ${AIMS_SELF_REGISTRATION:-on}
+      AIMS_PENDING_UPLOAD_MB: ${AIMS_PENDING_UPLOAD_MB:-500}
+      AIMS_PENDING_DEVICES_PER_CLINIC: ${AIMS_PENDING_DEVICES_PER_CLINIC:-5}
+      AIMS_PENDING_DEVICE_DAYS: ${AIMS_PENDING_DEVICE_DAYS:-7}
+      AIMS_REGISTRATIONS_PER_ADDRESS_PER_DAY: ${AIMS_REGISTRATIONS_PER_ADDRESS_PER_DAY:-10}
       # The identifier systems agreed with CMED for FHIR (fhir.py).
       AIMS_FHIR_SYSTEM_PATIENT: ${AIMS_FHIR_SYSTEM_PATIENT:-urn:aimscribe:cmed:patient}
       AIMS_FHIR_SYSTEM_PRACTITIONER: ${AIMS_FHIR_SYSTEM_PRACTITIONER:-urn:aimscribe:cmed:practitioner}

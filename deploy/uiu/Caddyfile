@@ -145,7 +145,7 @@
 # Only the admin routes and the dashboard; nothing a recorder or CMED uses.
 # ----------------------------------------------------------------
 http://:6001 {
-	@lab path /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/* /health
+	@lab path /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/* /health /health/*
 	handle @lab {
 		reverse_proxy api:6000 {
 			header_up X-Forwarded-For {remote_host}

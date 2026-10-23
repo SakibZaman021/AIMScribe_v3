@@ -19,6 +19,17 @@ The flow is designed so a doctor never sees it:
     every start after that
         reads device.json
 
+From 3.7 a PC with a TPM key needs no token at all:
+
+    first CMED consultation on this PC
+        POST /api/v2/device/register  { device_pubkey, proof, CMED's clinic code }
+        <- { device_id, hospital_id, device_token, approval: "pending" }
+
+The clinic is the one CMED's own trigger named on this PC, mapped by the
+server. The PC is pending until CMED's server confirms two of its recordings:
+it records and uploads meanwhile (up to an allowance), and nothing it records
+is kept unless CMED confirms that visit.
+
 The enrollment token is single-use and short-lived; the server binds the device to
 a hospital, so the agent never asserts its own tenancy. The device's Ed25519 public
 key is registered at the same time, which is what lets the server verify that every
@@ -54,11 +65,13 @@ DEVICE_TOKEN_FILE = "device.token"
 class EnrollmentError(RuntimeError):
     """Enrollment failed. The agent stays unenrolled and refuses to record."""
 
-    def __init__(self, message: str, *, rejected: bool = False):
+    def __init__(self, message: str, *, rejected: bool = False, code: str = ""):
         super().__init__(message)
         # The server said no - a mistyped, used or expired token. Trying the
         # same token again cannot succeed; an unreachable server can.
         self.rejected = rejected
+        # The server's reason, when it gave one (UNKNOWN_CLINIC, ...).
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -239,9 +252,77 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
     except Exception as exc:
         raise EnrollmentError(f"could not reach the backend: {exc}") from exc
 
+    identity = _keep(cfg, device_key, data)
+
+    # The token is single-use; leaving it on disk invites a replay attempt and
+    # confuses the next start.
+    try:
+        token_path(cfg).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove the used enrollment token: %s", exc)
+
+    logger.info("Enrolled as device %s for doctor %s at hospital %s",
+                identity.device_id, identity.doctor_id, identity.hospital_id)
+    return identity
+
+
+def can_self_register(cfg, device_key: DeviceKey) -> bool:
+    """Only a key the PC cannot give away - one in its TPM - may join without a token."""
+    return bool(getattr(cfg.security, "self_register", False)) and \
+        getattr(device_key, "kind", "") == "p256-tpm"
+
+
+async def register(cfg, device_key: DeviceKey, cmed_hospital_id: str, *,
+                   ssl_context=None) -> DeviceIdentity:
+    """
+    Join without a token, at the clinic CMED's trigger named. Raises
+    EnrollmentError (rejected, with the server's code) when the server says
+    no, and a plain one when it could not be reached.
+    """
+    url = cfg.backend.url("/device/register")
+    public = device_key.public_bytes_raw()
+    stamp = int(datetime.now(timezone.utc).timestamp())
+    proof = device_key.sign(crypto.registration_proof_message(cmed_hospital_id, public, stamp))
+    payload = {
+        "device_pubkey": public.hex(),
+        "key_proof": crypto.b64url(proof),
+        "cmed_hospital_id": cmed_hospital_id,
+        "timestamp": stamp,
+        **_machine_facts(cfg),
+    }
+    logger.info("Registering this PC with %s (CMED clinic %s)",
+                cfg.backend.base_url, cmed_hospital_id)
+    timeout = aiohttp.ClientTimeout(total=cfg.backend.request_timeout)
+    connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else None
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                body = await response.text()
+                if response.status >= 300:
+                    try:
+                        code = str(json.loads(body).get("code") or "")
+                    except Exception:
+                        code = ""
+                    raise EnrollmentError(
+                        f"server refused registration ({response.status} {code}): "
+                        f"{body[:200]}", rejected=400 <= response.status < 500, code=code)
+                data = json.loads(body)
+    except EnrollmentError:
+        raise
+    except Exception as exc:
+        raise EnrollmentError(f"could not reach the backend: {exc}") from exc
+
+    identity = _keep(cfg, device_key, data)
+    logger.info("Registered as device %s at %s (%s)", identity.device_id,
+                identity.hospital_id, data.get("approval", "pending"))
+    return identity
+
+
+def _keep(cfg, device_key: DeviceKey, data: Dict[str, Any]) -> DeviceIdentity:
+    """Store what the server issued - the token first, then the identity."""
     device_id = data.get("device_id")
     hospital_id = data.get("hospital_id")
-    doctor_id = data.get("doctor_id")
+    doctor_id = data.get("doctor_id") or ""
     device_token = data.get("device_token")
     if not device_id or not hospital_id:
         raise EnrollmentError("enrollment response did not include device_id and hospital_id")
@@ -271,16 +352,6 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
     tmp = path.with_suffix(".tmp")
     tmp.write_text(identity.to_json(), encoding="utf-8")
     os.replace(tmp, path)
-
-    # The token is single-use; leaving it on disk invites a replay attempt and
-    # confuses the next start.
-    try:
-        token_path(cfg).unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("Could not remove the used enrollment token: %s", exc)
-
-    logger.info("Enrolled as device %s for doctor %s at hospital %s",
-                identity.device_id, identity.doctor_id, identity.hospital_id)
     return identity
 
 
@@ -310,7 +381,8 @@ async def ensure_enrolled(cfg, device_key: DeviceKey, *, ssl_context=None) -> Op
 
 
 __all__ = [
-    "DeviceIdentity", "EnrollmentError", "ensure_enrolled", "enroll",
+    "DeviceIdentity", "EnrollmentError", "ensure_enrolled", "enroll", "register",
+    "can_self_register",
     "load_identity", "read_pending_token", "identity_path", "token_path",
     "device_token_path", "load_device_token", "store_device_token",
 ]
