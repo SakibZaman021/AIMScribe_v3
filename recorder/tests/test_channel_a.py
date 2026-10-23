@@ -438,3 +438,34 @@ async def test_stop_works_whether_or_not_armed(controller):
     await _open(controller, "P1")
     result = await controller.stop_session(reason="doctor_stopped")
     assert result["status"] == "stopped" and controller.state == "idle"
+
+
+# ============================================================
+# 3.7: a new PC joins at its first consultation
+# ============================================================
+
+async def test_a_new_pc_registers_at_its_first_consultation_then_records(controller):
+    asked = []
+
+    async def register(cmed_clinic):
+        asked.append(cmed_clinic)
+        controller.device_id, controller.hospital_id = "D-NEW", "HOSP003"
+        return None
+
+    controller.device_id, controller.register = "", register
+    result = await _open(controller)
+    assert asked == [_trigger("P1", "2026-09-13T10:00:00+06:00").hospital_id]
+    assert result["status"] == "recording"
+    assert controller.status()["hospital_id"] == "HOSP003"
+
+
+async def test_a_new_pc_that_cannot_join_says_why_and_records_nothing(controller):
+    async def register(cmed_clinic):
+        return "UNKNOWN_CLINIC"
+
+    controller.device_id, controller.register = "", register
+    with pytest.raises(SessionError) as err:
+        await _open(controller)
+    assert err.value.code == "DEVICE_NOT_ENROLLED"
+    assert "UNKNOWN_CLINIC" in str(err.value)
+    assert controller.state == "idle"

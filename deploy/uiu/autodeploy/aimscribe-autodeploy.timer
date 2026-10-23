@@ -1,0 +1,12 @@
+# Looks for a new commit on main every two minutes. A run that finds
+# nothing new is one `git fetch`.
+[Unit]
+Description=AIMScribe: look for a new commit on GitHub main
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+
+[Install]
+WantedBy=timers.target

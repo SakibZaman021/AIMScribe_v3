@@ -5,10 +5,12 @@ When a doctor opens a patient, CMED's page sends the trigger to the recorder
 and CMED's server sends API 2 to us. Both carry the same five fields, and
 when the two meet the recording is tied to CMED's clinical record.
 
-Meeting is enrichment, never admission. A recording started by CMED's trigger
-is an authentic consultation whatever happens to API 2: it is archived and kept
-whether API 2 arrives in a second, a month later or never. Deleting it for want
-of API 2 turned every CMED outage into lost consultations.
+Only what CMED's server confirms is kept. Every recording reaches the server
+at once - audio never waits on a laptop for CMED - and API 2 or API 3 (Channel
+B) confirms it whenever it arrives: in a second, or days later after a network
+outage. A recording CMED has not confirmed within UNCONFIRMED_ERASE_DAYS of
+opening is erased, as a refused one is. A clinic CMED has sent nothing for in
+the last day erases nothing: an outage is not a reason to lose consultations.
 
 This module holds the rules that do not need a database: what a valid set of
 five fields is, and the time limits.
@@ -39,15 +41,33 @@ CONFIRM_DEADLINE = timedelta(minutes=2)        # SRS-CNF-08: then shown "unconfi
 
 # Every recording reaches storage: a clinic's power or internet can be down
 # for hours, and API 2 and 3 then arrive late - audio must not wait on a
-# laptop for them. What decides whether a recording is in the DATASET is its
-# marking, written into the JSON beside the audio and kept current: confirmed
-# (CMED's own server vouched for this consultation, with that hospital's
-# token) or not yet. A PC's signature proves which PC recorded; only CMED
-# proves a consultation took place. Only a patient's refusal removes a
-# recording (SRS-CNS-04); "expired" remains for rows erased by older servers.
-ARCHIVABLE = frozenset({"confirmed", "legacy", "pending", "unconfirmed"})
+# laptop for them. A PC's signature proves which PC recorded; only CMED proves
+# a consultation took place, so only a confirmed recording is kept, copied to
+# the cloud archive and in the DATASET. The others wait, archived on the
+# server, until CMED confirms them or their erase_after passes ("expired").
+# Joined into a WAV on the server only once confirmed: a waiting recording
+# stays as its pieces in the cloud, so no audio waits on the server's disk.
+ARCHIVABLE = frozenset({"confirmed"})
 DATASET = frozenset({"confirmed"})
 WAITING = frozenset({"pending", "unconfirmed"})
+# Erased when erase_after passes: everything not confirmed. A legacy recording
+# (a recorder too old to ask for a grant) can never be confirmed.
+ERASABLE = frozenset({"pending", "unconfirmed", "legacy"})
+
+# A clinic CMED has sent nothing for in this long is treated as an outage:
+# its recordings wait, however old, and an alert says so.
+CMED_SILENT_AFTER = timedelta(hours=24)
+
+
+def unconfirmed_erase_days() -> int:
+    """AIMS_UNCONFIRMED_ERASE_DAYS: 7 by default, never under 2."""
+    raw = os.getenv("AIMS_UNCONFIRMED_ERASE_DAYS", "7").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        logger.warning("AIMS_UNCONFIRMED_ERASE_DAYS=%r is not a number; using 7", raw)
+        return 7
+    return max(days, 2)
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 FIVE_FIELDS = ("patient_id", "doctor_id", "hospital_id", "start_time", "date")

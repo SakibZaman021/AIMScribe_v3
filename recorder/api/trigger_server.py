@@ -58,6 +58,13 @@ class ForceResetRequest(BaseModel):
 # Runtime
 # ============================================================
 
+# A new PC with a TPM key and no token: not a problem, it joins at its first
+# consultation. Shown as a warning, so the tray does not say BLOCKED.
+AWAITING_REGISTRATION = ("This PC joins AIMS LAB by itself the first time CMED opens a "
+                         "patient on it; it needs the internet at that moment, once.")
+# How long a CMED click waits for this PC to register before it is told why not.
+REGISTER_WAIT_SECONDS = 8.0
+
 NOT_ENROLLED = ("This device is not enrolled. An administrator must install it with "
                 "-EnrollmentToken, or place enrollment.token in the state folder.")
 
@@ -135,7 +142,12 @@ class Runtime:
         except Exception as exc:
             logger.error("Enrollment check failed: %s", exc)
 
-        if self.identity is None:
+        from core.enrollment import can_self_register, read_pending_token
+        self_register = (self.identity is None and not read_pending_token(self.cfg)
+                         and can_self_register(self.cfg, self.device_key))
+        if self_register:
+            self.warnings.append(AWAITING_REGISTRATION)
+        elif self.identity is None:
             self.problems.append(NOT_ENROLLED)
 
         from core.enrollment import load_device_token
@@ -168,6 +180,8 @@ class Runtime:
             self.controller.hospital_id = self.identity.hospital_id
             self.controller.doctor_id = self.identity.doctor_id
 
+        if self_register:
+            self.controller.register = self.register_from_trigger
         await self.controller.start()
         self.ws.set_controller(self.controller)
         self.ws.set_register_source(self.uploader, self.controller.hospital_id)
@@ -219,6 +233,37 @@ class Runtime:
                 continue
             self.adopt_identity(identity, load_device_token(self.cfg))
 
+    async def register_from_trigger(self, cmed_hospital_id: str) -> Optional[str]:
+        """
+        A new PC's first CMED consultation: join at the clinic CMED named.
+        Returns None once registered, else why not, for the doctor's screen.
+        One registration at a time; a click that arrives meanwhile waits for it.
+        """
+        import asyncio
+        from core.enrollment import EnrollmentError, load_device_token, register
+        from core.uploader import build_ssl_context
+
+        lock = self.__dict__.setdefault("_register_lock", asyncio.Lock())
+        async with lock:
+            if self.identity is not None:
+                return None
+            try:
+                identity = await asyncio.wait_for(
+                    register(self.cfg, self.device_key, cmed_hospital_id,
+                             ssl_context=build_ssl_context(self.cfg)),
+                    timeout=REGISTER_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("Registration did not finish in %.0f s; the next patient "
+                               "tries again", REGISTER_WAIT_SECONDS)
+                return "the AIMS LAB server did not answer in time"
+            except EnrollmentError as exc:
+                logger.error("Registration failed: %s", exc)
+                return exc.code or "the AIMS LAB server could not be reached"
+            self.adopt_identity(identity, load_device_token(self.cfg))
+            if self.controller is not None:
+                self.controller.register = None
+            return None
+
     def adopt_identity(self, identity, device_token: Optional[str]) -> None:
         """Enrolled while running: from now on this PC records and uploads."""
         self.identity = identity
@@ -232,6 +277,8 @@ class Runtime:
             self.ws.set_register_source(self.uploader, identity.hospital_id)
         if NOT_ENROLLED in self.problems:
             self.problems.remove(NOT_ENROLLED)
+        if AWAITING_REGISTRATION in getattr(self, "warnings", ()):
+            self.warnings.remove(AWAITING_REGISTRATION)
         logger.info("Enrolled as device %s at %s; ready to record",
                     identity.device_id, identity.hospital_id)
         if self.uploader is not None:

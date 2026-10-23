@@ -67,3 +67,41 @@ async def test_a_refused_token_is_not_tried_for_ever(monkeypatch):
 def test_only_a_4xx_counts_as_refused():
     assert enrollment.EnrollmentError("x", rejected=True).rejected
     assert not enrollment.EnrollmentError("x").rejected
+
+
+# 3.7: a PC with a TPM key and no token joins at its first consultation.
+
+def registering(monkeypatch, outcome):
+    rt, _ = runtime(monkeypatch, [])
+    rt.problems, rt.warnings = [], [ts.AWAITING_REGISTRATION]
+    rt.controller.register = object()
+    asked = []
+
+    async def register(cfg, key, cmed_clinic, ssl_context=None):
+        asked.append(cmed_clinic)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(enrollment, "register", register)
+    return rt, asked
+
+
+async def test_the_first_consultation_registers_the_pc(monkeypatch):
+    identity = Identity(device_id="D-NEW", hospital_id="AALO_DHOLPUR", doctor_id="")
+    rt, asked = registering(monkeypatch, identity)
+    assert await rt.register_from_trigger("CMED-DHOLPUR") is None
+    assert asked == ["CMED-DHOLPUR"]
+    assert (rt.controller.device_id, rt.controller.hospital_id) == ("D-NEW", "AALO_DHOLPUR")
+    assert rt.uploader.token == "device-token" and rt.warnings == []
+    assert rt.controller.register is None            # joined: never asked again
+    assert await rt.register_from_trigger("CMED-DHOLPUR") is None and len(asked) == 1
+
+
+async def test_a_refused_registration_says_why_and_the_next_patient_tries_again(monkeypatch):
+    rt, asked = registering(monkeypatch, enrollment.EnrollmentError(
+        "server refused registration (403 UNKNOWN_CLINIC)", rejected=True,
+        code="UNKNOWN_CLINIC"))
+    assert await rt.register_from_trigger("CMED-NOWHERE") == "UNKNOWN_CLINIC"
+    assert rt.identity is None and rt.controller.register is not None
+    assert rt.warnings == [ts.AWAITING_REGISTRATION]

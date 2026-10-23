@@ -312,8 +312,9 @@ class ArchiveWorker:
     def sweep(self) -> None:
         """
         Ask the server to settle confirmation deadlines (SRS 3.2 §5.6):
-        two minutes without CMED's API 2 makes a recording unconfirmed, and 24
-        hours erases it. Best effort - archiving goes on if this fails.
+        two minutes without CMED's API 2 makes a recording unconfirmed; one CMED
+        never confirms is erased on its erase_after (7 days), never while CMED
+        is silent for its clinic. Best effort - archiving goes on if this fails.
         """
         try:
             response = self.session.post(

@@ -134,6 +134,8 @@ def test_cmeds_token_and_fhir_routes_are_not_blocked():
 def test_the_lab_door_serves_admin_and_dashboard_only():
     door = _block(CADDYFILE, "http://:6001")
     assert "@lab path /api/v2/admin /api/v2/admin/* /api/v2/dashboard " in door
+    # /health/ready too: the deployer asks it from the droplet itself.
+    assert "/health /health/*" in door
     assert "respond 404" in door
 
 
@@ -287,12 +289,45 @@ def test_the_schema_is_applied_in_the_order_the_tests_prove():
     file-name order, as test_db_integration.py - not from a list kept by hand,
     which is how a new migration would be one a new server never got.
     """
-    schema = (HERE / "postgres" / "init" / "02_schema.sh").read_text(encoding="utf-8")
-    assert "for script in /aims/scripts/0[0-9][0-9]_*.sql; do" in schema
+    runner = (HERE / "postgres" / "migrate.sh").read_text(encoding="utf-8")
+    assert "for script in /aims/scripts/0[0-9][0-9]_*.sql; do" in runner
     integration = (HERE.parent.parent / "backend" / "tests"
                    / "test_db_integration.py").read_text(encoding="utf-8")
     assert 'glob("0[0-9][0-9]_*.sql")' in integration
-    assert "SET ROLE aims_recordings" in schema
+    assert "apply aims_recordings aims_recordings" in runner
+    assert 'echo "SET ROLE $2;"' in runner
+
+
+def test_a_new_server_and_an_update_build_the_schema_the_same_way():
+    """One runner: 02_schema.sh calls it on a new server, the deployer on an update."""
+    schema = (HERE / "postgres" / "init" / "02_schema.sh").read_text(encoding="utf-8")
+    assert "AIMS_MIGRATIONS_FRESH=1 sh /aims/migrate.sh" in schema
+    mounts = SERVICES["postgres"]["volumes"]
+    assert "./postgres/migrate.sh:/aims/migrate.sh:ro" in mounts
+    deployer = (HERE / "autodeploy" / "autodeploy.sh").read_text(encoding="utf-8")
+    assert 'exec -T postgres sh -s < "$STACK/postgres/migrate.sh"' in deployer
+
+
+def test_a_migration_is_applied_once_and_never_guessed():
+    runner = (HERE / "postgres" / "migrate.sh").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS aims_migrations" in runner
+    assert "not applied again" in runner                    # an edited file is reported
+    assert "has tables but no migration ledger" in runner  # an old server is adopted, not re-run
+    assert "set -eu" in runner
+
+
+def test_the_deployer_runs_as_aims_and_holds_no_key_to_github():
+    service = (HERE / "autodeploy" / "aimscribe-autodeploy.service").read_text(encoding="utf-8")
+    assert "User=aims" in service and "User=root" not in service
+    deployer = (HERE / "autodeploy" / "autodeploy.sh").read_text(encoding="utf-8")
+    assert "git push" not in deployer and "GITHUB_TOKEN" not in deployer
+    assert "merge-base --is-ancestor" in deployer          # a force-push is refused
+    assert "status --porcelain" in deployer                # so is a hand-edited server
+
+
+def test_shell_scripts_reach_linux_without_carriage_returns():
+    attributes = (HERE.parent.parent / ".gitattributes").read_text(encoding="utf-8")
+    assert "*.sh text eol=lf" in attributes
 
 
 def test_the_owner_of_the_tables_cannot_log_in_and_the_api_role_is_not_it():

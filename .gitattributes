@@ -6,3 +6,7 @@ recorder/tests/wire_vectors.json -text
 
 # A PDF is bytes. Line-ending conversion on checkout would corrupt it.
 *.pdf binary
+
+# Shell scripts run inside Linux containers, often straight from a Windows
+# checkout through a bind mount, where a carriage return breaks `set -eu`.
+*.sh text eol=lf

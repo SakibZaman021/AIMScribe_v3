@@ -222,7 +222,13 @@ class FakeRepo:
     async def cmed_token_lookup(self, digest):
         return self.tokens.get(digest)
 
-    async def record_notice(self, visit, *, hospital_id, clinical_record_id):
+    async def record_notice(self, visit, *, hospital_id, clinical_record_id, latest=True):
+        # One notice per visit, whichever of API 2 and API 3 brought it (025).
+        same = [n for n in self.notices if self._match(n, visit, hospital_id)]
+        if same:
+            if latest:
+                same[0]["clinical_record_id"] = clinical_record_id
+            return same[0]["id"]
         nid = len(self.notices) + 1
         self.notices.append(dict(
             id=nid, cmed_hospital_id=visit.cmed_hospital_id, hospital_id=hospital_id,
@@ -230,6 +236,9 @@ class FakeRepo:
             start_time=visit.start_time, visit_date=visit.day,
             clinical_record_id=clinical_record_id, claimed_by_jti=None, received_at=NOW()))
         return nid
+
+    async def cmed_heard_from(self, hospital_id):
+        self.__dict__.setdefault("heard", {})[hospital_id] = NOW()
 
     async def set_file_names(self, session_id, *, file_stem, local_start, local_end):
         self.sessions[session_id]["file_stem"] = file_stem
@@ -253,14 +262,17 @@ class FakeRepo:
         cutoff = NOW() - timedelta(hours=hours)
         return [dict(s) for s in self.sessions.values()
                 if s.get("archived_at") and s["archived_at"] < cutoff
-                and not s.get("copied_at")]
+                and not s.get("copied_at") and s.get("confirmation") == "confirmed"]
 
     async def pending_copy(self, limit=5):
+        # Only a recording CMED confirmed is copied to the cloud archive (025).
         return [dict(s) for s in self.sessions.values()
-                if s.get("archived_at") and not s.get("copied_at")][:limit]
+                if s.get("archived_at") and not s.get("copied_at")
+                and s.get("confirmation") == "confirmed"][:limit]
 
     async def pending_json(self, limit=5):
-        return [dict(s) for s in self.sessions.values() if s.get("json_stale")][:limit]
+        return [dict(s) for s in self.sessions.values()
+                if s.get("json_stale") and s.get("confirmation") == "confirmed"][:limit]
 
     async def mark_json_stale(self, session_id):
         session = self.sessions.get(session_id)
@@ -876,8 +888,10 @@ async def test_pending_becomes_unconfirmed_after_two_minutes(server):
 async def test_every_recording_is_stored_and_marked(server):
     """
     A clinic's power or internet can be down for hours and API 2 arrives late,
-    so audio never waits on a laptop for it: every recording but a refused one
-    is stored. Its JSON marks whether it is in the dataset, and why not.
+    so audio never waits on a laptop for it: every recording reaches the
+    server. Only a confirmed one is joined into a WAV on the server's disk; the
+    rest wait as pieces in the cloud. The marking says whether it is in the
+    dataset, and why not.
     """
     states = ("confirmed", "unconfirmed", "pending", "legacy", "refused")
     sids = {}
@@ -885,7 +899,7 @@ async def test_every_recording_is_stored_and_marked(server):
         sids[state] = open_session(server, segments=1)
         server.repo.sessions[sids[state]].update(confirmation=state, closed_at=NOW())
     ready = {s["session_id"] for s in await server.repo.pending_archive()}
-    assert ready == {sids[s] for s in states if s != "refused"}
+    assert ready == {sids["confirmed"]}
     for state, expected in (("confirmed", True), ("unconfirmed", False), ("legacy", False)):
         marking = await api_v2._marking(server.repo.sessions[sids[state]])
         assert marking["cmed_confirmed"] is expected
@@ -955,6 +969,20 @@ async def test_sweep_never_erases_a_recording_without_api2(server):
 # ============================================================
 # Refusal (SRS §7.8a)
 # ============================================================
+
+async def test_api3_confirms_a_recording_whose_api2_never_came(server):
+    """025: API 3 is CMED's server naming the same visit; it confirms when API 2 is lost."""
+    _, reply = await mint()
+    assert reply["confirmation"] == "pending"
+    sid = open_session(server)
+    await api_v2._link_grant(sid, reply["jti"], "P0012345", DEVICE)
+    await send("prescription", prescription())
+    assert server.repo.sessions[sid]["confirmation"] == "confirmed"
+    # API 2 arriving after it changes nothing, and leaves no second notice.
+    await send("patient_information", api2())
+    assert len(server.repo.notices) == 1
+    assert server.repo.heard[server.repo.auths[reply["jti"]]["hospital_id"]]
+
 
 async def test_refusal_erases_the_consultation(server):
     """AT-03, server side."""

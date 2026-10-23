@@ -241,7 +241,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
     rows = await conn.fetch("""
         SELECT device_id, hospital_id, machine_name, app_version,
                last_seen_at, spool_bytes, pending_segments, revoked_at,
-               held_sessions, held_count, disk_encrypted, clock_offset_seconds
+               held_sessions, held_count, disk_encrypted, clock_offset_seconds,
+               approval, registered_via
           FROM devices
          WHERE ($1::text IS NULL OR hospital_id = $1)
          ORDER BY hospital_id, machine_name
@@ -275,6 +276,9 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             "pending_segments": pending,
             "spool_mb": round((row["spool_bytes"] or 0) / 1024 ** 2, 1),
             "revoked": row["revoked_at"] is not None,
+            # 025: a PC that registered itself waits for CMED, or for a person.
+            "approval": row["approval"],
+            "registered_via": row["registered_via"],
             "silent": is_silent,
             "offline_periods": offline.get(row["device_id"], []),
             # U3: what this PC is holding because the server said no, and why.
@@ -296,6 +300,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             "held": held_all,
             "minimum_version": api_v2.min_recorder_version(),
             "outdated": sum(1 for r in rooms if r["outdated"] and not r["revoked"]),
+            "awaiting_approval": sum(1 for r in rooms
+                                     if r["approval"] == "pending" and not r["revoked"]),
             "unencrypted": sum(1 for r in rooms
                                if r["disk_encrypted"] is False and not r["revoked"])}
 
@@ -440,7 +446,7 @@ async def _copies(conn) -> Dict[str, Any]:
                EXTRACT(EPOCH FROM (now() - min(archived_at))) / 3600 AS oldest_hours
           FROM sessions
          WHERE archived_at IS NOT NULL AND copied_at IS NULL
-           AND quarantine_reason IS NULL
+           AND quarantine_reason IS NULL AND confirmation = 'confirmed'
     """)
     stale_pieces = await conn.fetchval("""
         SELECT count(*) FROM segments
@@ -524,7 +530,8 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         "stopped_early": "s.close_reason IS NOT NULL AND "
                          "s.close_reason NOT IN ('prescription_built', '')",
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
-        "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL",
+        "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
+                    "AND s.confirmation = 'confirmed'",
     }
     if state in states:
         where.append(states[state])

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 APP_NAME = "AIMScribe Recorder"
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.7.0"
 
 # Wire format version. The server rejects a mismatched agent rather than guessing.
 PROTOCOL_VERSION = 2
@@ -316,6 +316,9 @@ class SecurityConfig:
     allowed_hosts: frozenset = frozenset()
     local_api_key: str = ""
     require_grant: bool = True
+    # A PC with a TPM key and no enrolment token registers itself at its first
+    # CMED consultation, and is pending until CMED confirms its recordings.
+    self_register: bool = True
     enable_docs: bool = False
     grant_issuer: str = "aimslab"
     grant_audience: str = "aimscribe-recorder"
@@ -463,6 +466,7 @@ class Config:
                 "AIMS_ALLOWED_HOSTS", "localhost:5050,127.0.0.1:5050,[::1]:5050")),
             local_api_key=_str("AIMS_LOCAL_API_KEY"),
             require_grant=_bool("AIMS_REQUIRE_GRANT", True),
+            self_register=_bool("AIMS_SELF_REGISTER", True),
             enable_docs=_bool("AIMS_ENABLE_DOCS", False),
             grant_issuer=_str("AIMS_GRANT_ISSUER", "aimslab"),
             grant_audience=_str("AIMS_GRANT_AUDIENCE", "aimscribe-recorder"),

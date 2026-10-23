@@ -1165,6 +1165,24 @@ class UploadManager:
             self.consecutive_failures += 1
         return ok
 
+    REVOKED_PAUSE_SECONDS = 900
+
+    def _revoked(self, body: str) -> None:
+        """
+        This PC was revoked or rejected. Asking every ten seconds cannot change
+        that; ask every 15 minutes (an administrator may re-enrol it), keep
+        every recording on disk, and say so once.
+        """
+        self._quiet_until = max(self._quiet_until,
+                                time.monotonic() + self.REVOKED_PAUSE_SECONDS)
+        if not getattr(self, "_revoked_reported", False):
+            self._revoked_reported = True
+            logger.critical("This PC has been revoked by the AIMS LAB server: %s", body[:200])
+            self._emit("integrity_alert", {
+                "session_id": None, "alert_type": "device_revoked",
+                "detail": "the server revoked this PC; recordings stay on it until an "
+                          "administrator enrols it again"})
+
     def _quiet(self) -> bool:
         return time.monotonic() < self._quiet_until
 
@@ -1234,6 +1252,8 @@ class UploadManager:
                         logger.error("%s %s rejected: %s %s", method, endpoint,
                                      response.status, body)
                         self.last_error = f"{response.status} {body}"
+                        if response.status == 403 and "revoked" in body:
+                            self._revoked(body)
                         return None
 
                     logger.warning("%s %s failed: %s %s", method, endpoint,

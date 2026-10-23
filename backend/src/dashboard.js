@@ -481,6 +481,7 @@ function drawCopies(d) {
    ============================================================ */
 const PC_FILTERS = [
   ["all", "All", () => true],
+  ["approval", "Waiting for approval", (q) => q.approval === "pending" && !q.revoked],
   ["offline", "Offline", (q) => q.silent && !q.revoked],
   ["outdated", "Needs update", (q) => q.outdated && !q.revoked],
   ["unencrypted", "Disk not encrypted", (q) => q.disk_encrypted === false && !q.revoked],
@@ -550,8 +551,14 @@ function drawRooms(d) {
     // Offline first inside each clinic.
     list.sort((a, b) => (b.silent && !b.revoked) - (a.silent && !a.revoked));
     body += list.map((q) => {
-      const state = q.revoked ? tag("quiet", "Revoked")
-        : q.silent ? tag("bad", "Offline") : tag("good", "Online");
+      const waits = q.approval === "pending" && !q.revoked;
+      const state = (q.revoked ? tag("quiet", "Revoked")
+        : q.silent ? tag("bad", "Offline") : tag("good", "Online"))
+        + (waits ? " " + tag("warn", "Waiting for CMED",
+          "Registered itself. Approved when CMED confirms 2 of its recordings, or here.")
+          + `<br><button type="button" class="chip" data-decide="approve" data-device="${esc(q.device_id)}">Approve</button>`
+          + ` <button type="button" class="chip" data-decide="reject" data-device="${esc(q.device_id)}">Reject</button>`
+          : "");
       const version = q.outdated
         ? tag("warn", `${q.app_version || "?"} · update`, `Below ${minV}`)
         : esc(q.app_version || "–");
@@ -569,6 +576,7 @@ function drawRooms(d) {
         ? `<b>${num(q.pending_segments)}</b> pieces · ${num(q.spool_mb)} MB`
         : `<span class="hint">0 · ${num(q.spool_mb)} MB</span>`;
       const rowTone = q.revoked ? "" : q.silent || q.held_count ? "row-bad"
+        : waits ? "row-warn"
         : q.outdated || q.disk_encrypted === false ? "row-warn" : "";
       return `<tr class="${rowTone}">`
         + td("PC", `<b>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</b>`)
@@ -587,6 +595,28 @@ function drawRooms(d) {
     + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Disk</th>`
     + `<th class="num">Clock</th><th>Offline (7 days)</th></tr></thead><tbody>${body}</tbody></table>`;
 }
+
+// A PC that registered itself: a person approves or rejects it, by name.
+$("rooms").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-decide]");
+  if (!b) return;
+  const approve = b.dataset.decide === "approve";
+  const who = (window.prompt(`${approve ? "Approve" : "Reject"} this PC. Your name, for the audit log:`) || "").trim();
+  if (who.length < 2) return;
+  if (!approve && !window.confirm("Reject and revoke this PC? Anything it recorded that CMED did not confirm is erased on its date.")) return;
+  if (!ADMIN_KEY) await askKey();
+  b.disabled = true;
+  try {
+    const response = await fetch(`/api/v2/admin/device/${encodeURIComponent(b.dataset.device)}/${b.dataset.decide}`,
+      { method: "POST", headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ decided_by: who }) });
+    if (!response.ok) throw new Error(`Server error ${response.status}`);
+    await refresh();
+  } catch (err) {
+    b.disabled = false;
+    window.alert(`Not done: ${err.message}`);
+  }
+});
 
 /* ============================================================
    Held on PCs: kept on a PC because this server said no.

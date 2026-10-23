@@ -335,9 +335,16 @@ async def process(kind: str, body: Dict[str, Any], raw: str,
     # by the sweep; it never fails the request (SRS-CRI-04).
     await store.load(record_id)
 
-    if kind == "patient_information" and hospital_id is not None:
+    if hospital_id is not None:
+        # CMED's server is talking to us for this clinic: not an outage, so its
+        # unconfirmed recordings may be erased when their time comes.
+        await repo.cmed_heard_from(hospital_id)
+        # API 2 confirms the recording; so does API 3, when API 2 was lost or is
+        # still on its way. Both are CMED's server naming the same five fields,
+        # and they share one notice per visit.
         notice_id = await repo.record_notice(visit, hospital_id=hospital_id,
-                                             clinical_record_id=record_id)
+                                             clinical_record_id=record_id,
+                                             latest=kind == "patient_information")
         await confirm_waiting(visit, hospital_id, notice_id)
     if hospital_id is not None:
         # An unmapped clinic's records attach to nothing: which recording they

@@ -35,6 +35,7 @@ import hmac
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -397,6 +398,29 @@ def enrolment_proof_message(token: str, public_key: bytes) -> bytes:
     """
     return (ENROLMENT_PROOF_DOMAIN + hashlib.sha256(token.encode("utf-8")).hexdigest()
             .encode("ascii") + b"\n" + public_key.hex().encode("ascii"))
+
+
+REGISTRATION_PROOF_DOMAIN = b"AIMS-REGISTER-V1\n"
+
+
+def registration_proof_message(cmed_hospital_id: str, public_key: bytes,
+                               timestamp: int) -> bytes:
+    """
+    What a PC signs when it registers itself, without a token: the clinic it
+    says it is in (CMED's code, from CMED's own trigger), the key, and the
+    time - so a registration seen on the wire cannot be replayed later.
+    """
+    return (REGISTRATION_PROOF_DOMAIN + cmed_hospital_id.encode("utf-8") + b"\n"
+            + public_key.hex().encode("ascii") + b"\n" + str(int(timestamp)).encode("ascii"))
+
+
+# A self-registered PC's id is its key's: the PC knows it before the server has
+# ever answered, so it can record its first consultation offline.
+DEVICE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://aimscribe/device-key/v1")
+
+
+def device_id_for_key(public_key: bytes) -> uuid.UUID:
+    return uuid.uuid5(DEVICE_ID_NAMESPACE, public_key.hex())
 
 
 def chain_summary(entries: Sequence[ChainEntry]) -> Dict[str, Any]:

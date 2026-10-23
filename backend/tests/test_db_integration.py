@@ -704,7 +704,8 @@ async def test_what_keeps_a_rogue_pc_out_of_the_dataset_runs_on_postgres(dbs):
     assert (await repo.session_for_visit(v, "HOSP003"))["session_id"] == sid
     assert await repo.session_for_visit(v, "HOSP999") is None
 
-    # Every recording is stored, confirmed or not; the JSON carries the marking.
+    # Every recording reaches the server; only a confirmed one is joined into a
+    # WAV on its disk. One still waiting stays as its pieces in the cloud.
     async with dbs.rec.acquire() as conn:
         await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
     held = await a_session(repo, first)
@@ -724,17 +725,13 @@ async def test_what_keeps_a_rogue_pc_out_of_the_dataset_runs_on_postgres(dbs):
                                   bytes, duration_seconds, state)
             VALUES ($1, 1, 1, $2, $3, 100, 1.0, 'committed')
         """, held, f"audio/{held}/seg_00001.wav", digest)
-    ready = {p["session_id"] for p in await repo.pending_archive(50)}
-    assert held in ready
+    assert held not in {p["session_id"] for p in await repo.pending_archive(50)}
 
-    # Confirmed after it was stored: its JSON is written again with the marking.
+    # CMED confirms it, however late: now it is joined and archived.
+    await repo.set_session_confirmation(held, "confirmed")
+    assert held in {p["session_id"] for p in await repo.pending_archive(50)}
     await repo.mark_archived(held, relpath="x/held.wav", sha256=b"\x11" * 32,
                              byte_length=44)
-    async with dbs.rec.acquire() as conn:
-        await conn.execute("UPDATE sessions SET json_stale = false WHERE session_id = $1",
-                           held)
-    await repo.set_session_confirmation(held, "confirmed")
-    assert held in [p["session_id"] for p in await repo.pending_json(50)]
 
     # A PC revoked as untrusted: its recordings not yet archived are held.
     # Already archived (held, above) stays as it is, marked; the rest is held.
@@ -1206,3 +1203,300 @@ async def test_the_same_piece_committed_twice_at_once_is_a_duplicate(dbs):
         byte_length=10, duration_seconds=1.0, sha256=other, rms_mean=1.0,
         captured_start_at=datetime.now(timezone.utc),
         captured_end_at=datetime.now(timezone.utc), is_final=False) == "conflict"
+
+
+async def test_the_viewer_sorts_recordings_by_day_and_clinic(dbs):
+    """023: a day's count per clinic, and the files behind every problem."""
+    device = await enrolled_device(dbs.repo)
+    # In the past: the grid of quiet days runs up to today.
+    day = date(2026, 1, 15)
+    fine, corrupt, short, odd_end = [await a_session(dbs.repo, device) for _ in range(4)]
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("""
+            UPDATE sessions
+               SET session_date = $2, status = 'archived', confirmation = 'confirmed',
+                   closed_at = now(), archived_at = now(), copied_at = now(),
+                   chain_verified_at = now(), archive_relpath = session_id || '.wav',
+                   archive_sha256 = $3, archive_bytes = 1000000,
+                   total_duration_seconds = 600, close_reason = 'doctor_stopped'
+             WHERE session_id = ANY($1::text[])
+        """, [fine, corrupt, short, odd_end], day, b"" * 32)
+        await conn.execute("UPDATE sessions SET status = 'quarantined', "
+                           "quarantine_reason = 'segment hash mismatch on arrival' "
+                           "WHERE session_id = $1", corrupt)
+        await conn.execute("UPDATE sessions SET total_duration_seconds = 2 "
+                           "WHERE session_id = $1", short)
+        await conn.execute("UPDATE sessions SET close_reason = 'tray_stop' "
+                           "WHERE session_id = $1", odd_end)
+
+        problems = {r["internal_key"]: r for r in await conn.fetch(
+            "SELECT * FROM v_audio_problems WHERE day = $1 AND hospital_id = 'HOSP003'", day)}
+        daily = await conn.fetchrow(
+            "SELECT * FROM v_audio_daily WHERE day = $1 AND hospital_id = 'HOSP003'", day)
+        quiet = await conn.fetchval(
+            "SELECT recordings FROM v_audio_daily WHERE day = $1 AND hospital_id = 'HOSP003'",
+            day + timedelta(days=1))
+        # Every way a consultation normally ends, none of them a problem.
+        for reason in api_v2.NORMAL_CLOSE_REASONS:
+            await conn.execute("UPDATE sessions SET close_reason = $2 WHERE session_id = $1",
+                               fine, reason)
+            assert not await conn.fetchval(
+                "SELECT count(*) FROM v_audio_problems WHERE internal_key = $1", fine), reason
+
+    assert set(problems) == {corrupt, short, odd_end}
+    assert problems[corrupt]["severity"] == "critical"
+    assert "segment hash mismatch" in problems[corrupt]["problems"]
+    assert problems[short]["problems"] == "under 5 seconds of audio"
+    assert problems[odd_end]["problems"] == "ended abnormally: tray_stop"
+    assert (daily["recordings"], daily["wav_saved"], daily["in_cloud"]) == (4, 4, 4)
+    assert (daily["corrupted"], daily["critical"], daily["need_attention"]) == (1, 1, 3)
+    # A clinic that recorded nothing that day is listed, with a zero.
+    assert quiet == 0
+
+
+async def test_the_viewer_names_each_pc_and_its_requests(dbs):
+    """024: a nonce reads as a PC at a clinic, and a replay is still refused."""
+    device = await enrolled_device(dbs.repo)
+    assert await dbs.repo.use_device_nonce(device["device_id"], "nonce-viewer-1")
+    assert not await dbs.repo.use_device_nonce(device["device_id"], "nonce-viewer-1")
+
+    async with dbs.rec.acquire() as conn:
+        pc = await conn.fetchrow("SELECT * FROM v_devices WHERE device_id = $1",
+                                 device["device_id"])
+        request = await conn.fetchrow(
+            "SELECT * FROM v_device_requests WHERE nonce = 'nonce-viewer-1'")
+        # A nonce from no PC the database knows is refused by the database itself.
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute("INSERT INTO device_nonces (device_id, nonce) "
+                               "VALUES (gen_random_uuid(), 'nonce-from-nowhere')")
+        described = await conn.fetchval("SELECT obj_description('device_nonces'::regclass)")
+
+    assert (pc["hospital_id"], pc["machine_name"]) == ("HOSP003", "PC")
+    assert pc["state"] == "enrolled, never heard from"
+    assert pc["signed_requests_15min"] == 1
+    assert (request["hospital_id"], request["machine_name"]) == ("HOSP003", "PC")
+    assert "v_device_requests" in described
+
+
+# ============================================================
+# 025: only what CMED confirms is kept; PCs that register themselves
+# ============================================================
+
+def _p256():
+    """A P-256 key, as a TPM holds one: the raw point, and r||s signatures."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    key = ec.generate_private_key(ec.SECP256R1())
+    public = key.public_key().public_bytes(serialization.Encoding.X962,
+                                           serialization.PublicFormat.UncompressedPoint)
+
+    def sign(message: bytes) -> bytes:
+        r, s = decode_dss_signature(key.sign(message, ec.ECDSA(hashes.SHA256())))
+        return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return public, sign
+
+
+def _registration(cmed_code="CMED-DHOLPUR", *, key=None, at=None, machine="CLINIC-PC"):
+    import base64
+    import time
+    import integrity
+    public, sign = key or _p256()
+    stamp = int(time.time() if at is None else at)
+    proof = sign(integrity.registration_proof_message(cmed_code, public, stamp))
+    return api_v2.RegisterRequest(
+        device_pubkey=public.hex(),
+        key_proof=base64.urlsafe_b64encode(proof).rstrip(b"=").decode(),
+        cmed_hospital_id=cmed_code, timestamp=stamp, machine_name=machine,
+        app_version="3.7.0")
+
+
+def _caller(address="203.0.113.7"):
+    return SimpleNamespace(client=SimpleNamespace(host=address), headers={})
+
+
+def _refusal(reply):
+    """A _coded() refusal as (status, code)."""
+    return reply.status_code, json.loads(reply.body)["code"]
+
+
+async def test_a_pc_registers_itself_and_cmed_confirming_two_visits_approves_it(dbs):
+    """025: no token; pending until CMED's server confirms two of its recordings."""
+    import integrity
+    await enrolled_device(dbs.repo)                       # HOSP003 <- CMED-DHOLPUR
+    key = _p256()
+    _server(dbs)
+    try:
+        reply = await api_v2.register_device(_registration(key=key), _caller())
+        assert reply["approval"] == "pending"
+        assert reply["device_id"] == str(integrity.device_id_for_key(key[0]))
+        assert reply["hospital_id"] == "HOSP003"
+        pc = await dbs.repo.device_by_token(reply["device_token"])
+        assert pc["approval"] == "pending"
+
+        first = await a_session(dbs.repo, pc)
+        second = await a_session(dbs.repo, pc)
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE sessions SET confirmation = 'confirmed' "
+                               "WHERE session_id = $1", first)
+            after_one = await conn.fetchval(
+                "SELECT approval FROM devices WHERE device_id = $1", pc["device_id"])
+            await conn.execute("UPDATE sessions SET confirmation = 'confirmed' "
+                               "WHERE session_id = $1", second)
+            after_two = await conn.fetchrow(
+                "SELECT approval, approved_by FROM devices WHERE device_id = $1",
+                pc["device_id"])
+        assert after_one == "pending"
+        assert (after_two["approval"], after_two["approved_by"]) == ("approved", "cmed")
+
+        await api_v2._settle_unconfirmed()                 # the sweep writes the audit entry
+        async with dbs.rec.acquire() as conn:
+            audited = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE device_id = $1 "
+                "AND event_type = 'device.approved'", pc["device_id"])
+        assert audited == 1
+    finally:
+        _unserve()
+
+
+async def test_what_an_outsider_cannot_register(dbs, monkeypatch):
+    """025: a wrong clinic, a key it does not hold, an old proof, too many at once."""
+    import time
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        assert _refusal(await api_v2.register_device(
+            _registration("NOT-A-CLINIC"), _caller())) == (403, "UNKNOWN_CLINIC")
+
+        forged = _registration()
+        forged.device_pubkey = _p256()[0].hex()            # proof made with another key
+        assert _refusal(await api_v2.register_device(forged, _caller())) \
+            == (401, "KEY_PROOF_INVALID")
+
+        assert _refusal(await api_v2.register_device(
+            _registration(at=time.time() - 3600), _caller())) == (401, "CLOCK")
+
+        # Asked again before it was ever heard from: a new token. After: refused,
+        # so a registration seen on the wire cannot take a working PC's token.
+        key = _p256()
+        first = await api_v2.register_device(_registration(key=key), _caller())
+        again = await api_v2.register_device(_registration(key=key), _caller())
+        assert again["device_id"] == first["device_id"]
+        assert again["device_token"] != first["device_token"]
+        await dbs.repo.touch_device(first["device_id"])
+        assert _refusal(await api_v2.register_device(_registration(key=key), _caller())) \
+            == (409, "ALREADY_REGISTERED")
+
+        async with dbs.rec.acquire() as conn:
+            pending = await conn.fetchval(
+                "SELECT count(*) FROM devices WHERE hospital_id = 'HOSP003' "
+                "AND approval = 'pending' AND revoked_at IS NULL")
+        monkeypatch.setenv("AIMS_PENDING_DEVICES_PER_CLINIC", str(pending + 1))
+        assert "device_token" in await api_v2.register_device(_registration(), _caller())
+        assert _refusal(await api_v2.register_device(_registration(), _caller())) \
+            == (429, "TOO_MANY_PENDING")
+
+        monkeypatch.setenv("AIMS_SELF_REGISTRATION", "off")
+        assert _refusal(await api_v2.register_device(_registration(), _caller())) \
+            == (403, "SELF_REGISTRATION_OFF")
+    finally:
+        _unserve()
+
+
+async def test_a_pending_pc_uploads_only_its_allowance(dbs, monkeypatch):
+    """025: an outsider who registers can never put more than this on the server."""
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    api_v2.ctx.minio.get_presigned_upload_url = lambda key, expires: f"https://put/{key}"
+    monkeypatch.setenv("AIMS_PENDING_UPLOAD_MB", "1")
+    try:
+        reply = await api_v2.register_device(_registration(), _caller())
+        pc = await dbs.repo.device_by_token(reply["device_token"])
+        sid = await a_session(dbs.repo, pc)
+        small = await api_v2.authorize_segment(
+            api_v2.AuthorizeRequest(session_id=sid, seq_no=1, bytes=500_000,
+                                    sha256="a" * 64), device=pc)
+        assert "upload_url" in small
+        large = await api_v2.authorize_segment(
+            api_v2.AuthorizeRequest(session_id=sid, seq_no=2, bytes=2 * 1024 * 1024,
+                                    sha256="b" * 64), device=pc)
+        assert _refusal(large) == (429, "AWAITING_APPROVAL")
+        assert large.headers["Retry-After"] == "300"
+    finally:
+        _unserve()
+
+
+async def test_only_what_cmed_confirms_is_kept_and_an_outage_erases_nothing(dbs):
+    """025: erased on its date unless confirmed - but never while CMED is silent."""
+    from datetime import timedelta as days_ago
+    device = await enrolled_device(dbs.repo)
+    await dbs.repo.upsert_hospital("HOSPERASE", "Erase clinic", "Asia/Dhaka")
+    old = days_ago(days=8)
+    waiting = await a_session(dbs.repo, device, opened_ago=old)
+    kept = await a_session(dbs.repo, device, opened_ago=old)
+    held = await a_session(dbs.repo, device, opened_ago=old)
+    young = await a_session(dbs.repo, device, opened_ago=days_ago(days=1))
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("""
+            UPDATE sessions SET hospital_id = 'HOSPERASE', confirmation = 'unconfirmed',
+                   patient_id = 'PERASE1'
+             WHERE session_id = ANY($1::text[])
+        """, [waiting, kept, held, young])
+        await conn.execute("UPDATE sessions SET legal_hold = true WHERE session_id = $1", held)
+    _server(dbs)
+    try:
+        # CMED has never been heard from for this clinic: an outage, nothing goes.
+        await api_v2._settle_unconfirmed()
+        async with dbs.rec.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT confirmation FROM sessions WHERE session_id = $1", waiting) \
+                == "unconfirmed"
+            silent = await conn.fetchval(
+                "SELECT detail->>'count' FROM integrity_alerts "
+                "WHERE alert_type = 'erase_held_cmed_silent' "
+                "AND detail->>'hospital_id' = 'HOSPERASE'")
+        assert silent == "2"            # both still waiting then
+
+        # CMED is talking again; one of them is confirmed just in time.
+        await dbs.repo.cmed_heard_from("HOSPERASE")
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE sessions SET confirmation = 'confirmed' "
+                               "WHERE session_id = $1", kept)
+        await api_v2._settle_unconfirmed()
+
+        async with dbs.rec.acquire() as conn:
+            rows = {r["session_id"]: r for r in await conn.fetch(
+                "SELECT session_id, confirmation, patient_id, erase_after FROM sessions "
+                "WHERE session_id = ANY($1::text[])", [waiting, kept, held, young])}
+            audited = await conn.fetchval(
+                "SELECT detail->>'reason' FROM audit_log WHERE session_id = $1 "
+                "AND event_type = 'session.expired'", waiting)
+        assert (rows[waiting]["confirmation"], rows[waiting]["patient_id"]) \
+            == ("expired", "REDACTED")
+        assert rows[kept]["confirmation"] == "confirmed"
+        assert rows[kept]["erase_after"] is None              # cleared by the database
+        assert rows[held]["confirmation"] == "unconfirmed"    # a legal hold is never erased
+        assert rows[young]["confirmation"] == "unconfirmed"
+        assert rows[young]["erase_after"] is not None         # its date is set, and shown
+        assert audited == "not confirmed by CMED"
+    finally:
+        _unserve()
+
+
+async def test_a_pc_cmed_never_vouches_for_is_rejected(dbs):
+    """025: pending for AIMS_PENDING_DEVICE_DAYS without two confirmations."""
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        reply = await api_v2.register_device(_registration(), _caller())
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE devices SET enrolled_at = now() - interval '8 days' "
+                               "WHERE device_id = $1::uuid", reply["device_id"])
+        await api_v2._settle_unconfirmed()
+        async with dbs.rec.acquire() as conn:
+            pc = await conn.fetchrow("SELECT approval, revoked_at FROM devices "
+                                     "WHERE device_id = $1::uuid", reply["device_id"])
+        assert pc["approval"] == "rejected" and pc["revoked_at"] is not None
+        assert await dbs.repo.device_by_token(reply["device_token"]) is None
+    finally:
+        _unserve()

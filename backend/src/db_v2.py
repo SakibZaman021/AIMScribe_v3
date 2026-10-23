@@ -290,10 +290,126 @@ class V2Repository:
         async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT device_id, hospital_id, tpm_pubkey, app_version, revoked_at,
-                       signs_requests
+                       signs_requests, approval
                 FROM devices WHERE token_sha256 = $1
             """, hash_token(token))
         return dict(row) if row else None
+
+    # ============================================================
+    # PCs that register themselves (no enrolment token)
+    # ============================================================
+
+    async def register_device(self, *, device_id, tpm_pubkey: bytes, hospital_id: str,
+                              machine_name: str, os_version: str, app_version: str,
+                              protocol_version: int, registered_ip: Optional[str],
+                              pending_per_clinic: int, per_ip_per_day: int
+                              ) -> Dict[str, Any]:
+        """
+        A PC that proved it holds its key, at a clinic CMED named, joins as
+        pending. Returns {"device_id", "hospital_id", "device_token",
+        "approval"} or {"refused": reason}.
+
+        Asked again (the answer was lost on the way), it gets a new token only
+        while the server has never heard from it with the first one: after
+        that, a replayed registration could otherwise take its token away.
+        """
+        token = new_token()
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                # One registration per clinic at a time, so the cap holds.
+                await conn.execute("SELECT 1 FROM hospitals WHERE hospital_id = $1 FOR UPDATE",
+                                   hospital_id)
+                existing = await conn.fetchrow(
+                    "SELECT * FROM devices WHERE device_id = $1 FOR UPDATE", device_id)
+                if existing is not None:
+                    if bytes(existing["tpm_pubkey"]) != tpm_pubkey:
+                        return {"refused": "key_mismatch"}
+                    if existing["revoked_at"] is not None or existing["approval"] == "rejected":
+                        return {"refused": "revoked"}
+                    if existing["hospital_id"] != hospital_id:
+                        return {"refused": "other_clinic"}
+                    if existing["last_seen_at"] is not None:
+                        return {"refused": "already_registered"}
+                    await conn.execute("UPDATE devices SET token_sha256 = $2 WHERE device_id = $1",
+                                       device_id, hash_token(token))
+                    return {"device_id": str(device_id), "hospital_id": hospital_id,
+                            "device_token": token, "approval": existing["approval"]}
+
+                pending = await conn.fetchval("""
+                    SELECT count(*) FROM devices
+                     WHERE hospital_id = $1 AND approval = 'pending' AND revoked_at IS NULL
+                """, hospital_id)
+                if pending >= pending_per_clinic:
+                    return {"refused": "too_many_pending"}
+                if registered_ip:
+                    recent = await conn.fetchval("""
+                        SELECT count(*) FROM devices
+                         WHERE registered_via = 'self' AND registered_ip = $1
+                           AND enrolled_at > now() - interval '1 day'
+                    """, registered_ip)
+                    if recent >= per_ip_per_day:
+                        return {"refused": "too_many_from_address"}
+                await conn.execute("""
+                    INSERT INTO devices (device_id, hospital_id, tpm_pubkey, token_sha256,
+                                         machine_name, os_version, app_version,
+                                         protocol_version, signs_requests, approval,
+                                         registered_via, registered_ip)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8, true, 'pending', 'self', $9)
+                """, device_id, hospital_id, tpm_pubkey, hash_token(token),
+                     machine_name[:128], os_version[:256], app_version[:32],
+                     protocol_version, registered_ip)
+        return {"device_id": str(device_id), "hospital_id": hospital_id,
+                "device_token": token, "approval": "pending"}
+
+    async def device_upload_bytes(self, device_id) -> int:
+        """Everything this PC has uploaded and the server still holds."""
+        async with self._acquire() as conn:
+            return int(await conn.fetchval("""
+                SELECT COALESCE(sum(g.bytes), 0) FROM segments g
+                  JOIN sessions s ON s.session_id = g.session_id
+                 WHERE s.device_id = $1
+            """, device_id))
+
+    async def set_device_approval(self, device_id, approval: str, *, by: str) -> bool:
+        """An administrator's decision on a pending PC. Rejecting also revokes."""
+        async with self._acquire() as conn:
+            if approval == "approved":
+                result = await conn.execute("""
+                    UPDATE devices SET approval = 'approved', approved_at = now(),
+                                       approved_by = $2
+                     WHERE device_id = $1 AND approval = 'pending' AND revoked_at IS NULL
+                """, device_id, by[:128])
+            else:
+                result = await conn.execute("""
+                    UPDATE devices SET approval = 'rejected', revoked_at = now(),
+                                       revoked_reason = $2, token_sha256 = NULL
+                     WHERE device_id = $1 AND approval = 'pending'
+                """, device_id, f"rejected by {by}"[:500])
+        return result.endswith("1")
+
+    async def expire_pending_devices(self, days: int) -> List[Dict[str, Any]]:
+        """Pending this long without CMED confirming two of its recordings: rejected."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                UPDATE devices
+                   SET approval = 'rejected', revoked_at = now(), token_sha256 = NULL,
+                       revoked_reason = 'not confirmed by CMED within '
+                                        || $1::text || ' days of registering'
+                 WHERE approval = 'pending' AND revoked_at IS NULL
+                   AND enrolled_at < now() - make_interval(days => $1)
+             RETURNING device_id, hospital_id, machine_name
+            """, days)
+        return [dict(r) for r in rows]
+
+    async def approvals_to_audit(self) -> List[Dict[str, Any]]:
+        """PCs the database approved (two confirmed recordings) not yet in the audit log."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                UPDATE devices SET approval_audited = true
+                 WHERE NOT approval_audited
+             RETURNING device_id, hospital_id, machine_name, approved_by
+            """)
+        return [dict(r) for r in rows]
 
     async def touch_device(
         self, device_id, *, spool_bytes: Optional[int] = None,
@@ -328,18 +444,19 @@ class V2Repository:
         """
         True the first time this device sends this nonce. Nonces older than
         the signature window are swept a few hundred at a time, so the table
-        stays the size of fifteen minutes of traffic.
+        stays the size of fifteen minutes of traffic. One statement, so one
+        round trip on every signed request.
         """
         async with self._acquire() as conn:
             fresh = await conn.fetchval("""
+                WITH swept AS (
+                    DELETE FROM device_nonces WHERE (device_id, nonce) IN (
+                        SELECT device_id, nonce FROM device_nonces
+                         WHERE seen_at < now() - interval '15 minutes' LIMIT 200)
+                )
                 INSERT INTO device_nonces (device_id, nonce) VALUES ($1, $2)
                 ON CONFLICT DO NOTHING RETURNING 1
             """, device_id, nonce)
-            await conn.execute("""
-                DELETE FROM device_nonces WHERE (device_id, nonce) IN (
-                    SELECT device_id, nonce FROM device_nonces
-                     WHERE seen_at < now() - interval '15 minutes' LIMIT 200)
-            """)
         return bool(fresh)
 
     async def mark_device_signs(self, device_id) -> None:
@@ -818,9 +935,11 @@ class V2Repository:
                   AND s.quarantine_reason IS NULL
                   AND s.status <> 'quarantined'
                   AND s.protocol_version >= 2
-                  -- Every recording is stored; its JSON marks whether CMED
-                  -- confirmed it (confirmation.ARCHIVABLE, .DATASET).
-                  AND s.confirmation IN ('confirmed', 'legacy', 'pending', 'unconfirmed')
+                  -- Only a recording CMED confirmed is joined into a WAV
+                  -- (confirmation.ARCHIVABLE). One still waiting stays as its
+                  -- pieces in the segment bucket - in the cloud, not on this
+                  -- server's disk - until it is confirmed or erased.
+                  AND s.confirmation = 'confirmed'
                   AND EXISTS (SELECT 1 FROM segments g
                                WHERE g.session_id = s.session_id
                                  AND g.state = 'committed')
@@ -855,7 +974,9 @@ class V2Repository:
         Archived recordings whose lossless cloud copy has not been made.
 
         Until that copy exists and is verified, the pieces stay in the segment
-        bucket: they are the only other copy of the audio (SRS-ARC-08).
+        bucket: they are the only other copy of the audio (SRS-ARC-08). Only a
+        recording CMED has confirmed is copied: the archive bucket holds the
+        dataset, and nothing it holds is ever erased for want of CMED.
         """
         async with self._acquire() as conn:
             rows = await conn.fetch("""
@@ -868,7 +989,7 @@ class V2Repository:
                    AND NOT parts_stale
                    AND quarantine_reason IS NULL
                    AND archive_relpath IS NOT NULL
-                   AND confirmation NOT IN ('refused', 'expired')
+                   AND confirmation = 'confirmed'
                  ORDER BY archived_at
                  LIMIT $1
             """, limit)
@@ -887,7 +1008,7 @@ class V2Repository:
                  WHERE json_stale
                    AND archived_at IS NOT NULL
                    AND archive_relpath IS NOT NULL
-                   AND confirmation NOT IN ('refused', 'expired')
+                   AND confirmation = 'confirmed'
                  ORDER BY archived_at
                  LIMIT $1
             """, limit)
@@ -904,6 +1025,7 @@ class V2Repository:
                  WHERE archived_at < now() - make_interval(hours => $1)
                    AND copied_at IS NULL
                    AND quarantine_reason IS NULL
+                   AND confirmation = 'confirmed'
                  ORDER BY archived_at
                  LIMIT 50
             """, hours)
@@ -1229,6 +1351,49 @@ class V2Repository:
                 "SELECT hospital_id FROM hospitals WHERE cmed_hospital_id = $1",
                 cmed_hospital_id)
 
+    async def active_clinic_for_cmed(self, cmed_hospital_id: str) -> Optional[str]:
+        """
+        Our clinic for CMED's code, if it is one we run: mapped through
+        cmed_hospital_id, or CMED already using our own code (as API 2 allows).
+        """
+        async with self._acquire() as conn:
+            return await conn.fetchval("""
+                SELECT hospital_id FROM hospitals
+                 WHERE active AND (cmed_hospital_id = $1
+                                   OR (hospital_id = $1 AND cmed_hospital_id IS NULL))
+                 ORDER BY (cmed_hospital_id = $1) DESC NULLS LAST
+                 LIMIT 1
+            """, cmed_hospital_id)
+
+    async def alert_once(self, *, alert_type: str, group: str, window: timedelta,
+                         severity: str = "warning",
+                         detail: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        One open alert per group and window, its detail kept current: for a
+        state that holds across many sweeps (a clinic CMED has gone quiet for),
+        which would otherwise be raised every 30 seconds.
+        """
+        payload = json.dumps({**(detail or {}), "group": group}, ensure_ascii=False,
+                             default=str)
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                    SELECT id FROM integrity_alerts
+                     WHERE alert_type = $1 AND detail->>'group' = $2
+                       AND resolved_at IS NULL AND raised_at > now() - $3::interval
+                     ORDER BY id DESC LIMIT 1 FOR UPDATE
+                """, alert_type, group, window)
+                if row is not None:
+                    await conn.execute("UPDATE integrity_alerts SET detail = $2 WHERE id = $1",
+                                       row["id"], payload)
+                    return False
+                await conn.execute("""
+                    INSERT INTO integrity_alerts (alert_type, severity, detail)
+                    VALUES ($1, $2, $3)
+                """, alert_type, severity, payload)
+        logger.warning("Integrity alert [%s/%s] group=%s", severity, alert_type, group)
+        return True
+
     async def hospital_exists(self, hospital_id: str) -> bool:
         async with self._acquire() as conn:
             return bool(await conn.fetchval(
@@ -1394,6 +1559,66 @@ class V2Repository:
                 RETURNING s.session_id
             """, limit)
         return [r["session_id"] for r in rows]
+
+    async def set_erase_deadlines(self, days: int) -> int:
+        """Every recording CMED has not confirmed gets its date (opened + days)."""
+        async with self._acquire() as conn:
+            result = await conn.execute("""
+                UPDATE sessions
+                   SET erase_after = opened_at + make_interval(days => $1)
+                 WHERE erase_after IS NULL
+                   AND confirmation IN ('pending', 'unconfirmed', 'legacy')
+                   AND protocol_version >= 2
+                   AND opened_at IS NOT NULL
+                   AND NOT legal_hold
+            """, days)
+        return int(result.split()[-1]) if result else 0
+
+    async def sessions_due_for_erasure(self, *, limit: int,
+                                       silent_after: timedelta) -> Dict[str, Any]:
+        """
+        Past their erase_after and still not confirmed. Those of a clinic CMED
+        has sent nothing for in `silent_after` are held back and counted per
+        clinic instead: during an outage nothing is erased.
+        """
+        async with self._acquire() as conn:
+            due = await conn.fetch("""
+                SELECT s.session_id, s.hospital_id, s.confirmation, s.opened_at,
+                       s.device_id
+                  FROM sessions s
+                  JOIN hospitals h ON h.hospital_id = s.hospital_id
+                 WHERE s.erase_after < now()
+                   AND s.confirmation IN ('pending', 'unconfirmed', 'legacy')
+                   AND NOT s.legal_hold
+                   AND h.cmed_last_message_at > now() - $2::interval
+                 ORDER BY s.erase_after
+                 LIMIT $1
+            """, limit, silent_after)
+            held = await conn.fetch("""
+                SELECT s.hospital_id, count(*) AS n, max(h.cmed_last_message_at) AS last_heard
+                  FROM sessions s
+                  LEFT JOIN hospitals h ON h.hospital_id = s.hospital_id
+                 WHERE s.erase_after < now()
+                   AND s.confirmation IN ('pending', 'unconfirmed', 'legacy')
+                   AND NOT s.legal_hold
+                   AND (h.cmed_last_message_at IS NULL
+                        OR h.cmed_last_message_at <= now() - $1::interval)
+                 GROUP BY s.hospital_id
+            """, silent_after)
+        return {"due": [dict(r) for r in due], "held": [dict(r) for r in held]}
+
+    async def erasing_soon(self, *, within: timedelta) -> List[Dict[str, Any]]:
+        """Per clinic: recordings that will be erased within `within` unless confirmed."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT hospital_id, count(*) AS n, min(erase_after) AS first
+                  FROM sessions
+                 WHERE erase_after BETWEEN now() AND now() + $1::interval
+                   AND confirmation IN ('pending', 'unconfirmed', 'legacy')
+                   AND NOT legal_hold
+                 GROUP BY hospital_id
+            """, within)
+        return [dict(r) for r in rows]
 
     async def sessions_in_confirmation(self, states: List[str], *,
                                        opened_before: datetime) -> List[Dict[str, Any]]:
@@ -1619,19 +1844,49 @@ class V2Repository:
         return int(result.split()[-1]) if result else 0
 
     async def record_notice(self, visit, *, hospital_id: str,
-                            clinical_record_id: int) -> int:
+                            clinical_record_id: int, latest: bool = True) -> int:
         """
-        API 2's five fields, kept for matching (SRS-CNF-03). The body is not
-        here: it is in aims_clinical, which this database never reads.
+        The five fields of a visit CMED's server told us about - by API 2, or
+        by API 3 when API 2 was lost or is late - kept for matching
+        (SRS-CNF-03). One notice per visit: the second message to arrive
+        returns the first one's id, pointing it at its own record when it is
+        the newer API 2 (`latest`) - the most recent API 2 is the one used
+        (SRS-CNF-05). The body is not here: it is in aims_clinical, which this
+        database never reads.
         """
         async with self._acquire() as conn:
-            return int(await conn.fetchval("""
-                INSERT INTO confirmation_notices
-                    (cmed_hospital_id, hospital_id, patient_id, doctor_id, start_time,
-                     visit_date, clinical_record_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
-            """, visit.cmed_hospital_id, hospital_id, visit.patient_id, visit.doctor_id,
-                 visit.start_time, visit.day, clinical_record_id))
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))",
+                                   "|".join((visit.cmed_hospital_id, visit.patient_id,
+                                             visit.doctor_id, visit.start_time,
+                                             str(visit.day))))
+                existing = await conn.fetchval("""
+                    SELECT id FROM confirmation_notices
+                     WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
+                       AND start_time = $4 AND visit_date = $5
+                       AND hospital_id IS NOT DISTINCT FROM $6
+                     ORDER BY id LIMIT 1
+                """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                     visit.start_time, visit.day, hospital_id)
+                if existing is not None:
+                    if latest:
+                        await conn.execute("UPDATE confirmation_notices "
+                                           "SET clinical_record_id = $2 WHERE id = $1",
+                                           existing, clinical_record_id)
+                    return int(existing)
+                return int(await conn.fetchval("""
+                    INSERT INTO confirmation_notices
+                        (cmed_hospital_id, hospital_id, patient_id, doctor_id, start_time,
+                         visit_date, clinical_record_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
+                """, visit.cmed_hospital_id, hospital_id, visit.patient_id, visit.doctor_id,
+                     visit.start_time, visit.day, clinical_record_id))
+
+    async def cmed_heard_from(self, hospital_id: str) -> None:
+        """CMED's server sent something for this clinic: it is not in an outage."""
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE hospitals SET cmed_last_message_at = now() "
+                               "WHERE hospital_id = $1", hospital_id)
 
     # ============================================================
     # Consultation parts: who each stretch of a recording belongs to

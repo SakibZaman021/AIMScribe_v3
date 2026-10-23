@@ -17,6 +17,9 @@ Every port, path, service, variable and command is taken from the stack itself:
   backend/src/api_v2.py                  the admin endpoints and their bodies
   backend/src/clinical.py                the two CMED endpoints and their replies
   backend/scripts/mint_enrolment_tokens.py
+  deploy/uiu/autodeploy/                 the automatic updates from GitHub main
+  deploy/uiu/postgres/migrate.sh         the migrations, applied once each
+  backend/archive_worker/restore.py      a cloud copy back to a playable WAV
   recorder/installer.iss, recorder/core/enrollment.py
 No secrets: every credential below is a placeholder or generated on the server.
 """
@@ -149,12 +152,12 @@ S = []
 S.append(Paragraph("Deploying the AIMScribe Server to DigitalOcean", H1))
 S.append(Paragraph("The complete manual: accounts, droplet, storage, the stack, the endpoints, "
                    "the clinic PCs, and keeping it running &middot; AIMS LAB &middot; "
-                   "20 October 2026 (server and recorder 3.5.0)", SUB))
+                   "23 October 2026 (server 3.7, recorder 3.7.0)", SUB))
 S.append(HRFlowable(width="100%", thickness=1, color=RULE, spaceAfter=8))
 S.append(Paragraph("This manual moves the <b>whole AIMScribe v3 server</b> &mdash; nine services, "
                    "both databases, the gateway, the archive worker, the backups and the monitor "
                    "&mdash; onto one DigitalOcean droplet in Bangalore, with the audio in "
-                   "Cloudflare R2. It is written for someone who has never run a Linux server: "
+                   "Cloudflare R2, <b>and keeps it up to date by itself</b>: whatever is pushed to GitHub's " + c("main") + " is deployed within minutes, checked, and rolled back if it is not healthy. It is written for someone who has never run a Linux server: "
                    "every step says <b>what to type</b>, <b>what you should see</b>, and "
                    "<b>what to do if you see something else</b>.", BODY))
 S.append(Spacer(1, 5))
@@ -165,12 +168,12 @@ S.append(tbl([["", "Stage", "Time", "Who"],
                            "Give this to CMED", "read it now", "you &rarr; CMED"],
               ["<b>B</b>", "Before you start: the checklist, the three R2 buckets, the plan", "45 min",
                "AIMS LAB"],
-              ["<b>C</b>", "<b>The deployment, twelve steps</b>", "<b>3&ndash;4 hours</b>",
+              ["<b>C</b>", "<b>The deployment, thirteen steps</b> &mdash; the last one turns on automatic updates", "<b>3&ndash;4 hours</b>",
                "AIMS LAB"],
               ["<b>D</b>", "Proving every endpoint answers", "20 min", "AIMS LAB"],
               ["<b>E</b>", "<b>Daily and weekly checks</b> &mdash; one page", "5 min a day",
                "AIMS LAB"],
-              ["<b>F</b>", "Updates, rollback, what was fixed, go-live checklist", "30 min", "AIMS LAB"]],
+              ["<b>F</b>", "Updates, rollback, <b>who may send audio</b>, go-live checklist", "30 min", "AIMS LAB"]],
              [10 * mm, 90 * mm, 26 * mm, 30 * mm], highlight=[2, 4]))
 S.append(Spacer(1, 5))
 S.append(box("The one thing to understand before starting",
@@ -192,6 +195,58 @@ S.append(tbl([["How to read the boxes in this manual"],
                "Commands that start with " + c("PS&gt;") + " are typed in <b>Windows PowerShell on "
                "your own laptop</b>. Everything else is typed <b>on the droplet</b>, over SSH."]],
              [156 * mm], bold_first=False))
+
+S.append(PageBreak())
+S.append(Paragraph("What it runs on: the specification", H2))
+S.append(tbl([["Item", "Specification", "About, a month"],
+              ["<b>Droplet</b>", c("s-8vcpu-16gb") + ": 8 vCPU, 16 GB memory, 320 GB SSD, "
+               "<b>Bangalore (BLR1)</b>, Ubuntu 24.04 LTS. Step 1", "$96"],
+              ["Droplet backups", "Weekly, kept by DigitalOcean. Step 1", "$19"],
+              ["<b>Data volume</b>", "100 GB block storage, encrypted at rest, mounted on "
+               + c("/srv/aimscribe") + ": the databases, a week of nightly backups, and the "
+               "working space where a confirmed recording is joined before it goes to "
+               "Cloudflare. <b>No audio is kept here.</b> Step 7", "$10"],
+              ["<b>Cloudflare R2</b>", "Three private buckets: segments, <b>archive</b>, backups. "
+               "3 TB of archive at $15 a TB, no charge for downloads. Section 6", "$45"],
+              ["Domain", "One name pointing at the droplet, for the certificate. Section 4",
+               "UIU / registrar"],
+              ["<b>Total</b>", "Grows with the archive by about $15 for each further TB",
+               "<b>about $173</b>"]],
+             [32 * mm, 100 * mm, 24 * mm], highlight=[6]))
+S.append(Spacer(1, 4))
+S.append(tbl([["Sized for", "Seven clinics, about 1,000 consultations a day"],
+              ["Audio", "WAV, 44.1 kHz: about 318 MB an hour of recording"],
+              ["Database", "PostgreSQL 16 in 6 GB (" + c("postgresql.16gb.conf") + "), pooled by "
+                           "pgbouncer. A year of recordings is a few hundred thousand rows"],
+              ["Open to the internet", "Ports 80 and 443 only, through the gateway; SSH from your "
+                                       "own address only"],
+              ["Updates", "Pulled from GitHub " + c("main") + " every two minutes; built, "
+                          "migrated, health-checked, rolled back on failure. Step 13"],
+              ["Where the archive lives", "<b>Cloudflare R2 only</b>, encrypted before upload. "
+                                          "A WAV leaves the droplet within 10 minutes of its "
+                                          "copy being proven. Section 6b"]],
+             [40 * mm, 116 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("Why 100 GB is enough: no audio is stored on DigitalOcean", H3))
+S.append(tbl([["On the volume", "Size", "Why"],
+              ["Both databases", "<b>about 3 GB</b> for 18,000 recordings; <b>50 GB</b> "
+               "allowed", "Measured rows: about 130 KB a recording with indexes (session, ~60 "
+               "clips, the signed chain, receipts, audit) = 2.3 GB; the clinical record ~25 KB "
+               "a visit = 0.5 GB. PostgreSQL needs about twice its data for its write log, "
+               "clean-up and index rebuilds; the rest is years of growth"],
+              ["Working space", "<b>under 5 GB</b>; 20 GB allowed",
+               "A confirmed recording's pieces are joined (in memory), written, encrypted and "
+               "copied to Cloudflare, and the WAV deleted within 10 minutes of the copy being "
+               "proven (" + c("AIMS_ARCHIVE_LOCAL_RETENTION_DAYS=0") + "). A recording CMED "
+               "has not confirmed stays as its pieces in Cloudflare, not here"],
+              ["Nightly backups", "<b>about 20 GB</b>", "7 nights here, encrypted; 90 in "
+               "Cloudflare (" + c("aimscribe-backups") + ")"],
+              ["<b>Total</b>", "<b>about 90 GB</b>", "A 100 GB volume; it can be enlarged "
+               "later without stopping the server"]],
+             [30 * mm, 42 * mm, 84 * mm], highlight=[4]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("The droplet's own 320 GB disk holds Ubuntu (20 GB), Docker's images and build "
+                   "cache (25 GB), logs (10 GB) and swap (4 GB): about 60 GB.", BODY))
 
 S.append(PageBreak())
 
@@ -485,6 +540,44 @@ S.append(Paragraph("<b>Keep the three pairs apart.</b> The segments token can de
                    "archive and backup tokens must never be given to anything except this "
                    "server's settings. A leaked segments token then cannot reach the backups.",
                    NOTE))
+
+S.append(Paragraph("6b &middot; The whole archive in Cloudflare", H2))
+S.append(Paragraph("Every finished consultation ends up in " + c("aimscribe-archive") + ", "
+                   "complete: the WAV and its clinical JSON, each encrypted on the droplet before "
+                   "it leaves. The droplet keeps its own copy only until the cloud copy is "
+                   "proven, plus two days. <b>The cloud is the archive</b>; the droplet is a "
+                   "short-term working copy. <b>Only a consultation CMED's server confirmed "
+                   "is copied</b>, so the bucket holds the dataset and nothing in it is ever "
+                   "erased for want of CMED (section 17d).", BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["", "How it works"],
+              ["In the bucket", c("copies/&lt;clinic&gt;/&lt;doctor&gt;/&lt;date&gt;/&lt;file "
+                                  "name&gt;.v1.wav.enc") + " and " + c(".v1.json.enc") + ", one "
+               "pair per consultation, in the same folders as the archive. A prescription that "
+               "arrives later adds " + c(".v2.json.enc") + "; nothing is overwritten"],
+              ["Who can read it", "<b>Nobody without " + c("AIMS_COPY_KEY") + "</b> &mdash; not "
+               "Cloudflare, not anyone holding the token. AES-GCM, and each copy is decrypted "
+               "and hashed again before it is uploaded"],
+              ["When a copy counts", "The server reads the stored object back (size and "
+               "fingerprint) before it lets the uploaded pieces or the local WAV go"],
+              ["The droplet's copy", c("AIMS_ARCHIVE_LOCAL_RETENTION_DAYS=0") + ": a WAV leaves "
+               "the droplet within 10 minutes of its copy being proven, never before. The "
+               "manifest, JSON and catalogue stay, and say where the copy is"],
+              ["Getting one back", "Download the " + c(".enc") + " files (the Cloudflare "
+               "dashboard, or " + c("rclone") + "), then on any PC with Python: "
+               + c("python backend/archive_worker/restore.py restore &lt;file or folder&gt; "
+                   "&lt;out folder&gt;") + " with " + c("AIMS_COPY_KEY") + " set. "
+               + c("restore.py check") + " compares the result with the catalogue's SHA-256"],
+              ["Protection", "Bucket lock (a retention rule) on " + c("aimscribe-archive")
+               + " only, so a copy cannot be deleted early; its token reaches that bucket "
+               "and nothing else"],
+              ["Cost", "$15 per TB a month; downloads are free. 3 TB is $45"]],
+             [32 * mm, 124 * mm], req=[2]))
+S.append(Spacer(1, 3))
+S.append(box("Practise getting one back",
+             "In step 12b's restore drill, also download one " + c(".wav.enc") + " from "
+             + c("aimscribe-archive") + ", restore it on your laptop and play it. An archive "
+             "nobody has restored from is a hope, not an archive."))
 
 S.append(Paragraph("7 &middot; What the 16 GB droplet needs that the default does not", H2))
 S.append(Paragraph("The stack's defaults were written for a 64 GB machine at UIU. On the "
@@ -840,7 +933,8 @@ S.append(code(
     'setv AIMS_WORK_TMPFS     3g\n'
     '\n'
     '# how long an archived WAV stays on this disk once its cloud copy is proven\n'
-    'setv AIMS_ARCHIVE_LOCAL_RETENTION_DAYS 2       # two clinic days: about 66 GB'))
+    'setv AIMS_ARCHIVE_LOCAL_RETENTION_DAYS 0       # no audio kept on the droplet\n'
+    'setv AIMS_BACKUP_KEEP_DAYS 7                  # a week here; 90 days in Cloudflare'))
 S.append(expect(c("shared_buffers = 4GB") + ", " + c("effective_cache_size = 10GB") + ", "
                 + c("work_mem = 16MB") + "."))
 S.append(Spacer(1, 3))
@@ -901,7 +995,7 @@ S.append(Paragraph("To read a value to copy it into the password manager, withou
 
 S += step("Step 7 &middot; The folders, on an encrypted volume",
           Paragraph("<b>First, the data volume.</b> In the DigitalOcean panel: Volumes &rarr; "
-                    "Create Volume, 400 GB, same region as the droplet, attach it to the "
+                    "Create Volume, 100 GB, same region as the droplet, attach it to the "
                     "droplet, <b>Manually format &amp; mount</b>. DigitalOcean encrypts volume "
                     "data at rest. The databases, the archive and the backups then live on it, "
                     "not on the droplet's own disk:", BODY),
@@ -921,7 +1015,7 @@ S += step("Step 7 &middot; The folders, on an encrypted volume",
                'sudo chown aims:aims /srv/aimscribe/backup\n'
                'df -h /srv'))
 S.append(expect("the volume mounted on " + c("/srv/aimscribe") + " with about "
-                + c("390G") + " available."))
+                + c("98G") + " available."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>Do not " + c("chown") + " the archive folder to " + c("aims")
                    + ".</b> The archive worker would then fail to write any recording, with "
@@ -1071,10 +1165,13 @@ S.append(box("<b>" + c("cmed_hospital_id") + " is the blocking prerequisite</b>"
              "it updates, it does not duplicate."))
 
 S += step("Step 11 &middot; Install the clinic PCs against the new address",
-          Paragraph("A recorder is enrolled to <b>one clinic and one server</b>. Moving a PC to "
-                    "this server means a fresh single-use token and one run of the installer. "
-                    "<b>Do one PC first, record a full test consultation, and only then do the "
-                    "rest.</b>", BODY))
+          Paragraph("A recorder is enrolled to <b>one clinic and one server</b>. <b>From "
+                    "recorder 3.7 no token is needed:</b> run the installer with the server "
+                    "address, and the PC joins by itself at its first CMED consultation, at "
+                    "the clinic CMED names (section 17c) &mdash; it needs the internet at that "
+                    "moment, once. The tokens below remain for PCs IT wants enrolled ahead of "
+                    "time. <b>Do one PC first, record a full test consultation, and only then "
+                    "do the rest.</b>", BODY))
 S.append(Paragraph("11a &middot; Mint the tokens (on the droplet)", H3))
 S.append(Paragraph("The fleet is described in a CSV, " + c("backend/scripts/laptops.csv")
                    + ": <b>one row per laptop, not per doctor</b>. <b>Add rows; never delete "
@@ -1285,6 +1382,80 @@ S.append(tbl([["", "Do this in DigitalOcean", "Emails the owner when"],
                "<b>the server stops answering</b>, and when the certificate nears expiry"]],
              [8 * mm, 98 * mm, 50 * mm], highlight=[4]))
 
+S += step("Step 13 &middot; Automatic updates from GitHub",
+          Paragraph("From here on the server updates itself. Every two minutes it asks GitHub "
+                    "whether " + c("main") + " has a new commit. When it has, the server builds "
+                    "the new images while the old ones keep serving, applies any new migration, "
+                    "restarts what changed and waits for " + c("/health/ready") + ". Healthy: "
+                    "it stays, and the alert webhook says <b>deployed</b>. Not healthy: the "
+                    "previous version is put back by itself, and the webhook says <b>rolled "
+                    "back</b>. The server <b>pulls</b>; GitHub is never given a way in, so the "
+                    "public repository holds no key to the server.", BODY),
+          code('cd ~/AIMScribe_v3/deploy/uiu/autodeploy\n'
+               'sudo cp aimscribe-autodeploy.service aimscribe-autodeploy.timer /etc/systemd/system/\n'
+               'sudo systemctl daemon-reload\n'
+               'sudo systemctl enable --now aimscribe-autodeploy.timer\n'
+               'systemctl list-timers aimscribe-autodeploy.timer'))
+S.append(expect("one line, with " + c("NEXT") + " about two minutes away."))
+S.append(Spacer(1, 3))
+S.append(Paragraph("13b &middot; Prove it once", H3))
+S.append(Paragraph("On your laptop, change something harmless &mdash; a line in a README &mdash; "
+                   "commit it and push it to " + c("main") + ". Then, on the droplet:", BODY))
+S.append(code('journalctl -u aimscribe-autodeploy -f          # Ctrl+C to stop watching'))
+S.append(expect(c("deploying &lt;commit&gt;: &lt;your message&gt;") + ", the build, "
+                + c("Migrations: 0 applied") + ", then " + c("deployed &lt;commit&gt;")
+                + " &mdash; usually 5 to 15 minutes, most of it the build &mdash; and the same "
+                "line in the alert channel."))
+S.append(Spacer(1, 3))
+S.append(Paragraph("13c &middot; What it will not do", H3))
+S.append(tbl([["It sees", "It does", "You do"],
+              ["A commit that is not healthy", "Rolls back, alerts, and does not try that "
+               "commit again", "Push a fix; the fix is deployed"],
+              ["<b>A rewritten " + c("main") + "</b> (a force-push)", "Refuses and alerts. A "
+               "rewritten history is what a hijacked account looks like", "Find out why; deploy "
+               "by hand only if it was you"],
+              ["A file on the droplet edited by hand", "Refuses and alerts, rather than "
+               "overwrite it", c("git status") + " shows it: put it back, or commit the change "
+               "on GitHub"],
+              ["A new migration", "Applies it once, as the tables' owner, and records it in "
+               + c("aims_migrations"), "Nothing. A migration is never applied twice"],
+              ["A change in " + c(".env"), "Nothing: settings are not in git", "Edit "
+               + c(".env") + ", then " + c("docker compose up -d") + " by hand"]],
+             [44 * mm, 62 * mm, 50 * mm], req=[2]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("13d &middot; Lock the door it opens from", H3))
+S.append(Paragraph("Whoever can push to " + c("main") + " can now change the server, so the "
+                   "GitHub account is as important as the droplet's SSH key:", BAD))
+S.append(tbl([["", "Do this", "Why"],
+              ["1", "GitHub &rarr; Settings &rarr; Password and authentication &rarr; "
+                    "<b>two-factor authentication on</b>", "a stolen password alone cannot push"],
+              ["2", "The repository &rarr; Settings &rarr; Branches &rarr; rule for " + c("main")
+               + ": <b>block force pushes</b> and <b>restrict deletions</b>",
+               "the history cannot be rewritten (the server refuses it anyway)"],
+              ["3", "<b>Optional, strongest:</b> deploy only commits signed with your key "
+                    "(below)", "a pushed commit is not enough; it must carry your signature"]],
+             [8 * mm, 100 * mm, 48 * mm], req=[1]))
+S.append(Spacer(1, 3))
+S.append(code(
+    '# On your laptop, once: sign every commit with your SSH key\n'
+    'PS> git config --global gpg.format ssh\n'
+    'PS> git config --global user.signingkey $HOME/.ssh/id_ed25519.pub\n'
+    'PS> git config --global commit.gpgsign true\n'
+    '# On the droplet, as aims: trust that key, and require it\n'
+    'echo "<your email> $(cat <your id_ed25519.pub>)" > ~/.ssh/allowed_signers\n'
+    'git -C ~/AIMScribe_v3 config gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers\n'
+    'sudo mkdir -p /etc/aimscribe\n'
+    'echo AIMS_DEPLOY_REQUIRE_SIGNED=true | sudo tee /etc/aimscribe/autodeploy.env'))
+S.append(Spacer(1, 3))
+S.append(tbl([["When you want to", "Type"],
+              ["Deploy now, without waiting", c("sudo systemctl start aimscribe-autodeploy.service")],
+              ["See what it did", c("journalctl -u aimscribe-autodeploy -n 50")],
+              ["Pause updates (an exam week, a clinic event)",
+               c("sudo systemctl stop aimscribe-autodeploy.timer")],
+              ["Resume them", c("sudo systemctl start aimscribe-autodeploy.timer")],
+              ["See every deploy", c("cat ~/.aimscribe-deploy/deployed.log")]],
+             [62 * mm, 94 * mm]))
+
 S.append(PageBreak())
 
 # ============================================================ PART D
@@ -1440,53 +1611,33 @@ S.append(part("PART F", "Updates, rollback, what was fixed, go-live",
               "What to do later, and what to settle before the clinics depend on it"))
 
 S.append(Paragraph("14 &middot; Updating to a new release", H2))
-S.append(code(
-    'cd ~/AIMScribe_v3/deploy/uiu\n'
-    'git log -1 --oneline > ~/before-update.txt     # where you were, for rollback\n'
-    'git pull\n'
-    'ls ../../backend/scripts/                      # any NEW numbered .sql file?\n'
-    'docker compose up -d --build\n'
-    'docker compose ps'))
-S.append(Paragraph("<b>Outside clinic hours.</b> A consultation in progress survives an API "
-                   "restart &mdash; the gateway holds requests for up to 30 seconds and the "
-                   "recorder keeps its pieces and retries &mdash; but there is no reason to "
-                   "test that.", NOTE))
+S.append(Paragraph("<b>Updates arrive by themselves</b> (step 13): push to " + c("main")
+                   + " and the server deploys it. This section is for the rare update by hand, "
+                   "and for a server built before the migration ledger.", BODY))
 S.append(Spacer(1, 3))
-S.append(Paragraph("<b>A new migration is not applied by itself.</b> The schema scripts run only "
-                   "on the very first start of an empty database; a new droplet built with this "
-                   "manual already has every one. <b>A database created before this release needs "
-                   "four applied by hand</b>, in order, as the role that owns the tables &mdash; "
-                   + c("013_v3_reassign.sql") + " (recordings from older recorders that move to "
-                   "the patient their prescription named), " + c("014_v3_device_health.sql")
-                   + " (the recorders' offline log), " + c("015_v3_consultation_parts.sql")
-                   + " (which patient was opened at which second of a recording, and the "
-                   "per-patient files cut from it) and " + c("016_v3_device_state.sql")
-                   + " (what each PC reports: held recordings, disk encryption, clock, version, "
-                   "and a resumed recording's link to its first part), then every later file in "
-                   + c("backend/scripts") + " the same way &mdash; including "
-                   + c("018_v3_least_privilege.sql") + ", which needs the step after this one "
-                   "first. Without 015, every recording that has a "
-                   "second patient click or a prescription signal stops at that step and never "
-                   "completes; without 014, the offline log is refused and stays on the "
-                   "laptops.", BAD))
-S.append(code(
-    'U=$(docker compose exec -T postgres printenv POSTGRES_USER)\n'
-    'for f in 013_v3_reassign.sql 014_v3_device_health.sql \\\n'
-    '         015_v3_consultation_parts.sql 016_v3_device_state.sql; do\n'
-    '  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" \\\n'
-    '    -d aims_recordings -c "SET ROLE aims_recordings" -f /aims/scripts/$f\n'
-    'done\n'
-    '# check: one line must come back\n'
-    'docker compose exec -T postgres psql -U "$U" -d aims_recordings -tAc \\\n'
-    '  "select to_regclass(\'device_health_log\'), to_regclass(\'consultation_parts\'), \\\n'
-    '   pg_get_constraintdef(oid) \\\n'
-    '   from pg_constraint where conname = \'chain_entries_entry_type_check\'"'))
-S.append(expect(c("device_health_log") + ", " + c("consultation_parts") + " and a CHECK that "
-                "lists " + c("'reassign'") + " and " + c("'marker'")
-                + ". Run the scripts again and nothing changes: all three are safe to repeat. "
-                "Within a minute the server's own /health (step 9, row 3b) shows "
-                + c('"schema":"ok"') + "; until then it names the file still missing, and the "
-                "monitor alerts."))
+S.append(Paragraph("<b>Migrations are applied once each, automatically.</b> Every update runs "
+                   + c("deploy/uiu/postgres/migrate.sh") + ": each new file in "
+                   + c("backend/scripts") + " is applied in order, as the role that owns the "
+                   "tables, and recorded in the " + c("aims_migrations") + " table. A file "
+                   "already recorded is never applied again &mdash; re-running an old "
+                   "migration on a database full of recordings is not safe &mdash; and one "
+                   "that was edited after it was applied is reported, not re-run: a change to "
+                   "the schema is always a new file. By hand:", BODY))
+S.append(code('cd ~/AIMScribe_v3/deploy/uiu\n'
+              'docker compose exec -T postgres sh -s < postgres/migrate.sh'))
+S.append(expect(c("Migrations: 0 applied, 25 already in place, 0 changed since applied.")
+                + " The numbers grow with each release; " + c("changed") + " stays 0."))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>A server built before 24 October 2026 has no ledger,</b> and the runner "
+                   "refuses it rather than guess which migrations it has. Adopt it once: "
+                   + c("/health") + " (step 9, row 3b) names the first migration it is "
+                   "missing &mdash; adopt through the one before. If it names none, adopt "
+                   "through the last file in " + c("backend/scripts") + ".", BAD))
+S.append(code('# e.g. /health says 023 is missing:\n'
+              'docker compose exec -T -e AIMS_MIGRATIONS_ADOPT_THROUGH=022 \\\n'
+              '  postgres sh -s < postgres/migrate.sh'))
+S.append(expect("the older files listed as " + c("adopted (already on this server)")
+                + ", then " + c("applying 023_...") + " and every later one."))
 S.append(Spacer(1, 3))
 S.append(Paragraph("<b>A server set up before 018: give the API its own login.</b> Until 018 the "
                    "API logged in as " + c("aims_recordings") + ", the owner of every table "
@@ -1502,15 +1653,14 @@ S.append(code(
     'docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" -d postgres \\\n'
     '  -c "CREATE ROLE aims_api LOGIN PASSWORD \'$P\'"\n'
     'unset P\n'
-    'for f in $(cd ../../backend/scripts && ls 017_*.sql 018_*.sql 019_*.sql 020_*.sql); do\n'
-    '  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$U" \\\n'
-    '    -d aims_recordings -c "SET ROLE aims_recordings" -f /aims/scripts/$f\n'
-    'done\n'
+    '# a server this old has 016 at most: adopt it, then 017 onwards are applied\n'
+    'docker compose exec -T -e AIMS_MIGRATIONS_ADOPT_THROUGH=016 \\\n'
+    '  postgres sh -s < postgres/migrate.sh\n'
     'docker compose exec -T postgres psql -U "$U" -d postgres \\\n'
     '  -c "ALTER ROLE aims_recordings NOLOGIN"\n'
     '# the internal network gained a fixed range: recreate the networks once\n'
     'docker compose down && docker compose up -d --build'))
-S.append(expect(c("CREATE ROLE") + ", the four scripts without an error, " + c("ALTER ROLE")
+S.append(expect(c("CREATE ROLE") + ", the migrations without an error, " + c("ALTER ROLE")
                 + ", and every service back " + c("Up") + ". " + c("/health") + " says "
                 + c('"database":"connected"') + " - now as " + c("aims_api") + ". If the API "
                 "log says " + c("password authentication failed for user \"aims_api\"")
@@ -1522,25 +1672,26 @@ S.append(Paragraph("<b>Order: the server first, then the recorders.</b> A new re
                    + ", and its offline log; an old server answers 404, and a new one without "
                    "015 answers 500. The recorder keeps them waiting until the server is ready "
                    "&mdash; nothing is lost &mdash; but nothing after that step in the recording "
-                   "uploads until then. So update the server, apply 013 to 020 in order (017 to "
-                   "020 with the block above), then roll the installer out to the clinic PCs. "
+                   "uploads until then. So update the server first &mdash; its migrations come "
+                   "with it &mdash; then roll the installer out to the clinic PCs. "
                    "<b>Upgrade the archive worker together with the server:</b> the server now "
                    "receipts only the pieces the worker says it joined, so an old worker gets "
                    "409 and archives nothing until it is upgraded. <b>Once every PC runs "
-                   "3.5.0</b> (dashboard, Recorders panel), set "
+                   "3.6.1</b> (" + c("v_devices") + ", or the dashboard's Recorders panel), set "
                    + c("AIMS_REQUIRE_DEVICE_SIGNATURES=on") + ", "
                    + c("AIMS_REQUIRE_SIGNED_REFUSAL=on") + " and "
-                   + c("AIMS_MIN_RECORDER_VERSION=3.5.0") + " in " + c(".env") + " and "
+                   + c("AIMS_MIN_RECORDER_VERSION=3.6.1") + " in " + c(".env") + " and "
                    + c("docker compose up -d api") + "; before that they would refuse the 3.4 "
-                   "PCs. Every request then carries an " + c("X-Request-ID") + " that the "
+                   "and 3.5 PCs. Every request then carries an " + c("X-Request-ID") + " that the "
                    "gateway sets; quote it when reading the API log.", NOTE))
 
 S.append(Paragraph("15 &middot; If it has to be undone", H2))
 S.append(tbl([["", "Situation", "What to do"],
               ["<b>1</b>", "A release misbehaves",
-               c("git checkout &lt;the commit in ~/before-update.txt&gt;") + " then "
-               + c("docker compose up -d --build") + ". Return to " + c("main") + " with "
-               + c("git checkout main") + " when fixed"],
+               "If it is not healthy the server has already rolled it back (step 13). If it is "
+               "healthy but wrong: on your laptop " + c("git revert &lt;commit&gt;") + " and push "
+               "&mdash; the revert is a new commit, and it is deployed like any other. <b>Never "
+               "force-push</b>: the server refuses a rewritten " + c("main")],
               ["<b>2</b>", "The deployment fails before any clinic uses it",
                "<b>Nothing to undo.</b> Destroy the droplet. The old stack is untouched"],
               ["<b>3</b>", "It works, but a problem appears on day one",
@@ -1561,7 +1712,7 @@ S.append(Paragraph("Found while checking this manual against the code on 15 Octo
 S.append(Spacer(1, 3))
 S.append(tbl([["", "Was", "Now"],
               ["<b>1</b>", "Every archived WAV stayed on the server disk: full in about 9 days",
-               "Removed from this disk " + c("AIMS_ARCHIVE_LOCAL_RETENTION_DAYS") + " days (2 here) "
+               "Removed from this disk " + c("AIMS_ARCHIVE_LOCAL_RETENTION_DAYS") + " days (0 here) "
                "after its cloud copy is proven, and never without one. JSON, manifest and "
                "catalogue stay; the manifest says where the copy is"],
               ["<b>2</b>", "The backup service never made a backup, and could not encrypt",
@@ -1582,9 +1733,11 @@ S.append(tbl([["", "Was", "Now"],
                                        + c("caddy:2.8-alpine")],
               ["<b>8</b>", "The repository's public keys did not match the server",
                "11b now proves the pair before the installer is built"],
-              ["<b>9</b>", "A recording without CMED's API 2 was deleted after 24 hours",
-               "<b>Kept and archived</b>; CMED's record attaches whenever it arrives. Only a "
-               "patient's refusal erases"],
+              ["<b>9</b>", "A recording without CMED's API 2 was deleted after 24 hours, "
+                           "then kept for ever",
+               "<b>Kept until CMED's server confirms it</b> (API 2 or API 3, however late); "
+               "erased 7 days after it was made if CMED never does &mdash; never while CMED is "
+               "silent for that clinic, never under a legal hold (17d)"],
               ["<b>10</b>", "A server \"no\" &mdash; a wrong key, an unmapped clinic &mdash; "
                             "deleted the recording on the laptop",
                "<b>Held on the laptop</b> and asked again every 5 minutes; the fix releases it"],
@@ -1595,12 +1748,117 @@ S.append(tbl([["", "Was", "Now"],
              [8 * mm, 66 * mm, 82 * mm]))
 
 S.append(PageBreak())
-S.append(Paragraph("17 &middot; Go-live checklist", H2))
+S.append(Paragraph("17 &middot; Who may send audio", H2))
+S.append(Paragraph("Anyone on the internet can reach the server's address. <b>No one but an "
+                   "enrolled clinic PC can store audio in it</b>, and nothing reaches the "
+                   "dataset until CMED's own server has vouched for the visit:", BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["", "Layer", "What it stops"],
+              ["1", "<b>Every request is signed by the PC's own key, held in its TPM</b> (recorder "
+                    "3.6; older PCs: 17b). Each "
+                    "request carries the PC's token, a timestamp, a one-time nonce and a "
+                    "signature over all of it (" + c("device_nonces") + " remembers the nonces "
+                    "for 15 minutes; " + c("v_device_requests") + " shows them by PC and clinic)",
+               "A copied token alone is useless; a recorded request cannot be replayed"],
+              ["2", "<b>Joining needs a one-time token, or CMED.</b> A token is bound to one "
+                    "clinic, expiring, kept only as a hash. Without one (3.7), a PC with a TPM "
+                    "key is <b>pending</b> until CMED's server confirms two of its recordings "
+                    "(17c)", "An outsider cannot become a trusted PC"],
+              ["3", "<b>Rate limits</b>: 1,200 requests a minute per address; 100 failures in 5 "
+                    "minutes shuts an address out for 15; 10 for one credential",
+               "Guessing, and flooding the API"],
+              ["4", "<b>A PC records for its own clinic only.</b> Anything else is filed under its "
+                    "clinic and raised as " + c("clinic_mismatch"), "One clinic's PC posing as "
+                                                                       "another's"],
+              ["5", "<b>CMED confirms each visit</b> from its own server, signed with CMED's key "
+                    "(Channel B). Unconfirmed audio is kept, but never enters the dataset",
+               "Audio from a stolen or rogue PC passing as a real consultation"],
+              ["6", "<b>Revocation</b> in one call; " + c("hold") + " quarantines what it "
+                    "had not finished", "A lost or stolen PC"],
+              ["7", "<b>Admin and dashboard</b> answer only on the droplet itself (an SSH "
+                    "tunnel) or listed addresses", "Anyone else administering the server"]],
+             [8 * mm, 98 * mm, 50 * mm]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("17b &middot; Set at go-live", H3))
+S.append(tbl([["Setting", "Value", "Why"],
+              [c("AIMS_REQUIRE_DEVICE_SIGNATURES"), c("on"), "Every PC must sign every request. "
+               "Today a PC with a software key (recorder 3.4) only has to sign once it has "
+               "signed; " + c("v_devices") + " shows each PC's key kind"],
+              [c("AIMS_MIN_RECORDER_VERSION"), c("3.6.1"), "Older recorders are refused and "
+               "told to update"],
+              [c("AIMS_REQUIRE_SIGNED_REFUSAL"), c("on"), "A patient's refusal must be signed by "
+               "the PC that recorded"],
+              ["Enrolment tokens", "24&ndash;72 hours", "Mint them on the day of the install, not "
+               "two weeks ahead. Until it is used, the token sits in a file on the PC"],
+              ["Old PCs", "revoked", "A PC replaced or reinstalled: revoke the old entry. "
+               + c("v_devices") + " lists every PC with its state"],
+              [c("AIMS_UNCONFIRMED_ERASE_DAYS"), c("7"), "Days a recording waits for CMED "
+               "before it is erased (17d)"],
+              [c("AIMS_SELF_REGISTRATION"), c("on"), c("off") + ": every PC needs a token "
+               "again"]],
+             [62 * mm, 20 * mm, 74 * mm], req=[1]))
+S.append(Spacer(1, 4))
+S.append(Paragraph("17c &middot; Enrolment without a token (server 025, recorder 3.7)", H3))
+S.append(Paragraph("A clinic PC needs no enrolment token. It can ask to join, and its audio "
+                   "reaches the server at once, but nothing it records is kept unless CMED's own "
+                   "server confirms that visit, and it becomes a trusted PC only when CMED has "
+                   "confirmed two of them. The dashboard's PC table shows a joining PC as "
+                   "<b>Waiting for CMED</b>, with Approve and Reject.", BODY))
+S.append(Spacer(1, 3))
+S.append(tbl([["", "What happens", "Why an outsider gets nowhere"],
+              ["1", "The installer makes the PC's key inside its TPM, as now. No token",
+               "The key never leaves the chip"],
+              ["2", "The first time CMED opens a patient on that PC, the recorder registers: "
+                    "its public key, proof it holds the key, and the clinic code from CMED's "
+                    "own trigger. The server files it as <b>pending</b> for that clinic",
+               "A pending PC uploads at most " + c("AIMS_PENDING_UPLOAD_MB") + " (500 MB), "
+               "and none of it is kept unless CMED confirms that visit"],
+              ["3", "CMED's server sends API 2 for that visit, signed with CMED's key. When it "
+                    "matches what the pending PC asked to record &mdash; patient, doctor, "
+                    "clinic, date and time &mdash; on two visits, the PC is <b>approved by "
+                    "itself</b> and its held audio uploads",
+               "Approval needs CMED's server, which an outsider does not have, to confirm "
+               "visits the PC really recorded"],
+              ["4", "The dashboard lists every pending PC (name, address, clinic): approve or "
+                    "reject at once, without waiting", "A person can always overrule"],
+              ["5", "Limits: 20 pending PCs a clinic, a pending PC expires after 7 days, "
+                    "registrations rate-limited per address", "Registering thousands of "
+                                                               "fake PCs"]],
+             [8 * mm, 92 * mm, 56 * mm]))
+S.append(Spacer(1, 3))
+S.append(Paragraph("<b>Further, optional:</b> TPM key attestation &mdash; Windows can produce a "
+                   "statement, chained to the TPM maker's certificate, that the key was made "
+                   "inside a real TPM. It proves the hardware, not just the key, and is not "
+                   "built yet. <b>Order:</b> update the server first, then install 3.7 on new "
+                   "PCs; an older recorder still enrols with a token.", NOTE))
+
+S.append(Paragraph("17d &middot; Only what CMED confirms is kept", H3))
+S.append(tbl([["", "What happens"],
+              ["Audio", "Reaches the server at once, whatever CMED does: a late API 2 or API 3 "
+                        "costs nothing"],
+              ["Confirmed", "API 2 or API 3 from CMED's server names the visit, to the second "
+                            "&mdash; minutes or days later. Kept, copied to the archive, in the "
+                            "dataset"],
+              ["Waiting", "Archived on the server, not copied. " + c("sessions.erase_after")
+                          + " says when it goes; " + c("v_audio_problems") + " lists those due "
+                          "within 48 hours, and an alert counts them per clinic"],
+              ["Never confirmed", "Erased " + c("AIMS_UNCONFIRMED_ERASE_DAYS") + " (7) days after "
+                                  "it was made, as a refused one is: audio, files and clinical "
+                                  "record go; a row without the patient stays"],
+              ["CMED silent", "A clinic CMED has sent nothing for in 24 hours erases nothing, "
+                              "however old: an outage is not a reason to lose consultations. An "
+                              "alert says so"],
+              ["Rescue one", "A legal hold, or the admin confirm (a name and a reason), before "
+                             "its date"]],
+             [30 * mm, 126 * mm], req=[4]))
+
+S.append(PageBreak())
+S.append(Paragraph("18 &middot; Go-live checklist", H2))
 S.append(tbl([["", "Item", "Where"],
               ["&#9744;", "Both accounts owned by " + OWNER_EMAIL + ", two-factor on, recovery "
                           "codes stored", "Part 0"],
               ["&#9744;", "Billing alert set on DigitalOcean", "0.2"],
-              ["&#9744;", "Two R2 buckets, two tokens, public access off", "6"],
+              ["&#9744;", "Three R2 buckets, three tokens, public access off; bucket lock on the archive", "6, 6b"],
               ["&#9744;", "Droplet in BLR1, " + c("s-8vcpu-16gb") + ", backups and monitoring on",
                "step 1"],
               ["&#9744;", "Name resolves to the droplet", "step 2"],
@@ -1622,13 +1880,20 @@ S.append(tbl([["", "Item", "Where"],
               ["&#9744;", "Email alerts and the uptime check active; webhook set", "12c, 6f"],
               ["&#9744;", c("/health") + " on the droplet shows both buckets "
                           + c("connected"), "step 9"],
-              ["&#9744;", "Schema scripts 013 to 020 present (automatic on a new database; "
-                          "by hand, in order, on an old one)", "14"],
+              ["&#9744;", c("migrate.sh") + " reports " + c("0 changed since applied")
+                          + " (a new server has the ledger; an old one is adopted once)", "14"],
               ["&#9744;", "Checks 10 and 11 answer 401, not 404", "Part D"],
-              ["&#9744;", "channel_b_test output sent to CMED", "Part D"]],
-             [10 * mm, 116 * mm, 30 * mm], req=[9, 14, 16, 17, 19, 21]))
+              ["&#9744;", "channel_b_test output sent to CMED", "Part D"],
+              ["&#9744;", "<b>Automatic updates on</b>: timer enabled, one test commit "
+                          "deployed and announced", "step 13"],
+              ["&#9744;", "GitHub: two-factor on; " + c("main") + " protected from force-push "
+                          "and deletion", "13d"],
+              ["&#9744;", "Device signatures required; minimum recorder 3.6.1; old PCs revoked",
+               "17b"],
+              ["&#9744;", "One cloud copy downloaded, restored and played", "6b, 12b"]],
+             [10 * mm, 116 * mm, 30 * mm], req=[9, 14, 16, 17, 19, 21, 23, 25]))
 
-S.append(Paragraph("18 &middot; One page to remember", H2))
+S.append(Paragraph("19 &middot; One page to remember", H2))
 S.append(tbl([["Question", "Answer"],
               ["Which compose file?", "<b>" + c("deploy/uiu/docker-compose.yml") + "</b> &mdash; "
                                       "the server stack, despite the folder name"],
@@ -1636,8 +1901,11 @@ S.append(tbl([["Question", "Answer"],
                                  "backups and monitoring on"],
               ["What must exist first?", "<b>A domain name pointing at the droplet</b>"],
               ["Which ports open?", "<b>80 and 443 only</b>, plus SSH from your own IP"],
-              ["How many buckets?", "<b>Two</b>: " + c("aimscribe-segments") + " and "
-                                    + c("aimscribe-archive")],
+              ["How many buckets?", "<b>Three</b>: " + c("aimscribe-segments") + ", "
+                                    + c("aimscribe-archive") + " and " + c("aimscribe-backups")],
+              ["<b>How do updates arrive?</b>", "<b>Push to " + c("main") + "</b>. The droplet "
+                                                "deploys it within minutes, checks it, and "
+                                                "rolls back by itself. Step 13"],
               ["What must change for 16 GB?", c("AIMS_PG_CONF") + ", " + c("AIMS_PG_MEMORY") + ", "
                                               + c("AIMS_ARCHIVE_MEMORY") + ", "
                                               + c("AIMS_WORK_TMPFS")],
@@ -1653,7 +1921,7 @@ S.append(tbl([["Question", "Answer"],
                                               "somewhere else</b>"],
               ["Most valuable half hour?", "<b>The restore drill.</b> Step 12b"],
               ["Who gets the notices?", OWNER_EMAIL]],
-             [54 * mm, 102 * mm], highlight=[7, 12]))
+             [54 * mm, 102 * mm], highlight=[6, 8, 13]))
 S.append(Spacer(1, 6))
 S.append(Paragraph("Prepared by AIMS LAB, United International University. Companions: "
                    "CMED_1 Software Integration, CMED_2 Server Deployment, and the Cloud Hosting "
