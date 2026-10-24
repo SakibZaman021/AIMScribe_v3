@@ -46,7 +46,7 @@
 
 	# The API answers machines, not browsers; nothing here should ever be
 	# framed, scripted or embedded.
-	@api not path /api/v2/dashboard /api/v2/dashboard/*
+	@api not path /api/v2/dashboard /api/v2/dashboard/* /db /db/*
 	header @api Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
 
 	# The one page a person opens: the operations dashboard. It may run its
@@ -75,14 +75,37 @@
 		respond 404
 	}
 
-	# The lab only. The admin key is still checked by the API; this is the
-	# second lock, so a leaked key is not enough from an unknown address.
+	# The portal: the dashboard, the database viewer and the admin routes the
+	# dashboard calls. From any browser, behind a login - the first lock. The
+	# second is each one's own: the admin key for the dashboard, the database
+	# password for the viewer. A bcrypt hash, base64, from .env; without one
+	# the gateway does not start, so the portal is never open by mistake.
+	@portal path /dashboard /dashboard/* /db /db/* /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
+	basic_auth @portal {
+		{$AIMS_PORTAL_USER} {$AIMS_PORTAL_HASH}
+	}
+
+	# Optionally, the portal from listed addresses only as well
+	# (AIMS_ADMIN_ALLOW, e.g. the lab's fixed address). Unset: from anywhere,
+	# behind the login above.
 	@lab_only_denied {
-		path /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
-		not remote_ip {$AIMS_ADMIN_ALLOW:127.0.0.1/32}
+		path /dashboard /dashboard/* /db /db/* /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
+		not remote_ip {$AIMS_ADMIN_ALLOW:0.0.0.0/0 ::/0}
 	}
 	handle @lab_only_denied {
 		respond 403
+	}
+
+	redir /dashboard /api/v2/dashboard 302
+	redir /dashboard/ /api/v2/dashboard 302
+
+	# The database viewer (Adminer), on the internal network, never published.
+	# It sets its own content policy; the API's is not applied here.
+	redir /db /db/ 308
+	handle_path /db/* {
+		reverse_proxy dbviewer:8080 {
+			header_up X-Forwarded-Proto https
+		}
 	}
 
 	handle {
