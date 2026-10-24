@@ -26,6 +26,8 @@
     </div>
   </div>
   <span class="spacer"></span>
+  <span id="who" class="who" hidden></span>
+  <a id="signout" class="ghost button" href="/auth/logout" hidden>Sign out</a>
   <span id="when" class="live" role="status">Connecting</span>
   <button id="pause" type="button" class="ghost" aria-pressed="false" title="Pause auto-refresh">Pause</button>
   <button id="refresh" type="button" class="primary">Refresh</button>
@@ -109,6 +111,20 @@
       (<code>/srv/aims/archive</code> on the UIU server). Delete the whole folder;
       the <code>.wav</code>, <code>.manifest.json</code> and clinical <code>.json</code> are inside.
     </div>
+  </section>
+  <section class="panel" aria-labelledby="h-people" id="peoplePanel" hidden>
+    <div class="head wrap"><h2 id="h-people">People</h2>
+      <span class="hint" id="peopleHint">Who may open this dashboard and the database viewer, by Google account</span></div>
+    <form id="peopleForm" class="peopleform">
+      <label>Google email <input id="pEmail" type="email" required autocomplete="off" placeholder="name@example.com"></label>
+      <label>Role <select id="pRole">
+        <option value="researcher">Researcher - look, never change</option>
+        <option value="admin">Admin - everything, and people</option>
+      </select></label>
+      <button type="submit" class="primary">Give access</button>
+      <span id="peopleMsg" class="hint" role="status"></span>
+    </form>
+    <div id="people"></div>
   </section>
 </main>
 

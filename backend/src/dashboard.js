@@ -3,6 +3,10 @@
 "use strict";
 
 let ADMIN_KEY = "";
+// Signed in with Google (portal.py): the session cookie is the credential,
+// and every request carries X-AIMS-Portal so no other site can use it.
+let PORTAL = null;          // {email, role} when signed in
+const portalHeaders = () => (PORTAL ? { "X-AIMS-Portal": "1" } : { "X-Admin-Key": ADMIN_KEY });
 let CLINICS = [];
 let LAST = null;            // last /summary answer, for redraws without a fetch
 let STATE = "";             // recordings table filter (the API's `state`)
@@ -86,12 +90,16 @@ $("keyForm").addEventListener("submit", (e) => {
 $("keyDialog").addEventListener("cancel", (e) => e.preventDefault());  // the page needs it
 
 async function api(path, params, retried) {
-  if (!ADMIN_KEY) await askKey();
+  if (!PORTAL && !ADMIN_KEY) await askKey();
   const query = new URLSearchParams(
     Object.entries(params || {}).filter(([, v]) => v !== "" && v != null));
   const response = await fetch(`/api/v2/dashboard${path}?${query}`,
-    { headers: { "X-Admin-Key": ADMIN_KEY } });
-  if (response.status === 401 || response.status === 403) {
+    { headers: portalHeaders() });
+  if (PORTAL && response.status === 401) {
+    window.location.href = "/auth/login?next=/dashboard";   // the session ended
+    throw new Error("Signed out.");
+  }
+  if (!PORTAL && (response.status === 401 || response.status === 403)) {
     ADMIN_KEY = "";
     if (!retried) {
       await askKey("Key not accepted. Try again.");
@@ -604,11 +612,11 @@ $("rooms").addEventListener("click", async (e) => {
   const who = (window.prompt(`${approve ? "Approve" : "Reject"} this PC. Your name, for the audit log:`) || "").trim();
   if (who.length < 2) return;
   if (!approve && !window.confirm("Reject and revoke this PC? Anything it recorded that CMED did not confirm is erased on its date.")) return;
-  if (!ADMIN_KEY) await askKey();
+  if (!PORTAL && !ADMIN_KEY) await askKey();
   b.disabled = true;
   try {
     const response = await fetch(`/api/v2/admin/device/${encodeURIComponent(b.dataset.device)}/${b.dataset.decide}`,
-      { method: "POST", headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json" },
+      { method: "POST", headers: { ...portalHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ decided_by: who }) });
     if (!response.ok) throw new Error(`Server error ${response.status}`);
     await refresh();
@@ -922,7 +930,81 @@ try {
   if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
 } catch { /* follow the system */ }
 
+/* ============================================================
+   Who is signed in, and the People panel (admins only).
+   ============================================================ */
+async function whoAmI() {
+  let reply;
+  try { reply = await fetch("/auth/me", { headers: { Accept: "application/json" } }); }
+  catch { return; }
+  if (reply.status === 404) return;                 // the loopback door: the admin key
+  const me = await reply.json().catch(() => ({}));
+  if (reply.ok && me.signed_in) {
+    PORTAL = { email: me.email, role: me.role };
+    $("who").textContent = `${me.email} \u00b7 ${me.role}`;
+    $("who").hidden = false;
+    $("signout").hidden = false;
+    if (me.role === "admin") { $("peoplePanel").hidden = false; loadPeople(); }
+  } else if (me.google) {
+    window.location.href = "/auth/login?next=/dashboard";
+    throw new Error("Not signed in.");
+  }
+}
+
+async function adminCall(method, path, body) {
+  const response = await fetch(path, {
+    method, headers: { ...portalHeaders(), "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+async function loadPeople() {
+  try {
+    const { people, mail } = await adminCall("GET", "/api/v2/admin/people");
+    $("peopleHint").textContent = mail ? "An invitation email is sent when you give access"
+      : "No mail account is set, so send them the link yourself";
+    const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
+    $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
+      + `<th>Given by</th><th>Last signed in</th><th></th></tr></thead><tbody>`
+      + people.map((p) => `<tr>`
+        + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
+        + td("Role", p.role === "admin" ? tag("warn", "Admin") : tag("good", "Researcher"))
+        + td("Given by", esc(p.added_by || ""))
+        + td("Last signed in", esc(when(p.last_signed_in)))
+        + td("", p.owner ? `<span class="hint">owner</span>`
+          : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    $("people").innerHTML = empty("People could not be loaded", err.message, true);
+  }
+}
+
+$("peopleForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const email = $("pEmail").value.trim();
+  if (!email) return;
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/people", { email, role: $("pRole").value });
+    $("peopleMsg").textContent = r.invited ? `Invitation sent to ${r.email}.`
+      : `${r.email} can now sign in at ${r.link}`;
+    $("pEmail").value = "";
+    loadPeople();
+  } catch (err) { $("peopleMsg").textContent = `Not done: ${err.message}`; }
+});
+
+$("people").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-remove]");
+  if (!b) return;
+  if (!window.confirm(`Remove ${b.dataset.remove}? Their access ends now, on every device.`)) return;
+  try { await adminCall("POST", "/api/v2/admin/people/remove", { email: b.dataset.remove }); }
+  catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadPeople();
+});
+
 async function start() {
+  try { await whoAmI(); } catch { return; }
   $("from").value = daysAgo(6);
   $("to").value = today();
   markRanges();

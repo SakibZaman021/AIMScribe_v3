@@ -76,13 +76,16 @@
 	}
 
 	# The portal: the dashboard, the database viewer and the admin routes the
-	# dashboard calls. From any browser, behind a login - the first lock. The
-	# second is each one's own: the admin key for the dashboard, the database
-	# password for the viewer. A bcrypt hash, base64, from .env; without one
-	# the gateway does not start, so the portal is never open by mistake.
+	# dashboard calls. From any browser, signed in with Google (portal.py):
+	# before each request the gateway asks /auth/check, which answers with the
+	# person's email and role - or a redirect to sign in, or 403 for a
+	# researcher on an admin route. The role goes on to the viewer
+	# (X-Portal-Role), set here on every request, so a browser cannot claim
+	# one. Not configured, nobody is let in: the portal fails closed.
 	@portal path /dashboard /dashboard/* /db /db/* /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
-	basic_auth @portal {
-		{$AIMS_PORTAL_USER} {$AIMS_PORTAL_HASH}
+	forward_auth @portal api:6000 {
+		uri /auth/check
+		copy_headers X-Portal-Email X-Portal-Role
 	}
 
 	# Optionally, the portal from listed addresses only as well

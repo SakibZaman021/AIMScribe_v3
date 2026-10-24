@@ -361,3 +361,9 @@ dialog::backdrop { background: rgba(8, 10, 12, .55); }
   tr.row-warn { box-shadow: inset 3px 0 0 var(--warn); }
   tbody tr:hover td { background: transparent; }
 }
+/* Signed in with Google, and the People panel */
+.who { font-size: .85rem; opacity: .8; }
+a.button { text-decoration: none; padding: .35rem .7rem; border-radius: 6px; }
+.peopleform { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; margin: .4rem 0 .8rem; }
+.peopleform label { display: flex; flex-direction: column; gap: .2rem; font-size: .85rem; }
+.peopleform input, .peopleform select { min-width: 16rem; padding: .35rem .5rem; }

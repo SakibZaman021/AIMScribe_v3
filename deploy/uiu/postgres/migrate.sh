@@ -125,4 +125,12 @@ prepare aims_clinical encounters
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/001_aims_clinical.sql
 apply aims_clinical "" /aims/scripts/clinical/002_roles.sql
 
+# The clinical database's read-only login, for the database viewer: its
+# password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.
+if [ -n "${AIMS_CLINICAL_READER_PASSWORD:-}" ]; then
+    psql_in aims_clinical -v pw="$AIMS_CLINICAL_READER_PASSWORD" <<'SQL'
+ALTER ROLE aims_clinical_reader LOGIN PASSWORD :'pw';
+SQL
+fi
+
 echo "Migrations: $applied applied, $current already in place, $changed changed since applied."

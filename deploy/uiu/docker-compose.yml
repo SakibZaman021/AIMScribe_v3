@@ -63,10 +63,6 @@ services:
       # ranges, separated by spaces. Unset means nobody from outside - the
       # gateway answers 403 - which is the safe way for this to fail.
       AIMS_ADMIN_ALLOW: ${AIMS_ADMIN_ALLOW:-0.0.0.0/0 ::/0}
-      # The portal's login (Caddyfile): a name, and the bcrypt hash of a long
-      # random password, base64. Required: no login, no gateway.
-      AIMS_PORTAL_USER: ${AIMS_PORTAL_USER:?set AIMS_PORTAL_USER in .env}
-      AIMS_PORTAL_HASH: ${AIMS_PORTAL_HASH:?set AIMS_PORTAL_HASH in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data           # certificates and their renewals
@@ -99,6 +95,9 @@ services:
       # has none (018_v3_least_privilege.sql).
       AIMS_API_DB_PASSWORD: ${AIMS_API_DB_PASSWORD:?set AIMS_API_DB_PASSWORD in .env}
       AIMS_CLINICAL_PASSWORD: ${AIMS_CLINICAL_PASSWORD:?set AIMS_CLINICAL_PASSWORD in .env}
+      # The clinical database's read-only login, for the database viewer
+      # (postgres/migrate.sh sets it on every update).
+      AIMS_CLINICAL_READER_PASSWORD: ${AIMS_CLINICAL_READER_PASSWORD:?set AIMS_CLINICAL_READER_PASSWORD in .env}
       AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD:?set AIMS_MONITOR_PASSWORD in .env}
       # initdb runs before the config file is read, so the collation and
       # checksums have to be settled here.
@@ -240,6 +239,18 @@ services:
       AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:?set AIMS_RECEIPT_PRIVATE_KEY in .env}
       # Credentials the API checks.
       AIMS_ADMIN_KEY: ${AIMS_ADMIN_KEY:?set AIMS_ADMIN_KEY in .env}
+      # Google sign-in for the dashboard and the database viewer (portal.py).
+      # Empty: nobody signs in, and the admin key still works on the loopback.
+      AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST:?set AIMS_PUBLIC_HOST in .env}
+      AIMS_GOOGLE_CLIENT_ID: ${AIMS_GOOGLE_CLIENT_ID:-}
+      AIMS_GOOGLE_CLIENT_SECRET: ${AIMS_GOOGLE_CLIENT_SECRET:-}
+      AIMS_PORTAL_OWNER_EMAIL: ${AIMS_PORTAL_OWNER_EMAIL:-}
+      # The invitation email when an admin gives someone access (optional).
+      AIMS_SMTP_HOST: ${AIMS_SMTP_HOST:-}
+      AIMS_SMTP_PORT: ${AIMS_SMTP_PORT:-587}
+      AIMS_SMTP_USER: ${AIMS_SMTP_USER:-}
+      AIMS_SMTP_PASSWORD: ${AIMS_SMTP_PASSWORD:-}
+      AIMS_SMTP_FROM: ${AIMS_SMTP_FROM:-}
       AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
       AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
       AIMS_CMED_WEBHOOK_ENABLED: ${AIMS_CMED_WEBHOOK_ENABLED:-false}
@@ -505,9 +516,11 @@ services:
     networks: [internal, edge]
 
   # ------------------------------------------------------------
-  # The database viewer (Adminer), at https://<host>/db/ behind the portal
-  # login (Caddyfile), then the database's own password. It publishes no
-  # port: the gateway reaches it on the internal network.
+  # The database viewer (Adminer), at https://<host>/db/ for people signed in
+  # to the portal with Google: read-only for everyone, without a database
+  # password (adminer/portal-readonly.php); an admin may also use a database
+  # account. It publishes no port: the gateway reaches it on the internal
+  # network.
   # Server: postgres. The Dracula look; the login offers PostgreSQL only.
   # ------------------------------------------------------------
   dbviewer:
@@ -517,9 +530,14 @@ services:
     <<: *hardening
     environment:
       ADMINER_DEFAULT_SERVER: postgres
+      # The read-only logins a portal user opens the databases with
+      # (adminer/portal-readonly.php). Neither can change anything.
+      AIMS_MONITOR_PASSWORD: ${AIMS_MONITOR_PASSWORD:?set AIMS_MONITOR_PASSWORD in .env}
+      AIMS_CLINICAL_READER_PASSWORD: ${AIMS_CLINICAL_READER_PASSWORD:?set AIMS_CLINICAL_READER_PASSWORD in .env}
     entrypoint: ["sh", "-c", "ln -sf designs/dracula/adminer-dark.css adminer.css && exec entrypoint.sh docker-php-entrypoint \"$$@\"", "--"]
     command: ["php", "-S", "[::]:8080", "-t", "/var/www/html"]
     volumes:
+      - ./adminer/portal-readonly.php:/var/www/html/plugins-enabled/800-portal-readonly.php:ro
       - ./adminer/postgres-only.php:/var/www/html/plugins-enabled/900-postgres-only.php:ro
     depends_on: [postgres]
     networks: [internal]
