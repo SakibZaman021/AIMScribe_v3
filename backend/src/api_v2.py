@@ -232,7 +232,29 @@ def _check_static_key(supplied: Optional[str], env_var: str, label: str) -> None
         raise HTTPException(status_code=401, detail=f"invalid {label} key")
 
 
-async def require_admin(x_admin_key: Optional[str] = Header(None)) -> None:
+async def require_admin(request: Request, x_admin_key: Optional[str] = Header(None)) -> None:
+    """
+    The admin key (the tools, the loopback door), or a browser signed in to the
+    portal as an admin (portal.py) - which must also send X-AIMS-Portal on
+    anything but a GET, so the session cannot be used from another site.
+    """
+    if not x_admin_key:
+        import portal
+        person = await portal.person_for(request)
+        if person is not None:
+            if person.role != "admin":
+                raise HTTPException(status_code=403, detail="this needs an administrator")
+            portal.check_csrf(request)
+            return
+    _check_static_key(x_admin_key, "AIMS_ADMIN_KEY", "admin")
+
+
+async def require_viewer(request: Request, x_admin_key: Optional[str] = Header(None)) -> None:
+    """Reading only: the admin key, or anyone signed in to the portal, researchers too."""
+    if not x_admin_key:
+        import portal
+        if await portal.person_for(request) is not None:
+            return
     _check_static_key(x_admin_key, "AIMS_ADMIN_KEY", "admin")
 
 

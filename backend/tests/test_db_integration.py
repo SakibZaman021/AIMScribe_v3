@@ -1500,3 +1500,146 @@ async def test_a_pc_cmed_never_vouches_for_is_rejected(dbs):
         assert await dbs.repo.device_by_token(reply["device_token"]) is None
     finally:
         _unserve()
+
+
+# ============================================================
+# 026: the portal - Google sign-in, roles, and who may change what
+# ============================================================
+
+def _portal_app(dbs, monkeypatch, *, google_email, owner="owner@uiu.example"):
+    """The sign-in routes and the dashboard on one app; Google's two calls stood in."""
+    import httpx
+    import portal
+    import dashboard
+    from fastapi import FastAPI
+
+    monkeypatch.setenv("AIMS_GOOGLE_CLIENT_ID", "client-123.apps.googleusercontent.com")
+    monkeypatch.setenv("AIMS_GOOGLE_CLIENT_SECRET", "test-secret")
+    monkeypatch.setenv("AIMS_PUBLIC_HOST", "aims.test")
+    monkeypatch.setenv("AIMS_PORTAL_OWNER_EMAIL", owner)
+    monkeypatch.setenv("AIMS_ADMIN_KEY", "the-admin-key")
+
+    async def exchange(code, verifier):
+        assert len(verifier) >= 43                         # PKCE verifier sent back
+        return {"id_token": "signed-by-google"}
+
+    def verify(token, nonce):
+        return {"email": google_email["value"], "email_verified": True, "name": "Test Person",
+                "nonce": nonce}
+
+    monkeypatch.setattr(portal, "_exchange", exchange)
+    monkeypatch.setattr(portal, "_verify_id_token", verify)
+    _server(dbs)
+    app = FastAPI()
+    app.include_router(portal.router)
+    app.include_router(dashboard.router)
+    app.include_router(api_v2.router)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                             base_url="https://aims.test")
+
+
+async def _sign_in(client, next_path="/dashboard"):
+    from urllib.parse import parse_qs, urlparse
+    start = await client.get(f"/auth/login?next={next_path}")
+    assert start.status_code == 302
+    query = parse_qs(urlparse(start.headers["location"]).query)
+    assert query["code_challenge_method"] == ["S256"] and query["code_challenge"][0]
+    assert query["redirect_uri"] == ["https://aims.test/auth/callback"]
+    return await client.get(f"/auth/callback?state={query['state'][0]}&code=abc")
+
+
+async def test_only_people_on_the_list_get_in_and_the_owner_always_does(dbs, monkeypatch):
+    who = {"value": "stranger@gmail.example"}
+    async with _portal_app(dbs, monkeypatch, google_email=who) as client:
+        refused = await _sign_in(client)
+        assert refused.status_code == 403 and "aims_portal" not in refused.cookies
+        assert (await client.get("/auth/me")).status_code == 401
+
+        who["value"] = "Owner@UIU.example"                 # Google's case, any case
+        signed = await _sign_in(client, "/db/")
+        assert signed.status_code == 302 and signed.headers["location"] == "/db/"
+        assert "httponly" in signed.headers["set-cookie"].lower()
+        assert "secure" in signed.headers["set-cookie"].lower()
+        me = (await client.get("/auth/me")).json()
+        assert (me["email"], me["role"]) == ("owner@uiu.example", "admin")
+    try:
+        async with dbs.rec.acquire() as conn:
+            refused_logged = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE event_type = 'portal.refused' "
+                "AND actor_id = 'stranger@gmail.example'")
+        assert refused_logged >= 1
+    finally:
+        _unserve()
+
+
+async def test_a_researcher_looks_but_cannot_change_anything(dbs, monkeypatch):
+    who = {"value": "owner@uiu.example"}
+    async with _portal_app(dbs, monkeypatch, google_email=who) as client:
+        await _sign_in(client)
+        added = await client.post("/api/v2/admin/people",
+                                  json={"email": "Researcher@uni.example", "role": "researcher"},
+                                  headers={"X-AIMS-Portal": "1"})
+        assert added.status_code == 200 and added.json()["email"] == "researcher@uni.example"
+
+        # The same admin session, from another site: no X-AIMS-Portal, refused.
+        forged = await client.post("/api/v2/admin/people",
+                                   json={"email": "evil@x.example", "role": "admin"})
+        assert forged.status_code == 403
+
+        client.cookies.clear()
+        who["value"] = "researcher@uni.example"
+        await _sign_in(client)
+        assert (await client.get("/api/v2/dashboard/clinics")).status_code == 200
+        assert (await client.get("/api/v2/admin/people")).status_code == 403
+        tried = await client.post("/api/v2/admin/people/remove",
+                                  json={"email": "owner@uiu.example"},
+                                  headers={"X-AIMS-Portal": "1"})
+        assert tried.status_code == 403
+
+        # The gateway's question, for the viewer and for an admin route.
+        ok = await client.get("/auth/check", headers={"X-Forwarded-Uri": "/db/"})
+        assert ok.status_code == 200 and ok.headers["x-portal-role"] == "researcher"
+        assert (await client.get("/auth/check",
+                                 headers={"X-Forwarded-Uri": "/api/v2/admin/people"})
+                ).status_code == 403
+    _unserve()
+
+
+async def test_removing_a_person_ends_their_session_at_once(dbs, monkeypatch):
+    who = {"value": "owner@uiu.example"}
+    async with _portal_app(dbs, monkeypatch, google_email=who) as client:
+        await _sign_in(client)
+        await client.post("/api/v2/admin/people", json={"email": "leaver@uni.example",
+                                                        "role": "researcher"},
+                          headers={"X-AIMS-Portal": "1"})
+        owner_cookie = client.cookies.get("aims_portal")
+        client.cookies.clear()
+        who["value"] = "leaver@uni.example"
+        await _sign_in(client)
+        assert (await client.get("/auth/me")).status_code == 200
+
+        leaver_cookie = client.cookies.get("aims_portal")
+        client.cookies.clear()
+        client.cookies.set("aims_portal", owner_cookie, domain="aims.test")
+        removed = await client.post("/api/v2/admin/people/remove",
+                                    json={"email": "leaver@uni.example"},
+                                    headers={"X-AIMS-Portal": "1"})
+        assert removed.status_code == 200
+        assert (await client.post("/api/v2/admin/people/remove",
+                                  json={"email": "owner@uiu.example"},
+                                  headers={"X-AIMS-Portal": "1"})).status_code == 409
+
+        client.cookies.clear()
+        client.cookies.set("aims_portal", leaver_cookie, domain="aims.test")
+        assert (await client.get("/auth/me")).status_code == 401
+        check = await client.get("/auth/check", headers={"X-Forwarded-Uri": "/dashboard",
+                                                         "Accept": "text/html"})
+        assert check.status_code == 302 and check.headers["location"].startswith("/auth/login")
+    _unserve()
+
+
+def test_sign_in_never_sends_anyone_to_another_site():
+    import portal
+    for bad in ("https://evil.example/", "//evil.example", "/\\evil", "", None, "/auth/logout"):
+        assert portal.safe_next(bad) == "/dashboard"
+    assert portal.safe_next("/db/?pgsql=postgres") == "/db/?pgsql=postgres"

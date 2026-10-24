@@ -133,6 +133,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      "column sessions.erase_after", _column("sessions", "erase_after")),
     ("025_v3_confirmed_only_and_self_registration.sql", "recordings",
      "column devices.approval", _column("devices", "approval")),
+    # Without it nobody can sign in to the portal with Google.
+    ("026_v3_portal_people.sql", "recordings", "table portal_people",
+     _table("portal_people")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
@@ -233,7 +236,7 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 025 present)")
+        logger.info("Database schema up to date (migrations up to 026 present)")
     await _warn_if_owner(recordings_pool)
     return problems
 

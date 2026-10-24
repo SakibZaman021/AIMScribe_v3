@@ -126,16 +126,26 @@ def test_the_internet_never_reaches_v1_the_docs_or_the_workers_routes():
     assert "respond 404" in _block(CADDYFILE, "handle @never")
 
 
-def test_admin_the_dashboard_and_the_viewer_sit_behind_a_login_and_fail_closed():
+def test_admin_the_dashboard_and_the_viewer_need_a_google_sign_in():
     portal = [line for line in CADDYFILE.split("\n") if line.strip().startswith("@portal path")][0]
     for path in ("/api/v2/admin/*", "/api/v2/dashboard/*", "/db/*", "/dashboard/*"):
         assert path in portal
-    assert "basic_auth @portal" in CADDYFILE
-    # No login configured: the stack refuses to start, so it is never open.
-    assert SERVICES["gateway"]["environment"]["AIMS_PORTAL_HASH"] \
-        == "${AIMS_PORTAL_HASH:?set AIMS_PORTAL_HASH in .env}"
+    door = _block(CADDYFILE, "forward_auth @portal api:6000")
+    assert "uri /auth/check" in door and "copy_headers X-Portal-Email X-Portal-Role" in door
+    assert "basic_auth" not in CADDYFILE
     # An address allow-list can still be added on top.
     assert "respond 403" in _block(CADDYFILE, "handle @lab_only_denied")
+
+
+def test_researchers_open_the_databases_with_read_only_logins_only():
+    viewer = SERVICES["dbviewer"]
+    plugins = " ".join(viewer["volumes"])
+    assert "portal-readonly.php" in plugins
+    plugin = (HERE / "adminer" / "portal-readonly.php").read_text(encoding="utf-8")
+    assert '"aims_monitor"' in plugin and '"aims_clinical_reader"' in plugin
+    assert "Researchers open the databases read-only" in plugin
+    # The superuser's password never reaches the viewer.
+    assert "POSTGRES_SUPERUSER_PASSWORD" not in str(viewer.get("environment"))
 
 
 def test_the_client_address_the_api_sees_is_the_gateways_not_the_clients_claim():

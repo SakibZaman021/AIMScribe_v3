@@ -260,6 +260,9 @@ app.include_router(v2_router)
 app.include_router(cmed_auth.router)
 app.include_router(fhir.router)
 app.include_router(fhir.well_known)
+# Google sign-in for the dashboard and the database viewer (portal.py).
+import portal  # noqa: E402
+app.include_router(portal.router)
 # Channel B: CMED's server sends API 2 and prescriptions here (SRS 3.2 §6.2).
 app.include_router(clinical_router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database

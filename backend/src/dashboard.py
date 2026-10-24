@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 
 import api_v2
-from api_v2 import require_admin
+from api_v2 import require_admin, require_viewer
 from integrity import safe_identifier
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ def _clinic(value: Optional[str]) -> Optional[str]:
 async def summary(from_date: Optional[str] = Query(None, alias="from"),
                   to_date: Optional[str] = Query(None, alias="to"),
                   hospital_id: Optional[str] = None,
-                  _: None = Depends(require_admin)):
+                  _: None = Depends(require_viewer)):
     """
     Everything §8.9 asks for, for a span of days: volume, confirmation,
     integrity, recorder health, reconciliation and the state of the copies.
@@ -492,7 +492,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                      state: Optional[str] = None,
                      search: Optional[str] = None,
                      limit: int = 100,
-                     _: None = Depends(require_admin)):
+                     _: None = Depends(require_viewer)):
     """
     Clinic, then doctor, then date, then patient - and a recording at any
     level (`SRS-DSH-02`). `state` opens one of the summary's counts:
@@ -601,7 +601,7 @@ def _recording_row(row) -> Dict[str, Any]:
 
 
 @router.get("/clinics")
-async def clinics(_: None = Depends(require_admin)):
+async def clinics(_: None = Depends(require_viewer)):
     """The clinics and doctors a dashboard filter can offer."""
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
