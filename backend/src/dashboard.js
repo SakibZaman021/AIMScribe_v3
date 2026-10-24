@@ -1043,6 +1043,236 @@ $("people").addEventListener("click", async (e) => {
   loadPeople();
 });
 
+/* ============================================================
+   Download in batches (bulk.py): a selection, and the next files of
+   it this person does not have yet, one ZIP at a time.
+   ============================================================ */
+let BULK = null;            // last /bulk/preview answer
+let BULK_DOCTORS = null;    // null: every doctor; else the chosen ids
+let bulkSeq = 0;
+let bulkTimer = 0;
+
+const size = (b) => {
+  const n = Number(b || 0);
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${Math.round(n / 1e6)} MB`;
+  return `${Math.max(1, Math.round(n / 1e3))} KB`;
+};
+const shortDay = (iso) => {
+  const d = new Date(`${iso}T00:00:00`);
+  return isNaN(d) ? iso : d.toLocaleDateString([], { day: "numeric", month: "short" });
+};
+
+async function bulkCall(method, path, params, body) {
+  const query = new URLSearchParams();
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (Array.isArray(v)) v.forEach((x) => query.append(k, x));
+    else if (v !== "" && v != null) query.append(k, v);
+  });
+  const response = await fetch(`/api/v2/dashboard/bulk${path}${method === "GET" ? `?${query}` : ""}`, {
+    method, headers: { ...portalHeaders(), "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined });
+  if (response.status === 401) { window.location.href = "/auth/login?next=/dashboard"; throw new Error("Signed out."); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+function bulkSelection() {
+  return { hospital_id: $("bClinic").value, from: $("bFrom").value, to: $("bTo").value,
+           doctor: BULK_DOCTORS || [], size: $("bSize").value || 200 };
+}
+
+function bulkSoon(ms) { clearTimeout(bulkTimer); bulkTimer = setTimeout(loadBulk, ms || 250); }
+
+async function loadBulk() {
+  if (!PORTAL) return;
+  const seq = ++bulkSeq;
+  try {
+    const d = await bulkCall("GET", "/preview", bulkSelection());
+    if (seq !== bulkSeq) return;
+    BULK = d;
+    drawBulk(d);
+  } catch (err) {
+    if (seq !== bulkSeq) return;
+    $("bSummary").innerHTML = empty("Could not load this selection", err.message);
+    $("bGo").disabled = true;
+  }
+  loadBatches();
+}
+
+function drawBulk(d) {
+  const lim = d.limits;
+  // The batch sizes this person may ask for, keeping their choice.
+  const chosen = Number($("bSize").value) || Math.min(200, lim.batch_max);
+  $("bSize").innerHTML = lim.sizes.map((s) =>
+    `<option value="${s}"${s === chosen ? " selected" : ""}>${num(s)}</option>`).join("");
+  if (!lim.sizes.includes(chosen)) $("bSize").value = String(lim.sizes[lim.sizes.length - 1]);
+
+  // Doctors, with what each has and what this person already took.
+  const all = BULK_DOCTORS === null;
+  $("bAll").setAttribute("aria-pressed", String(all));
+  $("bDoctors").innerHTML = d.doctors.length ? d.doctors.map((x) => {
+    const on = all || BULK_DOCTORS.includes(x.doctor_id);
+    return `<button type="button" class="chip" data-doc="${esc(x.doctor_id)}" aria-pressed="${on}"`
+      + ` title="${esc(`${x.downloaded} of ${x.files} already downloaded by you`)}">`
+      + `${esc(x.doctor_id)} · <b>${num(x.files)}</b>`
+      + (x.downloaded ? ` <span class="hint">(${num(x.downloaded)} yours)</span>` : "") + `</button>`;
+  }).join("") : `<span class="hint">No downloadable recordings for these days.</span>`;
+
+  const pct = d.total ? Math.round((d.downloaded / d.total) * 100) : 0;
+  $("bSummary").innerHTML = d.total ? `<div class="bnums">`
+      + `<div><b>${num(d.total)}</b><small>files in this selection · ${size(d.bytes_total)}</small></div>`
+      + `<div class="good"><b>${num(d.downloaded)}</b><small>already downloaded by you</small></div>`
+      + `<div class="info"><b>${num(d.remaining)}</b><small>left · about ${size(d.bytes_remaining)}</small></div>`
+      + `</div><div class="meter" title="${pct}% downloaded"><i data-pct="${pct}"></i></div>`
+      + `<div class="bdays">${d.days.map((y) => `<span>${esc(shortDay(y.date))}: <b>${num(y.files)}</b>`
+        + (y.downloaded ? ` <span class="hint">(${num(y.downloaded)} yours)</span>` : "") + `</span>`).join("")}</div>`
+    : empty("Nothing to download here", "Only recordings CMED confirmed and copied to the cloud can be downloaded.");
+  // Set from script: the page policy allows no inline style.
+  $("bSummary").querySelectorAll(".meter i").forEach((bar) => { bar.style.width = `${bar.dataset.pct}%`; });
+
+  // The button says exactly which files come next, or why none can.
+  const go = $("bGo");
+  const w = lim.window || { open: true };
+  let reason = "";
+  if (d.running) reason = `Batch ${d.running.batch_no} is downloading: ${num(d.running.files_done)} of ${num(d.running.files)} files so far.`;
+  else if (!w.open) reason = `Batch downloads for researchers open at ${w.hours.split("-")[0]} (in ${Math.floor(w.opens_in_minutes / 60)} h ${w.opens_in_minutes % 60} min) and close at ${w.hours.split("-")[1]}, clinic time.`;
+  else if (!d.total) reason = "";
+  else if (!d.remaining) reason = `You have all ${num(d.total)} files of this selection.`;
+  else if (lim.left_today === 0) reason = `You have taken today's ${num(lim.daily_files)} files.`
+    + (lim.frees_at ? ` More from ${when(lim.frees_at)}.` : "");
+  go.disabled = !!reason || !d.next;
+  go.textContent = d.next
+    ? `Download batch ${d.next.batch_no} · files ${num(d.next.first_no)}–${num(d.next.last_no)} of ${num(d.total)} · about ${size(d.next.bytes)}`
+    : "Download next batch";
+  $("bMsg").textContent = reason;
+  $("bulkHint").textContent = lim.daily_files != null
+    ? `Today: ${num(lim.used_today)} of ${num(lim.daily_files)} files` + (lim.window && lim.window.hours ? ` · open ${lim.window.hours}` : "")
+    : "Admin: no daily limit, any time";
+}
+
+$("bDoctors").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-doc]");
+  if (!b || !BULK) return;
+  const ids = BULK.doctors.map((x) => x.doctor_id);
+  let picked = BULK_DOCTORS === null ? ids.slice() : BULK_DOCTORS.slice();
+  picked = picked.includes(b.dataset.doc) ? picked.filter((x) => x !== b.dataset.doc) : picked.concat(b.dataset.doc);
+  BULK_DOCTORS = picked.length === ids.length || !picked.length ? null : picked;
+  bulkSoon(0);
+});
+$("bAll").addEventListener("click", () => { BULK_DOCTORS = null; bulkSoon(0); });
+["bClinic", "bFrom", "bTo"].forEach((id) => $(id).addEventListener("change", () => {
+  BULK_DOCTORS = null;           // another selection: its own doctors
+  bulkSoon(0);
+}));
+$("bSize").addEventListener("change", () => bulkSoon(0));
+
+$("bGo").addEventListener("click", async () => {
+  const go = $("bGo");
+  go.disabled = true;
+  $("bMsg").textContent = "Preparing the batch…";
+  try {
+    const s = bulkSelection();
+    const batch = await bulkCall("POST", "/batches", null, {
+      hospital_id: s.hospital_id || null, from: s.from, to: s.to,
+      doctors: BULK_DOCTORS, size: Number(s.size) });
+    startZip(batch);
+  } catch (err) {
+    $("bMsg").textContent = `Not started: ${err.message}`;
+    bulkSoon(1500);
+  }
+});
+
+/* The browser saves the ZIP itself; this page only watches the batch. Asked
+   first whether it may start, so a refusal is said here, not on a bare page. */
+async function startZip(batch) {
+  try {
+    const ok = await bulkCall("GET", `/batches/${encodeURIComponent(batch.id)}/check`, {});
+    if (!ok.ok) { $("bMsg").textContent = `Not started: ${ok.detail}`; bulkSoon(1500); return; }
+  } catch (err) { $("bMsg").textContent = `Not started: ${err.message}`; return; }
+  const a = document.createElement("a");
+  a.href = `/api/v2/dashboard/bulk/batches/${encodeURIComponent(batch.id)}/zip`;
+  a.download = "";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  $("bMsg").textContent = (batch.batch_no
+    ? `Batch ${batch.batch_no} (files ${num(batch.first_no)}–${num(batch.last_no)}) is downloading. `
+    : "The batch is downloading again. ")
+    + "Your browser shows its progress; the next batch can start when it finishes.";
+  setTimeout(loadBulk, 2000);
+}
+
+async function loadBatches() {
+  try {
+    const { batches } = await bulkCall("GET", "/batches", { everyone: $("bEveryone").checked ? 1 : "" });
+    drawBatches(batches || []);
+    clearTimeout(window._bpoll);
+    if (batches.some((b) => b.outcome === "started")) window._bpoll = setTimeout(loadBulk, 5000);
+  } catch (err) {
+    $("bBatches").innerHTML = empty("Could not load batches", err.message);
+  }
+}
+
+function batchStatus(b) {
+  if (b.outcome === "started") return tag("info", `Downloading ${num(b.files_done)}/${num(b.files)}`);
+  if (b.outcome === "completed") {
+    return tag("good", "Done", `${b.files_done} files arrived whole`)
+      + (b.files_failed ? " " + tag("warn", `${b.files_failed} failed`, "These come again in your next batch.") : "");
+  }
+  if (b.outcome === "failed") return tag("bad", "Stopped", b.reason || "");
+  return tag("quiet", "Not started");
+}
+
+function drawBatches(list) {
+  if (!list.length) {
+    $("bBatches").innerHTML = empty("No batches yet", "Choose a selection above and download its first batch.", true);
+    return;
+  }
+  const everyone = $("bEveryone").checked;
+  $("bBatches").innerHTML = `<table><thead><tr><th>Batch</th>${everyone ? "<th>Who</th>" : ""}`
+    + `<th>Selection</th><th class="num">Files</th><th class="num">Size</th><th>Started</th>`
+    + `<th>Status</th><th></th></tr></thead><tbody>`
+    + list.map((b) => {
+      const docs = b.doctors ? (b.doctors.length > 3 ? `${b.doctors.length} doctors` : b.doctors.join(", ")) : "all doctors";
+      const days = b.from === b.to ? shortDay(b.from) : `${shortDay(b.from)} – ${shortDay(b.to)}`;
+      const mine = !PORTAL || b.email === PORTAL.email;
+      const again = !mine || b.outcome === "started" ? ""
+        : `<button type="button" class="chip" data-again="${b.id}">${b.outcome === "completed" ? "Download again" : "Try again"}</button>`;
+      return `<tr class="${b.outcome === "failed" ? "row-bad" : ""}">`
+        + td("Batch", `<b>${num(b.batch_no)}</b><span class="sub2">files ${num(b.first_no)}–${num(b.last_no)} of ${num(b.selection_total)}</span>`)
+        + (everyone ? td("Who", esc(b.email)) : "")
+        + td("Selection", `${esc(clinicName(b.hospital_id) || "All clinics")}<span class="sub2">${esc(days)} · ${esc(docs)}</span>`, "wrap")
+        + td("Files", num(b.files), "num")
+        + td("Size", size(b.bytes_sent || b.bytes_estimate), "num")
+        + td("Started", esc(when(b.started_at || b.created_at)))
+        + td("Status", `<span class="tags">${batchStatus(b)}</span>`)
+        + td("", again)
+        + `</tr>`;
+    }).join("") + `</tbody></table>`;
+}
+
+$("bBatches").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-again]");
+  if (!b) return;
+  b.disabled = true;
+  startZip({ id: b.dataset.again }).finally(() => { b.disabled = false; });
+});
+$("bEveryone").addEventListener("change", loadBatches);
+
+function startBulk() {
+  $("bulkPanel").hidden = false;
+  $("bEveryoneLabel").hidden = PORTAL.role !== "admin";
+  $("bClinic").innerHTML = `<option value="">All clinics</option>`
+    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+  $("bClinic").value = $("clinic").value;
+  $("bFrom").value = $("from").value;
+  $("bTo").value = $("to").value;
+  loadBulk();
+}
+
 async function start() {
   try { await whoAmI(); } catch { return; }
   $("from").value = daysAgo(6);
@@ -1055,6 +1285,7 @@ async function start() {
       + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
+  if (PORTAL) startBulk();
   await refresh();
 }
 

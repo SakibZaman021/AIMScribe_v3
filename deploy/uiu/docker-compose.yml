@@ -257,6 +257,14 @@ services:
       AIMS_DECRYPT_URL: http://archive-worker:7070
       AIMS_DOWNLOAD_DAILY_LIMIT: ${AIMS_DOWNLOAD_DAILY_LIMIT:-50}
       AIMS_DOWNLOAD_AT_ONCE: ${AIMS_DOWNLOAD_AT_ONCE:-2}
+      # In batches, one ZIP each (bulk.py): researchers within the hours,
+      # per batch and per 24 hours; the server, batches at once and speed.
+      AIMS_BULK_HOURS: ${AIMS_BULK_HOURS-22:00-07:00}
+      AIMS_BULK_BATCH_SIZE: ${AIMS_BULK_BATCH_SIZE:-200}
+      AIMS_BULK_DAILY_FILES: ${AIMS_BULK_DAILY_FILES:-600}
+      AIMS_BULK_ADMIN_BATCH_SIZE: ${AIMS_BULK_ADMIN_BATCH_SIZE:-1000}
+      AIMS_BULK_AT_ONCE: ${AIMS_BULK_AT_ONCE:-2}
+      AIMS_BULK_STREAM_MBPS: ${AIMS_BULK_STREAM_MBPS:-10}
       AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
       AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
       AIMS_CMED_WEBHOOK_ENABLED: ${AIMS_CMED_WEBHOOK_ENABLED:-false}
@@ -414,7 +422,7 @@ services:
       # Decrypts one copy for a portal download (serve.py), for the API only:
       # the worker key is required and the port is not published.
       AIMS_DECRYPT_PORT: 7070
-      AIMS_DECRYPT_CONCURRENCY: ${AIMS_DECRYPT_CONCURRENCY:-2}
+      AIMS_DECRYPT_CONCURRENCY: ${AIMS_DECRYPT_CONCURRENCY:-4}
       AIMS_POLL_SECONDS: ${AIMS_POLL_SECONDS:-30}
       AIMS_BATCH_SIZE: ${AIMS_BATCH_SIZE:-5}
       AIMS_DISK_HEADROOM_BYTES: ${AIMS_DISK_HEADROOM_BYTES:-21474836480}

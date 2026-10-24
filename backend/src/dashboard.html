@@ -112,6 +112,31 @@
       the <code>.wav</code>, <code>.manifest.json</code> and clinical <code>.json</code> are inside.
     </div>
   </section>
+  <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
+    <div class="head wrap"><h2 id="h-bulk">Download in batches</h2>
+      <button type="button" class="q" aria-label="About batches" data-tip="Pick a clinic, days and doctors. Each batch is the next files of that selection you do not have yet, oldest first, in one ZIP. A batch that breaks off, or a file that fails its check, is simply in your next batch: nothing is repeated and nothing is skipped.">?</button>
+      <span class="hint" id="bulkHint"></span></div>
+    <div class="body bulk">
+      <div class="bulkform">
+        <label class="field col"><span>Clinic</span> <select id="bClinic"></select></label>
+        <label class="field col"><span>From</span> <input type="date" id="bFrom"></label>
+        <label class="field col"><span>To</span> <input type="date" id="bTo"></label>
+        <label class="field col"><span>Files per batch</span> <select id="bSize"></select></label>
+      </div>
+      <div class="bdocs">
+        <div class="group-title">Doctors <button type="button" class="chip" id="bAll">All doctors</button></div>
+        <div class="chips small" id="bDoctors" role="group" aria-label="Doctors in this selection"></div>
+      </div>
+      <div id="bSummary" class="bsum" role="status"></div>
+      <div class="bgo">
+        <button type="button" class="primary" id="bGo" disabled>Download next batch</button>
+        <span id="bMsg" class="hint" role="status"></span>
+      </div>
+    </div>
+    <div class="head wrap bhead"><h2 id="h-batches">Batches</h2>
+      <label class="hint" id="bEveryoneLabel" hidden><input type="checkbox" id="bEveryone"> Everyone's</label></div>
+    <div class="scroll short"><div id="bBatches"></div></div>
+  </section>
   <section class="panel" aria-labelledby="h-people" id="peoplePanel" hidden>
     <div class="head wrap"><h2 id="h-people">People</h2>
       <span class="hint" id="peopleHint">Who may open this dashboard and the database viewer, by Google account</span></div>

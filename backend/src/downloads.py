@@ -130,8 +130,9 @@ async def _the_copy(session_id: str, part: Optional[int]) -> Dict[str, Any]:
             "filename": _SAFE_NAME.sub("-", name)[:150] + ".wav"}
 
 
-async def _within_limits(conn, email: str) -> None:
-    per_day = _limit("AIMS_DOWNLOAD_DAILY_LIMIT", 50)
+async def _within_limits(conn, email: str, role: str = "researcher") -> None:
+    """At most a few at once for anyone; a day's limit for researchers, none for an admin."""
+    per_day = _limit("AIMS_DOWNLOAD_DAILY_LIMIT", 50) if role != "admin" else 10**9
     at_once = _limit("AIMS_DOWNLOAD_AT_ONCE", 2)
     today, running = await conn.fetchrow("""
         SELECT count(*) FILTER (WHERE started_at > now() - interval '1 day'),
@@ -180,7 +181,7 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
     try:
         copy = await _the_copy(sid, part)
         async with portal._pool().acquire() as conn:
-            await _within_limits(conn, person.email)
+            await _within_limits(conn, person.email, person.role)
             row_id = await conn.fetchval("""
                 INSERT INTO portal_downloads (email, session_id, part_no, object_key, address)
                 VALUES ($1, $2, $3, $4, $5) RETURNING id

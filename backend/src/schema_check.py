@@ -142,6 +142,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it no researcher can be given their own database login.
     ("028_v3_researcher_db_logins.sql", "recordings", "column portal_people.db_user",
      _column("portal_people", "db_user")),
+    # Without it nothing can be downloaded in batches.
+    ("029_v3_portal_batches.sql", "recordings", "table portal_batches",
+     _table("portal_batches")),
+    ("029_v3_portal_batches.sql", "recordings", "table portal_batch_files",
+     _table("portal_batch_files")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
@@ -245,7 +250,7 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 028 present)")
+        logger.info("Database schema up to date (migrations up to 029 present)")
     await _warn_if_owner(recordings_pool)
     return problems
 

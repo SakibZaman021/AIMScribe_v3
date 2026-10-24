@@ -371,3 +371,35 @@ a.button { text-decoration: none; padding: .35rem .7rem; border-radius: 6px; }
            line-height: 22px; background: var(--surface); border: 1px solid var(--line);
            border-radius: 8px; color: inherit; }
 .copy.dl:hover { border-color: var(--muted); }
+/* Download in batches */
+.bulk { display: grid; gap: 12px; }
+.bulkform { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: end; }
+.bdocs .group-title { display: flex; align-items: center; gap: 8px; }
+.bdocs .group-title .chip { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.bsum { display: grid; gap: 8px; }
+.bnums { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: baseline; }
+.bnums div { display: flex; flex-direction: column; }
+.bnums b { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.bnums small { color: var(--muted); font-size: 12px; }
+.bnums .good b { color: var(--good-ink); }
+.bnums .info b { color: var(--info-ink); }
+.bsum .meter { height: 8px; border-radius: 4px; }
+.bsum .meter i { background: var(--good); border-radius: 4px; }
+.bdays { font-size: 12.5px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.bgo { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.bgo button.primary { min-height: 40px; padding: 0 16px; font-weight: 650; }
+.bgo button[disabled] { opacity: .55; cursor: not-allowed; filter: none; }
+.bhead { border-top: 1px solid var(--line); }
+.bhead label { display: inline-flex; align-items: center; gap: 6px; }
+.chip[aria-pressed="true"] .hint { color: inherit; opacity: .8; }
+@media (max-width: 640px) {
+  .bulkform label.field { flex: 1 1 140px; min-width: 0; }
+  .bulkform input, .bulkform select { width: 100%; min-width: 0; box-sizing: border-box; }
+  .bgo button.primary { width: 100%; white-space: normal; padding: 8px 12px; text-align: center; }
+  .bnums { gap: 8px 16px; }
+}
+@media (max-width: 640px) {
+  .top { flex-wrap: wrap; }
+  .who { order: 10; flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+         white-space: nowrap; }
+}

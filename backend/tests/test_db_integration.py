@@ -1796,6 +1796,202 @@ async def test_downloads_have_a_daily_limit_and_need_a_confirmed_copy(dbs, monke
 
 
 # ============================================================
+# 029: downloading in numbered batches - never a file twice, never one skipped
+# ============================================================
+
+def _wav_for(sid: str) -> bytes:
+    return b"RIFF" + sid.encode("ascii") * 64
+
+
+async def _bulk_recording(dbs, patient, doctor, day, minute):
+    """A confirmed, copied recording by this doctor on this day, at 10:<minute>."""
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id=patient, doctor_id=doctor, visit_date=day.isoformat())
+    stem = f"{patient}_{doctor}_HOSP003_10{minute:02d}00_10{minute:02d}59_{day:%Y%m%d}"
+    sid = await _archived(dbs, device, v, stem=stem)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("""
+            UPDATE sessions SET session_date = $2, doctor_id = $3, local_start = $4,
+                                opened_at = $5, total_duration_seconds = 600
+             WHERE session_id = $1
+        """, sid, day, doctor, datetime(2000, 1, 1, 10, minute).time(),
+            datetime(day.year, day.month, day.day, 4, minute, tzinfo=timezone.utc))
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", version=1,
+        object_key=f"copies/HOSP003/{doctor}/{day.isoformat()}/{stem}.v1.wav.enc",
+        byte_length=len(_wav_for(sid)) + 200, sha256=b"\x22" * 32,
+        plain_sha256=hashlib.sha256(_wav_for(sid)).digest())
+    await dbs.repo.mark_copied(sid)
+    return sid
+
+
+def _bulk_app(dbs, monkeypatch, who, worker):
+    import bulk
+    client = _download_app(dbs, monkeypatch, who, worker)
+    client._transport.app.include_router(bulk.router)
+    monkeypatch.setenv("AIMS_BULK_HOURS", "")
+    return client
+
+
+def _zip_of(response):
+    import io
+    import zipfile
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/zip"
+    z = zipfile.ZipFile(io.BytesIO(response.content))
+    assert z.testzip() is None
+    rows = list(__import__("csv").DictReader(io.StringIO(z.read("manifest.csv").decode())))
+    return z, rows
+
+
+async def test_batches_hand_out_a_selection_without_repeats_or_gaps(dbs, monkeypatch):
+    import httpx
+    d1, d2 = date(2026, 8, 1), date(2026, 8, 2)
+    made = [await _bulk_recording(dbs, f"PBULK{n}", doc, day, n) for n, (doc, day) in enumerate(
+        [("DRBULKA", d1)] * 3 + [("DRBULKA", d2)] * 2 + [("DRBULKB", d2)] * 2)]
+    short = set()
+
+    def worker(request):
+        sid = json.loads(request.content)["expect"]["session_id"]
+        body = _wav_for(sid)
+        if sid in short:                       # fails its check: cut short
+            return httpx.Response(200, content=body[:50],
+                                  headers={"Content-Length": str(len(body))})
+        return httpx.Response(200, content=body, headers={"Content-Length": str(len(body))})
+
+    monkeypatch.setenv("AIMS_BULK_BATCH_SIZE", "3")
+    who = {"value": ""}
+    sel = {"hospital_id": "HOSP003", "from": "2026-08-01", "to": "2026-08-02"}
+    got: list = []
+    async with _bulk_app(dbs, monkeypatch, who, worker) as client:
+        await _researcher(client, who, "bulk@uni.example")
+        H = {"X-AIMS-Portal": "1"}
+        first = (await client.get("/api/v2/dashboard/bulk/preview", params=sel)).json()
+        assert (first["total"], first["downloaded"], first["remaining"]) == (7, 0, 7)
+        assert {(d["doctor_id"], d["files"]) for d in first["doctors"]} == {
+            ("DRBULKA", 5), ("DRBULKB", 2)}
+        assert first["next"] == {**first["next"], "batch_no": 1, "first_no": 1, "last_no": 3}
+
+        # Without X-AIMS-Portal (another site's form): refused.
+        assert (await client.post("/api/v2/dashboard/bulk/batches", json=sel)).status_code == 403
+
+        for expect_no, expect_files in ((1, 3), (2, 3)):
+            batch = (await client.post("/api/v2/dashboard/bulk/batches",
+                                       json={**sel, "size": 50}, headers=H)).json()
+            assert (batch["batch_no"], batch["files"]) == (expect_no, expect_files)
+            assert (await client.get(f"/api/v2/dashboard/bulk/batches/{batch['id']}/check")
+                    ).json() == {"ok": True}
+            z, rows = _zip_of(await client.get(batch["url"]))
+            assert "README.txt" in z.namelist()
+            assert all(r["status"] == "OK" for r in rows)
+            for r in rows:
+                assert z.read(r["file"]) == _wav_for(r["session_id"])
+                assert "PBULK" not in r["file"]                 # no patient id
+                assert r["sha256"] == hashlib.sha256(_wav_for(r["session_id"])).hexdigest()
+            got += [r["session_id"] for r in rows]
+
+        middle = (await client.get("/api/v2/dashboard/bulk/preview", params=sel)).json()
+        assert (middle["downloaded"], middle["remaining"]) == (6, 1)
+        assert middle["next"]["first_no"] == 7 and middle["next"]["batch_no"] == 3
+
+        # The last file fails its check: the batch completes, the file does not count.
+        last = (set(made) - set(got)).pop()
+        short.add(last)
+        batch = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        z, rows = _zip_of(await client.get(batch["url"]))
+        assert [(r["session_id"], r["status"]) for r in rows] == [(last, "FAILED")]
+        assert (await client.get("/api/v2/dashboard/bulk/preview", params=sel)).json()["remaining"] == 1
+
+        # ... so it is in the next batch, and then the selection is done.
+        short.clear()
+        batch = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        z, rows = _zip_of(await client.get(batch["url"]))
+        assert [(r["session_id"], r["status"]) for r in rows] == [(last, "OK")]
+        got.append(last)
+        done = await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)
+        assert done.status_code == 409 and "already have all 7" in done.json()["detail"]
+
+        # One doctor of the same days: already all downloaded.
+        one = (await client.get("/api/v2/dashboard/bulk/preview",
+                                params={**sel, "doctor": "DRBULKB"})).json()
+        assert (one["total"], one["remaining"]) == (2, 0)
+        listed = (await client.get("/api/v2/dashboard/bulk/batches")).json()["batches"]
+        assert [b["outcome"] for b in listed] == ["completed"] * 4
+    _unserve()
+    assert sorted(got) == sorted(made)                         # every file, once
+
+
+async def test_batch_hours_daily_limit_and_a_stopped_batch(dbs, monkeypatch):
+    import httpx
+    day = date(2026, 8, 5)
+    made = [await _bulk_recording(dbs, f"PLIM{n}", "DRLIMIT", day, n) for n in range(4)]
+
+    def worker(request):
+        body = _wav_for(json.loads(request.content)["expect"]["session_id"])
+        return httpx.Response(200, content=body, headers={"Content-Length": str(len(body))})
+
+    sel = {"hospital_id": "HOSP003", "from": "2026-08-05", "to": "2026-08-05"}
+    H = {"X-AIMS-Portal": "1"}
+    who = {"value": ""}
+    async with _bulk_app(dbs, monkeypatch, who, worker) as client:
+        # Outside the hours: a researcher is told when they open; an admin is not held.
+        now = datetime.now()
+        later = (now + timedelta(hours=2)).strftime("%H:%M")
+        much_later = (now + timedelta(hours=3)).strftime("%H:%M")
+        monkeypatch.setenv("AIMS_BULK_HOURS", f"{later}-{much_later}")
+        await _researcher(client, who, "night@uni.example")
+        closed = await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)
+        assert closed.status_code == 403 and "open" in closed.json()["detail"]
+        assert (await client.get("/api/v2/dashboard/bulk/preview", params=sel)
+                ).json()["limits"]["window"]["open"] is False
+
+        # Any time, but 2 files a day.
+        monkeypatch.setenv("AIMS_BULK_HOURS", "")
+        monkeypatch.setenv("AIMS_BULK_DAILY_FILES", "2")
+        batch = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        assert batch["files"] == 2
+        _zip_of(await client.get(batch["url"]))
+        limited = await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)
+        assert limited.status_code == 429 and "limit of 2" in limited.json()["detail"]
+
+        # A batch whose download stopped part way: not running any more, and
+        # its files are left for the next batch.
+        monkeypatch.setenv("AIMS_BULK_DAILY_FILES", "100")
+        stuck = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE portal_batches SET outcome = 'started', started_at = now(), "
+                               "progress_at = now() WHERE id = $1", stuck["id"])
+        busy = await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)
+        assert busy.status_code == 409 and "downloading now" in busy.json()["detail"]
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE portal_batches SET progress_at = now() - interval '1 hour' "
+                               "WHERE id = $1", stuck["id"])
+        view = (await client.get("/api/v2/dashboard/bulk/preview", params=sel)).json()
+        assert (view["downloaded"], view["remaining"], view["running"]) == (2, 2, None)
+        again = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        assert again["first_no"] == 3 and again["files"] == 2
+        z, rows = _zip_of(await client.get(again["url"]))
+        assert sorted(r["session_id"] for r in rows) == sorted(made[2:])
+
+        # The admin: no hours, no daily limit, and may see everyone's batches.
+        monkeypatch.setenv("AIMS_BULK_HOURS", f"{later}-{much_later}")
+        monkeypatch.setenv("AIMS_BULK_DAILY_FILES", "1")
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        mine = (await client.post("/api/v2/dashboard/bulk/batches", json=sel, headers=H)).json()
+        assert mine["files"] == 4                               # the admin has none yet
+        _zip_of(await client.get(mine["url"]))
+        everyone = (await client.get("/api/v2/dashboard/bulk/batches",
+                                     params={"everyone": "true"})).json()["batches"]
+        assert {"night@uni.example", "owner@uiu.example"} <= {b["email"] for b in everyone}
+        # Someone else's batch is not theirs to download.
+        theirs = next(b for b in everyone if b["email"] == "night@uni.example")
+        assert (await client.get(theirs["url"])).status_code == 404
+    _unserve()
+
+
+# ============================================================
 # 028: each researcher's own read-only database login
 # ============================================================
 
