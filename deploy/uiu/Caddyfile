@@ -85,7 +85,7 @@
 	@portal path /dashboard /dashboard/* /db /db/* /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
 	forward_auth @portal api:6000 {
 		uri /auth/check
-		copy_headers X-Portal-Email X-Portal-Role
+		copy_headers X-Portal-Email X-Portal-Role X-Portal-Db-User
 	}
 
 	# Optionally, the portal from listed addresses only as well

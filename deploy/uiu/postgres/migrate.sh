@@ -124,6 +124,8 @@ psql_in aims_recordings -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO aims_
 prepare aims_clinical encounters
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/001_aims_clinical.sql
 apply aims_clinical "" /aims/scripts/clinical/002_roles.sql
+# The doctor's findings with each prescription (API 3).
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/003_consultation_findings.sql
 
 # The clinical database's read-only login, for the database viewer: its
 # password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.
@@ -132,5 +134,12 @@ if [ -n "${AIMS_CLINICAL_READER_PASSWORD:-}" ]; then
 ALTER ROLE aims_clinical_reader LOGIN PASSWORD :'pw';
 SQL
 fi
+
+# Researchers' own read-only logins (the portal's People panel): the roles,
+# the read-only grants on both databases - again on every update, so a new
+# table is readable too - and the two functions the server calls to make
+# and remove a login. As the superuser; safe to repeat.
+psql_in aims_recordings -f /aims/scripts/roles/researcher_logins_recordings.sql
+psql_in aims_clinical -f /aims/scripts/roles/researcher_logins_clinical.sql
 
 echo "Migrations: $applied applied, $current already in place, $changed changed since applied."

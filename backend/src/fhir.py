@@ -40,6 +40,7 @@ element - never a 500, which CMED's outbox would rightly retry for ever.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -358,31 +359,71 @@ def five_fields(b: Bundle, encounter: Dict[str, Any], where: str,
 
 
 def demographics(patient: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sex and date of birth: all the research needs of who the patient is. A
+    name, phone or address CMED sends anyway is not read, not stored, and named
+    in a warning (`not_stored`).
+    """
     out: Dict[str, Any] = {}
-    n = _first(patient.get("name"))
-    if n:
-        text = _str(n.get("text")) or " ".join(
-            [*[g for g in _list(n.get("given")) if isinstance(g, str)],
-             *([n["family"]] if isinstance(n.get("family"), str) else [])]).strip()
-        if text:
-            out["name"] = text
     if patient.get("gender") in ("female", "male"):
         out["sex"] = patient["gender"]
     if isinstance(patient.get("birthDate"), str) and len(patient["birthDate"]) == 10:
         out["date_of_birth"] = patient["birthDate"]
-    for t in _list(patient.get("telecom")):
-        if isinstance(t, dict) and t.get("system") == "phone" and isinstance(t.get("value"), str):
-            out["phone"] = t["value"]
-            break
-    for a in _list(patient.get("address")):
-        if isinstance(a, dict):
-            text = _str(a.get("text")) or ", ".join(
-                [*[x for x in _list(a.get("line")) if isinstance(x, str)],
-                 *[a[k] for k in ("city", "district", "state", "postalCode")
-                   if isinstance(a.get(k), str)]])
-            if text:
-                out["address"] = text
-                break
+    dropped = [name for name, key in (("name", "name"), ("phone", "telecom"),
+                                      ("address", "address")) if patient.get(key)]
+    if dropped:
+        out["not_stored"] = dropped
+    return out
+
+
+# The doctor's findings, in API 3: an Observation whose category names the
+# section (system FINDING_SYSTEM), code.text the item, value[x] the finding;
+# allergies may also come as AllergyIntolerance.
+FINDING_SYSTEM = "urn:aimscribe:fhir:finding"
+FINDING_SECTIONS = {"chief-complaint": "chief_complaint", "history": "history",
+                    "allergy": "allergy", "on-examination": "on_examination",
+                    "systemic-examination": "systemic_examination",
+                    "gynae-obstetric": "gynae_obstetric"}
+
+
+def _finding_section(obs: Dict[str, Any]) -> Optional[str]:
+    for cat in _list(obs.get("category")):
+        for code in _codes(cat):
+            if code in FINDING_SECTIONS:
+                return FINDING_SECTIONS[code]
+    return None
+
+
+def findings_of(b: "Bundle", mine) -> List[Dict[str, Any]]:
+    """The findings that belong to one encounter, as {section, item, value, detail}."""
+    out: List[Dict[str, Any]] = []
+    for obs in b.of("Observation"):
+        section = _finding_section(obs)
+        if section is None or not mine(obs):
+            continue
+        item = _text(obs.get("code"))
+        if not item:
+            continue
+        value = _value(obs)
+        detail = {k: v for k, v in (
+            (_text(c.get("code")), _value(c)) for c in _list(obs.get("component"))
+            if isinstance(c, dict)) if k and v is not None}
+        if _notes(obs):
+            detail["note"] = _notes(obs)
+        out.append({"section": section, "item": item,
+                    "value": None if value is None else str(value), "detail": detail})
+    for allergy in b.of("AllergyIntolerance"):
+        if not mine(allergy):
+            continue
+        kind = next((c for c in _list(allergy.get("category")) if isinstance(c, str)), "allergy")
+        what = _text(allergy.get("code"))
+        if what:
+            reactions = [_text(m) for r in _list(allergy.get("reaction")) if isinstance(r, dict)
+                         for m in _list(r.get("manifestation"))]
+            detail = {"reaction": "; ".join(t for t in reactions if t)} if any(reactions) else {}
+            if _notes(allergy):
+                detail["note"] = _notes(allergy)
+            out.append({"section": "allergy", "item": kind, "value": what, "detail": detail})
     return out
 
 
@@ -399,6 +440,8 @@ def observations(b: Bundle, encounter: Dict[str, Any], focus: Dict[str, Any]
             continue
         codes = _codes(obs.get("code"))
         categories = [c for cat in _list(obs.get("category")) for c in _codes(cat)]
+        if any(c in FINDING_SECTIONS for c in categories):
+            continue                          # the doctor's findings: API 3 (findings_of)
         group = next((c.replace("-", "_") for c in categories
                       if c in ("female-details", "male-details")), None)
         if group:
@@ -491,6 +534,9 @@ def prescription_of(b: Bundle, encounter: Dict[str, Any], focus: Dict[str, Any]
         "investigations": [t for t in (_text(s.get("code"))
                                        for s in b.of("ServiceRequest") if mine(s)) if t],
     }
+    findings = findings_of(b, mine)
+    if findings:
+        out["findings"] = findings
     authored = [m.get("authoredOn") for m in b.of("MedicationRequest")
                 if mine(m) and isinstance(m.get("authoredOn"), str)]
     if authored:
@@ -533,6 +579,9 @@ def to_body(b: Bundle, systems: Optional[Dict[str, str]] = None) -> Tuple[str, D
     paramedic, age, details = observations(b, focus, focus)
     if age is not None:
         body["demographics"]["age_years"] = _number(age)
+    early = findings_of(b, lambda r: b.refers_to(r, focus))
+    if early:
+        body["findings"] = early
     if paramedic:
         body["paramedic"] = paramedic
     body.update(details)
@@ -582,6 +631,11 @@ def _response_message(request_bundle: Dict[str, Any], status: int, code: str,
             params.append({"name": key, "valueString": str(extra[key])})
     if extra.get("version") is not None:
         params.append({"name": "version", "valueInteger": int(extra["version"])})
+    for w in extra.get("warnings") or []:
+        params.append({"name": "warning", "part": [
+            {"name": "field", "valueString": str(w.get("field"))},
+            {"name": "note", "valueString": str(w.get("note"))},
+            {"name": "sent", "valueString": json.dumps(w.get("sent"), ensure_ascii=False)}]})
     pv = extra.get("previous_visit")
     if isinstance(pv, dict):
         params.append({"name": "previous_visit", "part": [

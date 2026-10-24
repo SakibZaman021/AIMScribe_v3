@@ -321,7 +321,8 @@ def test_api2_in_fhir_reads_as_the_json_body():
     kind, body = fhir.to_body(fhir.Bundle(fhir_message("patient-information", extra=VITALS)))
     assert kind == "patient_information"
     assert {k: body[k] for k in FIELDS} == FIELDS
-    assert body["demographics"] == {"name": "Test", "sex": "female", "age_years": 34}
+    # The name was sent; it is not read, and the reply will say so.
+    assert body["demographics"] == {"sex": "female", "age_years": 34, "not_stored": ["name"]}
     assert body["paramedic"] == {
         "recorded_at": "2026-09-13T10:02:10+06:00", "weight_kg": 58.4, "height_cm": 157,
         "pulse_bpm": 78, "temperature_c": 37, "spo2_percent": 98,
@@ -556,9 +557,9 @@ def _reference_client():
 
 
 FULL_API2 = {**FIELDS,
-             "demographics": {"name": "Rahima Begum", "sex": "female", "age_years": 34,
-                              "date_of_birth": "1992-03-11", "phone": "01711000000",
-                              "address": "Dholpur, Dhaka"},
+             # Sex and date of birth only: name, phone and address are not sent.
+             "demographics": {"sex": "female", "age_years": 34,
+                              "date_of_birth": "1992-03-11"},
              "paramedic": {"recorded_at": "2026-09-13T10:02:10+06:00", "weight_kg": 58.4,
                            "height_cm": 157, "blood_pressure": "120/80", "pulse_bpm": 78,
                            "temperature_c": 36.8, "spo2_percent": 98, "notes": "anxious"},
@@ -573,14 +574,30 @@ FULL_API2 = {**FIELDS,
                                                  "diagnoses": ["Type 2 diabetes mellitus"],
                                                  "investigations": ["HbA1c"],
                                                  "advice": "walk daily",
-                                                 "follow_up": "2026-06-16", "notes": "r"}}}
+                                                 "follow_up": "2026-06-16", "notes": "r",
+                                                 "findings": [{"section": "chief_complaint",
+                                                               "item": "Thirst", "value": None,
+                                                               "detail": {}}]}}}
 FULL_API3 = {**FIELDS, "issued_at": "2026-09-13T10:26:55+06:00",
              "items": [{"drug": "Metformin 500 mg", "dose": "1 tablet",
                         "frequency": "1+0+1", "duration": "30 days",
                         "instructions": "after meals"},
                        {"drug": "Napa", "dose": "500 mg"}],
              "diagnoses": ["Type 2 diabetes mellitus"], "investigations": ["HbA1c", "CBC"],
-             "advice": "walk daily", "follow_up": "2026-10-13", "notes": "n"}
+             "advice": "walk daily", "follow_up": "2026-10-13", "notes": "n",
+             # The doctor's findings travel with the prescription.
+             "findings": [
+                 {"section": "chief_complaint", "item": "Fever", "value": None,
+                  "detail": {"severity": "moderate", "duration": "3 days"}},
+                 {"section": "history", "item": "family", "value": "Diabetes (mother)",
+                  "detail": {}},
+                 {"section": "allergy", "item": "medicine", "value": "Penicillin", "detail": {}},
+                 {"section": "on_examination", "item": "jaundice", "value": "absent",
+                  "detail": {}},
+                 {"section": "systemic_examination", "item": "heart", "value": "S1 S2 normal",
+                  "detail": {"note": "no murmur"}},
+                 {"section": "gynae_obstetric", "item": "obstetric", "value": "G2 P2",
+                  "detail": {}}]}
 
 
 @pytest.mark.parametrize("kind, body", [("patient_information", FULL_API2),

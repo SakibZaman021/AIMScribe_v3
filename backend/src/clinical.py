@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse
 import api_v2
 import cmed_auth
 import security
+import clinical_model as cm
 import confirmation as conf
 import integrity
 from confirmation import FieldError, Visit
@@ -148,15 +149,6 @@ def _problem(field: str, text: str) -> Dict[str, str]:
     return {"field": field, "problem": text}
 
 
-def _is_time(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        return datetime.fromisoformat(value).tzinfo is not None
-    except ValueError:
-        return False
-
-
 def _is_day(value: Any) -> bool:
     if not isinstance(value, str) or len(value) != 10:
         return False
@@ -167,85 +159,20 @@ def _is_day(value: Any) -> bool:
         return False
 
 
-def problems_with(kind: str, body: Dict[str, Any]) -> List[Dict[str, str]]:
+def problems_with(kind: str, body: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Everything beyond the five fields. Unknown fields are never a problem
-    (SRS-CHB-11): they are stored with the rest of the body.
+    What in this message was converted, read in another form, or could not be
+    used - each one a warning in the reply ({"field", "sent", "note"}).
+
+    None of them refuses the message. Only the five fields can, because they
+    tie it to its recording. A message refused for one odd value would leave
+    its recording unconfirmed, and an unconfirmed recording is erased after
+    its grace period: a whole consultation lost over a capital F. So a value
+    is read however a clinic writes it (clinical_model), one that cannot be
+    read is kept as sent, and the sender is told - and the message, stored
+    exactly as received, is accepted.
     """
-    found: List[Dict[str, str]] = []
-    if kind == "patient_information":
-        demographics = body.get("demographics")
-        if not isinstance(demographics, dict):
-            found.append(_problem("demographics", "required, and must be an object"))
-        elif "sex" in demographics and demographics["sex"] not in ("female", "male"):
-            found.append(_problem("demographics.sex", "must be 'female' or 'male'"))
-        if "paramedic" in body and body["paramedic"] is not None \
-                and not isinstance(body["paramedic"], dict):
-            found.append(_problem("paramedic", "must be an object"))
-        if "previous_visit" not in body:
-            found.append(_problem("previous_visit", "required; send null for a first visit"))
-        elif body["previous_visit"] is not None and not isinstance(body["previous_visit"], dict):
-            found.append(_problem("previous_visit", "must be an object or null"))
-        elif isinstance(body["previous_visit"], dict):
-            found.extend(_previous_visit_problems(body, body["previous_visit"]))
-    else:
-        if not _is_time(body.get("issued_at")):
-            found.append(_problem("issued_at", "required: a date and time with its time zone"))
-        for name in ("diagnoses", "investigations"):
-            if not isinstance(body.get(name), list):
-                found.append(_problem(name, "required: a list, empty if none"))
-        items = body.get("items")
-        if not isinstance(items, list):
-            found.append(_problem("items", "required: a list, one entry per medicine"))
-        else:
-            for n, item in enumerate(items):
-                if not isinstance(item, dict) or not isinstance(item.get("drug"), str) \
-                        or not item["drug"].strip():
-                    found.append(_problem(f"items[{n}].drug", "each item needs a drug"))
-        if body.get("follow_up") not in (None, "") and not _is_day(body.get("follow_up")):
-            found.append(_problem("follow_up", "must be YYYY-MM-DD"))
-    return found
-
-
-_PREVIOUS_IDENTITY = ("doctor_id", "hospital_id", "start_time")
-
-
-def _previous_visit_problems(body: Dict[str, Any], p: Dict[str, Any]) -> List[Dict[str, str]]:
-    """
-    previous_visit names the earlier visit by its own five fields, or - the
-    older shape, still accepted - by its date alone. Half a name is refused:
-    a doctor without a time could file the prescription against the wrong
-    visit, which is worse than not filing it.
-    """
-    found: List[Dict[str, str]] = []
-    if not _is_day(p.get("date")):
-        found.append(_problem("previous_visit.date", "required: YYYY-MM-DD"))
-    given = [name for name in _PREVIOUS_IDENTITY if p.get(name) not in (None, "")]
-    if p.get("patient_id") not in (None, "") and p.get("patient_id") != body.get("patient_id"):
-        found.append(_problem("previous_visit.patient_id",
-                              "must be the same patient as this visit"))
-    if given and len(given) < len(_PREVIOUS_IDENTITY):
-        for name in _PREVIOUS_IDENTITY:
-            if name not in given:
-                found.append(_problem(f"previous_visit.{name}",
-                                      "send all of doctor_id, hospital_id and start_time, "
-                                      "or none of them"))
-    elif given and not found:
-        try:
-            earlier = conf.parse_visit({"patient_id": body.get("patient_id"),
-                                        **{n: p.get(n) for n in _PREVIOUS_IDENTITY},
-                                        "date": p.get("date")}, strict_date=True)
-        except FieldError as exc:
-            found.append(_problem(f"previous_visit.{exc.field}", str(exc)))
-        else:
-            now = (body.get("date"), body.get("start_time"))
-            if (earlier.visit_date, earlier.start_time) == now:
-                found.append(_problem("previous_visit", "names this visit, not an earlier one"))
-            elif isinstance(body.get("date"), str) and earlier.visit_date > body["date"]:
-                found.append(_problem("previous_visit.date", "is after this visit"))
-    if not isinstance(p.get("prescription"), dict):
-        found.append(_problem("previous_visit.prescription", "required, and must be an object"))
-    return found
+    return cm.quality_notes(kind, body)
 
 
 # ------------------------------------------------------------------ endpoints
@@ -293,13 +220,21 @@ async def process(kind: str, body: Dict[str, Any], raw: str,
 
     store = api_v2._clinical()
 
-    problems = problems_with(kind, body)
-    if problems:
-        qid = await store.quarantine(kind=kind, raw=raw, problems=problems)
-        await repo.raise_alert(alert_type="clinical_schema_invalid", severity="warning",
-                               detail={"kind": kind, "quarantine_id": qid,
-                                       "fields": [p["field"] for p in problems]})
-        return 422, "SCHEMA_INVALID", None, {"fields": problems, "quarantine_id": str(qid)}
+    # Name, phone and address are not kept: removed before anything is stored.
+    dropped: List[str] = []
+    if kind == "patient_information":
+        body, dropped = cm.minimise(body)
+
+    # Accepted whatever the values say; what was adjusted goes back as warnings.
+    warnings = problems_with(kind, body)
+    if dropped:
+        warnings.append({"field": "demographics", "sent": dropped,
+                         "note": "not needed and not stored: send only sex and date of "
+                                 "birth (or age)"})
+    noted = {"warnings": warnings} if warnings else {}
+    if warnings:
+        logger.info("%s from %s accepted with %d warning(s): %s", kind, principal.actor,
+                    len(warnings), ", ".join(w["field"] for w in warnings))
 
     # The patient refused to be recorded: keep nothing from this visit, and
     # answer as usual so CMED needs no special handling (SRS-CNS-04).
@@ -329,7 +264,7 @@ async def process(kind: str, body: Dict[str, Any], raw: str,
             extra["previous_visit"] = await _previous_outcome(store, body, record_id,
                                                               repeat=True)
         return 200, "ALREADY_RECEIVED", None, {
-            "record_id": str(record_id) if record_id is not None else None, **extra}
+            "record_id": str(record_id) if record_id is not None else None, **extra, **noted}
 
     # Into the tables now. A load that fails keeps the body and is tried again
     # by the sweep; it never fails the request (SRS-CRI-04).
@@ -356,7 +291,7 @@ async def process(kind: str, body: Dict[str, Any], raw: str,
     if kind == "patient_information":
         extra["previous_visit"] = await _previous_outcome(store, body, record_id)
     return 202, "ACCEPTED", None, {"record_id": str(record_id), "received_at": _now_iso(),
-                                   **extra}
+                                   **extra, **noted}
 
 
 async def _previous_outcome(store, body: Dict[str, Any], record_id, *,
@@ -368,6 +303,10 @@ async def _previous_outcome(store, body: Dict[str, Any], record_id, *,
     """
     if not isinstance(body.get("previous_visit"), dict):
         return {"status": "NOT_SENT"}
+    issue = cm.previous_visit_issue(body)
+    if issue:
+        # Set aside, never the reason today's information is refused.
+        return {"status": "NOT_USED", "reason": issue}
     try:
         outcome = await store.previous_visit_outcome(int(record_id))
     except Exception as exc:

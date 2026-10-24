@@ -15,7 +15,10 @@ Google says who someone is; this server decides whether they may come in.
     /auth/logout     ends the session
 
 Roles: admin (everything, and managing people) and researcher (look, never
-change). The owner (AIMS_PORTAL_OWNER_EMAIL) is always an admin, so the portal
+change). Each person can also have their own read-only database login for
+the viewer (r_<name>_<hash>), made here and usable only behind their own
+Google sign-in: the gateway passes it on as X-Portal-Db-User, and the viewer
+accepts no other name from them. Its password is shown once, never stored. The owner (AIMS_PORTAL_OWNER_EMAIL) is always an admin, so the portal
 cannot lock its owner out. Removing a person ends their sessions at once.
 
 A browser signed in by cookie must send X-AIMS-Portal on anything that is not
@@ -29,7 +32,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
+import re
 import logging
 import os
 import secrets
@@ -67,6 +72,7 @@ ADMIN_PATHS = ("/api/v2/admin",)
 class Person:
     email: str
     role: str
+    db_user: Optional[str] = None
 
 
 def _env(name: str) -> str:
@@ -137,12 +143,12 @@ async def person_for(request: Request) -> Optional[Person]:
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT p.email, p.role FROM portal_sessions s
+            SELECT p.email, p.role, p.db_user FROM portal_sessions s
               JOIN portal_people p ON p.email = s.email
              WHERE s.token_sha256 = $1 AND s.ended_at IS NULL AND s.expires_at > now()
                AND p.removed_at IS NULL
         """, _sha(token))
-    return Person(row["email"], row["role"]) if row else None
+    return Person(row["email"], row["role"], row["db_user"]) if row else None
 
 
 def check_csrf(request: Request) -> None:
@@ -322,8 +328,10 @@ async def check(request: Request):
         return JSONResponse(status_code=401, content={"detail": "sign in first"})
     if uri.startswith(ADMIN_PATHS) and person.role != "admin":
         return JSONResponse(status_code=403, content={"detail": "this needs an administrator"})
-    return JSONResponse(content={"ok": True},
-                        headers={"X-Portal-Email": person.email, "X-Portal-Role": person.role})
+    headers = {"X-Portal-Email": person.email, "X-Portal-Role": person.role}
+    if person.db_user:
+        headers["X-Portal-Db-User"] = person.db_user
+    return JSONResponse(content={"ok": True}, headers=headers)
 
 
 # ------------------------------------------------------------------ people (admins)
@@ -352,7 +360,8 @@ def _admin():
 async def list_people(_: None = _admin()):
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
-            SELECT email, role, display_name, added_by, added_at, last_signed_in
+            SELECT email, role, display_name, added_by, added_at, last_signed_in,
+                   db_user, db_password_set_at
               FROM portal_people WHERE removed_at IS NULL ORDER BY role, email
         """)
     owner = owner_email()
@@ -375,8 +384,15 @@ async def add_person(body: PersonRequest, request: Request, _: None = _admin()):
         """, email, body.role, by)
     await _audit("portal.person_added", by, {"email": email, "role": body.role})
     invited = await _invite(email, body.role, by)
-    return {"status": "added", "email": email, "role": body.role, "invited": invited,
-            "link": _base() + "/dashboard"}
+    answer = {"status": "added", "email": email, "role": body.role, "invited": invited,
+              "link": _base() + "/dashboard"}
+    if body.role == "researcher":
+        # A researcher's own read-only login, from the start.
+        try:
+            answer["db_login"] = await _set_db_login(email, by)
+        except HTTPException as exc:
+            answer["db_login_error"] = exc.detail
+    return answer
 
 
 @router.post("/api/v2/admin/people/remove")
@@ -393,10 +409,82 @@ async def remove_person(body: RemoveRequest, request: Request, _: None = _admin(
             """, email, by)
             await conn.execute("UPDATE portal_sessions SET ended_at = now() "
                                "WHERE email = $1 AND ended_at IS NULL", email)
+            db_user = await conn.fetchval("SELECT db_user FROM portal_people WHERE email = $1",
+                                          email)
     if not done.endswith("1"):
         raise HTTPException(status_code=404, detail="no such person")
-    await _audit("portal.person_removed", by, {"email": email})
+    if db_user:
+        await _drop_db_login(email, db_user)
+    await _audit("portal.person_removed", by, {"email": email, "db_user": db_user})
     return {"status": "removed", "email": email}
+
+
+# ------------------------------------------------------------------ own database logins
+
+def db_user_for(email: str) -> str:
+    """r_<the address's name, simplified>_<6 hex of the whole address>: stable, unique."""
+    local = re.sub(r"[^a-z0-9]+", "_", email.split("@", 1)[0].lower()).strip("_")[:24] or "user"
+    return f"r_{local}_{hashlib.sha256(email.encode('utf-8')).hexdigest()[:6]}"
+
+
+def scram_verifier(password: str, iterations: int = 4096) -> str:
+    """
+    What PostgreSQL stores for a SCRAM-SHA-256 password (RFC 5802/7677), made
+    here so the password itself never reaches the database or its log.
+    """
+    salt = secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client_key = hmac.new(salted, b"Client Key", "sha256").digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", "sha256").digest()
+    b64 = lambda raw: base64.b64encode(raw).decode("ascii")    # noqa: E731
+    return f"SCRAM-SHA-256${iterations}:{b64(salt)}${b64(stored_key)}:{b64(server_key)}"
+
+
+async def _set_db_login(email: str, by: str) -> Dict[str, str]:
+    """Make, or give a new password to, this person's read-only login."""
+    db_user = db_user_for(email)
+    password = secrets.token_urlsafe(18)
+    try:
+        async with _pool().acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT portal_db_login_set($1, $2)",
+                                   db_user, scram_verifier(password))
+                await conn.execute("""
+                    UPDATE portal_people SET db_user = $2, db_password_set_at = now()
+                     WHERE email = $1 AND removed_at IS NULL
+                """, email, db_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("The database login for %s could not be set: %s", email, exc)
+        raise HTTPException(status_code=503, detail="the database login could not be set; "
+                                                    "the server's role setup may be missing "
+                                                    "(postgres/migrate.sh)")
+    await _audit("portal.db_login_set", by, {"email": email, "db_user": db_user})
+    return {"db_user": db_user, "password": password}
+
+
+async def _drop_db_login(email: str, db_user: str) -> None:
+    try:
+        async with _pool().acquire() as conn:
+            await conn.execute("SELECT portal_db_login_drop($1)", db_user)
+            await conn.execute("UPDATE portal_people SET db_user = NULL, db_password_set_at = NULL "
+                               "WHERE email = $1", email)
+    except Exception as exc:                       # the person is removed either way
+        logger.error("The database login %s could not be removed: %s", db_user, exc)
+
+
+@router.post("/api/v2/admin/people/db-login")
+async def set_db_login(body: RemoveRequest, request: Request, _: None = _admin()):
+    """A person's own read-only database login: made, or given a new password."""
+    email = body.email.strip().lower()
+    async with _pool().acquire() as conn:
+        known = await conn.fetchval("SELECT 1 FROM portal_people WHERE email = $1 "
+                                    "AND removed_at IS NULL", email)
+    if not known:
+        raise HTTPException(status_code=404, detail="no such person")
+    return {"email": email, **await _set_db_login(email, await _actor(request))}
 
 
 # ------------------------------------------------------------------ the invitation
@@ -434,4 +522,5 @@ async def _invite(email: str, role: str, by: str) -> bool:
         return False
 
 
-__all__ = ["router", "person_for", "check_csrf", "Person", "configured", "safe_next"]
+__all__ = ["router", "person_for", "check_csrf", "Person", "configured", "safe_next",
+           "db_user_for", "scram_verifier"]

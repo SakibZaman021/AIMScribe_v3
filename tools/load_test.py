@@ -7,7 +7,7 @@ and closing. It uses the recorder's own crypto, so what the server sees here
 is what it will see in a clinic - a test that passes with made-up messages
 would prove nothing.
 
-    python tools/load_test.py --server https://aimscribe.uiu.ac.bd \\
+    python tools/load_test.py --server https://aimscribe.iriic.uiu.ac.bd \\
         --admin-key "$AIMS_ADMIN_KEY" --hospital HOSP003 --rooms 14 --hours 8
 
 It writes real sessions and uploads real objects, so it belongs on a new

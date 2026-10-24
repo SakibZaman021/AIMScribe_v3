@@ -670,7 +670,7 @@ class FakeRequest:
 
 
 def api2(**changes):
-    body = {**FIELDS, "demographics": {"name": "Test", "sex": "female", "age_years": 34},
+    body = {**FIELDS, "demographics": {"sex": "female", "age_years": 34},
             "paramedic": {"blood_pressure": "120/80"}, "previous_visit": None}
     body.update(changes)
     return body
@@ -1071,19 +1071,27 @@ async def test_five_field_problems_are_400(server):
     assert (status, reply["code"]) == (400, "INVALID_IDENTIFIER")
 
 
-async def test_schema_problems_are_quarantined(server):
-    """AT-49: stored unchanged, reported, nothing partly loaded."""
+async def test_odd_values_are_accepted_with_warnings_never_quarantined(server):
+    """
+    AT-49, as changed: a message is refused only for its five fields. Odd
+    values are accepted - the body stored unchanged - and answered with
+    warnings, so the recording is still confirmed and nothing is lost.
+    """
     body = api2(demographics="not an object")
     del body["previous_visit"]
     status, reply = await send("patient_information", body)
-    assert (status, reply["code"]) == (422, "SCHEMA_INVALID")
-    assert {p["field"] for p in reply["fields"]} == {"demographics", "previous_visit"}
-    assert json.loads(server.clinical.quarantined[0]["raw"]) == body
-    assert server.clinical.records == []
-    assert server.repo.alerts[-1]["alert_type"] == "clinical_schema_invalid"
+    assert (status, reply["code"]) == (202, "ACCEPTED")
+    assert {w["field"] for w in reply["warnings"]} == {"demographics", "previous_visit"}
+    assert server.clinical.quarantined == []
+    assert len(server.clinical.records) == 1
 
     status, reply = await send("prescription", prescription(items="Paracetamol 500mg"))
-    assert status == 422
+    assert (status, reply["code"]) == (202, "ACCEPTED")
+    assert any(w["field"] == "items" for w in reply["warnings"])
+
+    # A clean message carries no warnings at all.
+    status, reply = await send("patient_information", api2(patient_id="P0099999"))
+    assert status == 202 and "warnings" not in reply
 
 
 async def test_the_same_request_twice_is_one_record(server):
@@ -1293,7 +1301,7 @@ async def test_the_json_beside_the_audio_carries_both_halves(server):
     document = await api_v2.archive_clinical_document(sid)
 
     assert document["file_stem"] == STEM
-    assert document["patient"]["full_name"] == "Test"
+    assert document["patient"]["full_name"] is None        # names are not kept
     assert document["visit"]["doctor_id"] == "DR0042"
     assert document["recording"]["session_id"] == sid
     assert document["recording"]["audio_sha256"] == "ab" * 32

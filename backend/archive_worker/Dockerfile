@@ -1,7 +1,8 @@
 # AIMScribe Archive Worker
 #
-# Runs on the AIMS LAB server. Exposes no ports and runs as a non-root user: it
-# holds every consultation recording, so it gets the smallest surface possible.
+# Runs on the AIMS LAB server as a non-root user: it holds every consultation
+# recording, so it gets the smallest surface possible. Its one listener is the
+# download decryption (serve.py), on the internal network only, for the API.
 
 FROM python:3.12-slim
 
@@ -19,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # restore.py is not run by the worker, but it is the only way to read a
 # cloud copy back, so it ships in the image that made them.
-COPY worker.py archive.py catalogue.py cloudcopy.py restore.py ./
+COPY worker.py archive.py catalogue.py cloudcopy.py restore.py serve.py ./
 
 # Copies are raw WAV now; the codec is kept only so restore.py can still read
 # a FLAC copy made before that. Fail the build if it is not usable.
@@ -34,7 +35,8 @@ USER aimscribe
 ENV PYTHONUNBUFFERED=1 \
     AIMS_ARCHIVE_ROOT=/archive
 
-# No EXPOSE: this container accepts no inbound connections.
+# No EXPOSE and no published port: only the API, on the internal network,
+# reaches the decryption, with the worker key (AIMS_DECRYPT_PORT).
 
 # Liveness only - the worker has no HTTP surface to probe.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \

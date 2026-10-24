@@ -31,6 +31,13 @@ def _visit_args(visit) -> tuple:
             visit.start_time, visit.day)
 
 
+def _json(value) -> Dict[str, Any]:
+    """A JSONB column, however the driver hands it back."""
+    if isinstance(value, str):
+        value = json.loads(value)
+    return value if isinstance(value, dict) else {}
+
+
 def _plain(value):
     """Database values as JSON can carry them: no Decimal, no date objects."""
     if isinstance(value, decimal.Decimal):
@@ -103,7 +110,8 @@ class ClinicalStore:
                     # keys in another order. Only a real change is a new version.
                     latest = await self._latest_for_visit(conn, visit)
                     if latest is not None:
-                        if latest["fingerprint"] == cm.fingerprint(cm.prescription(body)):
+                        # The findings count too: a corrected examination is a new version.
+                        if latest["fingerprint"] == cm.content_fingerprint(cm.prescription(body)):
                             return latest["record_id"], True, latest["version"]
                         version = latest["version"] + 1
                 new_id = await conn.fetchval("""
@@ -140,7 +148,7 @@ class ClinicalStore:
             if isinstance(body, str):
                 body = json.loads(body)
             best = {"version": int(row["version"]), "record_id": int(row["id"]),
-                    "fingerprint": cm.fingerprint(cm.prescription(body))}
+                    "fingerprint": cm.content_fingerprint(cm.prescription(body))}
         loaded = await conn.fetchrow("""
             SELECT p.prescription_id, p.version, p.intake_id
               FROM prescriptions p JOIN encounters e USING (encounter_id)
@@ -150,12 +158,17 @@ class ClinicalStore:
         """, *_visit_args(visit))
         if loaded is not None and (best is None or loaded["version"] > best["version"]):
             best = {"version": int(loaded["version"]), "record_id": loaded["intake_id"],
-                    "fingerprint": await self._fingerprint_of(conn, loaded["prescription_id"])}
+                    "fingerprint": await self._fingerprint_of(conn, loaded["prescription_id"],
+                                                              content=True)}
         return best
 
     @staticmethod
-    async def _fingerprint_of(conn, prescription_id) -> str:
-        """The fingerprint of a prescription as the tables hold it."""
+    async def _fingerprint_of(conn, prescription_id, *, content: bool = False) -> str:
+        """
+        The fingerprint of a prescription as the tables hold it - the one CMED
+        computes - or, with `content`, with its findings too (what decides a
+        new version).
+        """
         row = await conn.fetchrow(
             "SELECT advice, follow_up_date, notes FROM prescriptions "
             "WHERE prescription_id = $1", prescription_id)
@@ -168,11 +181,20 @@ class ClinicalStore:
         investigations = await conn.fetch(
             "SELECT name FROM investigations WHERE prescription_id = $1 ORDER BY line_no",
             prescription_id)
-        return cm.fingerprint_of(
-            items=[dict(i) for i in items], diagnoses=[d["text"] for d in diagnoses],
-            investigations=[i["name"] for i in investigations], advice=row["advice"],
-            follow_up=row["follow_up_date"].isoformat() if row["follow_up_date"] else None,
-            notes=row["notes"])
+        held = cm.Prescription(
+            issued_at=None, advice=row["advice"], follow_up_date=row["follow_up_date"],
+            notes=row["notes"], raw={},
+            items=[cm.Item(line_no=n, **dict(i)) for n, i in enumerate(items, start=1)],
+            diagnoses=[d["text"] for d in diagnoses],
+            investigations=[i["name"] for i in investigations])
+        if content:
+            held.findings = [
+                cm.Finding(f["section"], f["item"], f["value"], _json(f["detail"]))
+                for f in await conn.fetch(
+                    "SELECT section, item, value, detail FROM consultation_findings "
+                    "WHERE prescription_id = $1 ORDER BY line_no", prescription_id)]
+            return cm.content_fingerprint(held)
+        return cm.fingerprint(held)
 
     async def _latest_of_encounter(self, conn, encounter_id) -> Optional[Dict[str, Any]]:
         row = await conn.fetchrow(
@@ -181,7 +203,8 @@ class ClinicalStore:
         if row is None:
             return None
         return {"version": int(row["version"]), "record_id": row["intake_id"],
-                "fingerprint": await self._fingerprint_of(conn, row["prescription_id"])}
+                "fingerprint": await self._fingerprint_of(conn, row["prescription_id"],
+                                                          content=True)}
 
     async def quarantine(self, *, kind: str, raw: str, problems: List[Dict[str, str]]) -> int:
         async with self._pool.acquire() as conn:
@@ -364,7 +387,7 @@ class ClinicalStore:
         never stored twice; a changed one becomes that visit's next version,
         and the newest is the one read (SRS-CRI-02).
         """
-        fp = cm.fingerprint(pv.prescription)
+        fp = cm.content_fingerprint(pv.prescription)
         doctor, clinic, start, hospital_id = self._previous_identity(row, pv)
         if not pv.identified:
             # Without a doctor or a time, a prescription already held for any
@@ -442,7 +465,7 @@ class ClinicalStore:
                                                    start, pv.visit_date)
             latest = await self._latest_of_encounter(conn, encounter) if encounter else None
             if latest is not None and self.foreign(row, pv) \
-                    and latest["fingerprint"] != cm.fingerprint(pv.prescription):
+                    and latest["fingerprint"] != cm.content_fingerprint(pv.prescription):
                 return {"status": "NOT_PERMITTED", "version": latest["version"],
                         "reason": "that visit belongs to another hospital and is held "
                                   "already; only that hospital may change it"}
@@ -487,6 +510,13 @@ class ClinicalStore:
         await conn.executemany(
             "INSERT INTO investigations (prescription_id, line_no, name) VALUES ($1,$2,$3)",
             [(prescription_id, n, t) for n, t in enumerate(p.investigations, start=1)])
+        await conn.executemany("""
+            INSERT INTO consultation_findings
+                (prescription_id, line_no, section, item, value, detail)
+            VALUES ($1,$2,$3,$4,$5,$6)
+        """, [(prescription_id, n, f.section, f.item, f.value,
+               json.dumps(f.detail, ensure_ascii=False, default=str))
+              for n, f in enumerate(p.findings, start=1)])
 
     # ------------------------------------------------------------ linking
 
@@ -707,6 +737,9 @@ class ClinicalStore:
         investigations = await conn.fetch(
             "SELECT name FROM investigations WHERE prescription_id = $1 ORDER BY line_no",
             pid)
+        findings = await conn.fetch(
+            "SELECT section, item, value, detail FROM consultation_findings "
+            "WHERE prescription_id = $1 ORDER BY line_no", pid)
         return {
             "version": row["version"],
             "issued_at": _plain(row["issued_at"]),
@@ -716,6 +749,8 @@ class ClinicalStore:
             "diagnoses": [d["text"] for d in diagnoses],
             "investigations": [i["name"] for i in investigations],
             "items": [_row(i) for i in items],
+            "findings": [{"section": f["section"], "item": f["item"], "value": f["value"],
+                          "detail": _json(f["detail"])} for f in findings],
         }
 
     async def prescription_for(self, patient_id: str, *, which: str,

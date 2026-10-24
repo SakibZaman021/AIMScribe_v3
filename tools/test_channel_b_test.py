@@ -35,14 +35,13 @@ def test_the_sample_says_out_loud_that_it_is_a_test():
     assert "Test" in body["demographics"]["name"]
 
 
-def test_a_first_visit_says_so_rather_than_leaving_it_out():
-    """SRS-CHB-11: `previous_visit: null` is required, so a missing one is caught."""
+def test_a_first_visit_left_out_is_accepted_and_warned_about():
+    """SRS-CHB-11: send `previous_visit: null`; leaving it out is a warning, not a refusal."""
     body = tool.sample("patient_information")
     assert body["previous_visit"] is None
     without = {k: v for k, v in body.items() if k != "previous_visit"}
     verdict = tool.validate("patient_information", without)
-    assert not verdict.ok
-    assert verdict.problems[0]["field"] == "previous_visit"
+    assert verdict.ok and "previous_visit" in verdict.note
 
 
 # ============================================================
@@ -63,19 +62,17 @@ def test_a_start_time_with_no_time_zone_is_refused():
     assert not tool.validate("patient_information", body).ok
 
 
-def test_a_sex_we_do_not_know_is_refused_not_guessed():
+def test_a_sex_written_another_way_is_read_and_warned_about():
     body = tool.sample("patient_information")
     body["demographics"] = {**body["demographics"], "sex": "F"}
     verdict = tool.validate("patient_information", body)
-    assert not verdict.ok
-    assert verdict.problems[0]["field"] == "demographics.sex"
+    assert verdict.ok and "demographics.sex: read as female" in verdict.note
 
 
-def test_a_medicine_with_no_name_is_refused():
+def test_a_medicine_with_no_name_is_left_out_and_warned_about():
     body = dict(tool.sample("prescription"), items=[{"dose": "5 mg"}])
     verdict = tool.validate("prescription", body)
-    assert not verdict.ok
-    assert "drug" in verdict.problems[0]["field"]
+    assert verdict.ok and "no medicine name" in verdict.note
 
 
 def test_a_message_over_the_limit_is_refused_before_anything_else():
@@ -135,7 +132,7 @@ def test_every_case_says_what_it_proves():
 def test_the_cases_cover_every_reply_the_interface_can_give():
     """§6.2.4: the codes CMED has to handle."""
     covered = {case.expect_code for case in tool.CASES}
-    assert covered == {"ACCEPTED", "ALREADY_RECEIVED", "SCHEMA_INVALID",
+    assert covered == {"ACCEPTED", "ALREADY_RECEIVED",
                        "MISSING_FIELD", "INVALID_KEY", "TOO_LARGE"}
 
 

@@ -136,7 +136,16 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it nobody can sign in to the portal with Google.
     ("026_v3_portal_people.sql", "recordings", "table portal_people",
      _table("portal_people")),
+    # Without it no recording can be downloaded from the portal.
+    ("027_v3_portal_downloads.sql", "recordings", "table portal_downloads",
+     _table("portal_downloads")),
+    # Without it no researcher can be given their own database login.
+    ("028_v3_researcher_db_logins.sql", "recordings", "column portal_people.db_user",
+     _column("portal_people", "db_user")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
+    # Without it the doctor's findings in API 3 cannot be stored.
+    ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
+     _table("consultation_findings")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
     ("clinical/001_aims_clinical.sql", "clinical", "table prescriptions",
@@ -236,7 +245,7 @@ async def at_startup(recordings_pool, clinical_pool=None, repo=None) -> List[Dic
         raise RuntimeError("AIMS_SCHEMA_STRICT is set and the database is missing "
                            + ", ".join(p["migration"] for p in problems))
     if not problems:
-        logger.info("Database schema up to date (migrations up to 026 present)")
+        logger.info("Database schema up to date (migrations up to 028 present)")
     await _warn_if_owner(recordings_pool)
     return problems
 

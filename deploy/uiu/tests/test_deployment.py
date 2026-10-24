@@ -143,7 +143,12 @@ def test_researchers_open_the_databases_with_read_only_logins_only():
     assert "portal-readonly.php" in plugins
     plugin = (HERE / "adminer" / "portal-readonly.php").read_text(encoding="utf-8")
     assert '"aims_monitor"' in plugin and '"aims_clinical_reader"' in plugin
-    assert "Researchers open the databases read-only" in plugin
+    # A researcher: their own login only, the name handed on by the gateway.
+    assert "Use your own database login" in plugin and "HTTP_X_PORTAL_DB_USER" in plugin
+    assert "copy_headers X-Portal-Email X-Portal-Role X-Portal-Db-User" in CADDYFILE
+    migrate = (HERE / "postgres" / "migrate.sh").read_text(encoding="utf-8")
+    assert "roles/researcher_logins_recordings.sql" in migrate
+    assert "roles/researcher_logins_clinical.sql" in migrate
     # The superuser's password never reaches the viewer.
     assert "POSTGRES_SUPERUSER_PASSWORD" not in str(viewer.get("environment"))
 
@@ -415,3 +420,15 @@ def test_logs_cannot_fill_the_disk_that_holds_the_recordings():
         options = service.get("logging", {}).get("options", {})
         assert options.get("max-size"), name
         assert options.get("max-file"), name
+
+
+def test_a_download_is_decrypted_by_the_worker_on_the_internal_network_only():
+    api = SERVICES["api"]["environment"]
+    worker = SERVICES["archive-worker"]
+    assert api["AIMS_DECRYPT_URL"] == "http://archive-worker:7070"
+    assert str(worker["environment"]["AIMS_DECRYPT_PORT"]) == "7070"
+    # The key stays with the worker; the API never has it.
+    assert "AIMS_COPY_KEY" in worker["environment"] and "AIMS_COPY_KEY" not in api
+    assert "internal" in worker["networks"] and not worker.get("ports")
+    dockerfile = (HERE.parent.parent / "backend" / "archive_worker" / "Dockerfile").read_text()
+    assert "serve.py" in dockerfile and "EXPOSE" not in dockerfile.replace("No EXPOSE", "")

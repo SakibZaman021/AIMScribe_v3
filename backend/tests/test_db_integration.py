@@ -11,6 +11,7 @@ store on them - so the SQL itself is tested, not a stand-in.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -47,7 +48,9 @@ RECORDINGS_SCRIPTS = sorted((BACKEND / "scripts").glob("0[0-9][0-9]_*.sql"))
 V1_BASELINE = (BACKEND.parent / "deploy" / "uiu" / "postgres" / "schema"
                / "00_v1_baseline.sql").read_text(encoding="utf-8")
 
-CLINICAL_SCRIPTS = sorted((BACKEND / "scripts" / "clinical").glob("001_*.sql"))
+# 002 makes the server's roles (superuser only); the rest are the clinical schema.
+CLINICAL_SCRIPTS = [s for s in sorted((BACKEND / "scripts" / "clinical").glob("0[0-9][0-9]_*.sql"))
+                    if not s.name.startswith("002_")]
 
 
 # The portable PostgreSQL used here ships without contrib extensions. 002 asks
@@ -246,8 +249,9 @@ async def test_the_whole_server_flow_on_postgres(dbs):
                 "USING (encounter_id) WHERE e.patient_id = $1", v.patient_id)
             male = await conn.fetchval(
                 "SELECT count(*) FROM male_details WHERE patient_id = $1", v.patient_id)
+        # The name was sent, and is not kept: sex is all that is needed.
         assert (patient["full_name"], patient["sex"], obs["systolic"], male) == (
-            "Test Patient", "male", 140, 1)
+            None, "male", 140, 1)
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.grants = None
 
@@ -1643,3 +1647,414 @@ def test_sign_in_never_sends_anyone_to_another_site():
     for bad in ("https://evil.example/", "//evil.example", "/\\evil", "", None, "/auth/logout"):
         assert portal.safe_next(bad) == "/dashboard"
     assert portal.safe_next("/db/?pgsql=postgres") == "/db/?pgsql=postgres"
+
+
+# ============================================================
+# 027: downloading a recording - decrypted by the archive worker, logged
+# ============================================================
+
+_DL_WAV = b"RIFF" + bytes(range(256)) * 40
+
+
+def _download_app(dbs, monkeypatch, who, worker):
+    """The portal app with downloads; the copy store and the archive worker stood in."""
+    import httpx
+    import downloads
+    client = _portal_app(dbs, monkeypatch, google_email=who)
+    client._transport.app.include_router(downloads.router)
+    monkeypatch.setenv("AIMS_DECRYPT_URL", "http://archive-worker:7070")
+    monkeypatch.setenv("AIMS_WORKER_KEY", "the-worker-key")
+    api_v2.ctx.copy.get_presigned_download_url = \
+        lambda key, expires: f"https://copies/get/{key}?expires={expires}"
+    monkeypatch.setattr(downloads, "_client",
+                        lambda: httpx.AsyncClient(transport=httpx.MockTransport(worker)))
+    return client
+
+
+async def _copied_recording(dbs, patient, *, plain=_DL_WAV):
+    device = await enrolled_device(dbs.repo)
+    v = visit(patient_id=patient)
+    stem = f"{patient}_DR0042_HOSP003_101432_102847_20260913"
+    sid = await _archived(dbs, device, v, stem=stem)
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="audio", object_key=f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.wav.enc",
+        version=1, byte_length=len(plain) + 200, sha256=b"\x22" * 32,
+        plain_sha256=hashlib.sha256(plain).digest())
+    await dbs.repo.mark_copied(sid)
+    return sid, stem
+
+
+async def _researcher(client, who, email="researcher@uni.example"):
+    who["value"] = "owner@uiu.example"
+    await _sign_in(client)
+    await client.post("/api/v2/admin/people", json={"email": email, "role": "researcher"},
+                      headers={"X-AIMS-Portal": "1"})
+    client.cookies.clear()
+    who["value"] = email
+    await _sign_in(client)
+
+
+async def test_a_researcher_downloads_the_archived_wav_and_it_is_logged(dbs, monkeypatch):
+    sid, stem = await _copied_recording(dbs, "PDOWN1")
+    asked = []
+
+    def worker(request):
+        asked.append((request.headers.get("x-worker-key"), json.loads(request.content)))
+        return httpx.Response(200, content=_DL_WAV,
+                              headers={"Content-Length": str(len(_DL_WAV))})
+
+    import httpx
+    who = {"value": ""}
+    async with _download_app(dbs, monkeypatch, who, worker) as client:
+        await _researcher(client, who)
+        got = await client.get(f"/api/v2/dashboard/recordings/{sid}/audio",
+                               headers={"Sec-Fetch-Site": "same-origin"})
+        assert got.status_code == 200 and got.content == _DL_WAV
+        assert got.headers["content-type"] == "audio/wav"
+        disposition = got.headers["content-disposition"]
+        assert sid in disposition and "PDOWN1" not in disposition   # no patient id
+        assert got.headers["cache-control"] == "no-store"
+
+        # Not signed in, or started from another site: nothing.
+        assert (await client.get(f"/api/v2/dashboard/recordings/{sid}/audio",
+                                 headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
+        client.cookies.clear()
+        assert (await client.get(f"/api/v2/dashboard/recordings/{sid}/audio")).status_code == 401
+    try:
+        key, body = asked[0]
+        assert key == "the-worker-key"
+        assert body["url"].startswith("https://copies/get/copies/HOSP003/")
+        assert body["plain_sha256"] == hashlib.sha256(_DL_WAV).hexdigest()
+        assert body["expect"] == {"session_id": sid, "kind": "audio",
+                                  "stem_sha256": hashlib.sha256(stem.encode()).hexdigest()}
+        async with dbs.rec.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM portal_downloads WHERE session_id = $1", sid)
+            logged = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE event_type = 'recording.downloaded' "
+                "AND actor_id = 'researcher@uni.example' AND session_id = $1", sid)
+        assert (row["email"], row["outcome"], row["bytes"]) == (
+            "researcher@uni.example", "completed", len(_DL_WAV))
+        assert logged == 1
+    finally:
+        _unserve()
+
+
+async def test_a_download_the_worker_refuses_or_cuts_short_is_logged_as_failed(dbs, monkeypatch):
+    import httpx
+    refused_sid, _ = await _copied_recording(dbs, "PDOWN2")
+    short_sid, _ = await _copied_recording(dbs, "PDOWN3")
+
+    def worker(request):
+        if json.loads(request.content)["expect"]["session_id"] == refused_sid:
+            return httpx.Response(409, json={"detail": "not the copy asked for"})
+        return httpx.Response(200, content=_DL_WAV[:100],
+                              headers={"Content-Length": str(len(_DL_WAV))})
+
+    who = {"value": ""}
+    async with _download_app(dbs, monkeypatch, who, worker) as client:
+        await _researcher(client, who, "failing@uni.example")
+        refused = await client.get(f"/api/v2/dashboard/recordings/{refused_sid}/audio",
+                                   headers={"Accept": "text/html"})
+        assert refused.status_code == 409 and "did not pass its check" in refused.text
+        try:
+            await client.get(f"/api/v2/dashboard/recordings/{short_sid}/audio")
+        except Exception:
+            pass                                   # the transport may notice the short body
+    try:
+        async with dbs.rec.acquire() as conn:
+            rows = {r["session_id"]: r for r in await conn.fetch(
+                "SELECT session_id, outcome, reason FROM portal_downloads "
+                "WHERE session_id = ANY($1::text[])", [refused_sid, short_sid])}
+        assert rows[refused_sid]["outcome"] == "failed"
+        assert "not the copy asked for" in rows[refused_sid]["reason"]
+        assert rows[short_sid]["outcome"] == "failed"
+    finally:
+        _unserve()
+
+
+async def test_downloads_have_a_daily_limit_and_need_a_confirmed_copy(dbs, monkeypatch):
+    import httpx
+    sid, _ = await _copied_recording(dbs, "PDOWN4")
+    bare_device = await enrolled_device(dbs.repo)
+    uncopied = await _archived(dbs, bare_device, visit(patient_id="PDOWN5"),
+                               stem="PDOWN5_DR0042_HOSP003_101432_102847_20260913")
+    monkeypatch.setenv("AIMS_DOWNLOAD_DAILY_LIMIT", "1")
+
+    def worker(request):
+        return httpx.Response(200, content=_DL_WAV,
+                              headers={"Content-Length": str(len(_DL_WAV))})
+
+    who = {"value": ""}
+    async with _download_app(dbs, monkeypatch, who, worker) as client:
+        await _researcher(client, who, "limited@uni.example")
+        assert (await client.get(f"/api/v2/dashboard/recordings/{uncopied}/audio")
+                ).status_code == 409
+        assert (await client.get(f"/api/v2/dashboard/recordings/{sid}/audio")).status_code == 200
+        limited = await client.get(f"/api/v2/dashboard/recordings/{sid}/audio")
+        assert limited.status_code == 429 and "limit" in limited.json()["detail"]
+    _unserve()
+
+
+# ============================================================
+# 028: each researcher's own read-only database login
+# ============================================================
+
+ROLE_SCRIPTS = BACKEND / "scripts" / "roles"
+
+
+async def _role_setup(pg):
+    """What the migration runner does as the superuser on every update."""
+    for uri, name in ((pg.recordings, "researcher_logins_recordings.sql"),
+                      (pg.clinical, "researcher_logins_clinical.sql")):
+        conn = await asyncpg.connect(uri)
+        try:
+            await conn.execute((ROLE_SCRIPTS / name).read_text(encoding="utf-8"))
+            await conn.execute((ROLE_SCRIPTS / name).read_text(encoding="utf-8"))   # twice: safe
+        finally:
+            await conn.close()
+
+
+def _as(uri, user, password):
+    root, db = uri.rsplit("/", 1)
+    host = root.split("@", 1)[1]
+    return asyncpg.connect(f"postgresql://{user}:{password}@{host}/{db}")
+
+
+async def test_a_researcher_gets_their_own_read_only_login(pg, dbs, monkeypatch):
+    import portal
+    await _role_setup(pg)
+    who = {"value": "owner@uiu.example"}
+    async with _portal_app(dbs, monkeypatch, google_email=who) as client:
+        await _sign_in(client)
+        added = (await client.post("/api/v2/admin/people",
+                                   json={"email": "Dr.Analyst@uni.example", "role": "researcher"},
+                                   headers={"X-AIMS-Portal": "1"})).json()
+        login = added["db_login"]
+        assert login["db_user"] == portal.db_user_for("dr.analyst@uni.example")
+        assert login["db_user"].startswith("r_dr_analyst_")
+
+        # Reads both databases; changes nothing; sees no sign-in secrets.
+        for uri in (pg.recordings, pg.clinical):
+            conn = await _as(uri, login["db_user"], login["password"])
+            try:
+                await conn.fetchval("SELECT count(*) FROM pg_class")
+                table = "sessions" if uri == pg.recordings else "encounters"
+                await conn.fetchval(f"SELECT count(*) FROM {table}")
+                for right in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                    assert not await conn.fetchval(
+                        "SELECT has_table_privilege(current_user, $1, $2)", table, right)
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await conn.execute(f"BEGIN READ WRITE; DELETE FROM {table}; COMMIT")
+                await conn.execute("ROLLBACK")
+                if uri == pg.recordings:
+                    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                        await conn.fetchval("SELECT count(*) FROM portal_logins")
+                    with pytest.raises(asyncpg.PostgresError):
+                        await conn.execute("CREATE ROLE intruder LOGIN")
+            finally:
+                await conn.close()
+
+        # The gateway hands the viewer this person's login name, and only it.
+        client.cookies.clear()
+        who["value"] = "dr.analyst@uni.example"
+        await _sign_in(client)
+        check = await client.get("/auth/check", headers={"X-Forwarded-Uri": "/db/"})
+        assert check.headers["x-portal-db-user"] == login["db_user"]
+
+        # A new password: the old one stops working.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        again = (await client.post("/api/v2/admin/people/db-login",
+                                   json={"email": "dr.analyst@uni.example"},
+                                   headers={"X-AIMS-Portal": "1"})).json()
+        assert again["db_user"] == login["db_user"] and again["password"] != login["password"]
+        with pytest.raises(asyncpg.InvalidPasswordError):
+            await _as(pg.recordings, login["db_user"], login["password"])
+        (await _as(pg.recordings, again["db_user"], again["password"])).terminate()
+
+        # Removed from the portal: the login is gone too.
+        removed = await client.post("/api/v2/admin/people/remove",
+                                    json={"email": "dr.analyst@uni.example"},
+                                    headers={"X-AIMS-Portal": "1"})
+        assert removed.status_code == 200
+        with pytest.raises(asyncpg.PostgresError):
+            await _as(pg.recordings, again["db_user"], again["password"])
+    try:
+        async with dbs.rec.acquire() as conn:
+            left = await conn.fetchval("SELECT count(*) FROM pg_roles WHERE rolname = $1",
+                                       login["db_user"])
+            logged = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE event_type = 'portal.db_login_set'")
+        assert left == 0 and logged >= 2
+    finally:
+        _unserve()
+
+
+async def test_the_role_functions_make_researcher_logins_and_nothing_else(pg, dbs):
+    import portal
+    await _role_setup(pg)
+    async with dbs.rec.acquire() as conn:
+        for bad in ("aims_api", "postgres", "r_x; DROP ROLE aims_api", "R_upper"):
+            with pytest.raises(asyncpg.PostgresError):
+                await conn.execute("SELECT portal_db_login_set($1, $2)", bad,
+                                   portal.scram_verifier("x"))
+        with pytest.raises(asyncpg.PostgresError, match="verifier"):
+            await conn.execute("SELECT portal_db_login_set('r_plain_abc123', 'a plain password')")
+        await conn.execute("CREATE ROLE r_not_ours_000000 LOGIN")
+        try:
+            with pytest.raises(asyncpg.PostgresError, match="not a researcher login"):
+                await conn.execute("SELECT portal_db_login_set($1, $2)", "r_not_ours_000000",
+                                   portal.scram_verifier("x"))
+            await conn.execute("SELECT portal_db_login_drop('r_not_ours_000000')")
+            assert await conn.fetchval("SELECT rolcanlogin FROM pg_roles "
+                                       "WHERE rolname = 'r_not_ours_000000'")
+        finally:
+            await conn.execute("DROP ROLE r_not_ours_000000")
+
+
+# ============================================================
+# Odd values: accepted, read the way clinics write them, never lost
+# ============================================================
+
+async def test_a_message_full_of_odd_values_still_confirms_its_recording(dbs):
+    """
+    The capital F, the Fahrenheit, the pounds, the "7 days": each once
+    quarantined API 2 or API 3, which left the recording unconfirmed and
+    eventually erased. Now accepted, read correctly, warned about.
+    """
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    key = await repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None,
+                                     cmed_hospital_ids=["CMED-DHOLPUR"])
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from grants import GrantIssuer
+    api_v2.ctx.repo, api_v2.ctx.clinical = repo, dbs.clinical
+    api_v2.ctx.grants = GrantIssuer(Ed25519PrivateKey.generate())
+    sent = {}
+
+    class Request:
+        headers = {"x-cmed-key": key}
+
+        async def body(self):
+            return json.dumps(sent).encode()
+
+    try:
+        v = visit()
+        five = {"patient_id": v.patient_id, "doctor_id": v.doctor_id,
+                "hospital_id": v.cmed_hospital_id, "start_time": v.start_time,
+                "date": v.visit_date}
+        sent.update(five, demographics={"name": "Rahima", "sex": "F", "age_years": "34 years",
+                                        "date_of_birth": "11/03/1992"},
+                    paramedic={"weight_kg": "128 lb", "height_cm": "5.2",
+                               "temperature_c": "৯৮.৬", "blood_pressure": "120/80 mmHg",
+                               "spo2_percent": "98%"})          # previous_visit left out
+        reply = await clinical.receive(Request(), "patient_information")
+        answer = json.loads(reply.body)
+        assert (reply.status_code, answer["code"]) == (202, "ACCEPTED")
+        warned = {w["field"] for w in answer["warnings"]}
+        assert {"demographics.sex", "paramedic.weight_kg", "paramedic.height_cm",
+                "paramedic.temperature_c", "previous_visit"} <= warned
+
+        sent.clear()
+        sent.update(five, issued_at="2026-09-13 10:40:00", diagnoses="Fever",
+                    items=[{"medicine": "Napa 500", "dosage": "1 tab"}, {"dose": "2 tab"}],
+                    investigations=[], follow_up="৭ দিন পর")
+        reply = await clinical.receive(Request(), "prescription")
+        assert (reply.status_code, json.loads(reply.body)["code"]) == (202, "ACCEPTED")
+
+        minted = await api_v2.mint_grant(five, device=device)
+        assert minted["confirmation"] == "confirmed"
+
+        async with dbs.cli.acquire() as conn:
+            d = await conn.fetchrow(
+                "SELECT d.sex, d.age_years, d.date_of_birth FROM encounter_demographics d "
+                "JOIN encounters e USING (encounter_id) WHERE e.patient_id = $1", v.patient_id)
+            o = await conn.fetchrow(
+                "SELECT o.weight_kg, o.height_cm, o.temperature_c, o.systolic, o.spo2_percent,"
+                " o.other FROM paramedic_observations o JOIN encounters e USING (encounter_id)"
+                " WHERE e.patient_id = $1", v.patient_id)
+            rx = await conn.fetchrow(
+                "SELECT p.prescription_id, p.follow_up_date, p.issued_at FROM prescriptions p "
+                "JOIN encounters e USING (encounter_id) WHERE e.patient_id = $1", v.patient_id)
+            drugs = await conn.fetch("SELECT drug, dose FROM prescription_items "
+                                     "WHERE prescription_id = $1 ORDER BY line_no",
+                                     rx["prescription_id"])
+            diagnoses = await conn.fetch("SELECT * FROM diagnoses WHERE prescription_id = $1",
+                                         rx["prescription_id"])
+            quarantined = await conn.fetchval("SELECT count(*) FROM intake_quarantine")
+        assert (d["sex"], d["age_years"], str(d["date_of_birth"])) == ("female", 34, "1992-03-11")
+        assert (float(o["weight_kg"]), float(o["temperature_c"]), o["systolic"],
+                o["spo2_percent"]) == (58.1, 37.0, 120, 98)
+        other = o["other"] if isinstance(o["other"], dict) else json.loads(o["other"])
+        assert o["height_cm"] is None and other["height_cm"] == "5.2"   # not guessed, kept
+        assert str(rx["follow_up_date"]) == "2026-09-20"
+        assert rx["issued_at"].utcoffset() is not None
+        assert [(r["drug"], r["dose"]) for r in drugs] == [("Napa 500", "1 tab")]
+        assert len(diagnoses) == 1 and quarantined == 0
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.grants = None
+
+
+async def test_api3_brings_the_doctors_findings_and_api2_keeps_no_name(dbs):
+    """API 2: the paramedic's data, no name. API 3: the whole consultation."""
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    key = await repo.create_cmed_key(label="cmed", created_by="tests", expires_at=None,
+                                     cmed_hospital_ids=["CMED-DHOLPUR"])
+    api_v2.ctx.repo, api_v2.ctx.clinical = repo, dbs.clinical
+    sent = {}
+
+    class Request:
+        headers = {"x-cmed-key": key}
+
+        async def body(self):
+            return json.dumps(sent).encode()
+
+    try:
+        v = visit()
+        five = {"patient_id": v.patient_id, "doctor_id": v.doctor_id,
+                "hospital_id": v.cmed_hospital_id, "start_time": v.start_time,
+                "date": v.visit_date}
+        sent.update(five, demographics={"name": "Rahima", "phone": "017", "sex": "female",
+                                        "date_of_birth": "1992-03-11"},
+                    paramedic={"blood_pressure": "120/80"}, previous_visit=None)
+        reply = json.loads((await clinical.receive(Request(), "patient_information")).body)
+        assert reply["code"] == "ACCEPTED"
+        assert any(w["field"] == "demographics" and "not stored" in w["note"]
+                   for w in reply["warnings"])
+
+        rx = {**five, "issued_at": "2026-09-13T10:40:00+06:00",
+              "chief_complaints": [{"complaint": "Fever", "duration": "3 days"}],
+              "on_examination": {"jaundice": "absent"},
+              "items": [{"drug": "Napa 500"}], "diagnoses": ["Fever"], "investigations": []}
+        sent.clear(); sent.update(rx)
+        assert (await clinical.receive(Request(), "prescription")).status_code == 202
+        # The same prescription with a corrected examination: the next version.
+        sent.clear(); sent.update({**rx, "on_examination": {"jaundice": "mild"}})
+        again = json.loads((await clinical.receive(Request(), "prescription")).body)
+        assert (again["code"], again["version"]) == ("ACCEPTED", 2)
+
+        async with dbs.cli.acquire() as conn:
+            names = await conn.fetchrow(
+                "SELECT p.full_name, p.phone, d.full_name AS shown, d.sex "
+                "FROM patients p JOIN encounters e USING (patient_id) "
+                "JOIN encounter_demographics d USING (encounter_id) WHERE p.patient_id = $1",
+                v.patient_id)
+            raw = await conn.fetchval("SELECT body::text FROM intake_records "
+                                      "WHERE patient_id = $1 AND kind = 'patient_information'",
+                                      v.patient_id)
+            rows = await conn.fetch(
+                "SELECT p.version, f.section, f.item, f.value, f.detail FROM consultation_findings f "
+                "JOIN prescriptions p USING (prescription_id) JOIN encounters e USING (encounter_id) "
+                "WHERE e.patient_id = $1 ORDER BY p.version, f.line_no", v.patient_id)
+        assert (names["full_name"], names["phone"], names["shown"], names["sex"]) == (
+            None, None, None, "female")
+        assert "Rahima" not in raw and "017" not in raw          # not even in the stored message
+        assert [(r["version"], r["section"], r["item"], r["value"]) for r in rows] == [
+            (1, "chief_complaint", "Fever", None), (1, "on_examination", "jaundice", "absent"),
+            (2, "chief_complaint", "Fever", None), (2, "on_examination", "jaundice", "mild")]
+        detail = rows[0]["detail"]
+        assert (json.loads(detail) if isinstance(detail, str) else detail) == {"duration": "3 days"}
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = None

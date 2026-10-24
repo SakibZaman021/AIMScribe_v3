@@ -204,7 +204,7 @@ late or missing. The reply rules are in
 
 | Item | Where it comes from |
 |---|---|
-| The AIMS LAB server URL | e.g. `https://aimscribe.uiu.ac.bd` |
+| The AIMS LAB server URL | e.g. `https://aimscribe.iriic.uiu.ac.bd` |
 | For each hospital, its **client id and kid** | `POST /api/v2/admin/cmed-client`, after CMED sends that hospital's public key. Nothing secret |
 | The recorder's port and path | `ws://127.0.0.1:5050/ws` — the same on every PC |
 | The **local API key** for the HTTP routes | Generated per install, in that PC's `.env` |
@@ -228,7 +228,7 @@ Bench values on the AIMS LAB laptop. The UIU server gets its own.
 
 | Setting | Value |
 |---|---|
-| AIMS LAB server | `http://localhost:6060` (bench) → `https://aimscribe.uiu.ac.bd` |
+| AIMS LAB server | `http://localhost:6060` (bench) → `https://aimscribe.iriic.uiu.ac.bd` |
 | Recorder socket | `ws://127.0.0.1:5050/ws` |
 | `AIMS_ALLOWED_ORIGINS` | must list CMED's exact origins — **currently only the bench page** |
 | Clinics registered | `AALO_KARAIL` · `AALO_MIRPUR` · `AALO_DHOLPUR` · `AALO_SHYAMPUR` · `AALO_NARAYANGANJ` · `AALO_ERSHADNAGAR` · `AMADER_SUSASTHO` |

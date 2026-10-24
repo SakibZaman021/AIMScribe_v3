@@ -251,6 +251,12 @@ services:
       AIMS_SMTP_USER: ${AIMS_SMTP_USER:-}
       AIMS_SMTP_PASSWORD: ${AIMS_SMTP_PASSWORD:-}
       AIMS_SMTP_FROM: ${AIMS_SMTP_FROM:-}
+      # Downloads from the portal (downloads.py): the archive worker decrypts
+      # one copy and streams it back, on the internal network. The limits are
+      # per person.
+      AIMS_DECRYPT_URL: http://archive-worker:7070
+      AIMS_DOWNLOAD_DAILY_LIMIT: ${AIMS_DOWNLOAD_DAILY_LIMIT:-50}
+      AIMS_DOWNLOAD_AT_ONCE: ${AIMS_DOWNLOAD_AT_ONCE:-2}
       AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
       AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
       AIMS_CMED_WEBHOOK_ENABLED: ${AIMS_CMED_WEBHOOK_ENABLED:-false}
@@ -405,6 +411,10 @@ services:
       # else - not on the API, not at either storage provider (SRS-DAT-08).
       AIMS_COPY_KEY: ${AIMS_COPY_KEY:-}
       AIMS_COPY_BATCH: ${AIMS_COPY_BATCH:-2}
+      # Decrypts one copy for a portal download (serve.py), for the API only:
+      # the worker key is required and the port is not published.
+      AIMS_DECRYPT_PORT: 7070
+      AIMS_DECRYPT_CONCURRENCY: ${AIMS_DECRYPT_CONCURRENCY:-2}
       AIMS_POLL_SECONDS: ${AIMS_POLL_SECONDS:-30}
       AIMS_BATCH_SIZE: ${AIMS_BATCH_SIZE:-5}
       AIMS_DISK_HEADROOM_BYTES: ${AIMS_DISK_HEADROOM_BYTES:-21474836480}

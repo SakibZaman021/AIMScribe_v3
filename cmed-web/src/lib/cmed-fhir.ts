@@ -155,6 +155,22 @@ function prescriptionResources(p: Json, encounter: string, patient: string,
                subject: ref(patient), encounter: ref(encounter),
                code: { text: typeof t === 'string' ? t : (t.text ?? t.name) } });
   }
+  // The doctor's findings: one Observation each, its category naming the section.
+  for (const f of p.findings ?? []) {
+    const detail: Json = { ...(f.detail ?? {}) };
+    const note = detail.note;
+    delete detail.note;
+    out.push({
+      resourceType: 'Observation', status: 'final',
+      category: [{ coding: [{ system: 'urn:aimscribe:fhir:finding',
+                              code: String(f.section).replace(/_/g, '-') }] }],
+      code: { text: f.item }, subject: ref(patient), encounter: ref(encounter),
+      ...(f.value != null ? { valueString: f.value } : {}),
+      ...(Object.keys(detail).length ? { component: Object.entries(detail).map(
+        ([k, v]) => ({ code: { text: k }, valueString: String(v) })) } : {}),
+      ...(note ? { note: [{ text: note }] } : {}),
+    });
+  }
   if (p.advice || p.follow_up || p.notes) {
     out.push({ resourceType: 'CarePlan', status: 'active', intent: 'plan',
                subject: ref(patient), encounter: ref(encounter),
@@ -183,12 +199,10 @@ export function toFhirMessage(kind: Kind, b: Json): Json {
   }]);
   const d: Json = b.demographics ?? {};
   resources.push([pat, {
+    // Sex and date of birth only: name, phone and address are not needed.
     resourceType: 'Patient', identifier: ident('Patient', b.patient_id),
-    ...(d.name ? { name: [{ text: d.name }] } : {}),
     ...(d.sex ? { gender: d.sex } : {}),
     ...(d.date_of_birth ? { birthDate: d.date_of_birth } : {}),
-    ...(d.phone ? { telecom: [{ system: 'phone', value: d.phone }] } : {}),
-    ...(d.address ? { address: [{ text: d.address }] } : {}),
   }]);
   resources.push([doc, { resourceType: 'Practitioner',
                          identifier: ident('Practitioner', b.doctor_id) }]);

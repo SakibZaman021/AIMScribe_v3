@@ -4,16 +4,17 @@ The address is not written into any code. It is one setting in four places,
 and one of them — the recorders — is the one that takes planning, because a
 doctor's PC is enrolled **against** a server, not merely pointed at one.
 
-Say UIU gives us `aimscribe.uiu.ac.bd`.
+UIU gave us `aimscribe.iriic.uiu.ac.bd` (live since 24 October 2026; the server moved to it
+from its temporary name with one change to `AIMS_PUBLIC_HOST`, same database, no PC to re-enrol).
 
 ## The four places
 
 | Who | Setting | Where |
 |---|---|---|
-| The server itself | `AIMS_PUBLIC_HOST=aimscribe.uiu.ac.bd` | `deploy/uiu/.env` — the gateway gets its certificate for this name |
+| The server itself | `AIMS_PUBLIC_HOST=aimscribe.iriic.uiu.ac.bd` | `deploy/uiu/.env` — the gateway gets its certificate for this name |
 | The archive worker | nothing | it talks to the API inside the machine (`http://api:6060`) |
-| CMED | `AIMS_SERVER_URL=https://aimscribe.uiu.ac.bd` | CMED's own server environment (`cmed-web/.env.local` in the test app) |
-| Every recorder | `AIMS_BACKEND_URL=https://aimscribe.uiu.ac.bd` | `.env` beside `AIMScribe_Agent.exe` on each PC, written by the installer |
+| CMED | `AIMS_SERVER_URL=https://aimscribe.iriic.uiu.ac.bd` | CMED's own server environment (`cmed-web/.env.local` in the test app) |
+| Every recorder | `AIMS_BACKEND_URL=https://aimscribe.iriic.uiu.ac.bd` | `.env` beside `AIMScribe_Agent.exe` on each PC, written by the installer |
 
 Nothing else. No code changes, no rebuild of the server, and CMED's page never
 learns the address at all — it talks to the recorder on `localhost` and to its
@@ -24,7 +25,7 @@ own server, which is where the AIMS LAB address lives.
 1. A name, not an IP. A certificate is issued for a name, and a recorder that
    pins a name keeps working when the machine behind it changes.
 2. Resolvable from the clinics, not only from inside UIU. Test it from a clinic
-   laptop before rolling anything out: `nslookup aimscribe.uiu.ac.bd`.
+   laptop before rolling anything out: `nslookup aimscribe.iriic.uiu.ac.bd`.
 3. Reachable on 443 from the clinics, and on **80 from the internet** — port 80
    is how the certificate renews itself. Blocking it works for 90 days and then
    stops the whole fleet.
@@ -53,7 +54,7 @@ it is not theory.
 ### Moving the fleet, in order
 
 1. Stand the UIU server up and let it get its certificate. Check
-   `curl https://aimscribe.uiu.ac.bd/health` from a clinic.
+   `curl https://aimscribe.iriic.uiu.ac.bd/health` from a clinic.
 2. Move the data: `pg_dump` from Neon, restore into `aims_recordings` (the
    procedure is in `README.md` §4). Leave Neon running, read-only, for a week.
 3. Register the clinics and issue CMED's key on the new server; give CMED the
@@ -82,9 +83,9 @@ as the exception; the numbered list above is the safe path.
 CMED will want somewhere to point their test system that is not the clinics'
 server. Two names, two deployments, two CMED keys:
 
-    aimscribe.uiu.ac.bd          the clinics
-    aimscribe-test.uiu.ac.bd     CMED's integration work
+    aimscribe.iriic.uiu.ac.bd          the clinics
+    aimscribe-test.iriic.uiu.ac.bd     CMED's integration work
 
 The test one can be the same stack with its own `.env`, its own database and its
-own buckets. `tools/channel_b_test.py --server https://aimscribe-test.uiu.ac.bd`
+own buckets. `tools/channel_b_test.py --server https://aimscribe-test.iriic.uiu.ac.bd`
 is what CMED runs against it.
