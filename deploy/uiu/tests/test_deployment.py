@@ -38,6 +38,12 @@ def test_only_the_gateway_is_reachable_from_outside():
         f"gateway may (SRS-TOP-02).")
 
 
+def test_the_database_viewer_is_reached_only_through_the_portal():
+    viewer = SERVICES["dbviewer"]
+    assert "ports" not in viewer and viewer["networks"] == ["internal"]
+    assert "handle_path /db/*" in CADDYFILE and "reverse_proxy dbviewer:8080" in CADDYFILE
+
+
 def test_the_gateway_opens_only_80_and_443():
     """To the world: 80 and 443. Anything else is bound to the machine's loopback."""
     public = {p.split(":")[0] for p in SERVICES["gateway"]["ports"]
@@ -67,6 +73,16 @@ def test_the_services_that_reach_r2_or_azure_have_a_way_out_and_no_way_in():
         assert _networks(name) == ["egress", "internal"], name
         assert not SERVICES[name].get("ports"), name
     assert COMPOSE["networks"]["egress"].get("internal") is not True
+
+
+def test_the_gateways_fixed_address_is_outside_the_dynamic_range():
+    """Otherwise a container that starts first can take it, and the gateway cannot start."""
+    import ipaddress
+    config = COMPOSE["networks"]["internal"]["ipam"]["config"][0]
+    dynamic = ipaddress.ip_network(config["ip_range"].split(":-")[1].rstrip("}"))
+    gateway = ipaddress.ip_address(
+        SERVICES["gateway"]["networks"]["internal"]["ipv4_address"].split(":-")[1].rstrip("}"))
+    assert gateway not in dynamic
 
 
 def test_the_internal_network_has_no_way_out():
@@ -110,14 +126,16 @@ def test_the_internet_never_reaches_v1_the_docs_or_the_workers_routes():
     assert "respond 404" in _block(CADDYFILE, "handle @never")
 
 
-def test_admin_and_the_dashboard_answer_only_the_lab_and_fail_closed():
-    denied = _block(CADDYFILE, "@lab_only_denied")
-    assert "/api/v2/admin/*" in denied and "/api/v2/dashboard/*" in denied
-    # Unset means loopback only - nobody outside - never "everyone".
-    assert "not remote_ip {$AIMS_ADMIN_ALLOW:127.0.0.1/32}" in denied
+def test_admin_the_dashboard_and_the_viewer_sit_behind_a_login_and_fail_closed():
+    portal = [line for line in CADDYFILE.split("\n") if line.strip().startswith("@portal path")][0]
+    for path in ("/api/v2/admin/*", "/api/v2/dashboard/*", "/db/*", "/dashboard/*"):
+        assert path in portal
+    assert "basic_auth @portal" in CADDYFILE
+    # No login configured: the stack refuses to start, so it is never open.
+    assert SERVICES["gateway"]["environment"]["AIMS_PORTAL_HASH"] \
+        == "${AIMS_PORTAL_HASH:?set AIMS_PORTAL_HASH in .env}"
+    # An address allow-list can still be added on top.
     assert "respond 403" in _block(CADDYFILE, "handle @lab_only_denied")
-    assert SERVICES["gateway"]["environment"]["AIMS_ADMIN_ALLOW"] \
-        == "${AIMS_ADMIN_ALLOW:-127.0.0.1/32}"
 
 
 def test_the_client_address_the_api_sees_is_the_gateways_not_the_clients_claim():
