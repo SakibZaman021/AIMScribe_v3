@@ -225,7 +225,7 @@ refuse it outright. The system uses 6060 internally and 443 at the edge.
 
 ### Five policy points that will break the system if missed
 
-1. **A DNS name, never an IP address, and lower case.** `aimscribe.uiu.ac.bd`,
+1. **A DNS name, never an IP address, and lower case.** `aimscribe.iriic.uiu.ac.bd`,
    with an A record to the server. Certificates are issued for names, and a name
    survives the machine moving. We proved this the hard way: a DHCP lease changed
    overnight and every recorder pointing at the old number went silent. Upload
@@ -320,7 +320,7 @@ In this order, all scripted:
 |---|---|
 | A machine | 8 cores, 8 GB **on Ubuntu Server 24.04**, 1 TB NVMe |
 | **Archive storage** | **1.5 TB usable minimum for the study; 2 TB comfortable.** RAID is for uptime, not for safety — the off-site copy is the second copy |
-| A DNS name | `aimscribe.uiu.ac.bd`, lower case, static address |
+| A DNS name | `aimscribe.iriic.uiu.ac.bd`, lower case, static address |
 | Inbound | 443 TCP+UDP, 80 TCP for certificates, SSH from named machines |
 | Outbound | 443 to two storage providers, NTP, container registries |
 | No middlebox | No TLS interception, no short idle timeouts |

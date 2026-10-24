@@ -271,6 +271,24 @@ def _prescription(p: Dict[str, Any], encounter: str, patient: str,
         out.append({"resourceType": "ServiceRequest", "status": "active", "intent": "order",
                     "subject": _ref(patient), "encounter": _ref(encounter),
                     "code": {"text": t if isinstance(t, str) else t.get("text") or t.get("name")}})
+    # The doctor's findings: one Observation each, its category naming the section.
+    for f in p.get("findings") or []:
+        obs: Dict[str, Any] = {
+            "resourceType": "Observation", "status": "final",
+            "category": [{"coding": [{"system": "urn:aimscribe:fhir:finding",
+                                      "code": f["section"].replace("_", "-")}]}],
+            "code": {"text": f["item"]}, "subject": _ref(patient),
+            "encounter": _ref(encounter)}
+        if f.get("value") is not None:
+            obs["valueString"] = f["value"]
+        detail = dict(f.get("detail") or {})
+        note = detail.pop("note", None)
+        if detail:
+            obs["component"] = [{"code": {"text": k}, "valueString": str(v)}
+                                for k, v in detail.items()]
+        if note:
+            obs["note"] = [{"text": note}]
+        out.append(obs)
     if p.get("advice") or p.get("follow_up") or p.get("notes"):
         plan: Dict[str, Any] = {"resourceType": "CarePlan", "status": "active",
                                 "intent": "plan", "subject": _ref(patient),
@@ -312,18 +330,13 @@ def to_fhir(kind: str, b: Dict[str, Any]) -> Dict[str, Any]:
                "serviceProvider": _ref(org), "period": {"start": b.get("start_time")}}),
     ]
     d = b.get("demographics") or {}
+    # Sex and date of birth only: name, phone and address are not needed.
     patient: Dict[str, Any] = {"resourceType": "Patient",
                                "identifier": _ident("Patient", b.get("patient_id"))}
-    if d.get("name"):
-        patient["name"] = [{"text": d["name"]}]
     if d.get("sex") in ("female", "male"):
         patient["gender"] = d["sex"]
     if d.get("date_of_birth"):
         patient["birthDate"] = d["date_of_birth"]
-    if d.get("phone"):
-        patient["telecom"] = [{"system": "phone", "value": d["phone"]}]
-    if d.get("address"):
-        patient["address"] = [{"text": d["address"]}]
     res += [(pat, patient),
             (doc, {"resourceType": "Practitioner",
                    "identifier": _ident("Practitioner", b.get("doctor_id"))}),

@@ -60,6 +60,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import archive
 import cloudcopy
+import serve
 from archive import ArchiveError
 from cloudcopy import CopyError
 
@@ -118,6 +120,10 @@ class Settings:
         # container's memory, and an hour-long consultation would not fit.
         self.copy_work_dir = Path(os.getenv("AIMS_COPY_WORK_DIR",
                                             str(self.archive_root / ".copywork")))
+        # Downloads from the portal (serve.py): the API asks this worker to
+        # decrypt one copy and stream it back. 0 turns it off.
+        self.decrypt_port = int(os.getenv("AIMS_DECRYPT_PORT", "0"))
+        self.decrypt_concurrency = int(os.getenv("AIMS_DECRYPT_CONCURRENCY", "2"))
 
     def problems(self) -> List[str]:
         issues = []
@@ -172,12 +178,15 @@ class ArchiveWorker:
         self._next_pressure = 0.0
         self._pressure_warned = False
         self.released_on_pressure = 0
+        self.decrypt = None
 
     # ---- lifecycle ----
 
     def stop(self, *_: Any) -> None:
         logger.info("Shutdown requested; finishing the current session first")
         self.running = False
+        if self.decrypt is not None:
+            threading.Thread(target=self.decrypt.shutdown, daemon=True).start()
 
     def run(self) -> int:
         root = self.settings.archive_root
@@ -206,6 +215,14 @@ class ArchiveWorker:
                     f"day(s) after its cloud copy is proven")
         logger.info("Pressure: below %.1f GB free, copied WAVs leave early",
                     self.pressure_floor() / 1024 ** 3)
+        try:
+            self.decrypt = serve.start(self.settings)
+        except OSError as exc:
+            logger.error("Downloads: could not listen on port %s: %s",
+                         self.settings.decrypt_port, exc)
+        logger.info("Download: %s", f"on, port {self.settings.decrypt_port} (internal), "
+                    f"{self.settings.decrypt_concurrency} at a time"
+                    if self.decrypt is not None else "off")
         logger.info("=" * 64)
 
         while self.running:

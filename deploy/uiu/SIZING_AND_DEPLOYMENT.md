@@ -179,7 +179,7 @@ It depends on one thing: **where the clinic PCs are.**
 | The clinics are | What you need |
 |---|---|
 | On UIU's own network | **No public URL.** An internal DNS name, a certificate from UIU's own authority. The server never faces the internet |
-| Elsewhere, on the internet | A public hostname with TLS — `aimscribe.uiu.ac.bd` — reachable on 443, and **80 open for certificate renewal** |
+| Elsewhere, on the internet | A public hostname with TLS — `aimscribe.iriic.uiu.ac.bd` — reachable on 443, and **80 open for certificate renewal** |
 | Elsewhere, and CITS will not open ports | A tunnel: Cloudflare Tunnel or Tailscale. No inbound port at all, the server dials out |
 
 Three things are true whichever you choose:

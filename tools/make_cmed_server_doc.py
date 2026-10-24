@@ -230,7 +230,7 @@ S.append(part("PART C", "How it is exposed",
 S.append(Paragraph("6 &middot; The name and the certificate", H2))
 S.append(tbl([["", "Detail"],
               ["The address", "a DNS <font face='Courier'>A</font> record pointing at the droplet "
-                              "&mdash; for example <font face='Courier'>aimscribe.uiu.ac.bd</font>"],
+                              "&mdash; for example <font face='Courier'>aimscribe.iriic.uiu.ac.bd</font>"],
               ["<b>Certificate</b>", "<b>Let's Encrypt, issued and renewed automatically</b> by "
                                      "the gateway. No manual step, no expiry to diarise"],
               ["TLS", "<b>1.2 and 1.3 only.</b> Older versions are refused"],

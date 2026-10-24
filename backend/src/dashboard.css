@@ -367,3 +367,7 @@ a.button { text-decoration: none; padding: .35rem .7rem; border-radius: 6px; }
 .peopleform { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; margin: .4rem 0 .8rem; }
 .peopleform label { display: flex; flex-direction: column; gap: .2rem; font-size: .85rem; }
 .peopleform input, .peopleform select { min-width: 16rem; padding: .35rem .5rem; }
+.copy.dl { display: inline-block; text-decoration: none; margin: 1px 2px; white-space: nowrap;
+           line-height: 22px; background: var(--surface); border: 1px solid var(--line);
+           border-radius: 8px; color: inherit; }
+.copy.dl:hover { border-color: var(--muted); }

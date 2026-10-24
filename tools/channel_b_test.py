@@ -127,13 +127,15 @@ def validate(kind: str, body: Any) -> Verdict:
     except FieldError as exc:
         return Verdict(False, [{"field": exc.field, "problem": str(exc)}])
 
-    problems = clinical.problems_with(kind, body)
-    if problems:
-        return Verdict(False, problems)
-
+    # Accepted whatever the values: what the server will adjust comes back as
+    # warnings in its reply, listed here too so they can be fixed at source.
+    warnings = clinical.problems_with(kind, body)
     extra = sorted(set(body) - _known_fields(kind))
-    return Verdict(True, note=f"Extra fields kept as sent: {', '.join(extra)}."
-                   if extra else "")
+    note = " ".join(filter(None, [
+        f"Extra fields kept as sent: {', '.join(extra)}." if extra else "",
+        "Accepted with warnings: " + "; ".join(f"{w['field']}: {w['note']}" for w in warnings)
+        if warnings else ""]))
+    return Verdict(True, note=note)
 
 
 def _known_fields(kind: str) -> set:
@@ -165,11 +167,11 @@ CASES: List[Case] = [
     Case("The same API 2 again", "patient_information", 200, "ALREADY_RECEIVED",
          "a retry after a timeout must not store the visit twice (SRS-CHB-07)",
          mutate=lambda body: body),
-    Case("An API 2 with no demographics", "patient_information", 422, "SCHEMA_INVALID",
-         "kept in quarantine and reported, never silently dropped",
+    Case("An API 2 with no demographics", "patient_information", 202, "ACCEPTED",
+         "accepted with a warning: only the five fields can refuse a message",
          mutate=lambda body: {k: v for k, v in body.items() if k != "demographics"}),
-    Case("An API 2 with a sex we do not know", "patient_information", 422,
-         "SCHEMA_INVALID", "'female' or 'male'; anything else is reported",
+    Case("An API 2 with sex written 'F'", "patient_information", 202,
+         "ACCEPTED", "read as female, and said so in a warning",
          mutate=lambda body: {**body, "demographics": {**body["demographics"],
                                                        "sex": "F"}}),
     Case("An API 2 with no start_time", "patient_information", 400, "MISSING_FIELD",
@@ -179,8 +181,8 @@ CASES: List[Case] = [
     Case("The prescription, changed", "prescription", 202, "ACCEPTED",
          "a new version; earlier ones are kept (SRS-CHB-08)",
          mutate=lambda body: {**body, "advice": "Changed advice"}),
-    Case("A prescription with a medicine that has no name", "prescription", 422,
-         "SCHEMA_INVALID", "every item needs a drug",
+    Case("A prescription with a medicine that has no name", "prescription", 202,
+         "ACCEPTED", "that line is not stored, the rest is; a warning names it",
          mutate=lambda body: {**body, "items": [{"dose": "5 mg"}]}),
     Case("A message with the wrong key", "patient_information", 401, "INVALID_KEY",
          "the key is checked before anything else (SRS-CHB-02)",
@@ -326,9 +328,9 @@ def run_fhir_cases(server: str, client_id: str, kid: str, private_pem: bytes, *,
               "prescription", rx, "200 ACCEPTED")
     fhir_case("The prescription, changed", "a new version; earlier ones are kept",
               "prescription", {**rx, "advice": "Changed advice"}, "200 ACCEPTED")
-    fhir_case("A medicine with no name", "every MedicationRequest needs its medicine",
+    fhir_case("A medicine with no name", "that line is not stored; a warning names it",
               "prescription", {**rx, "items": [{"drug": "", "dose": "5 mg"}]},
-              "422 SCHEMA_INVALID")
+              "200 ACCEPTED")
     fhir_case("Another hospital's patient", "a token speaks for its own hospital only",
               "patient_information", {**api2, "hospital_id": hospital + "-OTHER"},
               "403 HOSPITAL_NOT_ALLOWED")

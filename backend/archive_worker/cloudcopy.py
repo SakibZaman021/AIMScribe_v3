@@ -232,12 +232,17 @@ def encrypt_file(source: Path, target: Path, key: bytes,
 
 def _read_header(reader, name: str) -> Optional[bytes]:
     """The binding as sealed (format 2), or None for a format-1 copy."""
+    return _read_header_sized(reader, name)[0]
+
+
+def _read_header_sized(reader, name: str) -> Tuple[Optional[bytes], int, int]:
+    """The binding, the chunk size, and how many bytes the header took."""
     head = reader.read(_HEADER.size)
     if len(head) != _HEADER.size:
         raise CopyError(f"{name} is not an AIMScribe copy")
-    magic, _ = _HEADER.unpack(head)
+    magic, chunk_bytes = _HEADER.unpack(head)
     if magic == MAGIC:
-        return None
+        return None, chunk_bytes, _HEADER.size
     if magic != MAGIC_BOUND:
         raise CopyError(f"{name} is not an AIMScribe copy")
     size_raw = reader.read(_BINDING_LEN.size)
@@ -249,7 +254,22 @@ def _read_header(reader, name: str) -> Optional[bytes]:
     context = reader.read(size)
     if len(context) != size:
         raise CopyError(f"{name} ends in its header")
-    return context
+    return context, chunk_bytes, _HEADER.size + _BINDING_LEN.size + size
+
+
+_CHUNK_OVERHEAD = NONCE_BYTES + _FRAME.size + 16       # nonce, length, GCM tag
+
+
+def plain_size(body_bytes: int, chunk_bytes: int = CHUNK_BYTES) -> int:
+    """
+    The plaintext size of a sealed body (everything after the header): every
+    chunk but the last holds `chunk_bytes`, and each adds the same overhead.
+    Lets a download announce its length before a byte is decrypted.
+    """
+    if body_bytes < _CHUNK_OVERHEAD or chunk_bytes <= 0:
+        raise CopyError("the copy is too short to hold any audio")
+    chunks = -(-body_bytes // (chunk_bytes + _CHUNK_OVERHEAD))
+    return body_bytes - chunks * _CHUNK_OVERHEAD
 
 
 def read_binding(source: Path) -> Optional[Dict[str, Any]]:
@@ -303,43 +323,71 @@ def check_binding(found: Optional[Dict[str, Any]], expect: Optional[Dict[str, An
 def _plain_chunks(source: Path, key: bytes,
                   expect: Optional[Dict[str, Any]] = None) -> Iterator[bytes]:
     """The plaintext of one sealed file, chunk by chunk, each one authenticated."""
-    aes = _cipher(key)
     with open(source, "rb") as reader:
-        context = _read_header(reader, source.name)
-        if expect:
-            # Checked before any plaintext leaves; the decryption below then
-            # proves the binding read here is the one that was sealed.
-            found = None
-            if context is not None:
-                try:
-                    found = json.loads(context.decode("utf-8")) if context else {}
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise CopyError(f"{source.name} has a malformed binding") from exc
-            check_binding(found, expect, source.name)
-        index, done = 0, False
-        while not done:
-            nonce = reader.read(NONCE_BYTES)
-            header = reader.read(_FRAME.size)
-            if len(nonce) != NONCE_BYTES or len(header) != _FRAME.size:
-                raise CopyError(f"{source.name} ends in the middle of a chunk")
-            (length,) = _FRAME.unpack(header)
-            sealed = reader.read(length)
-            if len(sealed) != length:
-                raise CopyError(f"{source.name} is truncated")
-            # Whether this was the last chunk is sealed into it, so a file
-            # cut short fails here instead of decrypting to less audio.
-            for last in (False, True):
-                try:
-                    plain = aes.decrypt(nonce, sealed, _aad(index, last, context))
-                    done = last
-                    break
-                except Exception:
-                    if last:
-                        raise CopyError(
-                            f"{source.name} does not decrypt: wrong key, or the "
-                            f"file has been changed (chunk {index})")
-            yield plain
-            index += 1
+        _, chunks = open_sealed(reader, source.name, key, expect)
+        yield from chunks
+
+
+MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def open_sealed(reader, name: str, key: bytes,
+                expect: Optional[Dict[str, Any]] = None,
+                total_bytes: Optional[int] = None) -> Tuple[Optional[int], Iterator[bytes]]:
+    """
+    Start reading one sealed copy from any stream - a file, or the store's
+    answer to a download. The header is read and the binding checked now,
+    before any plaintext. Returns the plaintext's size (when `total_bytes`,
+    the sealed object's size, is known) and the plaintext, chunk by chunk,
+    each one authenticated as it is read.
+    """
+    aes = _cipher(key)
+    context, chunk_bytes, header_bytes = _read_header_sized(reader, name)
+    if not 0 < chunk_bytes <= MAX_CHUNK_BYTES:
+        raise CopyError(f"{name} has a malformed header")
+    if expect:
+        # Checked before any plaintext leaves; the decryption below then
+        # proves the binding read here is the one that was sealed.
+        found = None
+        if context is not None:
+            try:
+                found = json.loads(context.decode("utf-8")) if context else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CopyError(f"{name} has a malformed binding") from exc
+        check_binding(found, expect, name)
+    size = plain_size(total_bytes - header_bytes, chunk_bytes) \
+        if total_bytes is not None else None
+    return size, _chunks(reader, name, aes, context, chunk_bytes)
+
+
+def _chunks(reader, name: str, aes, context: Optional[bytes],
+            chunk_bytes: int) -> Iterator[bytes]:
+    index, done = 0, False
+    while not done:
+        nonce = reader.read(NONCE_BYTES)
+        header = reader.read(_FRAME.size)
+        if len(nonce) != NONCE_BYTES or len(header) != _FRAME.size:
+            raise CopyError(f"{name} ends in the middle of a chunk")
+        (length,) = _FRAME.unpack(header)
+        if length > chunk_bytes + 16:
+            raise CopyError(f"{name} has a malformed chunk ({index})")
+        sealed = reader.read(length)
+        if len(sealed) != length:
+            raise CopyError(f"{name} is truncated")
+        # Whether this was the last chunk is sealed into it, so a file
+        # cut short fails here instead of decrypting to less audio.
+        for last in (False, True):
+            try:
+                plain = aes.decrypt(nonce, sealed, _aad(index, last, context))
+                done = last
+                break
+            except Exception:
+                if last:
+                    raise CopyError(
+                        f"{name} does not decrypt: wrong key, or the "
+                        f"file has been changed (chunk {index})")
+        yield plain
+        index += 1
 
 
 def decrypt_file(source: Path, target: Path, key: bytes,
@@ -396,4 +444,4 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
 __all__ = ["CopyError", "Encrypted", "audio_fingerprint", "binding", "check_binding",
            "stem_fingerprint",
            "decrypt_file", "encrypt_file", "flac_matches_wav", "load_key",
-           "read_binding", "sealed_sha256", "sha256_file"]
+           "open_sealed", "plain_size", "read_binding", "sealed_sha256", "sha256_file"]

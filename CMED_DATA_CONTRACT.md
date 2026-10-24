@@ -14,7 +14,8 @@ Audio never reaches CMED, and nothing clinical is ever sent back.
 | | API 2 — patient information | API 3 — prescription |
 |---|---|---|
 | Endpoint | `POST /fhir/r4/$process-message`, event `patient-information` | same, event `prescription` |
-| Sent when | The patient is opened, at the same moment as the recorder trigger | The doctor builds the prescription |
+| Sent when | The patient is opened, at the same moment as the recorder trigger (API 1, the doctor's browser to AIMScribe.exe) | The doctor builds the prescription |
+| Carries | **What the paramedic collected**: sex, date of birth or age, health screening. And the **previous prescription, only if we do not hold it** (§3) | **The whole consultation**: the doctor's findings (chief complaints, history, allergies, O/E, S/E, G/H and O/H) and the prescription (investigations, diagnosis, medicines, advice, next visit) |
 | Header | `Authorization: Bearer <that hospital's 5-minute token>` (§1a) | same |
 | Body limit | 1 MB | 1 MB |
 | Success | HTTP `200`, code `ACCEPTED` in `Parameters` — stored before the reply is sent (interim JSON form: `202 ACCEPTED`) | same |
@@ -26,6 +27,14 @@ exactly them (§1a).
 **Neither message may delay the doctor.** Send them from an outbox and retry on
 failure; a recording is never held up by a clinical message, and a late message
 is reconciled afterwards.
+
+**Only the five fields (§2) can refuse a message.** Everything else is
+accepted however it is written - the body is stored exactly as received - and
+read the way clinics write it (§3, Accepted values). Anything converted, read
+in another form, or not usable comes back in the reply as `warnings`, so CMED
+can correct it at source while nothing waits. A refused API 2 would leave its
+recording unconfirmed, and an unconfirmed recording is erased after its grace
+period; one odd value must never cost a consultation.
 
 ---
 
@@ -115,6 +124,14 @@ before the first clinic goes live.**
 
 ## 2. The five fields — identical in every message
 
+**Why API 2 and API 3 carry them, when API 1 already did.** API 1 starts the
+audio on the doctor's PC, and the recording reaches us labelled with these five
+values. API 2 and API 3 come separately, from CMED's server, minutes or hours
+later. The five values are the only link between them — a label, not extra
+data. Without them a prescription could not be joined to its consultation, and
+a recording could not be confirmed (we keep only recordings CMED's server
+confirms).
+
 Every API 1, API 2 and API 3 for one visit must carry **exactly** these, with
 identical values. They are what ties a recording to its clinical record.
 
@@ -148,8 +165,7 @@ built. It is how the prescription finds its consultation.
   "start_time": "2026-09-13T10:14:32+06:00", "date": "2026-09-13",
 
   "demographics": {
-    "name": "…", "sex": "female", "age_years": 34,
-    "date_of_birth": "1992-03-11", "phone": "01…", "address": "…"
+    "sex": "female", "age_years": 34, "date_of_birth": "1992-03-11"
   },
 
   "paramedic": {
@@ -171,10 +187,17 @@ built. It is how the prescription finds its consultation.
 }
 ```
 
-**Required:** `demographics` must be an object, on **every** visit — first,
-second, tenth. `previous_visit` must be present as a key; **send `null` when
-there is no prior visit to give**, rather than omitting it. That distinction is
-how we tell "nothing to send" from "CMED forgot".
+**Not sent: the patient's name, phone or address.** Sex and date of birth (or
+age) are all the research needs of who the patient is. If they are sent anyway
+they are removed before anything is stored, and the reply says so.
+**Not sent in API 2: anything the doctor records** — it comes with the
+prescription, in API 3 (§4).
+
+**Expected:** `demographics` as an object, on **every** visit — first, second,
+tenth — and `previous_visit` present as a key: **send `null` when there is no
+prior visit to give**, rather than omitting it. That distinction is how we tell
+"nothing to send" from "CMED forgot". Either one missing is accepted with a
+warning; today's visit is stored without it.
 
 ### `previous_visit` — the history rule
 
@@ -211,11 +234,14 @@ stored; otherwise it is stored under doctor and clinic `UNKNOWN`. The reply
 says `UNIDENTIFIED`, with `"stored": true` or `false`. Send the five fields
 instead; this shape exists only so nothing already built breaks.
 
-**Half a name is refused.** `doctor_id`, `hospital_id` and `start_time` are sent
-together or not at all; a doctor without a time could file a prescription
-against the wrong visit, which is worse than not filing it. A previous visit
-that is this visit, or later than it, is also refused. These come back as
-`422 SCHEMA_INVALID` with the field named.
+**Half a name is never used.** `doctor_id`, `hospital_id` and `start_time` are
+sent together or not at all; a doctor without a time could file a prescription
+against the wrong visit, which is worse than not filing it. With half a name
+the previous visit is kept by its date alone (as the date-only shape is). A
+previous visit that cannot be used at all — another patient, this visit or a
+later one, no date, no prescription — is set aside, with
+`previous_visit.status` `NOT_USED` and the reason. **In every case today's
+API 2 is accepted**: it is what confirms the recording.
 
 #### Ask before sending: what do you already hold?
 
@@ -321,24 +347,25 @@ suite pins the same value (`backend/tests/test_previous_visit.py`).
 
 ### Accepted values
 
-| Field | Type | Accepted | Outside that |
+| Field | Preferred | Also read (and converted) | Not understood |
 |---|---|---|---|
-| `name` | text | up to 200 characters | truncated |
-| `sex` | text | `female`, `male` | stored as `unknown` |
-| `age_years` | number | 0 – 130 | `null` |
-| `date_of_birth` | date | `YYYY-MM-DD` | `null` |
-| `phone` | text | up to 40 | truncated |
-| `address` | text | up to 500 | truncated |
-| `recorded_at` | timestamp | ISO 8601 **with offset** | `null` |
-| `weight_kg` | number | 0.5 – 499 | `null` |
-| `height_cm` | number | 20 – 299 | `null` |
-| `blood_pressure` | text | `"120/80"` — systolic 30–300, diastolic 10–250 | kept as text, split columns `null` |
-| `pulse_bpm` | whole | 10 – 300 | `null` |
-| `temperature_c` | number | 25 – 45 | `null` |
-| `spo2_percent` | whole | 0 – 100 | `null` |
+| `sex` | `female`, `male` | `F`/`M`, any case, `woman`/`man`, `মহিলা`/`নারী`/`পুরুষ` | `unknown`, warning |
+| `age_years` | number 0–130 | `"34 years"`, `"34Y"`, `"6 months"` (0), `"2y 3m"` (2), Bangla digits | empty, warning |
+| `date_of_birth` | `YYYY-MM-DD` | `11/03/1992` (day first), `11-03-1992`, `11 Mar 1992` | empty, warning |
+| `recorded_at` | ISO 8601 with offset | without offset: clinic time (+06:00) | empty |
+| `weight_kg` | kg, 0.5–499 | `"58 kg"`, `"128 lb"`, grams | empty, warning |
+| `height_cm` | cm, 20–299 | `"5'2\""`, `"5 ft 2 in"`, `"1.57 m"`, `1.57` (metres) | empty, warning — `5.2` is **not** guessed |
+| `blood_pressure` | `"120/80"` | `"120/80 mmHg"`, `"120 / 80"`, `"120-80"` | kept as text, warning |
+| `pulse_bpm` | 10–300 | `"78 bpm"`, `"78/min"` | empty, warning |
+| `temperature_c` | °C, 25–45 | `"98.6 F"`, and 98.6 with no unit (86–113 can only be °F) | empty, warning |
+| `spo2_percent` | 0–100 | `"98%"`, `0.98` | empty, warning |
 
-**A value we cannot read becomes `null`; it never rejects the message.** One
-mistyped temperature must not stop a prescription being stored.
+Bangla (`০–৯`) and Arabic-Indic digits are read as 0–9 everywhere.
+
+**A value we cannot read never rejects the message.** It is left out of its
+column — never guessed — and kept beside it (paramedic `other`), as well as in
+the stored body; the reply's `warnings` names it. One mistyped temperature must
+not stop a prescription, or a recording, being kept.
 
 **Anything else inside `paramedic` is kept**, in an `other` object. You do not
 need our permission to add a measurement — send it, and it is stored. The same
@@ -364,22 +391,49 @@ field is ever guessed, and nothing is discarded because we did not recognise it.
   ],
   "diagnoses":      ["Type 2 diabetes mellitus"],
   "investigations": ["HbA1c"],
-  "advice": "…", "follow_up": "2026-10-13", "notes": "…"
+  "advice": "…", "follow_up": "2026-10-13", "notes": "…",
+
+  "chief_complaints": [ { "complaint": "Fever", "severity": "moderate",
+                          "duration": "3 days" } ],
+  "history":   { "family": "Diabetes (mother)", "personal": "Non-smoker",
+                 "past": "…", "drug": "…" },
+  "allergies": { "food": "…", "medicine": "Penicillin", "pollen": "…",
+                 "dust": "…", "mites": "…" },
+  "on_examination":       { "anaemia": "absent", "jaundice": "absent",
+                            "dehydration": "mild", "oedema": "absent",
+                            "cyanosis": "absent", "lymph_nodes": "not palpable" },
+  "systemic_examination": { "heart": "S1 S2 normal", "lungs": "clear",
+                            "abdomen": "soft" },
+  "gynae_obstetric":      { "obstetric": "G2 P2", "menstrual": "regular" }
 }
 ```
 
-**Required:** `issued_at` (a timestamp **with its offset**), and `items`,
-`diagnoses` and `investigations` as **lists — empty lists if there are none**.
-An empty list means "the doctor ordered none"; a missing key means "CMED did not
-send it", and those are different facts.
+**The doctor's findings** travel with the prescription: chief complaints (each
+with any detail, such as severity and duration), history, allergies,
+on-examination, systemic examination, and gynaecological and obstetric history.
+Each is stored as one row of `consultation_findings` (section, item, value,
+detail), so every finding can be counted. In FHIR each is one Observation whose
+category (system `urn:aimscribe:fhir:finding`) names the section —
+`chief-complaint`, `history`, `allergy`, `on-examination`,
+`systemic-examination`, `gynae-obstetric` — with `code.text` the item and
+`valueString` the finding; allergies may also be `AllergyIntolerance`. A
+corrected finding makes the next version, like any other correction. The
+prescription fingerprint (§3) is unchanged: it covers the six keys only.
+
+**Expected:** `issued_at` (a timestamp with its offset; without one it is
+read as clinic time), and `items`, `diagnoses` and `investigations` as **lists —
+empty lists if there are none**. An empty list means "the doctor ordered none";
+a missing key means "CMED did not send it", and those are different facts.
+Either way the prescription is accepted; a missing one is a warning.
 
 | Field | Rule |
 |---|---|
-| `items[].drug` | **Required per entry.** An entry with no `drug` is skipped |
-| `items[].dose`, `.frequency`, `.duration` | text, up to 200 |
-| `items[].instructions` | text, up to 1000 |
-| `diagnoses`, `investigations` | list of strings, each up to 500. A bare string is accepted as a one-entry list. Objects are accepted if they carry `text` or `name` |
-| `follow_up` | `YYYY-MM-DD` |
+| `items[].drug` | The medicine's name. Also read from `medicine`, `medicine_name`, `name`. A line with no name is left out — the rest is stored — and named in a warning |
+| `items[].dose`, `.frequency`, `.duration` | text, up to 200 (also `dosage`; `days`) |
+| `items[].instructions` | text, up to 1000 (also `instruction`) |
+| `items` | a list; one object, or a medicine name alone, is read as a list of one |
+| `diagnoses`, `investigations` | list of strings, each up to 500. A bare string is a one-entry list. Objects are accepted if they carry `text` or `name` |
+| `follow_up` | `YYYY-MM-DD`. Also `20/09/2026` (day first), `20 Sep 2026`, and **`"7 days"`, `"2 weeks"`, `"1 month"`, `"৭ দিন পর"`** — counted from the visit date. Anything else: empty, warning |
 | `advice`, `notes` | text, up to 2000 |
 
 Items keep the order you send them; that order is stored as the line number.
@@ -409,10 +463,11 @@ recording is kept.
 | What you send | Where it lands |
 |---|---|
 | The whole body, unchanged | `intake_records` — once per body, always |
-| `demographics` | `patients`, `encounter_demographics` |
+| `demographics` | `patients`, `encounter_demographics` — sex, date of birth, age; never a name, phone or address |
 | `paramedic` | `paramedic_observations` — known fields in columns, the rest in `other` |
 | `previous_visit` | The earlier visit's own `encounters` row — the one already held, or a new one under its real doctor and clinic — with its prescription as a new version only if it changed. The date-only shape is filed under `UNKNOWN`, at midnight on its date |
 | `items` | `prescription_items`, one row per medicine |
+| The doctor's findings (API 3) | `consultation_findings`, one row per finding |
 | `diagnoses`, `investigations` | `diagnoses`, `investigations` |
 | `female_details`, `male_details` | `female_details`, `male_details` |
 | Everything | A copy as `<recording name>.json`, in the same folder as the audio |
@@ -437,7 +492,7 @@ built from the other.
 | `403 HOSPITAL_NOT_ALLOWED` | The message is for a hospital this token does not speak for | Use that hospital's own client. Do not retry; it raises an alert here |
 | `401 INVALID_KEY`, `403 KEY_NOT_BOUND` | Interim static key wrong, or naming no hospital | Stop and tell us |
 | `413 TOO_LARGE` | Over 1 MB | Split or trim; a body this large is usually a mistake |
-| `422 SCHEMA_INVALID` | **Stored in quarantine**, with the fields listed | Not lost. Fix the shape and resend |
+| `warnings` in a `200`/`202` reply | **Accepted.** Each warning is `{field, sent, note}`: what was converted, read in another form, or not usable | Remove from the outbox as usual. Fix the field at source when convenient; never resend because of a warning |
 | `429 RATE_LIMITED`, `5xx`, a timeout, no connection | Too fast (1,200 requests/min and 60 token requests/min per address, shared by every server process), a locked-out credential (10 wrong tries with the same credential in 5 minutes lock that credential — not the address — for 15 minutes), busy, or no internet. Honour `Retry-After` | **Keep it in the outbox** and retry with growing delay. Never drop it |
 
 **Send from an outbox.** Each Aalo branch keeps working on its local CMED server

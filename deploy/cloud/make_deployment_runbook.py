@@ -52,7 +52,7 @@ PARTBG = colors.HexColor("#17836f")
 # from the environment so a personal address is not published with the
 # repository: AIMS_OWNER_EMAIL=you@example.org python make_deployment_runbook.py
 OWNER_EMAIL = os.getenv("AIMS_OWNER_EMAIL", "your-team-email@example.org")
-HOST = "aimscribe.uiu.ac.bd"
+HOST = "aimscribe.iriic.uiu.ac.bd"
 
 ss = getSampleStyleSheet()
 H1 = ParagraphStyle("H1", parent=ss["Title"], fontName="Helvetica-Bold",

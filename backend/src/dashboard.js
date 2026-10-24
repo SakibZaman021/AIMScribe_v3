@@ -710,6 +710,23 @@ function storedTag(r) {
   return tag("warn", "Not archived");
 }
 
+/* The audio, decrypted from the cloud copy by the server as it downloads.
+   Only for someone signed in: each download is logged against their email.
+   One link per patient file when a recording was cut into several. */
+function audioLinks(r) {
+  if (!r.copied || r.confirmation !== "confirmed") return `<span class="hint">–</span>`;
+  if (!PORTAL) return `<span class="hint">sign in</span>`;
+  const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/audio`;
+  const files = r.files || [];
+  const link = (href, label, title) =>
+    `<a class="copy dl" href="${esc(href)}" title="${esc(title)}">${esc(label)}</a>`;
+  if (files.length > 1) {
+    return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
+      `Download patient file ${f.part_no} (WAV)`)).join(" ");
+  }
+  return link(base, "Download", "Download the WAV");
+}
+
 function recordingsTable(list) {
   if (!list.length) {
     return STATE
@@ -719,7 +736,7 @@ function recordingsTable(list) {
   const showClinic = !$("clinic").value;
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
     + `<th>Patient files and rule</th><th class="num">Length</th><th>CMED</th><th>Status</th>`
-    + `<th>Stored</th><th>Folder on server</th></tr></thead><tbody>`
+    + `<th>Stored</th><th>Audio</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
@@ -743,6 +760,7 @@ function recordingsTable(list) {
           + td("CMED", confirmTag(r.confirmation))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
+          + td("Audio", audioLinks(r))
           + td("Folder", folder
             ? `<span title="${esc(folder)}">${esc(folder)}</span>`
               + ` <button type="button" class="copy" data-copy="${esc(folder)}">Copy</button>`
@@ -967,12 +985,15 @@ async function loadPeople() {
       : "No mail account is set, so send them the link yourself";
     const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
-      + `<th>Given by</th><th>Last signed in</th><th></th></tr></thead><tbody>`
+      + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
         + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
         + td("Role", p.role === "admin" ? tag("warn", "Admin") : tag("good", "Researcher"))
         + td("Given by", esc(p.added_by || ""))
         + td("Last signed in", esc(when(p.last_signed_in)))
+        + td("Database login", (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
+          + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
+          + `${p.db_user ? "New password" : "Create login"}</button>`)
         + td("", p.owner ? `<span class="hint">owner</span>`
           : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -989,12 +1010,31 @@ $("peopleForm").addEventListener("submit", async (e) => {
     const r = await adminCall("POST", "/api/v2/admin/people", { email, role: $("pRole").value });
     $("peopleMsg").textContent = r.invited ? `Invitation sent to ${r.email}.`
       : `${r.email} can now sign in at ${r.link}`;
+    if (r.db_login) showDbLogin(r.email, r.db_login);
+    else if (r.db_login_error) $("peopleMsg").textContent += ` (No database login: ${r.db_login_error})`;
     $("pEmail").value = "";
     loadPeople();
   } catch (err) { $("peopleMsg").textContent = `Not done: ${err.message}`; }
 });
 
+/* The password is shown here once and never again: the server keeps no copy. */
+function showDbLogin(email, login) {
+  $("peopleMsg").innerHTML = `Database login for <b>${esc(email)}</b>: user `
+    + `<code>${esc(login.db_user)}</code>, password <code>${esc(login.password)}</code>. `
+    + `Send it to them privately now; it is not shown again. They open the database `
+    + `viewer (/db/) signed in with Google, then use this login.`;
+}
+
 $("people").addEventListener("click", async (e) => {
+  const k = e.target.closest("[data-dblogin]");
+  if (k) {
+    const who = k.dataset.dblogin;
+    if (!window.confirm(`Set a new database password for ${who}? Any old one stops working.`)) return;
+    try { showDbLogin(who, await adminCall("POST", "/api/v2/admin/people/db-login", { email: who })); }
+    catch (err) { window.alert(`Not done: ${err.message}`); }
+    loadPeople();
+    return;
+  }
   const b = e.target.closest("[data-remove]");
   if (!b) return;
   if (!window.confirm(`Remove ${b.dataset.remove}? Their access ends now, on every device.`)) return;

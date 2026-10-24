@@ -113,19 +113,32 @@ def _problems(previous, **body):
         "patient_information", api2(previous_visit=previous, **body))}
 
 
+def _used(previous):
+    return cm.previous_visit(api2(previous_visit=previous))
+
+
 def test_previous_visit_is_named_whole_or_by_date_only():
+    """
+    A previous visit that cannot be used safely is set aside - never filed
+    against the wrong visit, and never the reason today's API 2 is refused.
+    """
     whole = {"date": "2026-09-01", "doctor_id": "DR0001", "hospital_id": "CMED-1",
              "start_time": "2026-09-01T10:00:00+06:00", "prescription": EXAMPLE}
-    assert _problems(whole) == set()
-    assert _problems({"date": "2026-09-01", "prescription": EXAMPLE}) == set()
+    assert _problems(whole) == set() and _used(whole).identified
+    dated = {"date": "2026-09-01", "prescription": EXAMPLE}
+    assert _problems(dated) == set() and not _used(dated).identified
+    # Half a name: kept by its date alone, never under a guessed visit.
     half = {k: v for k, v in whole.items() if k != "start_time"}
-    assert _problems(half) == {"previous_visit.start_time"}
-    assert _problems(dict(whole, patient_id="SOMEONE_ELSE")) == {"previous_visit.patient_id"}
-    assert _problems(dict(whole, date="2026-09-30")) == {"previous_visit.date"}
-    assert _problems({"prescription": EXAMPLE}) == {"previous_visit.date"}
-    assert _problems({"date": "2026-09-01"}) == {"previous_visit.prescription"}
-    itself = dict(whole, date=FIELDS["date"], start_time=FIELDS["start_time"])
-    assert _problems(itself) == {"previous_visit"}
+    assert _problems(half) == {"previous_visit"}
+    assert not _used(half).identified and _used(half).doctor_id is None
+    # Unusable: another patient, later than today, no date, no prescription,
+    # or today's visit itself. Set aside, with the reason in the reply.
+    for bad in (dict(whole, patient_id="SOMEONE_ELSE"), dict(whole, date="2026-09-30",
+                start_time="2026-09-30T10:00:00+06:00"), {"prescription": EXAMPLE},
+                {"date": "2026-09-01"},
+                dict(whole, date=FIELDS["date"], start_time=FIELDS["start_time"])):
+        assert _problems(bad) == {"previous_visit"}, bad
+        assert _used(bad) is None, bad
 
 
 # ============================================================
