@@ -1000,6 +1000,9 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
     device = await enrolled_device(dbs.repo)
     quarantined = await a_session(dbs.repo, device)
     stopped = await a_session(dbs.repo, device)
+    # The two normal ends - the next patient, two minutes after the
+    # prescription - are not "stopped early".
+    normal = [await a_session(dbs.repo, device), await a_session(dbs.repo, device)]
     # Today, because an alert is stamped when it is raised: the dashboard
     # shows the alerts of the days it is asked about.
     day = datetime.now(timezone.utc).date()
@@ -1010,6 +1013,9 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
         await conn.execute("UPDATE sessions SET session_date = $2, "
                            "close_reason = 'doctor_stopped' WHERE session_id = $1",
                            stopped, day)
+        for sid, reason in zip(normal, ("superseded_by_new_patient", "counselling_limit")):
+            await conn.execute("UPDATE sessions SET session_date = $2, close_reason = $3 "
+                               "WHERE session_id = $1", sid, day, reason)
     await dbs.repo.raise_alert(alert_type="dashboard_test_alert", severity="warning",
                                session_id=stopped, detail={})
     _server(dbs)

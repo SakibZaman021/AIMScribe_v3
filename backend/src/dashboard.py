@@ -39,6 +39,13 @@ router = APIRouter(prefix="/api/v2/dashboard", tags=["dashboard"])
 HEARTBEAT_SECONDS = 60
 SILENT_AFTER = timedelta(seconds=3 * HEARTBEAT_SECONDS)
 
+# How a recording ends when nothing went wrong: the next patient opened, or
+# two minutes after the prescription (older recorders: at the prescription).
+# Anything else - the doctor's forced Stop, a shutdown, a reset - is "stopped
+# early" on the dashboard. Constants only, so safe to put in the SQL.
+_ENDED_NORMALLY = ("('prescription_built', 'superseded_by_new_patient', "
+                   "'counselling_limit', '')")
+
 
 def _pool():
     repo = api_v2._repo()
@@ -210,7 +217,7 @@ async def _integrity(conn, start: date, end: date,
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text IS NULL OR hospital_id = $3)
            AND close_reason IS NOT NULL
-           AND close_reason NOT IN ('prescription_built', '')
+           AND close_reason NOT IN """ + _ENDED_NORMALLY + """
          GROUP BY hospital_id, doctor_id, close_reason
          ORDER BY n DESC
     """, start, end, clinic)
@@ -528,7 +535,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     states = {
         "quarantined": "s.quarantine_reason IS NOT NULL",
         "stopped_early": "s.close_reason IS NOT NULL AND "
-                         "s.close_reason NOT IN ('prescription_built', '')",
+                         "s.close_reason NOT IN " + _ENDED_NORMALLY,
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
         "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
                     "AND s.confirmation = 'confirmed'",

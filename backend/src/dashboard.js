@@ -173,7 +173,7 @@ function barChart(host, rows) {
     host.innerHTML = empty("No recordings in this range", "Pick a wider range or another clinic.");
     return;
   }
-  const W = Math.max(300, host.clientWidth || 600), H = 220;
+  const W = Math.max(300, host.clientWidth || 600), H = 300;
   const padL = 34, padR = 8, padT = 18, padB = 28;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const max = Math.max(1, ...rows.map((r) => Number(r.recordings) || 0));
@@ -310,8 +310,63 @@ $("kpis").addEventListener("click", (e) => {
 function go(id) {
   const el = $(id);
   if (!el) return;
+  // Open the section it is in first, as a step the Back button undoes.
+  const view = el.closest(".view");
+  if (view && view.hidden) {
+    history.pushState(null, "", "#" + view.dataset.view);
+    showView(view.dataset.view);
+  }
   const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
   el.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "start" });
+}
+
+/* ============================================================
+   Sections: one shown at a time, named in the address (#recordings),
+   so Back, a bookmark and a shared link all land in the right place.
+   ============================================================ */
+const VIEWS = {
+  overview: ["Overview", "How the clinics, the recordings and the server are doing", true],
+  recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
+  pcs: ["PCs", "The recorders in the consulting rooms", true],
+  downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
+  people: ["People", "Who may sign in, and their database logins", false],
+};
+
+function showView(name) {
+  const link = document.querySelector(`#nav a[data-view="${name}"]`);
+  if (!VIEWS[name] || !link || link.hidden) name = "overview";
+  document.querySelectorAll("main .view").forEach((v) => { v.hidden = v.dataset.view !== name; });
+  document.querySelectorAll("#nav a").forEach((a) => {
+    if (a.dataset.view === name) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+  const [title, sub, filtered] = VIEWS[name];
+  $("viewTitle").textContent = title;
+  $("viewSub").textContent = sub;
+  $("filters").hidden = !filtered;
+  document.title = `${title} - AIMScribe`;
+  // The chart is sized to its panel, which has no width while hidden.
+  if (name === "overview" && LAST) drawChart(LAST);
+}
+
+addEventListener("hashchange", () => {
+  const name = location.hash.slice(1);
+  if (VIEWS[name]) showView(name);          // "#main" is the skip link, not a section
+});
+
+function setBadge(id, n, bad) {
+  const b = $(id);
+  if (!b) return;
+  b.hidden = !n;
+  b.textContent = n > 99 ? "99+" : String(n || "");
+  b.className = "badge" + (bad ? " bad" : "");
+}
+
+function drawBadges(d) {
+  const c = d.confirmation.totals || {}, i = d.integrity;
+  setBadge("badge-overview", i.alerts_total || 0, true);
+  setBadge("badge-recordings", (c.unconfirmed || 0) + (i.quarantined_total || 0), true);
+  setBadge("badge-pcs", activePcs(d).filter((q) => q.silent).length, false);
 }
 
 /* ============================================================
@@ -690,7 +745,18 @@ const confirmTag = (v) => {
   const m = CONFIRM[v] || ["quiet", v || "–"];
   return tag(m[0], m[1]);
 };
-const ENDED = { prescription_built: "Prescription" };
+// How a recording ended. The first three are the normal ends (dashboard.py,
+// _ENDED_NORMALLY); the others are "stopped early".
+const ENDED = {
+  superseded_by_new_patient: ["good", "Next patient"],
+  counselling_limit: ["good", "2 min after prescription"],
+  prescription_built: ["good", "Prescription"],
+  doctor_stopped: ["warn", "Stopped by the doctor"],
+  stopped_from_tray: ["warn", "Stopped by the doctor"],
+  pc_shutdown: ["warn", "PC shut down"],
+  agent_shutdown: ["warn", "Recorder closed"],
+  software_update: ["quiet", "Recorder updated"],
+};
 const timeOf = (v) => { const m = /(\d{2}:\d{2})/.exec(String(v || "")); return m ? m[1] : ""; };
 
 function filesText(r) {
@@ -743,10 +809,9 @@ function recordingsTable(list) {
         const t = timeOf(r.local_start);
         const status = [];
         if (r.quarantine_reason) status.push(tag("bad", "Held: " + human(r.quarantine_reason)));
-        if (r.close_reason && r.close_reason !== "prescription_built") {
-          status.push(tag("warn", "Stopped: " + human(r.close_reason)));
-        } else if (r.close_reason) {
-          status.push(tag("good", ENDED[r.close_reason]));
+        if (r.close_reason) {
+          const [tone, text] = ENDED[r.close_reason] || ["warn", "Stopped: " + human(r.close_reason)];
+          status.push(tag(tone, text));
         }
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
@@ -848,6 +913,7 @@ function markRanges() {
 }
 
 function drawAll(d) {
+  drawBadges(d);
   drawTiles(d);
   drawClinics(d);
   drawAttention(d);
@@ -962,7 +1028,11 @@ async function whoAmI() {
     $("who").textContent = `${me.email} \u00b7 ${me.role}`;
     $("who").hidden = false;
     $("signout").hidden = false;
-    if (me.role === "admin") { $("peoplePanel").hidden = false; loadPeople(); }
+    if (me.role === "admin") {
+      $("peoplePanel").hidden = false;
+      $("navPeople").hidden = false;
+      loadPeople();
+    }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
     throw new Error("Not signed in.");
@@ -1264,6 +1334,8 @@ $("bEveryone").addEventListener("change", loadBatches);
 
 function startBulk() {
   $("bulkPanel").hidden = false;
+  $("batchesPanel").hidden = false;
+  $("navDownloads").hidden = false;
   $("bEveryoneLabel").hidden = PORTAL.role !== "admin";
   $("bClinic").innerHTML = `<option value="">All clinics</option>`
     + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
@@ -1286,6 +1358,7 @@ async function start() {
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
   if (PORTAL) startBulk();
+  showView(location.hash.slice(1));
   await refresh();
 }
 

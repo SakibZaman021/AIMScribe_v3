@@ -10,6 +10,8 @@
   Three files, no packages, no build step. Style and script are separate
   files so the page policy can block all inline script and style.
   Reads /api/v2/dashboard only. No patient names, nothing clinical (SRS-DSH-06).
+  Five sections behind one sidebar; the script shows one at a time (#overview,
+  #recordings, #pcs, #downloads, #people).
 -->
 <link rel="stylesheet" href="/api/v2/dashboard/static/dashboard.css">
 </head>
@@ -17,141 +19,184 @@
 
 <a class="skip" href="#main">Skip to content</a>
 
-<header class="top">
+<div class="app">
+
+<aside class="side" aria-label="Sections">
   <div class="brand">
-    <div class="mark" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
     <div>
       <h1>AIMScribe</h1>
       <small>AIMS LAB server</small>
     </div>
   </div>
-  <span class="spacer"></span>
-  <span id="who" class="who" hidden></span>
-  <a id="signout" class="ghost button" href="/auth/logout" hidden>Sign out</a>
-  <span id="when" class="live" role="status">Connecting</span>
-  <button id="pause" type="button" class="ghost" aria-pressed="false" title="Pause auto-refresh">Pause</button>
-  <button id="refresh" type="button" class="primary">Refresh</button>
-  <button id="theme" type="button" class="ghost icon" title="Light / dark" aria-label="Switch light or dark mode">&#9680;</button>
-</header>
-
-<div class="filters" role="group" aria-label="Filters">
-  <div class="chips" id="ranges" role="group" aria-label="Date range">
-    <button type="button" class="chip" data-range="0">Today</button>
-    <button type="button" class="chip" data-range="6">7 days</button>
-    <button type="button" class="chip" data-range="29">30 days</button>
+  <nav class="nav" id="nav">
+    <a href="#overview" data-view="overview"><span class="ico ico-overview" aria-hidden="true"></span><span class="label">Overview</span><b class="badge" id="badge-overview" hidden></b></a>
+    <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
+    <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
+    <a href="#downloads" data-view="downloads" id="navDownloads" hidden><span class="ico ico-dl" aria-hidden="true"></span><span class="label">Downloads</span></a>
+    <a href="#people" data-view="people" id="navPeople" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">People</span></a>
+  </nav>
+  <div class="side-foot">
+    <span id="who" class="who" hidden></span>
+    <div class="side-actions">
+      <button id="theme" type="button" class="ghost small" title="Light / dark" aria-label="Switch light or dark mode">Theme</button>
+      <a id="signout" class="ghost small button" href="/auth/logout" hidden>Sign out</a>
+    </div>
   </div>
-  <label class="field"><span>From</span> <input type="date" id="from"></label>
-  <label class="field"><span>To</span> <input type="date" id="to"></label>
-  <label class="field"><span>Clinic</span> <select id="clinic"><option value="">All clinics</option></select></label>
+</aside>
+
+<div class="content">
+  <header class="top">
+    <div class="titles">
+      <h2 id="viewTitle">Overview</h2>
+      <span id="viewSub" class="sub">How the clinics, the recordings and the server are doing</span>
+    </div>
+    <span class="spacer"></span>
+    <span id="when" class="live" role="status">Connecting</span>
+    <button id="pause" type="button" class="ghost" aria-pressed="false" title="Pause auto-refresh">Pause</button>
+    <button id="refresh" type="button" class="primary">Refresh</button>
+  </header>
+
+  <div class="filters" id="filters" role="group" aria-label="Filters">
+    <div class="chips seg" id="ranges" role="group" aria-label="Date range">
+      <button type="button" class="chip" data-range="0">Today</button>
+      <button type="button" class="chip" data-range="6">7 days</button>
+      <button type="button" class="chip" data-range="29">30 days</button>
+    </div>
+    <label class="field"><span>From</span> <input type="date" id="from"></label>
+    <label class="field"><span>To</span> <input type="date" id="to"></label>
+    <label class="field"><span>Clinic</span> <select id="clinic"><option value="">All clinics</option></select></label>
+  </div>
+
+  <main id="main">
+    <div class="notice" id="notice" role="alert"></div>
+
+    <!-- ============================== Overview -->
+    <section class="view" data-view="overview" aria-label="Overview">
+      <div class="tiles" id="kpis"></div>
+
+      <div class="grid cols-a">
+        <section class="panel" aria-labelledby="h-day">
+          <div class="head"><h3 id="h-day">Recordings per day</h3>
+            <span class="hint" id="dayHint"></span></div>
+          <div class="body"><div id="byDay"></div></div>
+        </section>
+        <section class="panel" aria-labelledby="h-att">
+          <div class="head"><h3 id="h-att">Needs attention</h3>
+            <span class="hint">Click a row to list it</span></div>
+          <div class="body"><div class="att" id="attention"></div></div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="h-clinics">
+        <div class="head"><h3 id="h-clinics">Clinics</h3>
+          <span class="hint">Click one to see only that clinic</span></div>
+        <div class="body"><div class="clinics" id="clinicBoard"></div></div>
+      </section>
+
+      <div class="grid cols-b">
+        <section class="panel" aria-labelledby="h-prob" id="problemsPanel">
+          <div class="head"><h3 id="h-prob">Problems by type</h3>
+            <span class="hint" id="probHint"></span></div>
+          <div class="body" id="problems"></div>
+        </section>
+        <section class="panel" aria-labelledby="h-copy">
+          <div class="head"><h3 id="h-copy">Archive and cloud copy</h3></div>
+          <div class="body" id="copies"></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ============================== Recordings -->
+    <section class="view" data-view="recordings" aria-label="Recordings" hidden>
+      <section class="panel" aria-labelledby="recTitle" id="recPanel">
+        <div class="head wrap"><h3 id="recTitle">Recordings</h3>
+          <span class="hint" id="recHint"></span></div>
+        <div class="chips small bar" id="stateFilters" role="group" aria-label="Filter recordings by state"></div>
+        <div class="scroll tall"><div id="recTable"></div></div>
+        <div class="foot">
+          <b>Delete by hand:</b> the folder is under <code>AIMS_ARCHIVE_PATH</code>
+          (<code>/srv/aims/archive</code> on the UIU server). Delete the whole folder;
+          the <code>.wav</code>, <code>.manifest.json</code> and clinical <code>.json</code> are inside.
+        </div>
+      </section>
+
+      <div class="grid cols-b">
+        <section class="panel" aria-labelledby="h-review">
+          <div class="head"><h3 id="h-review">Needs review</h3>
+            <button type="button" class="q" aria-label="About review" data-tip="Patient labels the rules could not settle, or labels changed after archiving. Open alerts only.">?</button>
+            <span class="hint" id="reviewHint"></span></div>
+          <div class="scroll short"><div id="review"></div></div>
+        </section>
+        <section class="panel" aria-labelledby="h-held">
+          <div class="head"><h3 id="h-held">Held on PCs</h3>
+            <button type="button" class="q" aria-label="About held recordings" data-tip="Recordings a PC is keeping because this server refused them. Reason code comes from the PC.">?</button>
+            <span class="hint" id="heldHint"></span></div>
+          <div class="scroll short"><div id="held"></div></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ============================== PCs -->
+    <section class="view" data-view="pcs" aria-label="PCs" hidden>
+      <section class="panel" aria-labelledby="h-pcs" id="pcsPanel">
+        <div class="head wrap"><h3 id="h-pcs">PCs in the consulting rooms</h3>
+          <div class="chips small" id="pcFilters" role="group" aria-label="Filter PCs"></div></div>
+        <div class="scroll"><div id="rooms"></div></div>
+      </section>
+    </section>
+
+    <!-- ============================== Downloads -->
+    <section class="view" data-view="downloads" aria-label="Downloads" hidden>
+      <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
+        <div class="head wrap"><h3 id="h-bulk">Download in batches</h3>
+          <button type="button" class="q" aria-label="About batches" data-tip="Pick a clinic, days and doctors. Each batch is the next files of that selection you do not have yet, oldest first, in one ZIP. A batch that breaks off, or a file that fails its check, is simply in your next batch: nothing is repeated and nothing is skipped.">?</button>
+          <span class="hint" id="bulkHint"></span></div>
+        <div class="body bulk">
+          <div class="bulkform">
+            <label class="field col"><span>Clinic</span> <select id="bClinic"></select></label>
+            <label class="field col"><span>From</span> <input type="date" id="bFrom"></label>
+            <label class="field col"><span>To</span> <input type="date" id="bTo"></label>
+            <label class="field col"><span>Files per batch</span> <select id="bSize"></select></label>
+          </div>
+          <div class="bdocs">
+            <div class="group-title">Doctors <button type="button" class="chip" id="bAll">All doctors</button></div>
+            <div class="chips small" id="bDoctors" role="group" aria-label="Doctors in this selection"></div>
+          </div>
+          <div id="bSummary" class="bsum" role="status"></div>
+          <div class="bgo">
+            <button type="button" class="primary" id="bGo" disabled>Download next batch</button>
+            <span id="bMsg" class="hint" role="status"></span>
+          </div>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-batches" id="batchesPanel" hidden>
+        <div class="head wrap"><h3 id="h-batches">Batches</h3>
+          <label class="hint" id="bEveryoneLabel" hidden><input type="checkbox" id="bEveryone"> Everyone's</label></div>
+        <div class="scroll short"><div id="bBatches"></div></div>
+      </section>
+    </section>
+
+    <!-- ============================== People -->
+    <section class="view" data-view="people" aria-label="People" hidden>
+      <section class="panel" aria-labelledby="h-people" id="peoplePanel" hidden>
+        <div class="head wrap"><h3 id="h-people">People</h3>
+          <span class="hint" id="peopleHint">Who may open this dashboard and the database viewer, by Google account</span></div>
+        <form id="peopleForm" class="peopleform">
+          <label>Google email <input id="pEmail" type="email" required autocomplete="off" placeholder="name@example.com"></label>
+          <label>Role <select id="pRole">
+            <option value="researcher">Researcher - look, never change</option>
+            <option value="admin">Admin - everything, and people</option>
+          </select></label>
+          <button type="submit" class="primary">Give access</button>
+          <span id="peopleMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="people"></div></div>
+      </section>
+    </section>
+  </main>
 </div>
-
-<main id="main">
-  <div class="notice" id="notice" role="alert"></div>
-
-  <section aria-label="Status" class="tiles" id="kpis"></section>
-
-  <div class="grid cols-a">
-    <section class="panel" aria-labelledby="h-clinics">
-      <div class="head"><h2 id="h-clinics">Clinics</h2>
-        <span class="hint">Click to filter</span></div>
-      <div class="body"><div class="clinics" id="clinicBoard"></div></div>
-    </section>
-    <section class="panel" aria-labelledby="h-day">
-      <div class="head"><h2 id="h-day">Recordings per day</h2>
-        <span class="hint" id="dayHint"></span></div>
-      <div class="body"><div id="byDay"></div></div>
-    </section>
-  </div>
-
-  <div class="grid cols-3">
-    <section class="panel" aria-labelledby="h-att">
-      <div class="head"><h2 id="h-att">Needs attention</h2>
-        <span class="hint">Click a row to list it</span></div>
-      <div class="body"><div class="att" id="attention"></div></div>
-    </section>
-    <section class="panel" aria-labelledby="h-prob" id="problemsPanel">
-      <div class="head"><h2 id="h-prob">Problems by type</h2>
-        <span class="hint" id="probHint"></span></div>
-      <div class="body" id="problems"></div>
-    </section>
-    <section class="panel" aria-labelledby="h-copy">
-      <div class="head"><h2 id="h-copy">Archive and cloud copy</h2></div>
-      <div class="body" id="copies"></div>
-    </section>
-  </div>
-
-  <section class="panel" aria-labelledby="h-pcs" id="pcsPanel">
-    <div class="head wrap"><h2 id="h-pcs">PCs</h2>
-      <div class="chips small" id="pcFilters" role="group" aria-label="Filter PCs"></div></div>
-    <div class="scroll"><div id="rooms"></div></div>
-  </section>
-
-  <div class="grid cols-b">
-    <section class="panel" aria-labelledby="h-held">
-      <div class="head"><h2 id="h-held">Held on PCs</h2>
-        <button type="button" class="q" aria-label="About held recordings" data-tip="Recordings a PC is keeping because this server refused them. Reason code comes from the PC.">?</button>
-        <span class="hint" id="heldHint"></span></div>
-      <div class="scroll short"><div id="held"></div></div>
-    </section>
-    <section class="panel" aria-labelledby="h-review">
-      <div class="head"><h2 id="h-review">Needs review</h2>
-        <button type="button" class="q" aria-label="About review" data-tip="Patient labels the rules could not settle, or labels changed after archiving. Open alerts only.">?</button>
-        <span class="hint" id="reviewHint"></span></div>
-      <div class="scroll short"><div id="review"></div></div>
-    </section>
-  </div>
-
-  <section class="panel" aria-labelledby="recTitle" id="recPanel">
-    <div class="head wrap"><h2 id="recTitle">Recordings</h2>
-      <span class="hint" id="recHint"></span></div>
-    <div class="chips small bar" id="stateFilters" role="group" aria-label="Filter recordings by state"></div>
-    <div class="scroll tall"><div id="recTable"></div></div>
-    <div class="foot">
-      <b>Delete by hand:</b> the folder is under <code>AIMS_ARCHIVE_PATH</code>
-      (<code>/srv/aims/archive</code> on the UIU server). Delete the whole folder;
-      the <code>.wav</code>, <code>.manifest.json</code> and clinical <code>.json</code> are inside.
-    </div>
-  </section>
-  <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
-    <div class="head wrap"><h2 id="h-bulk">Download in batches</h2>
-      <button type="button" class="q" aria-label="About batches" data-tip="Pick a clinic, days and doctors. Each batch is the next files of that selection you do not have yet, oldest first, in one ZIP. A batch that breaks off, or a file that fails its check, is simply in your next batch: nothing is repeated and nothing is skipped.">?</button>
-      <span class="hint" id="bulkHint"></span></div>
-    <div class="body bulk">
-      <div class="bulkform">
-        <label class="field col"><span>Clinic</span> <select id="bClinic"></select></label>
-        <label class="field col"><span>From</span> <input type="date" id="bFrom"></label>
-        <label class="field col"><span>To</span> <input type="date" id="bTo"></label>
-        <label class="field col"><span>Files per batch</span> <select id="bSize"></select></label>
-      </div>
-      <div class="bdocs">
-        <div class="group-title">Doctors <button type="button" class="chip" id="bAll">All doctors</button></div>
-        <div class="chips small" id="bDoctors" role="group" aria-label="Doctors in this selection"></div>
-      </div>
-      <div id="bSummary" class="bsum" role="status"></div>
-      <div class="bgo">
-        <button type="button" class="primary" id="bGo" disabled>Download next batch</button>
-        <span id="bMsg" class="hint" role="status"></span>
-      </div>
-    </div>
-    <div class="head wrap bhead"><h2 id="h-batches">Batches</h2>
-      <label class="hint" id="bEveryoneLabel" hidden><input type="checkbox" id="bEveryone"> Everyone's</label></div>
-    <div class="scroll short"><div id="bBatches"></div></div>
-  </section>
-  <section class="panel" aria-labelledby="h-people" id="peoplePanel" hidden>
-    <div class="head wrap"><h2 id="h-people">People</h2>
-      <span class="hint" id="peopleHint">Who may open this dashboard and the database viewer, by Google account</span></div>
-    <form id="peopleForm" class="peopleform">
-      <label>Google email <input id="pEmail" type="email" required autocomplete="off" placeholder="name@example.com"></label>
-      <label>Role <select id="pRole">
-        <option value="researcher">Researcher - look, never change</option>
-        <option value="admin">Admin - everything, and people</option>
-      </select></label>
-      <button type="submit" class="primary">Give access</button>
-      <span id="peopleMsg" class="hint" role="status"></span>
-    </form>
-    <div id="people"></div>
-  </section>
-</main>
+</div>
 
 <dialog id="keyDialog" aria-labelledby="keyTitle">
   <form id="keyForm" class="keyform" novalidate>
