@@ -256,8 +256,8 @@ def sequence():
     g.add(text(7, y - 13, "THE MATCH   we compare the five fields the recorder "
                           "reported with the five CMED's server sent.", size=7.4,
                font=FB, fill=GOOD))
-    g.add(text(7, y - 24, "Identical: the clinical record is ATTACHED to the recording.  "
-                          "Late or missing: the recording is still kept.",
+    g.add(text(7, y - 24, "Identical: the recording is CONFIRMED and kept. Late (even "
+                          "days, after an outage): matched when it comes. Never: erased.",
                size=7.2, fill=GOOD))
     y -= MATCH + GAP
 
@@ -375,8 +375,8 @@ def gate():
               (xs[3] + bw / 2.0, ys - 34), (xs[3] + bw / 2.0, ys - 4)],
           colour=MUTED, sw=0.9, dash=[3, 2])
     label(g, (xs[1] + xs[3] + bw) / 2.0, ys - 45,
-          "the doctor's own Stop button  -  never CMED", size=7, font=FB,
-          fill=MUTED)
+          "stop: the doctor's Stop button, CMED's stop command, or the PC "
+          "shutting down", size=7, font=FB, fill=MUTED)
 
     g.add(box(4, 6, 486, 50, fill=CRITBG, stroke=CRIT, sw=1.0, radius=3))
     g.add(text(13, 44, "The third state is the one that gets missed.",
@@ -424,7 +424,8 @@ def five_fields():
     mx, mw, mh = 268, 218, 40
     msgs = [("API 1", "start", "to the recorder, over loopback", TEAL),
             ("API 2", "patient information", "to AIMS LAB, FHIR + token", TEAL),
-            ("API 3a", "prescription_built", "to the recorder, over loopback", TEAL),
+            ("API 3a", "prescription_built", "patient_id + the session_id start "
+                                              "returned", TEAL),
             ("API 3b", "the prescription", "to AIMS LAB, FHIR + token", TEAL)]
     tops = [H - 16, H - 70, H - 124, H - 178]
     for (a, b, c, col), t in zip(msgs, tops):
@@ -439,20 +440,98 @@ def five_fields():
     g.add(box(4, 6, 486, 58, fill=WARNBG, stroke=WARN, sw=1.0, radius=3))
     g.add(text(13, 52, "Pass the same object to all four. Never rebuild it and never "
                        "recompute the time.", size=8.2, font=FB, fill=WARN))
-    g.add(text(13, 40, "In API 3a and API 3b, start_time is still the moment the "
-                       "PATIENT WAS OPENED - not the moment the", size=7.4,
+    g.add(text(13, 40, "In API 3b, start_time is still the moment the PATIENT WAS "
+                       "OPENED - not the moment the", size=7.4,
                fill=WARN))
     g.add(text(13, 30, "prescription was built. That single mistake is the most common "
                        "way this integration fails, and it is", size=7.4,
                fill=WARN))
     g.add(text(13, 20, "silent: every message succeeds, and the prescription simply "
                        "never finds its recording.", size=7.4, fill=WARN))
-    g.add(text(13, 10, "Take hospital_id from the recorder's doctors command, not from "
-                       "your own settings.", size=7.4, font=FB, fill=WARN))
+    g.add(text(13, 10, "hospital_id is the clinic's CMED code, the one registered with "
+                       "AIMS LAB: the same in every message.", size=7.4, font=FB,
+               fill=WARN))
+
+    d.add(g)
+    return d
+
+
+# ------------------------------------------------------------ 5. the gateway
+
+def gateway():
+    """The one public door, the checks in it, and what stays behind it."""
+    H = 318.0
+    d = Drawing(W, H)
+    g = Group()
+
+    # ---- who knocks, on the left
+    callers = [("CMED's server", ["token, API 2, API 3b,", "visit lookups"], TEAL),
+               ("Doctors' PCs", ["grants, sessions,", "heartbeats"], TEAL),
+               ("AIMS LAB staff", ["dashboard, database", "viewer (Google sign-in)"], MUTED)]
+    cx, cw, chh = 4, 118, 50
+    gx, gw, gy, gh = 150, 176, 70, 240
+    for i, (name, lines, col) in enumerate(callers):
+        top = H - 14 - i * 78
+        y0 = top - chh
+        g.add(box(cx, y0, cw, chh, fill=WHITE, stroke=col, sw=1.0, radius=3))
+        centred(g, cx, y0 + chh - 15, cw, [name], size=8.2, font=FB, fill=col)
+        centred(g, cx, y0 + chh - 27, cw, lines, size=6.6, fill=MUTED, lead=9)
+        arrow(g, cx + cw + 3, y0 + chh / 2.0, gx - 3, y0 + chh / 2.0, colour=col,
+              sw=1.2)
+
+    # ---- the gateway and its checks, in order
+    g.add(box(gx, gy, gw, gh, fill=BAND, stroke=TEAL, sw=1.4, radius=4))
+    centred(g, gx, gy + gh - 16, gw, ["THE API GATEWAY"], size=8.6, font=FB, fill=TEAL)
+    centred(g, gx, gy + gh - 27, gw, ["the only public address: HTTPS, port 443"], size=6.8, fill=MUTED)
+    steps = [("1", "TLS 1.2/1.3 only; HTTP redirected;", "certificate renewed by itself"),
+             ("2", "body over 2 MB refused", "(the API's own limit is 1 MB)"),
+             ("3", "internal routes answer 404:", "/docs, /api/v1, archive, sweep"),
+             ("4", "portal routes need a Google", "sign-in an admin granted"),
+             ("5", "caller's address and a request", "id stamped; a forged one replaced"),
+             ("6", "passed on over the private", "network; held up to 30 s in updates"),
+             ("7", "logged without keys, tokens", "or query strings")]
+    for i, (n, a, b) in enumerate(steps):
+        yy = gy + gh - 46 - i * 27.5
+        g.add(box(gx + 8, yy - 12, 14, 14, fill=TEAL, stroke=TEAL, radius=2))
+        g.add(text(gx + 15, yy - 8, n, size=7.4, font=FB, fill=WHITE, anchor="middle"))
+        g.add(text(gx + 28, yy - 1, a, size=6.9, fill=INK))
+        g.add(text(gx + 28, yy - 10, b, size=6.9, fill=MUTED))
+
+    # ---- behind it: the private network
+    px, pw, py, ph = 346, 144, 70, 240
+    r = box(px, py, pw, ph, fill=PALE, stroke=RULE, sw=1.0, radius=4)
+    r.strokeDashArray = [3, 2]
+    g.add(r)
+    g.add(text(px + 8, py + ph - 14, "PRIVATE NETWORK", size=7.4, font=FB, fill=MUTED))
+    g.add(text(px + 8, py + ph - 24, "no public address at all", size=6.6, fill=MUTED))
+    inner = [("Application server", ["checks the token, reads", "FHIR, stores, replies"],
+              TEAL, BAND),
+             ("PostgreSQL x 2", ["recordings; clinical", "never reachable outside"],
+              INK, WHITE),
+             ("Cache, workers,", ["archive, backups,", "monitor"], INK, WHITE)]
+    for i, (name, lines, col, fill) in enumerate(inner):
+        top = py + ph - 34 - i * 66
+        g.add(box(px + 8, top - 54, pw - 16, 54, fill=fill, stroke=col if col is TEAL
+                  else RULE, sw=1.0, radius=3))
+        centred(g, px + 8, top - 15, pw - 16, [name], size=7.8, font=FB, fill=col)
+        centred(g, px + 8, top - 27, pw - 16, lines, size=6.6, fill=MUTED, lead=9)
+    arrow(g, gx + gw + 3, py + ph - 61, px + 5, py + ph - 61, colour=TEAL, sw=1.4)
+
+    # ---- the one thing that does not go through it
+    g.add(box(4, 6, 486, 52, fill=WARNBG, stroke=WARN, sw=1.0, radius=3))
+    g.add(text(13, 44, "Audio never passes through the gateway.", size=8.2, font=FB,
+               fill=WARN))
+    g.add(text(13, 32, "Each PC uploads its sealed, encrypted pieces straight to "
+                       "Cloudflare R2, with a link the server signs for that one",
+               size=7.2, fill=WARN))
+    g.add(text(13, 22, "piece, valid for five minutes. So the gateway only ever carries small "
+                       "messages, and CMED's traffic is never queued", size=7.2,
+               fill=WARN))
+    g.add(text(13, 12, "behind a clinic's uploads.", size=7.2, fill=WARN))
 
     d.add(g)
     return d
 
 
 ALL = {"architecture": architecture, "sequence": sequence,
-       "gate": gate, "five_fields": five_fields}
+       "gate": gate, "five_fields": five_fields, "gateway": gateway}
