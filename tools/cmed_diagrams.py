@@ -302,8 +302,9 @@ def sequence():
     g.add(text(7, y - 24, "That counselling is some of the most valuable audio in the "
                           "study, which is why API 3a stops nothing.", size=7.2,
                fill=WARN))
-    g.add(text(7, y - 35, "It only ARMS a gate, meaning: this consultation may now be "
-                          "closed by the next one.", size=7.2, fill=WARN))
+    g.add(text(7, y - 35, "It only ARMS a gate: the next patient closes it, or it closes "
+                          "itself 2 minutes later (+ up to 10 s, at a pause).", size=7.2,
+               fill=WARN))
     y -= STILL + GAP
 
     # ---------------------------------------------------- moment 3
@@ -355,7 +356,7 @@ def gate():
         centred(g, x, ys + bh - 16, bw, [a], size=8.4, font=FB, fill=inks[i])
         centred(g, x, ys + bh - 29, bw, [b, c], size=6.6, fill=MUTED)
 
-    for i, name in enumerate(("API 1", "API 3a", "API 1")):
+    for i, name in enumerate(("API 1", "API 3a", "API 1 / 2 min")):
         x1, x2 = xs[i] + bw, xs[i + 1]
         arrow(g, x1 + 3, ys + bh / 2.0, x2 - 3, ys + bh / 2.0, colour=TEAL,
               sw=1.3)
@@ -367,7 +368,7 @@ def gate():
     g.add(text(34, ys - 16, "= start", size=7, font=FM, fill=MUTED))
     g.add(text(92, ys - 16, "API 3a", size=7, font=FB, fill=TEAL))
     g.add(text(126, ys - 16, "= prescription_built", size=7, font=FM, fill=MUTED))
-    g.add(text(244, ys - 16, "the third arrow is the NEXT consultation's API 1",
+    g.add(text(244, ys - 16, "third: the NEXT patient's API 1, or 2 min (+10 s at a pause)",
                size=7, fill=MUTED))
 
     # the doctor's own stop, routed below everything
@@ -375,8 +376,8 @@ def gate():
               (xs[3] + bw / 2.0, ys - 34), (xs[3] + bw / 2.0, ys - 4)],
           colour=MUTED, sw=0.9, dash=[3, 2])
     label(g, (xs[1] + xs[3] + bw) / 2.0, ys - 45,
-          "stop: the doctor's Stop button, CMED's stop command, or the PC "
-          "shutting down", size=7, font=FB, fill=MUTED)
+          "the doctor's Stop on the recorder, with a reason  -  never the browser",
+          size=7, font=FB, fill=MUTED)
 
     g.add(box(4, 6, 486, 50, fill=CRITBG, stroke=CRIT, sw=1.0, radius=3))
     g.add(text(13, 44, "The third state is the one that gets missed.",

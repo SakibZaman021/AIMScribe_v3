@@ -264,10 +264,10 @@ def story(host, permanent):
                   ["", "<b>API 3</b> &mdash; CMED's server sends us <b>the whole "
                    "consultation</b>: chief complaints, history, allergies, O/E, S/E, G/H and "
                    "O/H, investigations, diagnosis, medicines, advice, next visit", "11, 12"],
-                  ["<b>3. Doctor logs out, or ends the day</b>", "<b>stop</b> &mdash; the "
-                   "browser tells AIMScribe.exe to close the last recording. Nothing else ends "
-                   "the last patient's recording but the doctor's own Stop button or the PC "
-                   "shutting down", "4, 5"],
+                  ["<b>3. Two minutes after the prescription</b>", "<b>Nothing to send.</b> "
+                   "The recording keeps the counselling, then closes by itself 2 minutes after "
+                   "the prescription (up to 10 s more, at a pause in speech) &mdash; unless the "
+                   "next patient's API 1 comes first. The browser can never stop it", "4, 5"],
                   ["<b>Every reply</b>", "200 ACCEPTED (sometimes with warnings): remove the "
                    "message from the outbox. Anything else: keep it and retry", "13"]],
                  [38 * mm, 100 * mm, 18 * mm], highlight=[4, 6, 7]))
@@ -361,9 +361,11 @@ def story(host, permanent):
                            Paragraph("This is the idea most often misread. <b>prescription_built does not stop "
                        "the recording</b>: the doctor usually goes on explaining the "
                        "prescription, and that audio is some of the most valuable in the "
-                       "study. It only arms the recording, so that the <b>next</b> patient's "
-                       "start closes it. <b>No clock ever ends a recording</b>: timers cut real "
-                       "consultations short when they were tried.", BODY),
+                       "study. It only arms the recording: the <b>next</b> patient's start "
+                       "closes it, or it closes by itself <b>2 minutes</b> after the "
+                       "prescription, at the first pause in speech within 10 more seconds. "
+                       "<b>Nothing in the browser can end it</b>: a reload, a closed tab or "
+                       "Chrome quitting leaves the recording untouched.", BODY),
                            Spacer(1, 3), diagrams.gate()]))
 
     # ---------------------------------------------------------------- 2 gateway
@@ -535,7 +537,9 @@ def story(host, permanent):
                    "and never more than one connection per page."],
                   ["<b>Keep the session_id</b> from the latest start reply, for "
                    "prescription_built."],
-                  ["<b>At most 10 messages a second</b>; more are answered AGENT_NOT_READY."]],
+                  ["<b>At most 10 messages a second</b>; more are answered AGENT_NOT_READY."],
+                  ["<b>Never stop or pause.</b> The page starts and arms recordings; only the "
+                   "doctor, on the recorder, can stop one (4.3)."]],
                  [156 * mm], bold_first=False))
 
     S.append(Paragraph("4.1 &middot; start (API 1): the doctor opens a patient", H3))
@@ -577,23 +581,25 @@ def story(host, permanent):
                        "session_id the running one; otherwise the answer is PATIENT_MISMATCH. "
                        "A follow-up with no prescription sends no prescription_built.", BODY))
 
-    S.append(Paragraph("4.3 &middot; stop: the doctor logs out or ends the day", H3))
-    S.append(Paragraph("The next patient's start closes a recording. After the <b>last</b> "
-                       "patient there is no next one, so the page sends <b>stop</b> when the "
-                       "doctor logs out of CMED or ends the day. Without it, the recording "
-                       "runs on until the doctor's own Stop button or the PC shutting down, "
-                       "and keeps whatever is said in the room. The audio is always kept: "
-                       "stop never erases anything.", BODY))
-    S.append(code(pretty({"command": "stop", "request_id": "c-0003",
-                          "reason": "consultation_finished"})))
-    S.append(Paragraph(f"{mono('reason')} is one of "
-                       f"{mono('consultation_finished')}, {mono('doctor_stopped')}, "
-                       f"{mono('patient_left')}, {mono('urgent_interruption')}, "
-                       f"{mono('technical_problem')}, {mono('software_update')}. The reply is "
-                       f"{mono('OK')}, or {mono('NO_ACTIVE_SESSION')} when nothing was "
-                       "recording &mdash; both are fine. <b>Do not send stop when the page "
-                       "merely reloads or a tab closes</b>: a reload in the middle of a "
-                       "consultation would cut it.", BODY))
+    S.append(Paragraph("4.3 &middot; How a recording ends &mdash; never from the browser", H3))
+    S.append(tbl([["A recording ends when", "Who"],
+                  ["The <b>next patient</b> is opened after a prescription (start, API 1)",
+                   "CMED's page, in its normal work"],
+                  ["<b>2 minutes after the prescription</b>, at the first pause in speech "
+                   "within 10 more seconds &mdash; this is what ends the last patient of the "
+                   "day", "the recorder, by itself"],
+                  ["The doctor presses <b>Stop</b> on the recorder and gives a reason",
+                   "the doctor"],
+                  ["The PC shuts down (the recording is closed cleanly first)", "Windows"]],
+                 [110 * mm, 46 * mm], highlight=[1, 2]))
+    S.append(Spacer(1, 3))
+    S.append(Paragraph("<b>The page cannot stop, pause or resume a recording.</b> Those commands "
+                       "are refused (409 REFUSED) and nothing changes. The recorder is a "
+                       "separate program: reloading the page, closing the tab, Chrome crashing "
+                       "or quitting, or the connection dropping leaves the recording "
+                       "untouched. When the page comes back it simply reconnects; if the doctor "
+                       "reopens the same patient, start with the same five fields continues "
+                       "the same recording.", BODY))
 
     S.append(Paragraph("4.4 &middot; Every reply code, and what the page does", H3))
     S.append(tbl([["Code", "Status", "Meaning", "The page does"],
@@ -601,8 +607,9 @@ def story(host, permanent):
                    "Keep the session_id; carry on"],
                   ["GATE_ARMED, GATE_ALREADY_ARMED", "200",
                    "The next patient will close this recording", "Nothing"],
-                  ["OK, NO_ACTIVE_SESSION", "200, 409", "Stopped, or nothing was running",
-                   "Nothing"],
+                  ["REFUSED", "409", "stop, pause or resume sent by the page: only the "
+                                     "doctor can, on the recorder",
+                   "Nothing; do not send them"],
                   ["MISSING_FIELD, INVALID_IDENTIFIER", "400",
                    "A field is missing or malformed; <b>nothing is recorded</b>",
                    "A bug in the page: log it with the field named in the message"],
@@ -657,18 +664,18 @@ def story(host, permanent):
          "start and API 2. No prescription_built and no API 3b: there is none",
          "The recording runs on to the next patient's start and is cut at that click: "
          "its own file (R4), confirmed by its API 2"),
-        ("4", "<b>The last patient of the day</b>",
-         "<b>stop</b> when the doctor logs out or ends the day (4.3)",
-         "Closed at stop. Without it: at the doctor's Stop button or PC shutdown"),
-        ("5", "<b>The doctor forgets to log out</b>",
-         "nothing more can be done by CMED",
-         "The recording runs until the next patient, Stop, or shutdown; the next morning's "
-         "first click still cuts it at the right second. Nothing is lost; the file is "
-         "longer"),
+        ("4", "<b>The last patient of the day</b>, or a long gap after a prescription",
+         "nothing: there is no next patient to send",
+         "Closes by itself 2 minutes after the prescription, at a pause in speech (up to "
+         "10 s more). The next patient later starts a new recording"),
+        ("5", "<b>Chrome reloaded, the tab closed, Chrome crashed</b> mid-consultation",
+         "nothing special; when the patient is reopened, start with the same five fields",
+         "The recording is untouched: it never depended on the browser. The repeated start "
+         "continues the same recording"),
         ("6", "<b>A corrected prescription</b>",
          "prescription_built again; API 3b again with the <b>same five fields</b> and a new "
          "authoredOn", "GATE_ALREADY_ARMED; the correction is stored as the next version"),
-        ("7", "<b>Page reloaded</b>, or the same patient clicked twice",
+        ("7", "<b>The same patient clicked twice</b>",
          "start again, same five fields", "Same recording; nothing changes"),
         ("8", "<b>AIMScribe.exe not running</b> (PC just started, crashed)",
          "carry on; API 2 and API 3b are still sent",
@@ -1195,8 +1202,8 @@ def story(host, permanent):
                   ["[  ]", "API 2 (first visit and returning) and API 3 return 200 ACCEPTED"],
                   ["[  ]", "The fingerprint example in 10.5 reproduced exactly"],
                   ["[  ]", "<b>The page:</b> start on every patient opened; prescription_built "
-                           "with the latest session_id; stop at log-out and end of day, never "
-                           "on reload (section 4)"],
+                           "with the latest session_id; never stop, pause or resume "
+                           "(section 4)"],
                   ["[  ]", "<b>The page never waits for the recorder</b>: tested with "
                            "AIMScribe.exe closed (section 5, case 8)"],
                   ["[  ]", "<b>The same five fields</b> in start, API 2 and API 3b, "

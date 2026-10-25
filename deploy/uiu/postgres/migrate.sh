@@ -142,6 +142,13 @@ fi
 psql_in aims_recordings -f /aims/scripts/roles/researcher_logins_recordings.sql
 psql_in aims_clinical -f /aims/scripts/roles/researcher_logins_clinical.sql
 
+# The data guard (scripts/guard/data_guard.sql): no drop, no truncate, no
+# delete of more than 5,000 rows in one statement, in either database, unless
+# a migration decided in review allows it. Last, so it covers every table the
+# migrations above made; again on every update; safe to repeat.
+psql_in aims_recordings -f /aims/scripts/guard/data_guard.sql
+psql_in aims_clinical -f /aims/scripts/guard/data_guard.sql
+
 # The access rules (hba/pg_hba.conf, a mounted folder) may have changed with
 # this update: read them again now. A setting that needs a restart, such as
 # archive_mode, takes effect when the update recreates the container.

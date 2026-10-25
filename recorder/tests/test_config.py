@@ -16,13 +16,15 @@ def test_a_bench_agent_keeps_its_state_out_of_the_way(monkeypatch, tmp_path):
     assert config_module.data_dir() == tmp_path / "machine" / "AIMScribe"
 
 
-def test_no_clock_ever_ends_a_consultation_by_default():
+def test_the_recording_ends_two_minutes_after_the_prescription():
     """
-    A 15-minute and a 2-minute limit ended real-length consultations on the
-    bench. Both are off unless a bench test turns them on.
+    Two minutes of counselling after the prescription, and up to ten seconds
+    more while someone is speaking. A follow-up with no prescription has no
+    clock: the next patient ends it.
     """
     import dataclasses
     import config as cfg_module
     fields = {f.name: f.default for f in dataclasses.fields(cfg_module.SecurityConfig)}
+    assert fields["counselling_limit_seconds"] == 120
+    assert fields["end_grace_seconds"] == 10
     assert fields["no_activity_limit_seconds"] == 0
-    assert fields["counselling_limit_seconds"] == 0

@@ -3378,7 +3378,25 @@ async def _delete_cloud_objects(keys: List[Dict[str, Any]]) -> List[Dict[str, An
         except Exception as exc:
             logger.warning("Could not delete cloud copy %s yet: %s", key.get("object_key"), exc)
             left.append(key)
+            continue
+        # A bucket lock keeps an object for its retention days, whatever a
+        # delete says: it is gone only when the store no longer has it, and
+        # until then it is asked for again on every pass.
+        if await loop.run_in_executor(None, _still_held, store, key["object_key"]):
+            logger.info("Cloud copy %s is still held (bucket lock); deleted when it ends",
+                        key.get("object_key"))
+            left.append(key)
     return left
+
+
+def _still_held(store, object_key: str) -> bool:
+    try:
+        store.client.stat_object(store.bucket, object_key)
+        return True
+    except Exception as exc:
+        said = f"{getattr(exc, 'code', '')} {exc}"
+        return not any(word in said for word in
+                       ("NoSuchKey", "NoSuchObject", "NotFound", "ResourceNotFound"))
 
 
 async def _finish_erase(session_id: str) -> Optional[Dict[str, Any]]:

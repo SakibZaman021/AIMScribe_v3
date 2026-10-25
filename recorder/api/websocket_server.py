@@ -296,6 +296,20 @@ class WebSocketManager:
 
     # ---- commands CMED does not use ----
 
+    def _doctor_only(self) -> None:
+        """
+        Stop, pause and resume belong to the doctor, on the recorder itself.
+        The page in the browser may start a recording (API 1) and arm it
+        (prescription_built), never end or silence one: a reload, a crashed
+        tab or a script on the page must not touch a consultation. Allowed in
+        developer mode only, for the bench's manual-test page.
+        """
+        if not getattr(self.cfg.security, "developer_mode", False):
+            raise ProtocolError(
+                "REFUSED", "Only the doctor can stop or pause a recording, on the "
+                "recorder. It ends at the next patient, or two minutes after the "
+                "prescription.")
+
     async def _stop(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
         Ends the recording and keeps it. The patient's refusal, which erases a
@@ -303,6 +317,7 @@ class WebSocketManager:
         a local program can forge this socket's Origin, and used to be able to
         delete a consultation by sending that one reason.
         """
+        self._doctor_only()
         asked = str(message.get("reason") or "doctor_stopped")[:64]
         reason = asked if asked in SOCKET_STOP_REASONS else "doctor_stopped"
         if asked == REFUSAL_REASON:
@@ -314,6 +329,7 @@ class WebSocketManager:
 
     async def _pause(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Supervised pause. Reason is mandatory; long pauses need a supervisor."""
+        self._doctor_only()
         return "OK", await self._controller.pause_session(
             reason=str(message.get("reason", "")),
             reason_detail=str(message.get("reason_detail", ""))[:500],
@@ -322,6 +338,7 @@ class WebSocketManager:
         )
 
     async def _resume(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        self._doctor_only()
         return "OK", await self._controller.resume_session()
 
     async def _status(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:

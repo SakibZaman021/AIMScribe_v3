@@ -788,7 +788,7 @@ class SessionController:
                 continue
             now = time.monotonic()
             if active.armed_at is not None:
-                limit = self._knob("counselling_limit_seconds", 0.0)
+                limit = self._knob("counselling_limit_seconds", 120.0)
                 if limit > 0 and now - active.armed_at >= limit:
                     await self._end_at_a_pause(active, "counselling_limit")
                     return

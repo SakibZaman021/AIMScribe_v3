@@ -51,6 +51,7 @@ V1_BASELINE = (BACKEND.parent / "deploy" / "uiu" / "postgres" / "schema"
 # 002 makes the server's roles (superuser only); the rest are the clinical schema.
 CLINICAL_SCRIPTS = [s for s in sorted((BACKEND / "scripts" / "clinical").glob("0[0-9][0-9]_*.sql"))
                     if not s.name.startswith("002_")]
+GUARD_SCRIPT = BACKEND / "scripts" / "guard" / "data_guard.sql"
 
 
 # The portable PostgreSQL used here ships without contrib extensions. 002 asks
@@ -71,10 +72,18 @@ def _portable(sql: str) -> str:
     return sql
 
 
+# The two migrations decided in review to destroy data (DESTRUCTIVE_APPROVED in
+# deploy/uiu/tests/test_deployment.py). They ran before the data guard existed;
+# applied again under it, as here, they need its switch.
+DECIDED_DESTRUCTIVE = {"022_v3_drop_v1_tables.sql", "024_v3_readable_devices.sql"}
+
+
 async def _apply(uri, scripts):
     conn = await asyncpg.connect(uri)
     try:
         for script in scripts:
+            approve = "on" if script.name in DECIDED_DESTRUCTIVE else ""
+            await conn.execute(f"SET aims.allow_destructive = '{approve}'")
             try:
                 await conn.execute(_portable(script.read_text(encoding="utf-8")))
             except Exception as exc:
@@ -101,6 +110,9 @@ def pg():
         await legacy.close()
         await _apply(recordings, RECORDINGS_SCRIPTS)
         await _apply(clinical_uri, CLINICAL_SCRIPTS)
+        # As migrate.sh does last: every test below runs under the data guard.
+        await _apply(recordings, [GUARD_SCRIPT])
+        await _apply(clinical_uri, [GUARD_SCRIPT])
         return recordings, clinical_uri
 
     recordings, clinical_uri = asyncio.run(build())

@@ -489,6 +489,71 @@ def test_the_destroy_check_catches_what_it_should():
     assert not any(_DESTROYS.match(s) for s in fine)
 
 
+def test_the_data_guard_is_applied_last_to_both_databases():
+    """
+    scripts/guard/data_guard.sql makes PostgreSQL itself refuse a drop, a
+    truncate or a mass delete. migrate.sh applies it on every update, after
+    the migrations, to both databases (tested against PostgreSQL in
+    backend/tests/test_data_guard.py).
+    """
+    runner = (HERE / "postgres" / "migrate.sh").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in runner.splitlines() if not ln.strip().startswith("#")]
+    guard = [i for i, ln in enumerate(lines) if "/aims/scripts/guard/data_guard.sql" in ln]
+    assert len(guard) == 2
+    assert any("aims_recordings" in lines[i] for i in guard)
+    assert any("aims_clinical" in lines[i] for i in guard)
+    last_migration = max(i for i, ln in enumerate(lines) if ln.startswith("apply "))
+    assert min(guard) > last_migration
+
+
+def test_only_a_decided_migration_switches_the_guard_off():
+    """
+    The guard's switch (aims.allow_destructive) is for the migrations decided
+    in review, and only those - otherwise a migration could simply turn it on.
+    """
+    switched = sorted(p.name for p in SCRIPTS.rglob("*.sql")
+                      if p.parent.name != "guard"
+                      and re.search(r"aims\.allow_destructive\s*=\s*'on'",
+                                    "\n".join(_statements(p.read_text(encoding="utf-8")))))
+    assert set(switched) <= set(DESTRUCTIVE_APPROVED), switched
+
+
+# Nothing that deploys may destroy where the data lives: the database folder,
+# the archive and the backups are bind mounts under /srv/aimscribe, which
+# Docker never removes by itself - only a command like these can.
+_LIVE = r"(aims_recordings|aims_clinical)\b"
+_WIPES = re.compile(
+    r"docker\s+(compose\b[^\n]*?\s)?down\b[^\n]*(\s-v\b|--volumes)"
+    r"|docker\s+volume\s+(rm|prune)|system\s+prune[^\n]*--volumes"
+    r"|rm\s+-[a-z]*r[a-z]*f?\s+[^\n]*(/srv|AIMS_DB_PATH|AIMS_BACKUP_PATH|AIMS_ARCHIVE_PATH)"
+    r"|dropdb\s+[^\n]*" + _LIVE + r"|DROP\s+DATABASE\s+(IF\s+EXISTS\s+)?" + _LIVE,
+    re.IGNORECASE)
+
+
+def test_no_deploy_script_can_wipe_the_data():
+    scripts = [p for p in HERE.rglob("*.sh") if "tests" not in p.parts]
+    scripts += [HERE / "docker-compose.yml"]
+    offenders = []
+    for path in scripts:
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.lstrip().startswith("#") and _WIPES.search(line):
+                offenders.append(f"{path.relative_to(HERE)}:{n}: {line.strip()[:80]}")
+    assert not offenders, offenders
+
+
+def test_the_wipe_check_catches_what_it_should():
+    bad = ["docker compose down -v", "docker compose -p x down --volumes",
+           "docker volume rm aimscribe_db", "docker system prune -a --volumes",
+           "rm -rf /srv/aimscribe/db", "rm -rf \"$AIMS_DB_PATH\"", "dropdb aims_recordings",
+           "DROP DATABASE IF EXISTS aims_clinical"]
+    # The restore drill drops its own scratch databases; that is fine.
+    fine = ["docker compose down", "docker compose up -d", "rm -f \"$tmp\"",
+            "rm -rf \"$work\"", "docker image prune -f",
+            "psql -c \"DROP DATABASE IF EXISTS $scratch\"", "DROP DATABASE aims_check"]
+    assert all(_WIPES.search(s) for s in bad)
+    assert not any(_WIPES.search(s) for s in fine)
+
+
 # ============================================================
 # Recovery to any minute: every profile archives, where the backup job looks
 # ============================================================

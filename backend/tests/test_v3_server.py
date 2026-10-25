@@ -1560,3 +1560,37 @@ async def test_the_worker_is_told_the_name_the_recording_was_given(server):
     sys.path.insert(0, str(BACKEND / "archive_worker"))
     import archive
     assert archive.name_for(mine, NOW(), NOW()) ==         "P0012345_DR0042_HOSP003_101432_102847_20260913.wav"
+
+
+async def test_a_cloud_copy_is_erased_only_when_the_store_no_longer_has_it():
+    """
+    Under a bucket lock a delete may be answered and the object kept. It counts
+    as erased only once the store says it is gone; until then it is retried.
+    """
+    class Store:
+        bucket = "aimscribe-archive"
+
+        def __init__(self, keeps=False, refuses=False):
+            self.held = {"a.wav.enc"}
+            self.keeps, self.refuses = keeps, refuses
+            self.client = SimpleNamespace(remove_object=self._remove, stat_object=self._stat)
+
+        def _remove(self, bucket, key):
+            if self.refuses:
+                raise RuntimeError("AccessDenied: object is locked")
+            if not self.keeps:
+                self.held.discard(key)
+
+        def _stat(self, bucket, key):
+            if key not in self.held:
+                raise RuntimeError("NoSuchKey")
+            return SimpleNamespace(size=1)
+
+    key = {"kind": "audio", "object_key": "a.wav.enc"}
+    try:
+        for store, left in ((Store(), []), (Store(keeps=True), [key]),
+                            (Store(refuses=True), [key])):
+            api_v2.ctx.copy = store
+            assert await api_v2._delete_cloud_objects([key]) == left
+    finally:
+        api_v2.ctx.copy = None

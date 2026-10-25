@@ -259,6 +259,24 @@ async def test_stop_carries_its_reason(make_security):
     assert controller.stopped == ["patient_left", "doctor_stopped"]
 
 
+async def test_the_page_can_never_stop_or_pause_an_installed_recorder(make_security):
+    """
+    Only API 1, the doctor's Stop on the recorder, and the two minutes after
+    the prescription end a recording. The browser's stop, pause and resume are
+    refused, and nothing reaches the controller.
+    """
+    manager, controller = _manager(make_security, developer_mode=False)
+    for command in ({"command": "stop", "reason": "consultation_finished"},
+                    {"command": "pause", "reason": "phone_call"},
+                    {"command": "resume"}):
+        reply = await _send(manager, command)
+        assert (reply["status"], reply["code"]) == (409, "REFUSED"), reply
+    assert controller.stopped == []
+    # Starting and arming still work.
+    started = await _send(manager, {"command": "start", "trigger": TRIGGER})
+    assert started["code"] == "RECORDING_STARTED"
+
+
 async def test_the_socket_can_never_erase_a_consultation(make_security):
     """
     Origin is a header any local program can write. The refusal - which deletes

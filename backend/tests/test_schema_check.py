@@ -46,6 +46,10 @@ async def broken(pool, *statements):
         tx = conn.transaction()
         await tx.start()
         try:
+            # A schema with a migration missing is made by dropping what it
+            # added, which the data guard refuses unless allowed - here, for
+            # this transaction only, and it is rolled back.
+            await conn.execute("SET LOCAL aims.allow_destructive = 'on'")
             for statement in statements:
                 await conn.execute(statement)
             yield OneConnection(conn)

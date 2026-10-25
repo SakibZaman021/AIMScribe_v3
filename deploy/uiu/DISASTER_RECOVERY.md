@@ -13,16 +13,35 @@ wrong. Every command runs on the server, as `aims`, in
 | **Dumps, nightly** | Each database as SQL, encrypted, here 7 days and off-site 90 | a day, if all else failed |
 | **Before every database change** | The deployer backs up both databases before any update that touches `backend/scripts` or `deploy/uiu/postgres`; no backup, no deploy | nothing |
 | **Restore drill, monthly** | The backup job rebuilds the server from the off-site copy alone, compares every table with the live one, and records the result; the monitor emails if it fails | - |
+| **Data guard, inside PostgreSQL** | No table, column or schema is dropped, no table truncated, no statement deletes more than 5,000 rows - by an update, a mistake at a psql prompt, or the server's own login. Only a migration decided in review may, as the table's owner (`backend/scripts/guard/data_guard.sql`, applied on every update) | - |
 | **Erase circuit breaker** | Automatic erasing stops for a clinic when far more of its recordings would go than stray clicks explain; `AIMS_ERASE_PAUSED=true` stops it everywhere | - |
 | **Deploy gate** | Only a commit whose tests passed on GitHub is deployed; a migration that drops or deletes fails those tests unless it was approved in review | - |
 | **Alerts** | The monitor emails problems, all-clears and a weekly report (`set-alerts.sh`); GitHub's `uptime` workflow emails if the whole server stops answering | - |
 | **Audio** | Three homes: the doctor's PC until a receipt, the archive on this server's volume, the encrypted copy in R2 | - |
 
-The off-site backup bucket should have a **bucket lock** (Cloudflare R2 >
-the bucket > Settings > Bucket lock rules: whole bucket, 30 days). Then no
-key - stolen, or used by mistake - can delete the last month of backups.
-The audio bucket must *not* be locked: a patient who withdraws consent has
-to be deleted from it.
+### What nothing on this server can destroy
+
+Everything above runs on this server, so a person or a program that takes
+the server over could reach it. What it cannot reach is a copy under a
+**bucket lock**: for its retention days Cloudflare refuses to delete or
+overwrite an object, whoever asks and with whatever key.
+
+| Bucket | Lock | Why |
+|---|---|---|
+| `aimscribe-backups` | whole bucket, 30 days | the database, as dumps, base backups and every minute's changes |
+| `aimscribe-archive` | whole bucket, 30 days | every confirmed recording, encrypted. A patient who withdraws consent is erased here and from the database at once; the cloud copy goes when its 30 days end - the server asks again on every pass and counts it erased only once Cloudflare no longer has it |
+| `aimscribe-segments` | never | pieces on their way in; the server removes them once a recording is archived |
+
+Cloudflare R2 > the bucket > Settings > Bucket lock rules > Add rule: no
+prefix (the whole bucket), 30 days.
+
+Two settings make the lock hold against someone holding this server's keys:
+
+- The R2 keys in `.env` are **Object Read & Write, for the named buckets
+  only** (R2 > Manage API tokens). Never Admin: an Admin key can remove a
+  lock rule; an object key cannot.
+- The Cloudflare account has two-factor sign-in, and only the owner can
+  change bucket settings.
 
 ## Recover the databases as they were at a moment
 

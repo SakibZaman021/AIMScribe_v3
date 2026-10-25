@@ -338,13 +338,15 @@ class SecurityConfig:
     # After a crash and restart, a consultation that was recording within this
     # long is recorded again by itself, under the same five fields.
     resume_within_seconds: float = 600.0
-    # Off (0): no recording is ever ended by a clock. A consultation lasts as
-    # long as it lasts - an hour's counselling, a long follow-up with no
-    # prescription - and cutting it on a timer lost real consultations on the
-    # bench. A recording ends when the doctor stops it, CMED starts the next
-    # patient, CMED's page sends stop, or the PC shuts down. A number here
-    # (seconds) brings a limit back, for a bench test only.
-    counselling_limit_seconds: float = 0.0
+    # A recording ends in three ways only: the next patient's start (API 1),
+    # the doctor's own Stop on the recorder, with a reason, or this limit -
+    # two minutes after the prescription is built, plus up to end_grace more
+    # while someone is still speaking, so it closes at a pause and never
+    # mid-sentence. That last one is what ends the last patient of the day.
+    # Never the browser: a reload, a closed tab or Chrome quitting changes
+    # nothing (websocket_server refuses stop, pause and resume from the page).
+    # A follow-up with no prescription has no limit; the next patient ends it.
+    counselling_limit_seconds: float = 120.0
     end_grace_seconds: float = 10.0
     no_activity_limit_seconds: float = 0.0
     receipt_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_receipt_pub.pem"))
@@ -479,7 +481,7 @@ class Config:
             device_key_store=("tpm" if installed
                               else _str("AIMS_DEVICE_KEY_STORE", "software").lower()),
             developer_mode=(not installed) or _bool("AIMS_DEVELOPER_MODE", False),
-            counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 0.0),
+            counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
             end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),
             no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 0.0),
         )
