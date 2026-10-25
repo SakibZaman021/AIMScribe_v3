@@ -230,3 +230,97 @@ def test_an_up_to_date_schema_is_ok_and_silence_is_a_warning():
     assert checks.schema({"status": "healthy", "schema": "ok"}).status == OK
     assert checks.schema(None).status == WARNING
     assert checks.schema({"status": "healthy"}).status == WARNING   # an older server
+
+
+# ---------------------------------------------------------------- recovery to a moment
+
+def test_wal_that_stops_leaving_the_server_is_critical():
+    fresh = NOON - timedelta(minutes=1)
+    ok = checks.wal_shipping({"pending": "0", "stuck": "0", "error": ""}, fresh, fresh, NOON)
+    assert ok.status == OK
+    stuck = checks.wal_shipping({"pending": "9", "stuck": "4", "error": "could not send x"},
+                                fresh, NOON - timedelta(hours=2), NOON)
+    assert stuck.status == CRITICAL and "4 WAL" in stuck.message and "could not send" in stuck.message
+    retrying = checks.wal_shipping({"pending": "1", "stuck": "0", "error": "could not send x"},
+                                   fresh, fresh, NOON)
+    assert retrying.status == WARNING
+
+
+def test_a_shipper_that_stopped_reporting_is_critical_and_one_never_started_is_raised():
+    old = NOON - timedelta(minutes=40)
+    assert checks.wal_shipping({"pending": "0", "stuck": "0"}, old, old, NOON).status == CRITICAL
+    assert checks.wal_shipping(None, None, None, NOON).status == WARNING
+
+
+def test_postgres_that_cannot_archive_is_critical_until_it_can_again():
+    failing = {"last_failed_time": NOON - timedelta(minutes=5), "last_failed_wal": "0001",
+               "last_archived_time": NOON - timedelta(hours=2), "failed_count": 7}
+    assert checks.wal_archiver(failing, NOON).status == CRITICAL
+    recovered = dict(failing, last_archived_time=NOON - timedelta(minutes=1))
+    assert checks.wal_archiver(recovered, NOON).status == OK
+    long_ago = dict(failing, last_failed_time=NOON - timedelta(days=2),
+                    last_archived_time=NOON - timedelta(days=3))
+    assert checks.wal_archiver(long_ago, NOON).status == OK          # an old blip
+    assert checks.wal_archiver(None, NOON).status == WARNING
+
+
+def test_no_base_backup_means_no_recovery_to_a_moment():
+    assert checks.base_backup(None, NOON).status == CRITICAL
+    assert checks.base_backup(NOON - timedelta(hours=40), NOON).status == CRITICAL
+    assert checks.base_backup(NOON - timedelta(hours=3), NOON).status == OK
+
+
+def test_a_failed_drill_is_critical_a_missed_one_a_warning_and_none_yet_is_quiet():
+    at = NOON - timedelta(days=3)
+    assert checks.restore_drill({"status": "ok", "message": "recovered"}, at, NOON).status == OK
+    failed = checks.restore_drill({"status": "failed", "message": " pitr.sessions:3/9"}, at, NOON)
+    assert failed.status == CRITICAL and "sessions" in failed.message
+    assert checks.restore_drill({"status": "ok"}, NOON - timedelta(days=40), NOON).status == WARNING
+    assert checks.restore_drill(None, None, NOON).status == OK       # first runs tonight
+
+
+# ---------------------------------------------------------------- email
+
+def test_alerts_go_by_email_once_per_pass_and_a_weekly_report(tmp_path, monkeypatch):
+    import asyncio
+    import monitor
+    sent = []
+
+    class Box(monitor.Mailer):
+        def send(self, subject, text):
+            sent.append((subject, text))
+            return True
+
+    monkeypatch.setenv("AIMS_ALERT_EMAIL", "lab@example.org")
+    monkeypatch.setenv("AIMS_RESEND_API_KEY", "re_test")
+    monkeypatch.setattr(monitor, "STATE", tmp_path)
+    monkeypatch.setattr(monitor, "disk_findings", lambda: [
+        Finding("disk:archive", CRITICAL, "archive has 3 GB free"),
+        Finding("disk:db", WARNING, "db has 40 GB free")])
+
+    async def no_db(dsn, now):
+        return []
+    monkeypatch.setattr(monitor, "database_findings", no_db)
+    monkeypatch.setattr(monitor, "certificate_finding", lambda h, n: Finding("tls", OK, "fine"))
+    monkeypatch.setattr(monitor, "backup_findings", lambda n: [])
+    monkeypatch.setattr(monitor, "schema_finding", lambda u: Finding("api:schema", OK, "ok"))
+
+    asyncio.run(monitor.one_pass("dsn", "aims.example", "", Box()))
+    problems = [s for s in sent if not s[0].startswith("weekly")]
+    assert len(problems) == 1                       # both findings, one email
+    subject, text = problems[0]
+    assert subject.startswith("CRITICAL") and "archive has 3 GB" in subject
+    assert "db has 40 GB" in text and "aims.example" in text
+    assert any(s[0].startswith("weekly") for s in sent)
+
+    sent.clear()
+    asyncio.run(monitor.one_pass("dsn", "aims.example", "", Box()))
+    assert sent == []                               # held back, and the weekly is done
+
+
+def test_without_a_key_no_email_is_attempted(monkeypatch):
+    import monitor
+    monkeypatch.delenv("AIMS_RESEND_API_KEY", raising=False)
+    monkeypatch.setenv("AIMS_ALERT_EMAIL", "lab@example.org")
+    assert monitor.Mailer().ready is False
+    assert monitor.Mailer().send("x", "y") is False

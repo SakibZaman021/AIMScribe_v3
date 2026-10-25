@@ -142,4 +142,9 @@ fi
 psql_in aims_recordings -f /aims/scripts/roles/researcher_logins_recordings.sql
 psql_in aims_clinical -f /aims/scripts/roles/researcher_logins_clinical.sql
 
+# The access rules (hba/pg_hba.conf, a mounted folder) may have changed with
+# this update: read them again now. A setting that needs a restart, such as
+# archive_mode, takes effect when the update recreates the container.
+psql_in postgres -At -c "SELECT pg_reload_conf()" >/dev/null
+
 echo "Migrations: $applied applied, $current already in place, $changed changed since applied."

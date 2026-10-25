@@ -18,14 +18,22 @@ export AIMS_DEPLOY_DIR="$WORK/server"
 export AIMS_DEPLOY_STATE="$WORK/state"
 export AIMS_DEPLOY_HEALTH_WAIT=1
 export AIMS_DEPLOY_HEALTH_URL="http://127.0.0.1:6001/health/ready"
+# Scenarios 1-6 are about the deploy itself; 7 and 8 turn the GitHub tests on.
+export AIMS_DEPLOY_REQUIRE_CI=false
+export AIMS_DEPLOY_GITHUB_REPO=owner/repo
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 mkdir -p "$WORK/bin"
+# The fake docker fails the backup before a database change while the
+# checked-out commit holds a file named BACKUP_FAILS.
 cat > "$WORK/bin/docker" <<EOF
 #!/usr/bin/env bash
 echo "docker \$*" >> "$WORK/docker.log"
+case "\$*" in *"backup --now"*) [ ! -e "$AIMS_DEPLOY_DIR/BACKUP_FAILS" ] || exit 1 ;; esac
 [ "\$2" != exec ] || cat > /dev/null
 EOF
+# The fake curl: the health check, GitHub's answer for a commit's workflow
+# runs (from $WORK/ci.json), and everything else recorded as an alert.
 cat > "$WORK/bin/curl" <<EOF
 #!/usr/bin/env bash
 for arg in "\$@"; do last="\$arg"; done
@@ -33,6 +41,12 @@ if [ "\$last" = "$AIMS_DEPLOY_HEALTH_URL" ]; then
     [ ! -e "$AIMS_DEPLOY_DIR/UNHEALTHY" ]
     exit
 fi
+case "\$last" in
+    *api.github.com/repos/owner/repo/actions/runs*)
+        [ -f "$WORK/ci.json" ] || exit 22
+        cat "$WORK/ci.json"
+        exit ;;
+esac
 echo "\$*" >> "$WORK/alerts.log"
 EOF
 chmod +x "$WORK/bin/docker" "$WORK/bin/curl"
@@ -112,5 +126,57 @@ run
 [ "$status" = 1 ] || fail "exit $status"
 [ "$(head_of "$AIMS_DEPLOY_DIR")" = "$here" ] || fail "deployed a rewritten main"
 grep -q "rewritten" "$WORK/alerts.log" || fail "no alert for the rewrite"
+# Back to a main the server can follow.
+git -C "$WORK/dev" reset -q --hard "$here"
+git -C "$WORK/dev" push -qf origin HEAD:main
+rm -f "$AIMS_DEPLOY_STATE/failed"
+
+echo "7. only a commit whose tests passed on GitHub is deployed"
+export AIMS_DEPLOY_REQUIRE_CI=true
+ci() {  # ci <status> <conclusion>: GitHub's answer for the newest commit
+    printf '{"workflow_runs": [{"name": "tests", "run_number": 3, "run_attempt": 1, "status": "%s", "conclusion": "%s", "head_sha": "%s"}]}' \
+        "$1" "$2" "$(head_of "$WORK/dev")" > "$WORK/ci.json"
+}
+commit "needs its tests"
+here=$(head_of "$AIMS_DEPLOY_DIR")
+rm -f "$WORK/ci.json"                                   # no run on GitHub yet
+run
+[ "$status" = 0 ] && [ "$(head_of "$AIMS_DEPLOY_DIR")" = "$here" ] || fail "deployed before its tests"
+ci in_progress null
+run
+[ "$status" = 0 ] && [ "$(head_of "$AIMS_DEPLOY_DIR")" = "$here" ] || fail "deployed while its tests ran"
+grep -q "waiting for the tests" "$WORK/run.log" || fail "not said it waits"
+ci completed failure
+run
+[ "$status" = 1 ] && [ "$(head_of "$AIMS_DEPLOY_DIR")" = "$here" ] || fail "deployed with failing tests"
+grep -q "tests failed on GitHub" "$WORK/alerts.log" || fail "no alert for failing tests"
+ci completed success                                    # re-run on GitHub, now green
+run
+[ "$status" = 0 ] || fail "exit $status: $(cat "$WORK/run.log")"
+[ "$(head_of "$AIMS_DEPLOY_DIR")" = "$(head_of "$WORK/dev")" ] || fail "a green re-run not deployed"
+
+echo "8. a commit that changes the database is backed up first; no backup, no deploy"
+: > "$WORK/docker.log"
+commit "no database change" "notes.txt"
+ci completed success
+run
+[ "$status" = 0 ] || fail "exit $status"
+! grep -q "backup --now" "$WORK/docker.log" || fail "backed up for a change that touches no database"
+mkdir -p "$WORK/dev/backend/scripts"
+commit "a migration" "backend/scripts/031_new.sql"
+ci completed success
+run
+[ "$status" = 0 ] || fail "exit $status: $(cat "$WORK/run.log")"
+grep -q "compose run --rm -T backup --now predeploy-" "$WORK/docker.log" || fail "no backup before the migration"
+grep -q "databases backed up first" "$WORK/alerts.log" || fail "the backup is not in the announcement"
+good=$(head_of "$AIMS_DEPLOY_DIR")
+mkdir -p "$WORK/dev/backend/scripts"
+echo x > "$WORK/dev/BACKUP_FAILS"
+commit "another migration, and the backup fails" "backend/scripts/032_new.sql"
+ci completed success
+run
+[ "$status" = 1 ] || fail "exit $status"
+[ "$(head_of "$AIMS_DEPLOY_DIR")" = "$good" ] || fail "deployed without its backup"
+grep -q "the backup before it failed" "$WORK/alerts.log" || fail "the reason is not in the alert"
 
 echo "All autodeploy scenarios passed."

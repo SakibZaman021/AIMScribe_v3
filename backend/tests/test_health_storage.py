@@ -52,6 +52,12 @@ def fresh(monkeypatch):
     monkeypatch.setattr(app_module.ctx, "db", Healthy())
     monkeypatch.setattr(app_module.ctx, "redis", Healthy())
     monkeypatch.setattr(api_v2.ctx, "copy", None, raising=False)
+    # Migrations are not what these tests are about (test_schema_check is).
+
+    async def schema_ok():
+        return "ok"
+
+    monkeypatch.setattr(app_module, "_schema_state", schema_ok)
     app_module._storage_cache.update(at=0.0, answer=None)
     yield
     app_module._storage_cache.update(at=0.0, answer=None)

@@ -16,9 +16,6 @@ __pycache__/
 *.swp
 *.swo
 
-# Claude Code
-.claude/
-
 # Logs
 logs/
 *.log

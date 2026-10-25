@@ -1,0 +1,29 @@
+# A watchdog outside the server. The monitor on the server emails about
+# everything it sees - but if the whole server is down, so is the monitor.
+# This asks from GitHub every fifteen minutes; a run that fails is emailed
+# by GitHub to the repository's owner.
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  health:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: The server answers, over a valid certificate
+        run: |
+          for attempt in 1 2 3; do
+            if curl -fsS -m 20 -o /dev/null https://aimscribe.iriic.uiu.ac.bd/health; then
+              echo "up"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::https://aimscribe.iriic.uiu.ac.bd/health did not answer three times in a row"
+          exit 1

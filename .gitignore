@@ -36,9 +36,6 @@ logs/
 recordings/
 temp_clips/*.wav
 
-# Claude
-.claude/
-
 # Agent secrets and local state — never commit these
 recorder/scripts/dev-keys/
 recorder/dist/
@@ -57,7 +54,6 @@ spool/
 journal.jsonl
 
 # Editor and tooling state, per-machine
-.claude/
 .vscode/
 .idea/
 

@@ -1487,6 +1487,59 @@ async def test_only_what_cmed_confirms_is_kept_and_an_outage_erases_nothing(dbs)
         _unserve()
 
 
+async def test_a_clinic_whose_recordings_would_mostly_be_erased_stops_until_an_admin_looks(
+        dbs, monkeypatch):
+    """030: the circuit breaker - a confirmation fault must not erase a clinic's week."""
+    from datetime import timedelta as days_ago
+    device = await enrolled_device(dbs.repo)
+    await dbs.repo.upsert_hospital("HOSPBRK", "Breaker clinic", "Asia/Dhaka")
+    await dbs.repo.cmed_heard_from("HOSPBRK")                 # not an outage
+    old = days_ago(days=8)
+    lost = [await a_session(dbs.repo, device, opened_ago=old) for _ in range(25)]
+    fine = [await a_session(dbs.repo, device, opened_ago=old) for _ in range(5)]
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET hospital_id = 'HOSPBRK', confirmation = 'unconfirmed' "
+                           "WHERE session_id = ANY($1::text[])", lost)
+        await conn.execute("UPDATE sessions SET hospital_id = 'HOSPBRK', confirmation = 'confirmed' "
+                           "WHERE session_id = ANY($1::text[])", fine)
+
+    async def states():
+        async with dbs.rec.acquire() as conn:
+            return {r["confirmation"] for r in await conn.fetch(
+                "SELECT confirmation FROM sessions WHERE session_id = ANY($1::text[])", lost)}
+
+    _server(dbs)
+    try:
+        # 25 of 30 would go: far beyond stray clicks. Nothing is erased; one critical alert.
+        result = await api_v2._settle_unconfirmed()
+        assert result[0] == 0 and result[4] == 1
+        assert await states() == {"unconfirmed"}
+        async with dbs.rec.acquire() as conn:
+            alert = await conn.fetchrow(
+                "SELECT severity, detail FROM integrity_alerts WHERE alert_type = 'erase_breaker' "
+                "AND detail->>'hospital_id' = 'HOSPBRK'")
+        assert alert["severity"] == "critical"
+        assert json.loads(alert["detail"])["unconfirmed"] == 25
+
+        # Paused altogether: nothing either, whatever the breaker says.
+        monkeypatch.setenv("AIMS_ERASE_PAUSED", "true")
+        await dbs.repo.release_erase("HOSPBRK", by="tests", reason="checked: strays", hours=1)
+        assert (await api_v2._settle_unconfirmed())[0] == 0
+        assert await states() == {"unconfirmed"}
+        status = await api_v2.admin_erase_status()
+        assert status["paused"] is True
+        assert status["clinics"][0]["breaker"] == "released"
+
+        # An admin has looked and released it: now they go.
+        monkeypatch.delenv("AIMS_ERASE_PAUSED")
+        erased = 0
+        for _ in range(3):
+            erased += (await api_v2._settle_unconfirmed())[0]
+        assert erased == 25 and await states() == {"expired"}
+    finally:
+        _unserve()
+
+
 async def test_a_pc_cmed_never_vouches_for_is_rejected(dbs):
     """025: pending for AIMS_PENDING_DEVICE_DAYS without two confirmations."""
     await enrolled_device(dbs.repo)

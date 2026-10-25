@@ -1607,6 +1607,51 @@ class V2Repository:
             """, silent_after)
         return {"due": [dict(r) for r in due], "held": [dict(r) for r in held]}
 
+    async def erase_share(self, hospital_ids: List[str], *, days: int,
+                          window_days: int = 7) -> Dict[str, Dict[str, int]]:
+        """
+        Per clinic, of the recordings opened in the week now coming due for
+        erasure: how many are still unconfirmed, and how many there were. The
+        circuit breaker (030) compares the two.
+        """
+        if not hospital_ids:
+            return {}
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT hospital_id,
+                       count(*) FILTER (WHERE confirmation IN ('pending', 'unconfirmed', 'legacy')
+                                          AND NOT legal_hold) AS unconfirmed,
+                       count(*) AS total
+                  FROM sessions
+                 WHERE hospital_id = ANY($1::text[])
+                   AND protocol_version >= 2
+                   AND opened_at >= now() - make_interval(days => $2::int + $3::int)
+                   AND opened_at <  now() - make_interval(days => $2::int) + interval '1 day'
+                 GROUP BY hospital_id
+            """, hospital_ids, days, window_days)
+        return {r["hospital_id"]: {"unconfirmed": int(r["unconfirmed"]), "total": int(r["total"])}
+                for r in rows}
+
+    async def erase_released(self, hospital_id: str) -> Optional[Dict[str, Any]]:
+        """An admin's release of this clinic's breaker that still holds, if any."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT released_by, reason, released_at, until FROM erase_releases
+                 WHERE hospital_id = $1 AND until > now()
+                 ORDER BY until DESC LIMIT 1
+            """, hospital_id)
+        return dict(row) if row else None
+
+    async def release_erase(self, hospital_id: str, *, by: str, reason: str,
+                            hours: int) -> Dict[str, Any]:
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
+                INSERT INTO erase_releases (hospital_id, released_by, reason, until)
+                VALUES ($1, $2, $3, now() + make_interval(hours => $4))
+                RETURNING hospital_id, released_by, reason, released_at, until
+            """, hospital_id, by, reason, hours)
+        return dict(row)
+
     async def erasing_soon(self, *, within: timedelta) -> List[Dict[str, Any]]:
         """Per clinic: recordings that will be erased within `within` unless confirmed."""
         async with self._acquire() as conn:

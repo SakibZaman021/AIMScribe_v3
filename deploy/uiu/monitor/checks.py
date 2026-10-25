@@ -297,6 +297,105 @@ def backups(last_local: Optional[datetime], last_offsite: Optional[datetime],
 
 
 # ============================================================
+# Recovery to any minute: the WAL archive, the base backup, the drill
+# ============================================================
+
+def _age_minutes(moment: Optional[datetime], now: datetime) -> Optional[float]:
+    return None if moment is None else (now - moment).total_seconds() / 60
+
+
+def wal_shipping(status: Optional[Dict[str, str]], checked_at: Optional[datetime],
+                 shipped_at: Optional[datetime], now: datetime) -> Finding:
+    """
+    Every change to the databases leaves the server within minutes, as WAL.
+    The backup job's shipper writes a status file each minute; the questions
+    are whether it is still running, and whether anything is stuck on this
+    server - where it would be lost with it.
+    """
+    if status is None or checked_at is None:
+        return Finding("backup:wal", WARNING,
+                       "the WAL shipper has not reported yet - recovery to a moment is "
+                       "not possible until it does", {})
+    age = _age_minutes(checked_at, now) or 0
+    stuck = int(status.get("stuck") or 0)
+    pending = int(status.get("pending") or 0)
+    error = (status.get("error") or "").strip()
+    detail = {"pending": pending, "stuck": stuck,
+              "minutes_since_check": round(age, 1)}
+    if age > 15:
+        return Finding("backup:wal", CRITICAL,
+                       f"the WAL shipper has not run for {age:.0f} min - changes since are "
+                       f"only on this server", detail)
+    if stuck:
+        return Finding("backup:wal", CRITICAL,
+                       f"{stuck} WAL file(s) waiting over 30 min to leave the server"
+                       + (f": {error}" if error else ""), detail)
+    if error:
+        return Finding("backup:wal", WARNING, f"WAL shipping is retrying: {error}", detail)
+    sent = _age_minutes(shipped_at, now)
+    return Finding("backup:wal", OK,
+                   "WAL off the server" + (f", last sent {sent:.0f} min ago"
+                                           if sent is not None else ""), detail)
+
+
+def wal_archiver(stats: Optional[Dict[str, Any]], now: datetime) -> Finding:
+    """
+    PostgreSQL's side of the archive (pg_stat_archiver). A failing
+    archive_command keeps the WAL in the database's own folder, which then
+    grows until the database volume is full.
+    """
+    if not stats:
+        return Finding("database:archiving", WARNING, "archiving state could not be read", {})
+    failed, archived = stats.get("last_failed_time"), stats.get("last_archived_time")
+    if failed is not None and (archived is None or failed > archived) \
+            and (now - failed) < timedelta(hours=1):
+        return Finding("database:archiving", CRITICAL,
+                       f"PostgreSQL cannot archive its WAL ({stats.get('last_failed_wal')}) - "
+                       f"check that /wal is writable; the database volume will fill",
+                       {"failed_count": stats.get("failed_count")})
+    return Finding("database:archiving", OK, "PostgreSQL is archiving its WAL",
+                   {"archived_count": stats.get("archived_count")})
+
+
+def base_backup(last: Optional[datetime], now: datetime, *, max_age_hours: int = 36) -> Finding:
+    """The nightly base backup: without one, the WAL has nothing to replay onto."""
+    age = _age_minutes(last, now)
+    if age is None:
+        return Finding("backup:base", CRITICAL,
+                       "no base backup has been taken - the server cannot be recovered "
+                       "to a moment", {})
+    if age / 60 > max_age_hours:
+        return Finding("backup:base", CRITICAL,
+                       f"the last base backup is {age / 60:.0f} h old",
+                       {"hours": round(age / 60, 1)})
+    return Finding("backup:base", OK, f"base backup {age / 60:.0f} h ago", {})
+
+
+def restore_drill(drill: Optional[Dict[str, str]], at: Optional[datetime], now: datetime, *,
+                  every_days: int = 30) -> Finding:
+    """
+    A backup is only known to work once it has been restored. The backup job
+    rehearses a full recovery by itself every month; this says whether the
+    last one passed, and raises it if the rehearsals stop.
+    """
+    if drill is None or at is None:
+        return Finding("backup:drill", OK,
+                       "no restore drill yet; the first runs with the next nightly backup", {})
+    days = (now - at).total_seconds() / 86400
+    detail = {"days_ago": round(days, 1), "seconds": drill.get("seconds")}
+    if drill.get("status") != "ok":
+        return Finding("backup:drill", CRITICAL,
+                       f"the last restore drill FAILED: {drill.get('message', '')}".strip(),
+                       detail)
+    if days > every_days + 5:
+        return Finding("backup:drill", WARNING,
+                       f"the last restore drill was {days:.0f} days ago", detail)
+    return Finding("backup:drill", OK,
+                   f"restore drill passed {days:.0f} days ago: {drill.get('message', '')}",
+                   detail)
+
+
+# ============================================================
 # The database schema
 # ============================================================
 
@@ -350,6 +449,7 @@ def summary(findings: Sequence[Finding]) -> Dict[str, Any]:
 
 
 __all__ = ["CRITICAL", "Finding", "OK", "WARNING", "archive_backlog", "certificate",
-           "backups", "schema",
+           "backups", "schema", "wal_shipping", "wal_archiver", "base_backup",
+           "restore_drill",
            "copies_behind", "disk_space", "failed_jobs", "in_clinic_hours",
            "should_send", "silent_recorders", "summary", "worst"]

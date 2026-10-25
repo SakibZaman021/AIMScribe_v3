@@ -37,7 +37,7 @@ import re
 import wave
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -3492,10 +3492,11 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             detail={"archived_at": row["archived_at"].isoformat()
                                    if row["archived_at"] else None})
 
-    erased, held, rejected, approved = await _settle_unconfirmed()
+    erased, held, rejected, approved, stopped = await _settle_unconfirmed()
 
     return {"status": "ok", "marked_unconfirmed": marked, "erased": erased,
-            "erase_held_clinics": held, "devices_rejected": rejected,
+            "erase_held_clinics": held, "erase_stopped_clinics": stopped,
+            "devices_rejected": rejected,
             "devices_approved": approved, "clinical_loaded": loaded,
             "copies_overdue": len(overdue), "reconciled": len(reconciled)}
 
@@ -3504,20 +3505,89 @@ ERASE_BATCH = 100                       # per sweep; the worker sweeps every 30 
 ERASE_WARNING = timedelta(hours=48)
 
 
-async def _settle_unconfirmed() -> Tuple[int, int, int, int]:
+def erase_paused() -> bool:
+    """AIMS_ERASE_PAUSED=true: nothing is erased automatically, by anyone's rule."""
+    return os.getenv("AIMS_ERASE_PAUSED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def breaker_limits() -> Tuple[float, int]:
+    """
+    (share, count): a clinic's erasing stops when more than this share of a
+    week's recordings, and at least this many, would go. A stray click is a
+    few a week; a third of a clinic is a fault.
+    """
+    try:
+        share = float(os.getenv("AIMS_ERASE_BREAKER_SHARE", "0.3"))
+    except ValueError:
+        share = 0.3
+    return min(max(share, 0.01), 1.0), max(1, _env_int("AIMS_ERASE_BREAKER_MIN", 20))
+
+
+async def _erase_breaker(due: List[Dict[str, Any]], days: int) -> Set[str]:
+    """
+    The clinics whose erasing stops now: far more of their recordings would
+    be erased than a stray click explains, and no admin has released them.
+    One critical alert a day for each.
+    """
+    repo = _repo()
+    if not due or not hasattr(repo, "erase_share"):
+        return set()
+    share_limit, count_limit = breaker_limits()
+    clinics = sorted({str(r["hospital_id"]) for r in due})
+    shares = await repo.erase_share(clinics, days=days)
+    stopped: Set[str] = set()
+    for clinic in clinics:
+        s = shares.get(clinic, {"unconfirmed": 0, "total": 0})
+        if s["unconfirmed"] < count_limit or not s["total"] \
+                or s["unconfirmed"] / s["total"] <= share_limit:
+            continue
+        if await repo.erase_released(clinic):
+            continue
+        stopped.add(clinic)
+        await repo.alert_once(
+            alert_type="erase_breaker", group=f"erase_breaker:{clinic}",
+            window=timedelta(hours=24), severity="critical",
+            detail={"hospital_id": clinic, "unconfirmed": s["unconfirmed"],
+                    "recordings": s["total"],
+                    "share": round(s["unconfirmed"] / s["total"], 2),
+                    "reason": "far more of this clinic's recordings would be erased than "
+                              "stray clicks explain - a fault in confirmation, or CMED "
+                              "sending another clinic's code. Nothing of this clinic is "
+                              "erased until an admin checks and releases it "
+                              "(POST /api/v2/admin/erase/release)"})
+    if stopped:
+        logger.error("Erasing stopped by the circuit breaker for %s", ", ".join(sorted(stopped)))
+    return stopped
+
+
+async def _settle_unconfirmed() -> Tuple[int, int, int, int, int]:
     """
     Keep only what CMED confirms: give each waiting recording its date, erase
     the ones past it, warn before, and settle self-registered PCs. Returns
-    (erased, clinics held back, PCs rejected, PCs approved).
+    (erased, clinics held back, PCs rejected, PCs approved, clinics stopped
+    by the circuit breaker).
     """
     repo = _repo()
     if not hasattr(repo, "set_erase_deadlines"):
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0
     days = conf.unconfirmed_erase_days()
     await repo.set_erase_deadlines(days)
 
     plan = await repo.sessions_due_for_erasure(limit=ERASE_BATCH,
                                                silent_after=conf.CMED_SILENT_AFTER)
+    stopped: Set[str] = set()
+    if erase_paused():
+        if plan["due"]:
+            await repo.alert_once(
+                alert_type="erase_paused", group="erase_paused", window=timedelta(hours=24),
+                severity="warning",
+                detail={"due": len(plan["due"]),
+                        "reason": "AIMS_ERASE_PAUSED is set: recordings past their date are "
+                                  "kept. Unset it when the reason for pausing is settled."})
+        plan["due"] = []
+    else:
+        stopped = await _erase_breaker(plan["due"], days)
+        plan["due"] = [r for r in plan["due"] if str(r["hospital_id"]) not in stopped]
     erased = 0
     for row in plan["due"]:
         sid = row["session_id"]
@@ -3572,7 +3642,7 @@ async def _settle_unconfirmed() -> Tuple[int, int, int, int]:
                          detail={"hospital_id": pc["hospital_id"],
                                  "machine_name": pc["machine_name"],
                                  "confirmations": SELF_APPROVAL_CONFIRMATIONS})
-    return erased, len(plan["held"]), len(rejected), len(approved)
+    return erased, len(plan["held"]), len(rejected), len(approved), len(stopped)
 
 
 # ============================================================
@@ -3788,6 +3858,65 @@ async def admin_confirm_session(session_id: str, body: ConfirmRequest,
                              "reason": body.reason})
     await confirm_continuations(session_id)
     return {"status": "confirmed", "session_id": session_id, "was": row["confirmation"]}
+
+
+class EraseReleaseRequest(BaseModel):
+    hospital_id: str = Field(..., max_length=64)
+    released_by: str = Field(..., min_length=2, max_length=128)
+    reason: str = Field(..., min_length=10, max_length=500)
+    hours: int = Field(24, ge=1, le=72)
+
+
+@router.get("/admin/erase/status")
+async def admin_erase_status(_: None = Depends(require_admin)):
+    """
+    What the automatic erasing would do now, per clinic: due, held for a CMED
+    outage, stopped by the circuit breaker, released by an admin - and whether
+    it is paused altogether.
+    """
+    repo = _repo()
+    days = conf.unconfirmed_erase_days()
+    plan = await repo.sessions_due_for_erasure(limit=10_000, silent_after=conf.CMED_SILENT_AFTER)
+    clinics = sorted({str(r["hospital_id"]) for r in plan["due"]})
+    shares = await repo.erase_share(clinics, days=days)
+    share_limit, count_limit = breaker_limits()
+    out = []
+    for clinic in clinics:
+        s = shares.get(clinic, {"unconfirmed": 0, "total": 0})
+        tripped = (s["unconfirmed"] >= count_limit and s["total"] > 0
+                   and s["unconfirmed"] / s["total"] > share_limit)
+        released = await repo.erase_released(clinic)
+        out.append({"hospital_id": clinic,
+                    "due": sum(1 for r in plan["due"] if str(r["hospital_id"]) == clinic),
+                    "unconfirmed_this_week": s["unconfirmed"], "recordings_this_week": s["total"],
+                    "breaker": "released" if tripped and released else
+                               "stopped" if tripped else "ok",
+                    "released_until": released["until"].isoformat() if released else None})
+    return {"paused": erase_paused(), "erase_after_days": days,
+            "breaker": {"share": share_limit, "min": count_limit},
+            "clinics": out,
+            "held_for_cmed_outage": [{"hospital_id": h["hospital_id"], "count": h["n"]}
+                                     for h in plan["held"]]}
+
+
+@router.post("/admin/erase/release")
+async def admin_erase_release(body: EraseReleaseRequest, _: None = Depends(require_admin)):
+    """
+    A person has looked at a clinic the circuit breaker stopped, and the
+    recordings really are strays CMED will never confirm: let the erasing go
+    on for that clinic, for a few hours. By name and with a reason.
+    """
+    try:
+        clinic = safe_identifier(body.hospital_id, field="hospital_id")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    row = await _repo().release_erase(clinic, by=body.released_by, reason=body.reason,
+                                      hours=body.hours)
+    await _repo().audit(event_type="erase.released", actor_type="admin",
+                        actor_id=body.released_by,
+                        detail={"hospital_id": clinic, "hours": body.hours,
+                                "reason": body.reason})
+    return {"status": "released", "hospital_id": clinic, "until": row["until"].isoformat()}
 
 
 class CmedKeyRequest(BaseModel):

@@ -432,3 +432,94 @@ def test_a_download_is_decrypted_by_the_worker_on_the_internal_network_only():
     assert "internal" in worker["networks"] and not worker.get("ports")
     dockerfile = (HERE.parent.parent / "backend" / "archive_worker" / "Dockerfile").read_text()
     assert "serve.py" in dockerfile and "EXPOSE" not in dockerfile.replace("No EXPOSE", "")
+
+
+# ============================================================
+# Migrations only add (autodeploy.sh: a rollback runs the old code on the
+# new schema, and nothing a migration destroys comes back without a restore)
+# ============================================================
+
+SCRIPTS = HERE.parent.parent / "backend" / "scripts"
+
+# Migrations that destroy data on purpose, each with why. Adding one here is a
+# decision someone has to make in review - with a backup taken first, which
+# the deployer does for every database change.
+DESTRUCTIVE_APPROVED = {
+    "022_v3_drop_v1_tables.sql": "the v1 pipeline's tables, empty since v3; dropped once",
+    "024_v3_readable_devices.sql": "one-time nonces past their window; never patient data",
+}
+
+_DESTROYS = re.compile(
+    r"^\s*(DROP\s+(TABLE|SCHEMA|DATABASE)\b|TRUNCATE\b|DELETE\s+FROM\b"
+    r"|ALTER\s+TABLE\b[^;]*\bDROP\s+COLUMN\b)", re.IGNORECASE | re.DOTALL)
+
+
+def _statements(sql: str):
+    """The statements of a script, comments removed; inside DO blocks too."""
+    sql = re.sub(r"--[^\n]*", "", sql)
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    for part in re.split(r";|\$\$", sql):
+        if part.strip():
+            yield part
+
+
+def test_no_migration_destroys_data_unless_it_was_decided():
+    offenders = []
+    for path in sorted(SCRIPTS.rglob("*.sql")):
+        if path.name in DESTRUCTIVE_APPROVED:
+            continue
+        for statement in _statements(path.read_text(encoding="utf-8")):
+            # A statement may follow BEGIN or THEN on the same line in a DO block.
+            for line in statement.splitlines():
+                if _DESTROYS.match(re.sub(r"^\s*(BEGIN|THEN|ELSE)\s+", "", line,
+                                          flags=re.IGNORECASE)):
+                    offenders.append(f"{path.relative_to(SCRIPTS)}: {line.strip()[:80]}")
+    assert not offenders, (
+        "these migrations drop or delete data: " + "; ".join(offenders) +
+        ". A migration only adds. If this one really must destroy, add it to "
+        "DESTRUCTIVE_APPROVED with the reason, in review.")
+
+
+def test_the_destroy_check_catches_what_it_should():
+    bad = ["DROP TABLE sessions", "truncate audit_log", "DELETE FROM patients WHERE 1=1",
+           "ALTER TABLE sessions DROP COLUMN patient_id"]
+    fine = ["DROP TRIGGER IF EXISTS t ON x", "CREATE TRIGGER t BEFORE TRUNCATE ON audit_log",
+            "ALTER TABLE x DROP CONSTRAINT y", "DROP VIEW IF EXISTS v", "DROP FUNCTION f()"]
+    assert all(_DESTROYS.match(s) for s in bad)
+    assert not any(_DESTROYS.match(s) for s in fine)
+
+
+# ============================================================
+# Recovery to any minute: every profile archives, where the backup job looks
+# ============================================================
+
+@pytest.mark.parametrize("profile", ["postgresql.conf", "postgresql.16gb.conf",
+                                     "postgresql.4gb.conf"])
+def test_every_postgres_profile_archives_its_wal_for_the_backup_job(profile):
+    conf = (HERE / "postgres" / profile).read_text(encoding="utf-8")
+    settings = dict(re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*(?:#.*)?$", conf, re.MULTILINE))
+    assert settings["wal_level"] == "replica"
+    assert settings["archive_mode"] == "on"
+    assert "/wal/%f.gz" in settings["archive_command"] and ".part" in settings["archive_command"]
+    assert int(settings["archive_timeout"]) <= 600          # at most ten minutes lost
+    assert settings["hba_file"] == "'/etc/postgresql/hba/pg_hba.conf'"
+
+
+def test_postgres_gets_its_access_rules_and_the_wal_folder_the_backup_job_reads():
+    pg = " ".join(SERVICES["postgres"]["volumes"])
+    backup = " ".join(SERVICES["backup"]["volumes"])
+    assert "./postgres/hba:/etc/postgresql/hba:ro" in pg
+    assert "${AIMS_BACKUP_PATH:?set AIMS_BACKUP_PATH in .env}/wal:/wal" in pg
+    assert "${AIMS_BACKUP_PATH:?set AIMS_BACKUP_PATH in .env}:/backups" in backup
+    hba = (HERE / "postgres" / "hba" / "pg_hba.conf").read_text(encoding="utf-8")
+    rules = [line.split() for line in hba.splitlines() if line and not line.startswith("#")]
+    # Replication from the network only with a password, never trust.
+    assert ["host", "replication", "all", "samenet", "scram-sha-256"] in rules
+    assert not any(r[0] == "host" and r[-1] == "trust" and r[3] not in ("127.0.0.1/32", "::1/128")
+                   for r in rules)
+
+
+def test_the_api_is_given_the_erase_switches():
+    env = SERVICES["api"]["environment"]
+    for name in ("AIMS_ERASE_PAUSED", "AIMS_ERASE_BREAKER_SHARE", "AIMS_ERASE_BREAKER_MIN"):
+        assert name in env, f"{name} is read by the API but never passed to it"

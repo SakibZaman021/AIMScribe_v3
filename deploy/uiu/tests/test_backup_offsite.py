@@ -270,3 +270,48 @@ def test_monitor_backups_that_did_not_leave_are_critical():
 def test_monitor_no_bucket_is_a_warning_and_no_backup_is_critical():
     found = statuses(checks.backups(None, None, False, NOW))
     assert found == {"backup:local": checks.CRITICAL, "backup:offsite": checks.WARNING}
+
+
+# ---------------------------------------------------------------- the WAL archive
+
+def test_wal_leaves_encrypted_in_order_and_is_kept_here_a_while(box):
+    run, backup, backups, remote = box
+    (backups / "wal").mkdir()
+    for n in (3, 1, 2):
+        (backups / "wal" / f"00000001000000000000000{n}.gz").write_bytes(os.urandom(3000))
+    done = run("--wal")
+    assert done.returncode == 0, done.stdout + done.stderr
+    sent = sorted(p.name for p in remote.iterdir())
+    assert sent == [f"00000001000000000000000{n}.gz.enc" for n in (1, 2, 3)]
+    # Encrypted: nothing sent is the segment as it was.
+    original = (backups / "wal-sent" / "000000010000000000000001.gz").read_bytes()
+    assert (remote / "000000010000000000000001.gz.enc").read_bytes() != original
+    assert list((backups / "wal").iterdir()) == []
+    status = dict(line.split("=", 1) for line in
+                  (backups / ".wal_status").read_text().splitlines())
+    assert (status["pending"], status["stuck"], status["error"]) == ("0", "0", "")
+    calls = (remote.parent / "remote.calls").read_text()
+    assert calls.index("0001.gz.enc") < calls.index("0002.gz.enc") < calls.index("0003.gz.enc")
+
+
+def test_wal_the_bucket_will_not_take_stays_queued_and_is_reported(box):
+    run, backup, backups, remote = box
+    (backups / "wal").mkdir()
+    (backups / "wal" / "000000010000000000000007.gz").write_bytes(os.urandom(3000))
+    (remote.parent / "remote.down").write_text("")
+    done = run("--wal")
+    assert done.returncode == 1
+    assert (backups / "wal" / "000000010000000000000007.gz").exists()   # still queued
+    status = (backups / ".wal_status").read_text()
+    assert "pending=1" in status and "could not send" in status
+
+    (remote.parent / "remote.down").unlink()
+    assert run("--wal").returncode == 0
+    assert (remote / "000000010000000000000007.gz.enc").exists()
+    assert "error=\n" in (backups / ".wal_status").read_text() + "\n"
+
+
+def test_a_backup_before_an_update_carries_its_label(box):
+    run, backup, backups, remote = box
+    refused = run("--now", "bad label;rm")
+    assert refused.returncode == 2 and "letters, digits" in refused.stdout

@@ -1,0 +1,41 @@
+# Every commit to main is tested here before the server will take it: the
+# deployer (deploy/uiu/autodeploy/autodeploy.sh) waits for this workflow's
+# result for the commit and deploys only on success. Its name, "tests", is
+# what the deployer looks for.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ptest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Every suite of what runs on the server
+        env:
+          AIMS_TEST_PG_URI: postgresql://postgres:ptest@127.0.0.1:5432/postgres
+        run: bash .github/ci/run_tests.sh

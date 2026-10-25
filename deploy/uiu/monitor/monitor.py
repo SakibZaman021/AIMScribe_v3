@@ -91,6 +91,11 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
         devices = await conn.fetch("""
             SELECT device_id, machine_name, last_seen_at, revoked_at FROM devices
         """)
+        archiver = await conn.fetchrow("""
+            SELECT archived_count, last_archived_time, failed_count, last_failed_wal,
+                   last_failed_time
+              FROM pg_stat_archiver
+        """)
     finally:
         await conn.close()
 
@@ -104,6 +109,7 @@ async def database_findings(dsn: str, now: datetime) -> List[Finding]:
         checks.failed_jobs([dict(a) for a in alerts]),
         checks.silent_recorders([dict(d) for d in devices], now,
                                 window=os.getenv("AIMS_CLINIC_HOURS", "08:00-22:00")),
+        checks.wal_archiver(dict(archiver) if archiver else None, now),
     ]
 
 
@@ -116,10 +122,34 @@ def _stamp(path: Path) -> Optional[datetime]:
         return None
 
 
+def _fields(path: Path) -> Optional[Dict[str, str]]:
+    """A key=value status file the backup job writes (.wal_status, .last_drill)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    return {k: v for k, _, v in (line.partition("=") for line in lines) if k}
+
+
+def _moment(value: Optional[str]) -> Optional[datetime]:
+    try:
+        return datetime.strptime((value or "").strip(), "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+
+
 def backup_findings(now: datetime) -> List[Finding]:
     folder = WATCHED["backups"][0]
-    return checks.backups(_stamp(folder / ".last_success"), _stamp(folder / ".last_offsite"),
-                          bool(os.getenv("AIMS_OFFSITE_BUCKET", "").strip()), now)
+    found = checks.backups(_stamp(folder / ".last_success"), _stamp(folder / ".last_offsite"),
+                           bool(os.getenv("AIMS_OFFSITE_BUCKET", "").strip()), now)
+    wal = _fields(folder / ".wal_status")
+    found.append(checks.wal_shipping(wal, _moment((wal or {}).get("checked_at")),
+                                     _moment((wal or {}).get("shipped_at")), now))
+    found.append(checks.base_backup(_stamp(folder / ".last_base"), now))
+    drill = _fields(folder / ".last_drill")
+    found.append(checks.restore_drill(drill, _moment((drill or {}).get("at")), now,
+                                      every_days=int(os.getenv("AIMS_DRILL_EVERY_DAYS", "30"))))
+    return found
 
 
 def schema_finding(url: str) -> Finding:
@@ -171,6 +201,59 @@ def save_state(state: Dict[str, str]) -> None:
         logger.warning("Could not write the monitor's state: %s", exc)
 
 
+class Mailer:
+    """
+    Alerts by email, through an HTTPS mail API (Resend): DigitalOcean closes
+    the SMTP ports, so plain mail cannot leave the droplet. Configured by
+    AIMS_ALERT_EMAIL and AIMS_RESEND_API_KEY (set with set-alerts.sh); unset,
+    it does nothing and the log and webhook still carry every alert.
+    """
+
+    URL = "https://api.resend.com/emails"
+
+    def __init__(self) -> None:
+        self.to = [a.strip() for a in os.getenv("AIMS_ALERT_EMAIL", "").split(",") if a.strip()]
+        self.key = os.getenv("AIMS_RESEND_API_KEY", "").strip()
+        self.sender = os.getenv("AIMS_ALERT_FROM", "").strip() or \
+            "AIMScribe server <onboarding@resend.dev>"
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.to and self.key)
+
+    def send(self, subject: str, text: str) -> bool:
+        if not self.ready:
+            return False
+        body = json.dumps({"from": self.sender, "to": self.to,
+                           "subject": f"[AIMScribe] {subject}"[:200],
+                           "text": text}).encode("utf-8")
+        request = urllib.request.Request(self.URL, data=body, method="POST", headers={
+            "Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
+            "User-Agent": "aimscribe-monitor"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status < 300
+        except urllib.error.HTTPError as exc:
+            logger.warning("Alert email refused: %s %s", exc.code,
+                           exc.read()[:200].decode("utf-8", "replace"))
+        except Exception as exc:
+            # An alert that cannot be delivered is still in the log.
+            logger.warning("Alert email failed: %s", exc)
+        return False
+
+
+def email_text(host: str, lines: List[str], report: Dict[str, Any]) -> str:
+    """One email for one pass: what changed, then the whole picture."""
+    out = [f"From the monitor on {host or 'the AIMScribe server'}, "
+           f"{datetime.now().astimezone():%Y-%m-%d %H:%M %Z}.", ""]
+    out += lines
+    out += ["", "Everything checked just now:"]
+    out += [f"  {f['status'].upper():8} {f['check']}: {f['message']}" for f in report["findings"]]
+    out += ["", "A problem is repeated every few hours while it lasts, and an all-clear is",
+            "sent once when it is fixed. deploy/uiu/DISASTER_RECOVERY.md says what to do."]
+    return "\n".join(out)
+
+
 def announce(finding: Finding, webhook: str) -> None:
     line = f"[{finding.status.upper()}] {finding.check}: {finding.message}"
     (logger.error if finding.status == checks.CRITICAL else
@@ -192,8 +275,12 @@ def announce(finding: Finding, webhook: str) -> None:
         logger.warning("Alert webhook failed: %s", exc)
 
 
-async def one_pass(dsn: str, host: str, webhook: str) -> str:
+WEEK = 7 * 24 * 3600
+
+
+async def one_pass(dsn: str, host: str, webhook: str, mailer: Optional[Mailer] = None) -> str:
     now = datetime.now(timezone.utc)
+    mailer = mailer or Mailer()
     findings = disk_findings()
     try:
         findings += await database_findings(dsn, now)
@@ -205,18 +292,39 @@ async def one_pass(dsn: str, host: str, webhook: str) -> str:
     findings.append(schema_finding(os.getenv("AIMS_API_HEALTH_URL", "http://api:6000/health")))
 
     state = load_state()
+    news: List[Finding] = []
     for finding in findings:
         last = state.get(finding.check)
         last_sent = datetime.fromisoformat(last) if last else None
         if checks.should_send(finding, last_sent, now):
             announce(finding, webhook)
+            news.append(finding)
             if finding.raise_it:
                 state[finding.check] = now.isoformat()
             else:
                 state.pop(finding.check, None)
-    save_state(state)
 
     report = checks.summary(findings)
+
+    # By email: one message for everything this pass found, worst first; and
+    # once a week a note that all is well, so a quiet inbox is never mistaken
+    # for a healthy server when it is really a monitor that stopped.
+    if mailer.ready and news:
+        news.sort(key=lambda f: {"critical": 0, "warning": 1}.get(f.status, 2))
+        first = news[0]
+        subject = (f"{first.status.upper()}: {first.message}" if first.raise_it
+                   else f"resolved: {first.check}")
+        mailer.send(subject, email_text(host, [
+            ("PROBLEM  " if f.raise_it else "RESOLVED ") + f"{f.check}: {f.message}"
+            for f in news], report))
+    weekly = state.get("_weekly")
+    if mailer.ready and (not weekly or
+                         (now - datetime.fromisoformat(weekly)).total_seconds() >= WEEK):
+        if mailer.send(f"weekly report: {report['status'].upper()}", email_text(
+                host, ["The weekly report. Nothing needs doing unless a line below says so."],
+                report)):
+            state["_weekly"] = now.isoformat()
+    save_state(state)
     try:
         STATE.mkdir(parents=True, exist_ok=True)
         (STATE / "status.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

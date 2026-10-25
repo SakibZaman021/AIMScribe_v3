@@ -122,6 +122,11 @@ services:
       # current file in instead: a mounted single file keeps its old contents
       # after git replaces it.
       - ./postgres/migrate.sh:/aims/migrate.sh:ro
+      # Who may connect (hba_file in the profile): a folder, so an edit is seen.
+      - ./postgres/hba:/etc/postgresql/hba:ro
+      # Each filled WAL segment, compressed, for the backup job to encrypt
+      # and send off the server (archive_command in the profile).
+      - ${AIMS_BACKUP_PATH:?set AIMS_BACKUP_PATH in .env}/wal:/wal
     shm_size: ${AIMS_PG_SHM:-1gb}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
@@ -256,6 +261,13 @@ services:
       # per person.
       AIMS_DECRYPT_URL: http://archive-worker:7070
       AIMS_DOWNLOAD_DAILY_LIMIT: ${AIMS_DOWNLOAD_DAILY_LIMIT:-50}
+      # The automatic erasing of recordings CMED never confirms (025, 030):
+      # paused altogether, or stopped per clinic by the circuit breaker when
+      # more than this share of a week's recordings - and at least this
+      # many - would go.
+      AIMS_ERASE_PAUSED: ${AIMS_ERASE_PAUSED:-false}
+      AIMS_ERASE_BREAKER_SHARE: ${AIMS_ERASE_BREAKER_SHARE:-0.3}
+      AIMS_ERASE_BREAKER_MIN: ${AIMS_ERASE_BREAKER_MIN:-20}
       AIMS_DOWNLOAD_AT_ONCE: ${AIMS_DOWNLOAD_AT_ONCE:-2}
       # In batches, one ZIP each (bulk.py): researchers within the hours,
       # per batch and per 24 hours; the server, batches at once and speed.
@@ -482,6 +494,13 @@ services:
       AIMS_OFFSITE_SECRET_KEY: ${AIMS_OFFSITE_SECRET_KEY:-}
       AIMS_OFFSITE_PROVIDER: ${AIMS_OFFSITE_PROVIDER:-Cloudflare}
       AIMS_OFFSITE_KEEP_DAYS: ${AIMS_OFFSITE_KEEP_DAYS:-90}
+      # Recovery to any minute (backup.sh, pitr.sh): the WAL is sent off-site
+      # every minute, a base backup is taken each night and kept this many
+      # days, and a full restore is rehearsed by itself every
+      # AIMS_DRILL_EVERY_DAYS, from the off-site copy alone.
+      AIMS_WAL_SHIP_SECONDS: ${AIMS_WAL_SHIP_SECONDS:-60}
+      AIMS_BASE_KEEP_DAYS: ${AIMS_BASE_KEEP_DAYS:-35}
+      AIMS_DRILL_EVERY_DAYS: ${AIMS_DRILL_EVERY_DAYS:-30}
       TZ: ${TZ:-Asia/Dhaka}
     volumes:
       - ./backup:/opt/aims:ro
@@ -506,6 +525,13 @@ services:
       AIMS_MONITOR_DSN: postgresql://aims_monitor:${AIMS_MONITOR_PASSWORD}@postgres:5432/aims_recordings
       AIMS_PUBLIC_HOST: ${AIMS_PUBLIC_HOST}
       AIMS_ALERT_WEBHOOK: ${AIMS_ALERT_WEBHOOK:-}
+      # Alerts by email, through an HTTPS mail API: DigitalOcean closes the
+      # SMTP ports. Set both with deploy/uiu/set-alerts.sh. The address is
+      # kept in .env on the server only, never in this repository.
+      AIMS_ALERT_EMAIL: ${AIMS_ALERT_EMAIL:-}
+      AIMS_RESEND_API_KEY: ${AIMS_RESEND_API_KEY:-}
+      AIMS_ALERT_FROM: ${AIMS_ALERT_FROM:-}
+      AIMS_DRILL_EVERY_DAYS: ${AIMS_DRILL_EVERY_DAYS:-30}
       AIMS_MONITOR_EVERY: ${AIMS_MONITOR_EVERY:-300}
       # The API's own health, for the schema check (migrations applied?).
       AIMS_API_HEALTH_URL: ${AIMS_API_HEALTH_URL:-http://api:6000/health}
