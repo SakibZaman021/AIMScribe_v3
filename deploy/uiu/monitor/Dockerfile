@@ -3,7 +3,9 @@
 FROM python:3.12-slim
 
 RUN pip install --no-cache-dir "asyncpg>=0.29" \
-    && groupadd -r aims && useradd -r -g aims aims
+    && groupadd -r aims && useradd -r -g aims aims     && mkdir /state && chown aims:aims /state
+# /state is a named volume; Docker gives a new one this folder's owner, so the
+# monitor can keep what it has sent (no repeated alerts, the weekly report).
 
 WORKDIR /app
 COPY checks.py monitor.py ./
