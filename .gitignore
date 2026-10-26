@@ -86,3 +86,4 @@ deploy/cloud/*.staged.pdf
 # Every password of the local system, filled in. Local only.
 LOCAL_MANUAL.pdf
 CMED_CONNECTION_GUIDE_v*.pdf
+cmed_v4_kit/

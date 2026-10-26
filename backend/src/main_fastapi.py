@@ -271,6 +271,9 @@ import bulk  # noqa: E402
 app.include_router(bulk.router)
 # Channel B: CMED's server sends API 2 and prescriptions here (SRS 3.2 §6.2).
 app.include_router(clinical_router)
+# Interface 4: the same, in plain JSON keyed by CMED's visit_id (clinical_v4.py).
+import clinical_v4  # noqa: E402
+app.include_router(clinical_v4.router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
 # only, behind the administrator key.
 app.include_router(dashboard_router)

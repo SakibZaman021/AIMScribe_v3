@@ -154,6 +154,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
      _table("consultation_findings")),
+    # Without it interface 4 (/api/v4/clinical) cannot file a visit.
+    ("clinical/004_patient_visit.sql", "clinical", "table patient_visit",
+     _table("patient_visit")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
     ("clinical/001_aims_clinical.sql", "clinical", "table prescriptions",
