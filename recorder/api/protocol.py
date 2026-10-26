@@ -17,6 +17,9 @@ from datetime import date as Date, datetime
 from typing import Any, Dict, Optional, Tuple
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# CMED's visit_id (interface 4). No underscore: it is one of the fields the
+# audio file's name joins with "_".
+VISIT_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REQUEST_ID_MAX = 128
 
@@ -75,21 +78,29 @@ class ProtocolError(Exception):
 
 @dataclass(frozen=True)
 class Trigger:
-    """API 1: the five fields that identify one consultation (SRS §6.1.3)."""
+    """
+    API 1: the five fields that identify one consultation (SRS §6.1.3), and,
+    from interface 4, CMED's visit_id. With a visit_id, a start for another
+    visit ends the running recording at once and the same visit continues it;
+    without one, the older gate decides (SessionController.open_session).
+    """
     patient_id: str
     doctor_id: str
     hospital_id: str          # CMED's clinic identifier; mapped by the server
     start_time: str           # exactly as CMED's server wrote it (SRS-CNF-02)
     date: str
+    visit_id: str = ""
 
     @property
     def start_at(self) -> datetime:
         return datetime.fromisoformat(self.start_time)
 
     def fields(self) -> Dict[str, str]:
-        return {"patient_id": self.patient_id, "doctor_id": self.doctor_id,
+        five = {"patient_id": self.patient_id, "doctor_id": self.doctor_id,
                 "hospital_id": self.hospital_id, "start_time": self.start_time,
                 "date": self.date}
+        # Only when sent, so a page without it sends the server what it did.
+        return {**five, "visit_id": self.visit_id} if self.visit_id else five
 
 
 @dataclass(frozen=True)
@@ -118,7 +129,8 @@ def _identifier(body: Dict[str, Any], name: str) -> str:
 
 def parse_trigger(message: Dict[str, Any]) -> Trigger:
     """
-    Read API 1. Refuses anything that is not exactly five usable fields.
+    Read API 1. Refuses anything that is not exactly five usable fields, and a
+    visit_id, when one is sent, that is not one.
 
     `start_time` is kept character for character: it is matched against the
     same value in CMED's API 2, and any normalisation here would break that
@@ -150,8 +162,18 @@ def parse_trigger(message: Dict[str, Any]) -> Trigger:
     if not valid_day:
         raise ProtocolError("MISSING_FIELD", "'date' must be YYYY-MM-DD.", field="date")
 
+    visit_id = body.get("visit_id")
+    if visit_id in (None, ""):
+        visit_id = ""
+    elif not isinstance(visit_id, str) or not VISIT_ID.match(visit_id.strip()):
+        raise ProtocolError("INVALID_IDENTIFIER",
+                            "'visit_id' may contain only letters, digits and '-', up to 64 "
+                            "characters.", field="visit_id")
+    else:
+        visit_id = visit_id.strip()
+
     return Trigger(patient_id=patient_id, doctor_id=doctor_id, hospital_id=hospital_id,
-                   start_time=start_time, date=day)
+                   start_time=start_time, date=day, visit_id=visit_id)
 
 
 def parse_prescription_built(message: Dict[str, Any]) -> PrescriptionBuilt:

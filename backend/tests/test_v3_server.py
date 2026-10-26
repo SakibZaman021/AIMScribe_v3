@@ -80,12 +80,30 @@ class FakeRepo:
         self.doctors.add((kw["doctor_id"], kw["hospital_id"]))
 
     # grants
-    async def create_authorisation(self, *, jti, device_id, hospital_id, visit, expires_at):
+    async def create_authorisation(self, *, jti, device_id, hospital_id, visit, expires_at,
+                                   visit_id=None):
         self.auths[jti] = dict(
             jti=jti, device_id=device_id, hospital_id=hospital_id,
             cmed_hospital_id=visit.cmed_hospital_id, patient_id=visit.patient_id,
             doctor_id=visit.doctor_id, start_time=visit.start_time,
-            visit_date=visit.day, notice_id=None, session_id=None, issued_at=NOW())
+            visit_date=visit.day, notice_id=None, session_id=None, issued_at=NOW(),
+            visit_id=visit_id)
+
+    # interface 4: the recording's visit_id, and when its API 3 arrived
+    async def set_session_visit(self, session_id, visit_id):
+        if session_id in self.sessions:
+            self.sessions[session_id]["visit_id"] = visit_id
+
+    async def note_prescription(self, session_id):
+        s = self.sessions.get(session_id)
+        if s is not None and s.get("prescription_received_at") is None:
+            s["prescription_received_at"] = NOW()
+
+    async def prescription_notice(self, device_id, session_id):
+        s = self.sessions.get(session_id)
+        if not s or s.get("closed_at") or s.get("prescription_received_at") is None                 or str(s.get("device_id")) != str(device_id):
+            return None
+        return max(0.0, (NOW() - s["prescription_received_at"]).total_seconds())
 
     async def get_authorisation(self, jti):
         return dict(self.auths[jti]) if jti in self.auths else None

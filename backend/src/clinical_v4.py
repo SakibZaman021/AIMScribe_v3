@@ -504,6 +504,10 @@ async def receive(request: Request, kind: str):
                 await conn.execute("UPDATE patient_visit SET aims_id = $2 WHERE id = $1 "
                                    "AND aims_id IS DISTINCT FROM $2", record_id,
                                    recording["session_id"])
+            if kind == "prescription" and recording.get("closed_at") is None:
+                # The recorder ends this recording about two minutes from now,
+                # unless the next patient is opened first (the heartbeat tells it).
+                await api_v2._repo().note_prescription(recording["session_id"])
     except Exception as exc:
         logger.warning("Could not look up the recording of %s: %s", visit_id, exc)
 

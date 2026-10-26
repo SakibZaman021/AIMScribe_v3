@@ -752,8 +752,12 @@ class UploadManager:
         session.mark_close_reported()
         return True
 
-    async def heartbeat(self, status: Dict[str, Any]) -> bool:
-        return await self._post("/heartbeat", status, attempts=1) is not None
+    async def heartbeat(self, status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The server's reply (truthy), or None when it could not be reached."""
+        reply = await self._post("/heartbeat", status, attempts=1)
+        if reply is None:
+            return None
+        return reply if isinstance(reply, dict) and reply else {"status": "ok"}
 
     async def deliver_health(self) -> int:
         """

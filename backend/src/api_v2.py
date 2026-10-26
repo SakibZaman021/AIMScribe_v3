@@ -1799,7 +1799,21 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
             detail={"spool_bytes": body.spool_bytes,
                     "pending_segments": body.pending_segments})
     await _check_clock(device, body)
-    return {"status": "ok"}
+    reply: Dict[str, Any] = {"status": "ok"}
+    # Interface 4: CMED's API 3 for the recording this PC has open has arrived.
+    # The recorder ends it about two minutes after that, unless the next
+    # patient is opened first; it is told on every heartbeat until it closes.
+    if body.session_id:
+        try:
+            ago = await _repo().prescription_notice(device["device_id"],
+                                                    str(body.session_id)[:64])
+        except Exception as exc:
+            logger.warning("Could not look up a prescription notice: %s", exc)
+            ago = None
+        if ago is not None:
+            reply["prescription_received"] = {"session_id": body.session_id,
+                                              "seconds_ago": round(ago, 1)}
+    return reply
 
 
 def min_recorder_version() -> str:
@@ -2788,9 +2802,14 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
 
     now = datetime.now(timezone.utc)
     jti = new_jti()
+    # Interface 4: CMED's visit_id, forwarded from API 1 by recorders from 3.8.
+    # Recorded when well formed; never a reason to refuse the grant.
+    visit_id = body.get("visit_id")
+    if not (isinstance(visit_id, str) and VISIT_ID.match(visit_id)):
+        visit_id = None
     await repo.create_authorisation(
         jti=jti, device_id=device["device_id"], hospital_id=clinic, visit=visit,
-        expires_at=now + timedelta(seconds=ctx.grants.lifetime))
+        expires_at=now + timedelta(seconds=ctx.grants.lifetime), visit_id=visit_id)
     confirmed = False
     if not mismatch and not await _visit_contested(visit, clinic):
         notice_id = await repo.find_unclaimed_notice(
@@ -3024,10 +3043,20 @@ def _visit_from_grant(grant: Dict[str, Any]) -> conf.Visit:
         else str(visit_date))
 
 
+# CMED's visit_id (interface 4): letters, digits and "-" - no "_", which joins
+# the fields of a file name.
+VISIT_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
 def file_stem_for(patient: str, doctor: str, hospital: str, local_start: datetime,
-                  local_end: datetime) -> str:
-    """`PatientID_DoctorID_HospitalID_HHMMSS_HHMMSS_YYYYMMDD` (SRS-SES-05)."""
-    return (f"{patient}_{doctor}_{hospital}_{local_start:%H%M%S}_{local_end:%H%M%S}"
+                  local_end: datetime, visit: Optional[str] = None) -> str:
+    """
+    `PatientID_DoctorID_HospitalID_HHMMSS_HHMMSS_YYYYMMDD` (SRS-SES-05), and
+    with CMED's visit_id (interface 4)
+    `PatientID_DoctorID_HospitalID_VisitID_HHMMSS_HHMMSS_YYYYMMDD`.
+    """
+    middle = f"{hospital}_{visit}" if visit else hospital
+    return (f"{patient}_{doctor}_{middle}_{local_start:%H%M%S}_{local_end:%H%M%S}"
             f"_{local_start:%Y%m%d}")
 
 
@@ -3043,10 +3072,16 @@ async def _record_file_name(session_id: str) -> Optional[str]:
         return None
     start = await _local_time(session["hospital_id"], session["opened_at"])
     end = await _local_time(session["hospital_id"], session["closed_at"])
+    # The recording's own grant names its visit_id, when API 1 carried one.
+    opening = (await repo.get_authorisation(session["grant_jti"])
+               if session.get("grant_jti") else None)
+    visit_id = (opening or {}).get("visit_id")
+    if visit_id:
+        await repo.set_session_visit(session_id, visit_id)
     stem = await repo.set_file_names(
         session_id,
         file_stem=file_stem_for(session["patient_id"], session["doctor_id"],
-                                session["hospital_id"], start, end),
+                                session["hospital_id"], start, end, visit=visit_id),
         local_start=start.time().replace(tzinfo=None),
         local_end=end.time().replace(tzinfo=None))
 

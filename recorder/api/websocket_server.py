@@ -264,6 +264,14 @@ class WebSocketManager:
         # API 2. The recording continues; `session_id` is the running one.
         if result.get("continued"):
             data["continued"] = True
+        # Interface 4: the visit now recording, and the one this start closed.
+        if trigger.visit_id:
+            data["visit_id"] = result.get("visit_id") or trigger.visit_id
+            data["continued"] = bool(result.get("continued"))
+            data["closed_previous"] = ({"session_id": result["previous_session_id"],
+                                        "visit_id": result.get("previous_visit_id"),
+                                        "ended_at": result.get("previous_ended_at")}
+                                       if result.get("previous_session_id") else None)
         return code, data
 
     @staticmethod

@@ -116,6 +116,9 @@ class ActiveSession:
     # patient it identifies the consultation, so a repeated trigger for the same
     # one is recognised rather than refused by the gate.
     trigger_start_time: str = ""
+    # CMED's visit_id (interface 4), when its page sends one. A start for
+    # another visit ends this recording at once; the same visit continues it.
+    visit_id: str = ""
     # Set by prescription_built (API 3). Until then a new trigger does not end
     # this recording (SRS-GAT-01..04): it is written in as a marker, and the
     # server decides from the markers whose consultation each part was.
@@ -418,9 +421,36 @@ class SessionController:
                     "This PC is registered to a different clinic, so the recording "
                     "cannot start. AIMS LAB has been alerted.", code="CLINIC_MISMATCH")
 
-            if self._active is not None:
+            previous_visit: Optional[str] = None
+            if self._active is not None and trigger.visit_id:
                 active = self._active
-                # The gate (SRS-GAT-03). Until the open consultation's
+                active.last_cmed_at = time.monotonic()
+                # Interface 4: CMED names the visit. The same visit again - a
+                # reload, a double click, the doctor reopening the patient - is
+                # the consultation still running.
+                if active.visit_id == trigger.visit_id:
+                    return {
+                        "session_id": active.session_id,
+                        "status": "recording",
+                        "continued": True,
+                        "visit_id": active.visit_id,
+                        "started_at": crypto.iso_utc(active.opened_at),
+                        "previous_session_stopped": False,
+                        "previous_session_id": None,
+                        "armed": active.armed,
+                        "authorisation": active.authorisation,
+                        "confirmation": active.confirmation,
+                    }
+                # Another visit: the next patient is in the room. The running
+                # recording ends now and the new one starts now, at one instant,
+                # whatever the time since the prescription - nobody waits.
+                previous_id, previous_visit = active.session_id, active.visit_id or None
+                logger.info("Visit changed: closing session %s before opening a new one",
+                            previous_id)
+                await self._close_active(reason="superseded_by_new_patient", at=boundary)
+            elif self._active is not None:
+                active = self._active
+                # The gate (SRS-GAT-03), for a page that sends no visit_id. Until the open consultation's
                 # prescription is built, a patient opened in CMED does not end
                 # it: it may be a glance at another file, the doctor correcting
                 # a wrong profile picked at the start, or - after a follow-up
@@ -559,6 +589,7 @@ class SessionController:
                 opened_at=opened_at,
                 doctor_id=doctor_id,
                 trigger_start_time=trigger.start_time,
+                visit_id=trigger.visit_id,
                 authorisation="granted" if grant is not None else "pending",
                 confirmation="" if grant is not None else "confirming",
                 focus=trigger.fields(),
@@ -608,9 +639,12 @@ class SessionController:
         return {
             "session_id": active.session_id,
             "status": "recording",
+            "visit_id": active.visit_id or None,
             "started_at": crypto.iso_utc(active.opened_at),
             "previous_session_stopped": previous_id is not None,
             "previous_session_id": previous_id,
+            "previous_visit_id": previous_visit,
+            "previous_ended_at": crypto.iso_utc(boundary) if previous_id else None,
             "armed": False,
             "authorisation": active.authorisation,
             "confirmation": active.confirmation,
@@ -728,6 +762,45 @@ class SessionController:
             logger.info("Session %s armed: the next patient will close it", active.session_id)
             self._emit("gate_armed", {"session_id": active.session_id})
             return {"session_id": active.session_id, "armed": True, "already": False}
+
+    async def prescription_received(self, *, session_id: str,
+                                    seconds_ago: float = 0.0) -> bool:
+        """
+        Interface 4: CMED's API 3 for this recording's visit has reached the
+        AIMS LAB server, which says so in its reply to the next heartbeat. It
+        starts the counselling limit exactly as prescription_built did, counted
+        from when API 3 arrived: if no next patient is opened first, the
+        recording ends at a pause about two minutes after the prescription.
+
+        Nothing is stopped here, and a next patient's start still ends the
+        recording at once. Repeated (every heartbeat until the recording
+        closes), it changes nothing after the first time.
+        """
+        async with self._lock:
+            active = self._active
+            if active is None or active.session_id != session_id or active.armed:
+                return False
+            limit = self._knob("counselling_limit_seconds", 120.0)
+            ago = min(max(0.0, float(seconds_ago or 0.0)), max(0.0, limit))
+            active.armed = True
+            active.armed_at = time.monotonic() - ago
+            self._keeper.armed()
+            logger.info("Session %s: the prescription reached the server %.0f s ago; it "
+                        "ends by itself unless the next patient is opened first",
+                        active.session_id, ago)
+            self._emit("gate_armed", {"session_id": active.session_id, "by": "server"})
+            return True
+
+    async def _on_heartbeat_reply(self, reply: Dict[str, Any]) -> None:
+        """What the server's heartbeat reply asks of this PC."""
+        notice = reply.get("prescription_received") if isinstance(reply, dict) else None
+        if isinstance(notice, dict) and notice.get("session_id"):
+            try:
+                ago = float(notice.get("seconds_ago") or 0.0)
+            except (TypeError, ValueError):
+                ago = 0.0
+            await self.prescription_received(session_id=str(notice["session_id"]),
+                                              seconds_ago=ago)
 
     def _note_click(self, active: ActiveSession, trigger, at: datetime) -> None:
         """
@@ -1507,7 +1580,9 @@ class SessionController:
                 self._check_disk()
                 payload = self.heartbeat_payload()
                 health = getattr(self._uploader, "health", None)
-                if await self._uploader.heartbeat(payload):
+                reply = await self._uploader.heartbeat(payload)
+                if reply:
+                    await self._on_heartbeat_reply(reply)
                     if health is not None:
                         await self._uploader.deliver_health()
                 elif health is not None:

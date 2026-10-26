@@ -285,3 +285,61 @@ async def test_the_status_of_one_visit(cmed):
     async with cmed.dbs.cli.acquire() as conn:
         assert await conn.fetchval("SELECT aims_id FROM patient_visit WHERE visit_id = $1",
                                    first["visit_id"]) == sid
+    # API 3 reached us while the recording was open: the heartbeat will say so.
+    async with cmed.dbs.rec.acquire() as conn:
+        assert await conn.fetchval("SELECT prescription_received_at IS NOT NULL FROM sessions "
+                                   "WHERE session_id = $1", sid)
+
+
+# ============================================================
+# The recording side of interface 4
+# ============================================================
+
+def test_the_file_name_carries_the_visit_when_there_is_one():
+    start = datetime(2025, 11, 15, 11, 40, 12)
+    end = datetime(2025, 11, 15, 11, 54, 52)
+    assert api_v2.file_stem_for("P1", "DR1", "HOSP003", start, end) == \
+        "P1_DR1_HOSP003_114012_115452_20251115"
+    assert api_v2.file_stem_for("P1", "DR1", "HOSP003", start, end, visit="VIS1001") == \
+        "P1_DR1_HOSP003_VIS1001_114012_115452_20251115"
+
+
+@postgres
+async def test_the_heartbeat_tells_the_recorder_its_prescription_arrived(cmed):
+    repo = cmed.dbs.repo
+    sid = uuid.uuid4().hex[:26].upper()
+    opened = datetime.now(timezone.utc) - timedelta(minutes=5)
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                  protocol_version, status, session_date, opened_at)
+            VALUES ($1, 'P1', 'DR0042', 'HOSP003', $2, 2, 'active', $3, $4)
+        """, sid, cmed.device["device_id"], opened.date(), opened)
+    beat = api_v2.HeartbeatRequest(device_id=str(cmed.device["device_id"]), session_id=sid)
+    reply = await api_v2.heartbeat(beat, device=cmed.device)
+    assert "prescription_received" not in reply             # no API 3 yet
+
+    await repo.note_prescription(sid)
+    first = await repo.prescription_notice(cmed.device["device_id"], sid)
+    await repo.note_prescription(sid)                       # a correction moves nothing
+    assert first is not None and first < 5
+    reply = await api_v2.heartbeat(beat, device=cmed.device)
+    assert reply["prescription_received"]["session_id"] == sid
+    # Another PC, or a closed recording, is told nothing.
+    assert await repo.prescription_notice(uuid.uuid4(), sid) is None
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
+    assert await repo.prescription_notice(cmed.device["device_id"], sid) is None
+
+
+@postgres
+async def test_a_grant_remembers_the_visit_id(cmed):
+    import confirmation as conf
+    visit = conf.parse_visit({"patient_id": "P1", "doctor_id": "DR0042",
+                              "hospital_id": "CMED-DHOLPUR",
+                              "start_time": "2025-11-15T11:40:12+06:00", "date": "2025-11-15"})
+    jti = uuid.uuid4().hex
+    await cmed.dbs.repo.create_authorisation(
+        jti=jti, device_id=cmed.device["device_id"], hospital_id="HOSP003", visit=visit,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=1), visit_id="VIS1001")
+    assert (await cmed.dbs.repo.get_authorisation(jti))["visit_id"] == "VIS1001"

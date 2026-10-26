@@ -1407,15 +1407,43 @@ class V2Repository:
                 hospital_id, cmed_hospital_id or None)
 
     async def create_authorisation(self, *, jti: str, device_id, hospital_id: str,
-                                   visit, expires_at: datetime) -> None:
+                                   visit, expires_at: datetime,
+                                   visit_id: Optional[str] = None) -> None:
         async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO grant_authorisations
                     (jti, device_id, hospital_id, cmed_hospital_id, patient_id,
-                     doctor_id, start_time, visit_date, expires_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                     doctor_id, start_time, visit_date, expires_at, visit_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             """, jti, device_id, hospital_id, visit.cmed_hospital_id, visit.patient_id,
-                 visit.doctor_id, visit.start_time, visit.day, expires_at)
+                 visit.doctor_id, visit.start_time, visit.day, expires_at, visit_id)
+
+    async def set_session_visit(self, session_id: str, visit_id: str) -> None:
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE sessions SET visit_id = $2 WHERE session_id = $1 "
+                               "AND visit_id IS DISTINCT FROM $2", session_id, visit_id)
+
+    async def note_prescription(self, session_id: str) -> None:
+        """CMED's API 3 for this recording arrived. Once: a correction moves nothing."""
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE sessions SET prescription_received_at = now() "
+                               "WHERE session_id = $1 AND prescription_received_at IS NULL",
+                               session_id)
+
+    async def prescription_notice(self, device_id: str, session_id: str
+                                  ) -> Optional[float]:
+        """
+        Seconds since API 3 arrived for this PC's open recording, or None: what
+        the heartbeat reply tells the recorder.
+        """
+        async with self._acquire() as conn:
+            ago = await conn.fetchval("""
+                SELECT EXTRACT(EPOCH FROM now() - prescription_received_at)
+                  FROM sessions
+                 WHERE session_id = $1 AND device_id = $2 AND closed_at IS NULL
+                   AND prescription_received_at IS NOT NULL
+            """, session_id, device_id)
+        return None if ago is None else max(0.0, float(ago))
 
     async def get_authorisation(self, jti: str) -> Optional[Dict[str, Any]]:
         async with self._acquire() as conn:

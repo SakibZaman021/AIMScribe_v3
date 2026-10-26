@@ -150,6 +150,10 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it an admin cannot release a clinic the erase breaker stopped.
     ("030_v3_erase_breaker.sql", "recordings", "table erase_releases",
      _table("erase_releases")),
+    # Without it a recording cannot carry CMED's visit_id, and the heartbeat
+    # cannot tell a recorder its prescription has arrived (interface 4).
+    ("031_v3_visit_id.sql", "recordings", "column sessions.prescription_received_at",
+     _column("sessions", "prescription_received_at")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
