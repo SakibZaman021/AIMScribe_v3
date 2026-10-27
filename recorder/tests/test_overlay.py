@@ -350,3 +350,14 @@ def test_the_no_signal_warning_goes_when_sound_comes_back():
     # It may come again if the microphone goes silent again.
     state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
     assert "gives no signal" in state.view(recording()).note
+
+
+def test_the_card_says_which_way_the_microphone_moved():
+    state = OverlayState()
+    state.on_event("recording_started", {"session_id": "S1"})
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
+                                       "device": "Microphone Array (2- Realtek(R) Audio)"})
+    assert "Jabra unplugged" in state.view(recording()).note
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
+                                       "device": "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"})
+    assert state.view(recording()).note == "Back on the Jabra speakerphone."

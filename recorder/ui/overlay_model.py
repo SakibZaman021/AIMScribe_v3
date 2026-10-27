@@ -144,7 +144,9 @@ class OverlayState:
                 self.shown.add(kind)
                 self.note = "The microphone is not working. Check that it is connected."
             elif kind == "microphone_switched":
-                self.note = "Microphone changed. Still recording, on this PC's microphone."
+                device = str(data.get("device") or "")
+                self.note = ("Back on the Jabra speakerphone." if "jabra" in device.lower()
+                             else "Jabra unplugged - recording on this PC's microphone.")
             return
         if event == "overlay_message":
             self._say(str(data.get("text", ""))[:200])

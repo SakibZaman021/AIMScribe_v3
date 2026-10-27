@@ -646,8 +646,10 @@ function drawRooms(d) {
         : waits ? "row-warn"
         : q.outdated || q.disk_encrypted === false || q.microphone_is_clinic === false
           ? "row-warn" : "";
+      const move = q.revoked ? "" : `<br><button type="button" class="chip" data-move="${esc(q.device_id)}"`
+        + ` data-from="${esc(q.hospital_id)}" title="Move this PC to another clinic">Move</button>`;
       return `<tr class="${rowTone}">`
-        + td("PC", `<b>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</b>`)
+        + td("PC", `<b>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</b>${move}`)
         + td("State", state)
         + td("Last seen", esc(ago(q.minutes_since_seen)))
         + td("Version", version)
@@ -664,6 +666,33 @@ function drawRooms(d) {
     + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th>`
     + `<th class="num">Clock</th><th>Offline (7 days)</th></tr></thead><tbody>${body}</tbody></table>`;
 }
+
+// Move a PC to another clinic: a PC never moves itself.
+$("rooms").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-move]");
+  if (!b) return;
+  const ids = CLINICS.map((c) => c.hospital_id).filter((h) => h !== b.dataset.from);
+  const to = (window.prompt(`Move this PC from ${clinicName(b.dataset.from)} to which clinic?\n`
+    + `Type one of: ${ids.join(", ")}`) || "").trim();
+  if (!to) return;
+  if (!ids.includes(to)) { window.alert(`No clinic "${to}".`); return; }
+  const again = window.confirm("Was this PC reinstalled, or its AIMScribe folder cleared?\n\n"
+    + "OK = yes: let it register again at the new clinic.\nCancel = no: it keeps working as it is.");
+  const who = (window.prompt("Your name, for the audit log:") || "").trim();
+  if (who.length < 2) return;
+  if (!PORTAL && !ADMIN_KEY) await askKey();
+  b.disabled = true;
+  try {
+    const response = await fetch(`/api/v2/admin/device/${encodeURIComponent(b.dataset.move)}/move`,
+      { method: "POST", headers: { ...portalHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ moved_by: who, hospital_id: to, register_again: again }) });
+    if (!response.ok) throw new Error(`Server error ${response.status}`);
+    await refresh();
+  } catch (err) {
+    b.disabled = false;
+    window.alert(`Not moved: ${err.message}`);
+  }
+});
 
 // A PC that registered itself: a person approves or rejects it, by name.
 $("rooms").addEventListener("click", async (e) => {

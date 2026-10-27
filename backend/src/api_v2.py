@@ -3894,6 +3894,40 @@ async def admin_reject_device(device_id: str, body: DeviceDecision,
     return {"status": "rejected", "device_id": str(did)}
 
 
+class DeviceMove(BaseModel):
+    moved_by: str = Field(..., min_length=2, max_length=128)
+    hospital_id: str = Field(..., min_length=1, max_length=64)
+    reason: str = Field("", max_length=500)
+    # The PC lost its registration (reinstalled, its folder cleared): let it
+    # register itself once more at the new clinic.
+    register_again: bool = False
+
+
+@router.post("/admin/device/{device_id}/move")
+async def admin_move_device(device_id: str, body: DeviceMove,
+                            _: None = Depends(require_admin)):
+    """
+    A PC that now serves another clinic - moved between rooms, or registered
+    at the wrong one. A PC never moves itself (registration refuses it:
+    OTHER_CLINIC); a person does it here, by name, in the audit log. Its
+    earlier recordings stay filed under the clinic where they were made.
+    """
+    did = _device_uuid(device_id)
+    hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    if not await _repo().hospital_exists(hospital_id):
+        raise HTTPException(status_code=404, detail=f"no clinic {hospital_id!r}")
+    was = await _repo().move_device(did, hospital_id, register_again=body.register_again)
+    if was is None:
+        raise HTTPException(status_code=404, detail="no active PC with that id")
+    await _repo().audit(event_type="device.moved", actor_type="admin",
+                        actor_id=body.moved_by, device_id=did,
+                        detail={"from": was, "to": hospital_id, "reason": body.reason,
+                                "register_again": body.register_again})
+    forget_directory()
+    return {"status": "moved", "device_id": str(did), "from": was, "to": hospital_id,
+            "register_again": body.register_again}
+
+
 class ConfirmRequest(BaseModel):
     confirmed_by: str = Field(..., min_length=2, max_length=128)
     reason: str = Field(..., min_length=10, max_length=500)

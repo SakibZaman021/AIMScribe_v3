@@ -88,6 +88,10 @@ def world(monkeypatch):
         PyAudio=PyAudio, paInt16=8, paInt32=2))
     monkeypatch.setattr(rec.AudioRecorder, "WATCH_INTERVAL", 0.02)
     monkeypatch.setattr(rec.AudioRecorder, "REOPEN_INTERVAL", 0.05)
+    monkeypatch.setattr(rec.AudioRecorder, "PREFERRED_CHECK_SECONDS", 0.1)
+    # Windows' own list of microphones is the fake PC's, not this machine's.
+    from core import microphone
+    monkeypatch.setattr(microphone, "endpoint_names", lambda: list(w.devices.values()))
     yield w
     w.release.set()                    # let any stuck reader go
 
@@ -209,4 +213,38 @@ def test_without_a_jabra_the_windows_default_records(world):
     r, chunks, events = capture(preferred_name="jabra")
     r.start()
     assert r.device_name == "USB microphone"
+    r.stop()
+
+
+def test_a_replugged_jabra_takes_the_recording_back(world):
+    """Unplugged mid-consultation, then plugged in again: back on the Jabra, no gap."""
+    jabra = "Microphone (Jabra SPEAK2 55)"
+    world.devices = {0: "PC microphone", 3: jabra}
+    world.default = 0
+    r, chunks, events = capture(preferred_name="jabra")
+    r.start()
+    assert r.device_name == jabra and r.on_preferred()
+
+    world.pull(jabra)
+    assert wait_for(lambda: events["changed"])
+    assert r.device_name == "PC microphone" and not r.on_preferred()
+    assert wait_for(lambda: chunks and chunks[-1][:1] == b"P")      # the PC's audio
+
+    world.behaviour[jabra] = "ok"                                     # plugged back in
+    world.devices[3] = jabra
+    assert wait_for(lambda: len(events["changed"]) == 2)
+    name, gap = events["changed"][1]
+    assert name == jabra and gap == 0.0 and r.on_preferred()
+    assert wait_for(lambda: chunks and chunks[-1][:1] == b"M")      # the Jabra's audio
+    stats = r.stop()
+    assert stats.device_changes == 2 and events["errors"] == []
+
+
+def test_the_pc_microphone_stays_while_the_jabra_is_away(world):
+    world.devices = {0: "PC microphone"}
+    world.default = 0
+    r, chunks, events = capture(preferred_name="jabra")
+    r.start()
+    time.sleep(0.5)                                  # several checks, nothing to move to
+    assert events["changed"] == [] and r.device_name == "PC microphone"
     r.stop()

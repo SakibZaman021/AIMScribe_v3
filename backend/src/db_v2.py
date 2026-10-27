@@ -370,6 +370,29 @@ class V2Repository:
                  WHERE s.device_id = $1
             """, device_id))
 
+    async def move_device(self, device_id, hospital_id: str, *,
+                          register_again: bool) -> Optional[str]:
+        """
+        Move a PC to another clinic. Returns the clinic it was at, or None when
+        there is no such PC (or it is revoked). Its earlier recordings stay
+        filed where they were made. With `register_again`, the PC may register
+        itself once more and get a new token - for one whose registration was
+        lost (Windows reinstalled, its ProgramData folder cleared).
+        """
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT hospital_id FROM devices WHERE device_id = $1 "
+                    "AND revoked_at IS NULL FOR UPDATE", device_id)
+                if row is None:
+                    return None
+                await conn.execute("""
+                    UPDATE devices SET hospital_id = $2,
+                           last_seen_at = CASE WHEN $3 THEN NULL ELSE last_seen_at END
+                     WHERE device_id = $1
+                """, device_id, hospital_id, register_again)
+                return row["hospital_id"]
+
     async def set_device_approval(self, device_id, approval: str, *, by: str) -> bool:
         """An administrator's decision on a pending PC. Rejecting also revokes."""
         async with self._acquire() as conn:

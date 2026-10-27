@@ -367,3 +367,41 @@ async def test_the_heartbeat_keeps_which_microphone_records(cmed):
         used = await conn.fetchval("SELECT microphones FROM sessions WHERE session_id = $1", sid)
     assert (device["microphone"], device["microphone_is_clinic"]) == (laptop, False)
     assert list(used) == [jabra, laptop]               # each once, in the order used
+
+
+@postgres
+async def test_a_person_moves_a_pc_to_another_clinic(cmed):
+    from fastapi import HTTPException
+    repo, did = cmed.dbs.repo, str(cmed.device["device_id"])
+    await repo.upsert_hospital("HOSP004", "Another clinic", "Asia/Dhaka")
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE devices SET last_seen_at = now() WHERE device_id = $1",
+                           cmed.device["device_id"])
+
+    moved = await api_v2.admin_move_device(did, api_v2.DeviceMove(
+        moved_by="Tester", hospital_id="HOSP004"), None)
+    assert (moved["from"], moved["to"]) == ("HOSP003", "HOSP004")
+    async with cmed.dbs.rec.acquire() as conn:
+        row = await conn.fetchrow("SELECT hospital_id, last_seen_at FROM devices "
+                                  "WHERE device_id = $1", cmed.device["device_id"])
+        audited = await conn.fetchval("SELECT count(*) FROM audit_log WHERE event_type = "
+                                      "'device.moved' AND device_id = $1", cmed.device["device_id"])
+    assert row["hospital_id"] == "HOSP004" and row["last_seen_at"] is not None
+    assert audited == 1
+
+    # Reinstalled: it may register again at the new clinic.
+    await api_v2.admin_move_device(did, api_v2.DeviceMove(
+        moved_by="Tester", hospital_id="HOSP003", register_again=True), None)
+    async with cmed.dbs.rec.acquire() as conn:
+        row = await conn.fetchrow("SELECT hospital_id, last_seen_at FROM devices "
+                                  "WHERE device_id = $1", cmed.device["device_id"])
+    assert row["hospital_id"] == "HOSP003" and row["last_seen_at"] is None
+
+    for bad in (api_v2.DeviceMove(moved_by="Tester", hospital_id="NO_SUCH_CLINIC"),):
+        with pytest.raises(HTTPException) as err:
+            await api_v2.admin_move_device(did, bad, None)
+        assert err.value.status_code == 404
+    with pytest.raises(HTTPException) as err:
+        await api_v2.admin_move_device(str(uuid.uuid4()), api_v2.DeviceMove(
+            moved_by="Tester", hospital_id="HOSP004"), None)
+    assert err.value.status_code == 404

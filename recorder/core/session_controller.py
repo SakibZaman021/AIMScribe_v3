@@ -1520,14 +1520,18 @@ class SessionController:
     def _on_microphone_switched(self, device: str, seconds_lost: float) -> None:
         """Called from the audio watchdog: the recording moved to another microphone."""
         active = self._active
-        if active is not None:
+        if active is not None and seconds_lost >= 0.5:
             # The gap is real time with no audio. Without this every later clip's
             # timestamps would be early by the length of the gap.
             active.segmenter.set_segment_start(datetime.now(timezone.utc))
+        back = seconds_lost < 0.5
         self._emit("integrity_alert", {
             "session_id": active.session_id if active else None,
             "alert_type": "microphone_switched",
-            "detail": (f"the microphone stopped; recording continued on {device} "
+            "device": device,
+            "detail": (f"the clinic microphone was plugged back in; recording continued on "
+                       f"{device}" if back else
+                       f"the microphone stopped; recording continued on {device} "
                        f"after about {seconds_lost:.0f}s"),
         })
 

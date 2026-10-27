@@ -86,6 +86,9 @@ class AudioRecorder:
     # microphone when none can be opened.
     WATCH_INTERVAL = 0.5
     REOPEN_INTERVAL = 1.0
+    # How often, while recording on another microphone, to look for the
+    # clinic's own (the Jabra) having been plugged back in.
+    PREFERRED_CHECK_SECONDS = 5.0
 
     def __init__(
         self,
@@ -424,6 +427,7 @@ class AudioRecorder:
         go on "recording" nothing, so the stream is replaced by the Windows
         default, which is the PC's own microphone once the USB one has gone.
         """
+        checked = time.monotonic()
         while self._running.is_set():
             time.sleep(self.WATCH_INTERVAL)
             if not self._running.is_set():
@@ -435,6 +439,62 @@ class AudioRecorder:
             if self._failed or stalled:
                 self._failover("reads failed" if self._failed else
                                f"no audio for {self.stall_seconds:.1f}s")
+            elif time.monotonic() - checked >= self.PREFERRED_CHECK_SECONDS:
+                checked = time.monotonic()
+                self._return_to_preferred()
+
+    def on_preferred(self) -> bool:
+        """Whether the recording is on the clinic's own microphone (or none is named)."""
+        return not self.preferred_name or \
+            self.preferred_name.lower() in (self.device_name or "").lower()
+
+    def _return_to_preferred(self) -> None:
+        """
+        The Jabra was unplugged and the recording carried on with the PC's own
+        microphone. Once it is plugged back in, the recording moves back to it:
+        it is opened first and only then swapped in, so at most one buffer of
+        audio is between the two. Nothing happens while it stays away.
+        """
+        if self.on_preferred():
+            return
+        from core.microphone import endpoint_names
+        if not any(self.preferred_name.lower() in name.lower() for name in endpoint_names()):
+            return                              # still unplugged: the cheap check, every time
+        import pyaudio
+        handle = pyaudio.PyAudio()
+        stream = None
+        try:
+            index = self._find(handle, self.preferred_name)
+            if index is None:
+                handle.terminate()
+                return
+            stream = handle.open(
+                format=pyaudio.paInt16 if self.sample_width == 2 else pyaudio.paInt32,
+                channels=self.channels, rate=self.sample_rate, input=True,
+                input_device_index=index, frames_per_buffer=self.frames_per_buffer)
+        except Exception as exc:
+            logger.info("The clinic microphone is back but could not be opened yet: %s", exc)
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            handle.terminate()
+            return
+        with self._state_lock:
+            if not self._running.is_set():
+                stream.close()
+                handle.terminate()
+                return
+            self._abandon()                     # the old reader sees a newer generation and stops
+            self._pyaudio, self._stream = handle, stream
+            self.device_name = self._name_of(handle, index)
+            self.stats.device_changes += 1
+            self._launch()
+        logger.warning("The clinic microphone is back: recording continues on %s",
+                       self.device_name)
+        if self._on_device_change:
+            self._on_device_change(self.device_name, 0.0)
 
     def _failover(self, why: str) -> None:
         lost_at = self._last_read
