@@ -1558,8 +1558,8 @@ async def test_a_clinic_whose_recordings_would_mostly_be_erased_stops_until_an_a
         _unserve()
 
 
-async def test_a_pc_cmed_never_vouches_for_is_rejected(dbs):
-    """025: pending for AIMS_PENDING_DEVICE_DAYS without two confirmations."""
+async def test_a_pc_that_registers_and_never_records_is_let_go(dbs):
+    """033: registered, recorded nothing for AIMS_PENDING_SILENT_DAYS (30): let go."""
     await enrolled_device(dbs.repo)
     _server(dbs)
     try:
@@ -1568,12 +1568,147 @@ async def test_a_pc_cmed_never_vouches_for_is_rejected(dbs):
             await conn.execute("UPDATE devices SET enrolled_at = now() - interval '8 days' "
                                "WHERE device_id = $1::uuid", reply["device_id"])
         await api_v2._settle_unconfirmed()
+        assert await dbs.repo.device_by_token(reply["device_token"]) is not None   # a week: kept
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE devices SET enrolled_at = now() - interval '31 days' "
+                               "WHERE device_id = $1::uuid", reply["device_id"])
+        await api_v2._settle_unconfirmed()
         async with dbs.rec.acquire() as conn:
             pc = await conn.fetchrow("SELECT approval, revoked_at FROM devices "
                                      "WHERE device_id = $1::uuid", reply["device_id"])
         assert pc["approval"] == "rejected" and pc["revoked_at"] is not None
         assert await dbs.repo.device_by_token(reply["device_token"]) is None
     finally:
+        _unserve()
+
+
+async def _pending_pc_with_recordings(dbs, n, *, ago_hours, confirmed=0):
+    """A self-registered PC at HOSP003 with n uploaded recordings, ago_hours old."""
+    import random
+    from core.spool import new_ulid
+    await enrolled_device(dbs.repo)
+    async with dbs.rec.acquire() as conn:
+        # Earlier tests' PCs would fill the clinic's pending places (the cap is 5).
+        await conn.execute("UPDATE devices SET approval = 'approved' "
+                           "WHERE hospital_id = 'HOSP003' AND approval = 'pending'")
+    reply = await api_v2.register_device(
+        _registration(), _caller(f"203.0.113.{random.randint(20, 250)}"))
+    assert isinstance(reply, dict), reply.body
+    opened = datetime.now(timezone.utc) - timedelta(hours=ago_hours)
+    async with dbs.rec.acquire() as conn:
+        for i in range(n):
+            await conn.execute("""
+                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                      protocol_version, status, session_date, opened_at,
+                                      segment_count, confirmation)
+                VALUES ($1, 'P1', 'DR0042', 'HOSP003', $2::uuid, 2, 'closed', $3, $4, 3, $5)
+            """, new_ulid(), reply["device_id"], opened.date(), opened + timedelta(minutes=i),
+                "confirmed" if i < confirmed else "unconfirmed")
+    return reply
+
+
+async def _cmed_heard(dbs, ago_hours):
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE hospitals SET cmed_last_message_at = now() - "
+                           "make_interval(hours => $1) WHERE hospital_id = 'HOSP003'", ago_hours)
+
+
+async def _approval(dbs, device_id):
+    async with dbs.rec.acquire() as conn:
+        return await conn.fetchrow("SELECT approval, revoked_at, blocked_at FROM devices "
+                                   "WHERE device_id = $1::uuid", device_id)
+
+
+async def test_an_outage_never_blocks_a_new_pc(dbs):
+    """033: CMED not heard from since the recordings: no evidence, nothing judged."""
+    _server(dbs)
+    try:
+        pc = await _pending_pc_with_recordings(dbs, 5, ago_hours=48)
+        await _cmed_heard(dbs, 60)                      # last heard before they were made
+        await api_v2._settle_unconfirmed()
+        assert (await _approval(dbs, pc["device_id"]))["approval"] == "pending"
+    finally:
+        _unserve()
+
+
+async def test_a_pc_cmed_works_for_but_never_confirms_is_blocked_and_can_be_unblocked(dbs):
+    """033: CMED working for the clinic, none of the PC's 3 recordings confirmed."""
+    _server(dbs)
+    try:
+        pc = await _pending_pc_with_recordings(dbs, 3, ago_hours=3)
+        await _cmed_heard(dbs, 0)                       # CMED talking for this clinic now
+        await api_v2._settle_unconfirmed()
+        row = await _approval(dbs, pc["device_id"])
+        assert row["approval"] == "rejected" and row["blocked_at"] is not None
+        assert (await dbs.repo.device_by_token(pc["device_token"]))["revoked_at"] is not None
+
+        await api_v2.admin_unblock_device(pc["device_id"], api_v2.DeviceDecision(
+            decided_by="Tester", reason="CMED's outbox was stuck"), None)
+        row = await _approval(dbs, pc["device_id"])
+        assert row["approval"] == "pending" and row["revoked_at"] is None
+        assert (await dbs.repo.device_by_token(pc["device_token"]))["revoked_at"] is None
+        await api_v2._settle_unconfirmed()             # its old recordings are not judged again
+        assert (await _approval(dbs, pc["device_id"]))["approval"] == "pending"
+    finally:
+        _unserve()
+
+
+async def test_one_confirmed_recording_means_it_is_ours(dbs):
+    _server(dbs)
+    try:
+        pc = await _pending_pc_with_recordings(dbs, 4, ago_hours=30, confirmed=1)
+        await _cmed_heard(dbs, 0)
+        await api_v2._settle_unconfirmed()
+        assert (await _approval(dbs, pc["device_id"]))["approval"] == "pending"
+    finally:
+        _unserve()
+
+
+async def test_a_clinic_recording_while_cmed_is_silent_raises_one_alert(dbs):
+    _server(dbs)
+    try:
+        await _pending_pc_with_recordings(dbs, 2, ago_hours=0.5)
+        await _cmed_heard(dbs, 5)
+        async with dbs.rec.acquire() as conn:          # an earlier test's sweep may have alerted
+            await conn.execute("UPDATE hospitals SET cmed_silence_alerted_at = NULL "
+                               "WHERE hospital_id = 'HOSP003'")
+        first = await dbs.repo.cmed_silent_clinics(window_minutes=120, min_recordings=2,
+                                                    repeat_hours=6)
+        again = await dbs.repo.cmed_silent_clinics(window_minutes=120, min_recordings=2,
+                                                    repeat_hours=6)
+        assert [c["hospital_id"] for c in first] == ["HOSP003"] and again == []
+    finally:
+        _unserve()
+
+
+async def test_trusted_origins_are_versioned_and_signed(dbs):
+    import integrity
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    repo = dbs.repo
+    _server(dbs)
+    key = Ed25519PrivateKey.generate()
+    api_v2.ctx.signer = integrity.ReceiptSigner(key)
+    try:
+        start = await repo.trusted_origins_version()
+        await api_v2.admin_add_trusted_origin(api_v2.TrustedOriginRequest(
+            origin="https://EMR.cmed.example/", by="Tester"), None)
+        v1 = await repo.trusted_origins_version()
+        assert v1 > start
+        bundle = await api_v2._trusted_origins_bundle()
+        payload = bundle["payload"]
+        assert "https://emr.cmed.example" in payload["origins"] and payload["version"] == v1
+        key.public_key().verify(bytes.fromhex(bundle["signature"]), integrity.digest(
+            integrity.ORIGINS_DOMAIN, integrity.canonical_json(payload)))
+        with pytest.raises(Exception):
+            await api_v2.admin_add_trusted_origin(api_v2.TrustedOriginRequest(
+                origin="https://*.cmed.example", by="Tester"), None)
+        await api_v2.admin_remove_trusted_origin(api_v2.TrustedOriginRequest(
+            origin="https://emr.cmed.example", by="Tester"), None)
+        assert await repo.trusted_origins_version() >= v1
+        assert "https://emr.cmed.example" not in (await api_v2._trusted_origins_bundle()
+                                                  )["payload"]["origins"]
+    finally:
+        api_v2.ctx.signer = None
         _unserve()
 
 

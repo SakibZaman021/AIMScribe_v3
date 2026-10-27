@@ -329,6 +329,7 @@ const VIEWS = {
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
   downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
+  cmed: ["CMED", "CMED's EHR addresses and the key each hospital signs with", false],
   people: ["People", "Who may sign in, and their database logins", false],
 };
 
@@ -551,6 +552,7 @@ const PC_FILTERS = [
   ["microphone", "Not on the Jabra", (q) => q.microphone_is_clinic === false && !q.revoked],
   ["holding", "Audio waiting", (q) => (q.pending_segments || 0) > 0],
   ["held", "Holding a recording", (q) => (q.held_count || 0) > 0],
+  ["blocked", "Blocked", (q) => q.blocked],
   ["revoked", "Revoked", (q) => q.revoked],
 ];
 
@@ -616,7 +618,9 @@ function drawRooms(d) {
     list.sort((a, b) => (b.silent && !b.revoked) - (a.silent && !a.revoked));
     body += list.map((q) => {
       const waits = q.approval === "pending" && !q.revoked;
-      const state = (q.revoked ? tag("quiet", "Revoked")
+      const state = (q.blocked ? tag("bad", "Blocked", q.blocked_reason || "")
+          + `<br><button type="button" class="chip" data-decide="unblock" data-device="${esc(q.device_id)}">Unblock</button>`
+        : q.revoked ? tag("quiet", "Revoked")
         : q.silent ? tag("bad", "Offline") : tag("good", "Online"))
         + (waits ? " " + tag("warn", "Waiting for CMED",
           "Registered itself. Approved when CMED confirms 2 of its recordings, or here.")
@@ -699,9 +703,11 @@ $("rooms").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-decide]");
   if (!b) return;
   const approve = b.dataset.decide === "approve";
-  const who = (window.prompt(`${approve ? "Approve" : "Reject"} this PC. Your name, for the audit log:`) || "").trim();
+  const unblock = b.dataset.decide === "unblock";
+  const who = (window.prompt(`${approve ? "Approve" : unblock ? "Unblock" : "Reject"} this PC. Your name, for the audit log:`) || "").trim();
   if (who.length < 2) return;
-  if (!approve && !window.confirm("Reject and revoke this PC? Anything it recorded that CMED did not confirm is erased on its date.")) return;
+  if (unblock && !window.confirm("Unblock this PC? It becomes pending again, and is approved once CMED confirms two of its new recordings.")) return;
+  if (!approve && !unblock && !window.confirm("Reject and revoke this PC? Anything it recorded that CMED did not confirm is erased on its date.")) return;
   if (!PORTAL && !ADMIN_KEY) await askKey();
   b.disabled = true;
   try {
@@ -1067,6 +1073,10 @@ async function whoAmI() {
       $("peoplePanel").hidden = false;
       $("navPeople").hidden = false;
       loadPeople();
+      $("originsPanel").hidden = false;
+      $("clientsPanel").hidden = false;
+      $("navCmed").hidden = false;
+      loadCmed();
     }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
@@ -1082,6 +1092,127 @@ async function adminCall(method, path, body) {
   if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
   return data;
 }
+
+/* ============================================================
+   CMED: the EHR addresses recorders obey, and each hospital's key.
+   ============================================================ */
+const dhaka = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
+
+async function loadCmed() {
+  try {
+    const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
+    $("origins").innerHTML = !origins.length
+      ? empty("No address trusted yet", "Add CMED's EHR address: until then no recorder obeys any page.", true)
+      : `<table><thead><tr><th>Address</th><th>Note</th><th>Added</th><th>State</th><th></th></tr></thead><tbody>`
+        + origins.map((o) => `<tr class="${o.removed_at ? "" : ""}">`
+          + td("Address", `<code>${esc(o.origin)}</code>`)
+          + td("Note", esc(o.note || ""))
+          + td("Added", `${esc(dhaka(o.added_at))}<br><span class="hint">by ${esc(o.added_by)}</span>`)
+          + td("State", o.removed_at ? tag("quiet", "Removed", `${o.removed_by} · ${dhaka(o.removed_at)}`)
+                                     : tag("good", "Trusted"))
+          + td("", o.removed_at ? "" : `<button type="button" class="chip" data-unorigin="${esc(o.origin)}">Remove</button>`)
+          + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    $("origins").innerHTML = empty("Addresses could not be loaded", err.message, true);
+  }
+  try {
+    const { clients } = await adminCall("GET", "/api/v2/admin/cmed-clients");
+    $("clients").innerHTML = !clients.length
+      ? empty("No hospital connected", "Register CMED's public key for a hospital.", true)
+      : `<table><thead><tr><th>Client id</th><th>Hospital</th><th>Key (kid)</th><th>Last used</th>`
+        + `<th>Valid until</th><th>State</th><th></th></tr></thead><tbody>`
+        + clients.map((c) => {
+          const live = !c.revoked_at;
+          return `<tr class="${live ? "" : ""}">`
+            + td("Client id", `<b><code>${esc(c.client_id)}</code></b><br><span class="hint">${esc(c.label || "")}</span>`)
+            + td("Hospital", esc((c.cmed_hospital_ids || []).join(", ")))
+            + td("Key", (c.kids || []).map((k) => `<code title="Confirm with CMED by phone">${esc(k)}</code>`).join("<br>") || `<span class="hint">none</span>`)
+            + td("Last used", esc(dhaka(c.last_used_at)))
+            + td("Valid until", esc(dhaka(c.expires_at)))
+            + td("State", live ? tag("good", "Active") : tag("quiet", "Revoked"))
+            + td("", live ? `<button type="button" class="chip" data-renew="${esc(c.client_id)}">Renew a year</button> `
+              + `<button type="button" class="chip" data-unclient="${esc(c.client_id)}">Revoke</button>` : "")
+            + `</tr>`;
+        }).join("") + `</tbody></table>`;
+  } catch (err) {
+    $("clients").innerHTML = empty("Connections could not be loaded", err.message, true);
+  }
+}
+
+function adminName() {
+  return (PORTAL && PORTAL.email) || (window.prompt("Your name, for the audit log:") || "").trim();
+}
+
+$("originForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const origin = $("oAddress").value.trim();
+  const by = adminName();
+  if (!origin || by.length < 2) return;
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/trusted-origins", { origin, by, note: $("oNote").value.trim() });
+    $("originMsg").textContent = `${r.origin} is trusted. Every recorder takes it within a minute.`;
+    $("oAddress").value = ""; $("oNote").value = "";
+    loadCmed();
+  } catch (err) { $("originMsg").textContent = `Not done: ${err.message}`; }
+});
+
+$("origins").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-unorigin]");
+  if (!b) return;
+  if (!window.confirm(`Stop trusting ${b.dataset.unorigin}? Recorders refuse that page within a minute.`)) return;
+  const by = adminName();
+  if (by.length < 2) return;
+  try { await adminCall("POST", "/api/v2/admin/trusted-origins/remove", { origin: b.dataset.unorigin, by }); }
+  catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadCmed();
+});
+
+$("cHospital").addEventListener("input", () => {
+  // The rule CMED is told in advance: client id = the hospital code, lower case.
+  $("cClient").value = $("cHospital").value.trim().toLowerCase();
+});
+
+$("clientForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  let jwk;
+  try { jwk = JSON.parse($("cJwk").value); }
+  catch { $("clientMsg").textContent = "The public key is not valid JSON: paste the whole .public.json."; return; }
+  if (jwk.d) { $("clientMsg").textContent = "That is a PRIVATE key. Ask CMED for the public one; tell them to keep this secret."; return; }
+  const by = adminName();
+  if (by.length < 2) return;
+  const hospital = $("cHospital").value.trim();
+  const alg = jwk.crv === "P-256" ? "ES256" : jwk.kty === "RSA" ? "RS384" : "ES384";
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/cmed-client", {
+      client_id: $("cClient").value.trim(), label: `CMED - ${hospital}`,
+      cmed_hospital_ids: [hospital], created_by: by, jwk, alg });
+    $("clientMsg").innerHTML = `Registered. Send CMED: client_id <code>${esc(r.client_id)}</code>, `
+      + `kid <code>${esc(r.kid)}</code>. Before they use it, read the kid to them by phone: `
+      + `their key tool printed the same value.`;
+    $("cJwk").value = "";
+    loadCmed();
+  } catch (err) { $("clientMsg").textContent = `Not registered: ${err.message}`; }
+});
+
+$("clients").addEventListener("click", async (e) => {
+  const renew = e.target.closest("[data-renew]");
+  const revoke = e.target.closest("[data-unclient]");
+  if (!renew && !revoke) return;
+  const by = adminName();
+  if (by.length < 2) return;
+  try {
+    if (renew) {
+      const r = await adminCall("POST", `/api/v2/admin/cmed-client/${encodeURIComponent(renew.dataset.renew)}/renew`,
+        { days: 365, created_by: by });
+      window.alert(`Valid until ${dhaka(r.expires_at)}.`);
+    } else {
+      if (!window.confirm(`Revoke ${revoke.dataset.unclient}? Its key and every live token stop at once: `
+        + "CMED's messages for that hospital are refused until a new key is registered.")) return;
+      await adminCall("POST", `/api/v2/admin/cmed-client/${encodeURIComponent(revoke.dataset.unclient)}/revoke`);
+    }
+  } catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadCmed();
+});
 
 async function loadPeople() {
   try {

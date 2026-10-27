@@ -411,18 +411,141 @@ class V2Repository:
         return result.endswith("1")
 
     async def expire_pending_devices(self, days: int) -> List[Dict[str, Any]]:
-        """Pending this long without CMED confirming two of its recordings: rejected."""
+        """
+        A PC that registered itself and then recorded nothing at all for this
+        many days: let go, so it does not hold one of the clinic's pending
+        places. It never uploaded, so nothing is lost. (A PC that records is
+        judged on evidence instead: block_unconfirmed_pending.)
+        """
         async with self._acquire() as conn:
             rows = await conn.fetch("""
-                UPDATE devices
+                UPDATE devices d
                    SET approval = 'rejected', revoked_at = now(), token_sha256 = NULL,
-                       revoked_reason = 'not confirmed by CMED within '
-                                        || $1::text || ' days of registering'
-                 WHERE approval = 'pending' AND revoked_at IS NULL
-                   AND enrolled_at < now() - make_interval(days => $1)
+                       revoked_reason = 'registered but recorded nothing for '
+                                        || $1::text || ' days'
+                 WHERE d.approval = 'pending' AND d.revoked_at IS NULL
+                   AND d.enrolled_at < now() - make_interval(days => $1)
+                   AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.device_id)
              RETURNING device_id, hospital_id, machine_name
             """, days)
         return [dict(r) for r in rows]
+
+    async def block_unconfirmed_pending(self, *, recordings: int, hours: int,
+                                        grace_minutes: int) -> List[Dict[str, Any]]:
+        """
+        A self-registered PC is blocked only on evidence, never by the clock:
+        CMED's server has been working for its clinic (it sent API 2 or API 3)
+        well after the PC's recordings reached us, and still confirmed none of
+        them - `recordings` of them, or the oldest one `hours` before CMED was
+        last heard from. During an outage CMED is not heard from, so nothing is
+        judged. Its token is kept, so an admin can unblock it in one step.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                WITH judged AS (
+                    SELECT d.device_id, h.cmed_last_message_at AS heard,
+                           count(*) FILTER (WHERE s.confirmation = 'confirmed') AS confirmed,
+                           count(*) FILTER (
+                               WHERE s.confirmation IS DISTINCT FROM 'confirmed'
+                                 AND s.opened_at < h.cmed_last_message_at
+                                                   - make_interval(mins => $3)) AS unheard,
+                           min(s.opened_at) FILTER (
+                               WHERE s.confirmation IS DISTINCT FROM 'confirmed') AS oldest
+                      FROM devices d
+                      JOIN hospitals h ON h.hospital_id = d.hospital_id
+                      JOIN sessions s ON s.device_id = d.device_id AND s.segment_count > 0
+                                     AND s.opened_at >= COALESCE(d.trust_judged_from,
+                                                                 '-infinity'::timestamptz)
+                     WHERE d.approval = 'pending' AND d.revoked_at IS NULL
+                       AND h.cmed_last_message_at IS NOT NULL
+                     GROUP BY d.device_id, h.cmed_last_message_at
+                )
+                UPDATE devices d
+                   SET approval = 'rejected', revoked_at = now(), blocked_at = now(),
+                       revoked_reason = 'blocked: CMED, working for this clinic, confirmed '
+                                        || 'none of its recordings'
+                  FROM judged j
+                 WHERE d.device_id = j.device_id AND j.confirmed = 0
+                   AND (j.unheard >= $1 OR j.oldest < j.heard - make_interval(hours => $2))
+             RETURNING d.device_id, d.hospital_id, d.machine_name
+            """, recordings, hours, grace_minutes)
+        return [dict(r) for r in rows]
+
+    async def unblock_device(self, device_id) -> Optional[Dict[str, Any]]:
+        """
+        An admin's word that a blocked PC is the clinic's own: pending again,
+        with its token, and judged only on what it records from now on.
+        """
+        async with self._acquire() as conn:
+            row = await conn.fetchrow("""
+                UPDATE devices
+                   SET approval = 'pending', revoked_at = NULL, revoked_reason = NULL,
+                       blocked_at = NULL, trust_judged_from = now()
+                 WHERE device_id = $1 AND blocked_at IS NOT NULL
+             RETURNING device_id, hospital_id, machine_name
+            """, device_id)
+        return dict(row) if row else None
+
+    async def cmed_silent_clinics(self, *, window_minutes: int, min_recordings: int,
+                                  repeat_hours: int) -> List[Dict[str, Any]]:
+        """
+        Clinics recording now while CMED's server has sent nothing for them:
+        their recordings will wait unconfirmed. Once per `repeat_hours`.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                UPDATE hospitals h SET cmed_silence_alerted_at = now()
+                 WHERE h.cmed_hospital_id IS NOT NULL
+                   AND (h.cmed_last_message_at IS NULL
+                        OR h.cmed_last_message_at < now() - make_interval(mins => $1))
+                   AND (h.cmed_silence_alerted_at IS NULL
+                        OR h.cmed_silence_alerted_at < now() - make_interval(hours => $3))
+                   AND (SELECT count(*) FROM sessions s
+                         WHERE s.hospital_id = h.hospital_id
+                           AND s.opened_at > now() - make_interval(mins => $1)) >= $2
+             RETURNING h.hospital_id, h.cmed_hospital_id, h.cmed_last_message_at
+            """, window_minutes, min_recordings, repeat_hours)
+        return [dict(r) for r in rows]
+
+    # ---- CMED's EHR addresses, sent to every recorder signed ----
+
+    async def trusted_origins(self, *, include_removed: bool = False) -> List[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT origin, added_by, added_at, note, removed_by, removed_at
+                  FROM cmed_trusted_origins
+                 WHERE $1 OR removed_at IS NULL
+                 ORDER BY removed_at NULLS FIRST, origin
+            """, include_removed)
+        return [dict(r) for r in rows]
+
+    async def trusted_origins_version(self) -> int:
+        """Milliseconds of the last change: grows with every add and removal."""
+        async with self._acquire() as conn:
+            when = await conn.fetchval("""
+                SELECT max(GREATEST(added_at, COALESCE(removed_at, added_at)))
+                  FROM cmed_trusted_origins
+            """)
+        return int(when.timestamp() * 1000) if when else 0
+
+    async def add_trusted_origin(self, origin: str, *, by: str, note: str = "") -> None:
+        async with self._acquire() as conn:
+            await conn.execute("""
+                INSERT INTO cmed_trusted_origins (origin, added_by, note)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (origin) DO UPDATE
+                   SET added_by = EXCLUDED.added_by, added_at = now(), note = EXCLUDED.note,
+                       removed_by = NULL, removed_at = NULL
+                 WHERE cmed_trusted_origins.removed_at IS NOT NULL
+            """, origin, by, note)
+
+    async def remove_trusted_origin(self, origin: str, *, by: str) -> bool:
+        async with self._acquire() as conn:
+            result = await conn.execute("""
+                UPDATE cmed_trusted_origins SET removed_by = $2, removed_at = now()
+                 WHERE origin = $1 AND removed_at IS NULL
+            """, origin, by)
+        return result.endswith(" 1")
 
     async def approvals_to_audit(self) -> List[Dict[str, Any]]:
         """PCs the database approved (two confirmed recordings) not yet in the audit log."""

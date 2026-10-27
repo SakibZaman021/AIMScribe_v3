@@ -60,8 +60,11 @@
 #ifndef DefaultBackend
   #error Build with /DDefaultBackend=https://<the AIMS LAB server> (see BUILD.bat)
 #endif
+; CMED's EHR addresses come from the AIMS LAB server (dashboard -> CMED
+; connections), signed, so every installer is the same for every hospital.
+; /DDefaultOrigin= or /ORIGIN= adds one more, for a development bench only.
 #ifndef DefaultOrigin
-  #error Build with /DDefaultOrigin=https://<CMED's page> (see BUILD.bat)
+  #define DefaultOrigin ""
 #endif
 
 [Setup]
@@ -255,7 +258,7 @@ begin
       'administrator still works. Doctors need nothing: CMED names them.');
 
   ConfigPage.Add('Backend URL:', False);
-  ConfigPage.Add('CMED web address:', False);
+  ConfigPage.Add('Extra CMED web address (leave empty - the server provides it):', False);
   if AlreadyEnrolled() then
     ConfigPage.Add('Enrolment token (leave empty - already enrolled):', False)
   else
@@ -302,11 +305,7 @@ begin
   then
     Result := 'The backend URL must start with https:// - recordings never travel ' +
               'unencrypted.'
-  else if Origin = '' then
-    Result := 'The CMED web address is required (/ORIGIN=https://...). The agent ' +
-              'refuses connections from any other page, so recording cannot start ' +
-              'without it.'
-  else if (Pos('*', Origin) > 0) or (Pos(' ', Origin) > 0) then
+  else if (Origin <> '') and ((Pos('*', Origin) > 0) or (Pos(' ', Origin) > 0)) then
     Result := 'The CMED web address must be exact addresses, with no * or spaces.'
   else if (Token <> '') and (Length(Token) < 20) then
     // A real token is 43 characters. Anything much shorter is a placeholder

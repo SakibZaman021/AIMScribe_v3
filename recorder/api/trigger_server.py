@@ -38,6 +38,10 @@ from api.websocket_server import GrantGuard, WebSocketManager
 
 logger = logging.getLogger(__name__)
 
+# What register_from_trigger's answer starts with when the server could not be
+# reached - not a refusal: the start is tried again until the internet is back.
+OFFLINE = "offline: "
+
 # The rate-limit bucket HTTP starts share (each WebSocket has its own).
 _HTTP_CLIENT = object()
 
@@ -123,6 +127,10 @@ class Runtime:
         except Exception as exc:
             logger.critical("Purge-receipt key unavailable (%s); local audio will never "
                             "be deleted automatically", exc)
+        # CMED's EHR addresses, kept by the server and signed with the same key
+        # under their own domain: loaded from disk now, renewed by the heartbeat.
+        from core import trusted_origins
+        trusted_origins.configure(self.cfg.paths.state_dir, receipt_key)
 
         # The AIMS LAB server's grant key, pinned at install (SRS-GRT-04).
         grant_key = None
@@ -257,12 +265,13 @@ class Runtime:
                              ssl_context=build_ssl_context(self.cfg)),
                     timeout=REGISTER_WAIT_SECONDS)
             except asyncio.TimeoutError:
-                logger.warning("Registration did not finish in %.0f s; the next patient "
-                               "tries again", REGISTER_WAIT_SECONDS)
-                return "the AIMS LAB server did not answer in time"
+                logger.warning("Registration did not finish in %.0f s; tried again "
+                               "shortly", REGISTER_WAIT_SECONDS)
+                return OFFLINE + "the AIMS LAB server did not answer in time"
             except EnrollmentError as exc:
                 logger.error("Registration failed: %s", exc)
-                return exc.code or "the AIMS LAB server could not be reached"
+                # A refusal names its code; anything else is the network.
+                return exc.code or OFFLINE + "the AIMS LAB server could not be reached"
             self.adopt_identity(identity, load_device_token(self.cfg))
             if self.controller is not None:
                 self.controller.register = None
@@ -382,8 +391,13 @@ def create_app(runtime: Runtime) -> FastAPI:
 
     # Exact origins only, and no credentials: the API key is a header, so cookies
     # are never needed and enabling them would widen the attack surface for free.
+    # The list is live: CMED's addresses arrive from the server after start-up.
+    class LiveOriginCORS(CORSMiddleware):
+        def is_allowed_origin(self, origin: str) -> bool:
+            return cfg.security.origin_allowed(origin)
+
     app.add_middleware(
-        CORSMiddleware,
+        LiveOriginCORS,
         allow_origins=sorted(cfg.security.allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],

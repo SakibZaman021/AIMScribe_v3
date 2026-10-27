@@ -383,6 +383,10 @@ dialog::backdrop { background: rgba(8, 10, 12, .55); }
 .peopleform label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px;
                     color: var(--muted); }
 .peopleform input, .peopleform select { min-width: 16rem; max-width: none; }
+.peopleform label.wide { flex-basis: 100%; }
+.peopleform textarea { width: 100%; min-height: 5.5em; font-family: var(--mono, monospace);
+                       font-size: 12px; resize: vertical; }
+@media (max-width: 640px) { .peopleform input, .peopleform select { min-width: 0; width: 100%; } }
 .copy.dl { display: inline-block; text-decoration: none; margin: 1px 2px; white-space: nowrap;
            line-height: 22px; background: var(--surface); border: 1px solid var(--line);
            border-radius: 8px; color: inherit; }

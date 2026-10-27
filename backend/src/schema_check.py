@@ -157,6 +157,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it the dashboard cannot show which microphone each PC records with.
     ("032_v3_microphone.sql", "recordings", "column devices.microphone",
      _column("devices", "microphone")),
+    # Without it recorders cannot be told CMED's EHR addresses.
+    ("033_v3_cmed_connections.sql", "recordings", "table cmed_trusted_origins",
+     _table("cmed_trusted_origins")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

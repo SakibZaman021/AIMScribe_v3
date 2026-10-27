@@ -34,6 +34,7 @@
     <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
     <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
     <a href="#downloads" data-view="downloads" id="navDownloads" hidden><span class="ico ico-dl" aria-hidden="true"></span><span class="label">Downloads</span></a>
+    <a href="#cmed" data-view="cmed" id="navCmed" hidden><span class="ico ico-pc" aria-hidden="true"></span><span class="label">CMED</span></a>
     <a href="#people" data-view="people" id="navPeople" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">People</span></a>
   </nav>
   <div class="side-foot">
@@ -174,6 +175,37 @@
         <div class="head wrap"><h3 id="h-batches">Batches</h3>
           <label class="hint" id="bEveryoneLabel" hidden><input type="checkbox" id="bEveryone"> Everyone's</label></div>
         <div class="scroll short"><div id="bBatches"></div></div>
+      </section>
+    </section>
+
+    <!-- ============================== CMED connections -->
+    <section class="view" data-view="cmed" aria-label="CMED" hidden>
+      <section class="panel" aria-labelledby="h-origins" id="originsPanel" hidden>
+        <div class="head wrap"><h3 id="h-origins">Trusted EHR addresses</h3>
+          <span class="hint">The web addresses of CMED's EHR. Every recorder obeys only these,
+            and takes a change within a minute - nothing is reinstalled.</span></div>
+        <form id="originForm" class="peopleform">
+          <label>Address <input id="oAddress" required autocomplete="off" placeholder="https://emr.cmed.com.bd"></label>
+          <label>Note <input id="oNote" autocomplete="off" placeholder="live EHR / staging"></label>
+          <button type="submit" class="primary">Trust this address</button>
+          <span id="originMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="origins"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-clients" id="clientsPanel" hidden>
+        <div class="head wrap"><h3 id="h-clients">CMED connections</h3>
+          <span class="hint">One per hospital: CMED's public key, which every API 2 and API 3 is
+            checked against. Confirm the key's fingerprint with CMED by phone before
+            registering it.</span></div>
+        <form id="clientForm" class="peopleform clientform">
+          <label>CMED hospital code <input id="cHospital" required autocomplete="off" placeholder="CMED-TEST"></label>
+          <label>Client id <input id="cClient" required autocomplete="off" placeholder="cmed-test"></label>
+          <label class="wide">CMED's public key (JWK, the .public.json they sent)
+            <textarea id="cJwk" rows="4" required spellcheck="false" placeholder='{"kty": "EC", "crv": "P-384", "x": "...", "y": "..."}'></textarea></label>
+          <button type="submit" class="primary">Register</button>
+          <span id="clientMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="clients"></div></div>
       </section>
     </section>
 

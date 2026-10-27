@@ -80,6 +80,11 @@ HOLD_MESSAGES = {
 }
 
 
+def _origins_version() -> int:
+    from core import trusted_origins
+    return trusted_origins.version()
+
+
 # Below this mean level (16-bit RMS, 0-32767) a segment is digital silence: what a
 # muted or dead microphone delivers. A quiet room with a working one measures in
 # the tens; 4 is far under any real room.
@@ -391,6 +396,16 @@ class SessionController:
             register = getattr(self, "register", None)
             if not self.device_id and register is not None:
                 why = await register(trigger.hospital_id)
+                if why is not None and not self.device_id and why.startswith("offline: "):
+                    # No internet at a new PC's first patient: not a refusal. The
+                    # start is tried again every few seconds (as for a busy
+                    # microphone) and records the moment the PC can join.
+                    self._want(trigger.fields())
+                    if not retrying:
+                        self._retry_start_later(trigger)
+                    raise SessionError(
+                        "This new PC is joining the AIMS LAB server. Recording starts by "
+                        "itself as soon as it can reach it.", code="AGENT_NOT_READY")
                 if why is not None and not self.device_id:
                     raise SessionError(
                         "This new PC could not join the AIMS LAB server yet "
@@ -808,6 +823,9 @@ class SessionController:
 
     async def _on_heartbeat_reply(self, reply: Dict[str, Any]) -> None:
         """What the server's heartbeat reply asks of this PC."""
+        if isinstance(reply, dict) and reply.get("trusted_origins"):
+            from core import trusted_origins
+            trusted_origins.apply(reply["trusted_origins"])
         notice = reply.get("prescription_received") if isinstance(reply, dict) else None
         if isinstance(notice, dict) and notice.get("session_id"):
             try:
@@ -1666,6 +1684,8 @@ class SessionController:
             # Which microphone it records with, and whether that is the clinic's
             # speakerphone - shown per PC on the dashboard, kept per recording.
             **self._microphone_report(active),
+            # The list of CMED addresses held: the server sends a newer one.
+            "trusted_origins_version": _origins_version(),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 

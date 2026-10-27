@@ -398,6 +398,8 @@ class HeartbeatRequest(BaseModel):
     # speakerphone (recorder 3.8+).
     microphone: Optional[str] = Field(None, max_length=200)
     microphone_is_clinic: Optional[bool] = None
+    # The version of CMED's address list it holds (recorder 3.8+).
+    trusted_origins_version: Optional[int] = None
 
 
 class ArchivedPart(BaseModel):
@@ -1825,7 +1827,81 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         if ago is not None:
             reply["prescription_received"] = {"session_id": body.session_id,
                                               "seconds_ago": round(ago, 1)}
+    # CMED's EHR addresses, signed, whenever this PC holds an older list.
+    if body.trusted_origins_version is not None and ctx.signer is not None:
+        try:
+            bundle = await _trusted_origins_bundle()
+            if bundle and bundle["payload"]["version"] > body.trusted_origins_version:
+                reply["trusted_origins"] = bundle
+        except Exception as exc:
+            logger.warning("Could not send the trusted origins: %s", exc)
     return reply
+
+
+_ORIGINS_CACHE: Dict[str, Any] = {"version": -1, "bundle": None}
+
+
+async def _trusted_origins_bundle() -> Optional[Dict[str, Any]]:
+    """The signed list, signed once per version rather than once per heartbeat."""
+    repo = _repo()
+    version = await repo.trusted_origins_version()
+    if version == 0:
+        return None
+    if _ORIGINS_CACHE["version"] != version:
+        origins = [r["origin"] for r in await repo.trusted_origins()]
+        _ORIGINS_CACHE.update(version=version, bundle=ctx.signer.sign_trusted_origins(
+            origins=origins, version=version, issued_at=datetime.now(timezone.utc)))
+    return _ORIGINS_CACHE["bundle"]
+
+
+TRUSTED_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+
+
+class TrustedOriginRequest(BaseModel):
+    origin: str = Field(..., min_length=8, max_length=200)
+    by: str = Field(..., min_length=2, max_length=128)
+    note: str = Field("", max_length=300)
+
+
+@router.get("/admin/trusted-origins")
+async def admin_trusted_origins(_: None = Depends(require_admin)):
+    """CMED's EHR addresses every recorder obeys, and the ones removed."""
+    rows = await _repo().trusted_origins(include_removed=True)
+    return {"version": await _repo().trusted_origins_version(),
+            "origins": [{k: (v.isoformat() if isinstance(v, datetime) else v)
+                         for k, v in r.items()} for r in rows]}
+
+
+@router.post("/admin/trusted-origins")
+async def admin_add_trusted_origin(body: TrustedOriginRequest,
+                                   _: None = Depends(require_admin)):
+    """
+    Trust one more CMED EHR address. Every recorder takes it at its next
+    heartbeat (within a minute); nothing is reinstalled. Exact addresses only:
+    scheme, host and port - no path, no wildcard. Plain http only for a test
+    page on a local network; CMED's real EHR is https.
+    """
+    origin = body.origin.strip().rstrip("/").lower()
+    if not TRUSTED_ORIGIN.match(origin):
+        raise HTTPException(status_code=422, detail="an exact address such as "
+                                                    "https://emr.example.com - no path or *")
+    await _repo().add_trusted_origin(origin, by=body.by, note=body.note)
+    await _repo().audit(event_type="trusted_origin.added", actor_type="admin",
+                        actor_id=body.by, detail={"origin": origin, "note": body.note})
+    return {"status": "trusted", "origin": origin,
+            "version": await _repo().trusted_origins_version()}
+
+
+@router.post("/admin/trusted-origins/remove")
+async def admin_remove_trusted_origin(body: TrustedOriginRequest,
+                                      _: None = Depends(require_admin)):
+    origin = body.origin.strip().rstrip("/").lower()
+    if not await _repo().remove_trusted_origin(origin, by=body.by):
+        raise HTTPException(status_code=404, detail="not a trusted address")
+    await _repo().audit(event_type="trusted_origin.removed", actor_type="admin",
+                        actor_id=body.by, detail={"origin": origin})
+    return {"status": "removed", "origin": origin,
+            "version": await _repo().trusted_origins_version()}
 
 
 def min_recorder_version() -> str:
@@ -3691,15 +3767,42 @@ async def _settle_unconfirmed() -> Tuple[int, int, int, int, int]:
                               "v_audio_problems lists them. A legal hold or the admin "
                               "confirm keeps one"})
 
-    rejected = await repo.expire_pending_devices(_env_int("AIMS_PENDING_DEVICE_DAYS", 7))
+    # A self-registered PC is blocked on evidence, never by the clock: CMED's
+    # server was working for its clinic and confirmed none of its recordings.
+    blocked = await repo.block_unconfirmed_pending(
+        recordings=_env_int("AIMS_BLOCK_AFTER_RECORDINGS", 3),
+        hours=_env_int("AIMS_BLOCK_AFTER_HOURS", 24),
+        grace_minutes=_env_int("AIMS_BLOCK_GRACE_MINUTES", 60))
+    for pc in blocked:
+        await repo.audit(event_type="device.blocked", actor_type="service",
+                         actor_id="sweep", device_id=pc["device_id"],
+                         detail={"reason": "CMED, working for this clinic, confirmed none of "
+                                           "its recordings"})
+        await repo.raise_alert(alert_type="device_blocked", severity="warning",
+                               device_id=pc["device_id"],
+                               detail={"hospital_id": pc["hospital_id"],
+                                       "machine_name": pc["machine_name"],
+                                       "next": "unblock it on the dashboard if it is the "
+                                               "clinic's own"})
+    # One that registered and never recorded anything: let go after a month.
+    rejected = await repo.expire_pending_devices(_env_int("AIMS_PENDING_SILENT_DAYS", 30))
     for pc in rejected:
         await repo.audit(event_type="device.rejected", actor_type="service",
                          actor_id="sweep", device_id=pc["device_id"],
-                         detail={"reason": "not confirmed by CMED in time"})
-        await repo.raise_alert(alert_type="device_rejected", severity="warning",
-                               device_id=pc["device_id"],
-                               detail={"hospital_id": pc["hospital_id"],
-                                       "machine_name": pc["machine_name"]})
+                         detail={"reason": "registered but never recorded"})
+    rejected = rejected + blocked
+    # A clinic recording while CMED has gone quiet: its visits wait unconfirmed.
+    for clinic in await repo.cmed_silent_clinics(
+            window_minutes=_env_int("AIMS_CMED_SILENT_MINUTES", 120),
+            min_recordings=2, repeat_hours=6):
+        await repo.raise_alert(
+            alert_type="cmed_silent", severity="warning",
+            detail={"hospital_id": clinic["hospital_id"],
+                    "cmed_hospital_id": clinic["cmed_hospital_id"],
+                    "last_heard": clinic["cmed_last_message_at"].isoformat()
+                    if clinic["cmed_last_message_at"] else None,
+                    "reason": "recording, but CMED's server has sent nothing for this "
+                              "clinic: its recordings wait unconfirmed"})
     approved = await repo.approvals_to_audit()
     for pc in approved:
         await repo.audit(event_type="device.approved", actor_type="service",
@@ -3926,6 +4029,24 @@ async def admin_move_device(device_id: str, body: DeviceMove,
     forget_directory()
     return {"status": "moved", "device_id": str(did), "from": was, "to": hospital_id,
             "register_again": body.register_again}
+
+
+@router.post("/admin/device/{device_id}/unblock")
+async def admin_unblock_device(device_id: str, body: DeviceDecision,
+                               _: None = Depends(require_admin)):
+    """
+    A PC the sweep blocked that is the clinic's own after all (CMED had a
+    problem with its visits): pending again with its own token, judged only on
+    what it records from now on. Two confirmed recordings approve it.
+    """
+    did = _device_uuid(device_id)
+    row = await _repo().unblock_device(did)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no blocked PC with that id")
+    await _repo().audit(event_type="device.unblocked", actor_type="admin",
+                        actor_id=body.decided_by, device_id=did,
+                        detail={"reason": body.reason})
+    return {"status": "pending", "device_id": str(did)}
 
 
 class ConfirmRequest(BaseModel):

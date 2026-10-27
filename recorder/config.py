@@ -366,7 +366,12 @@ class SecurityConfig:
     def origin_allowed(self, origin: Optional[str]) -> bool:
         # A missing or literal "null" Origin is rejected: sandboxed iframes and
         # non-browser clients both present it, and neither should drive a recording.
-        return bool(origin) and origin in self.allowed_origins
+        # CMED's addresses come from the AIMS LAB server (core.trusted_origins);
+        # any set at install are honoured too, for a development bench.
+        if not origin:
+            return False
+        from core import trusted_origins
+        return origin in self.allowed_origins or trusted_origins.allowed(origin)
 
     def host_allowed(self, host: Optional[str]) -> bool:
         return bool(host) and host.lower() in self.allowed_hosts
@@ -521,9 +526,8 @@ class Config:
         """
         problems: List[str] = []
 
-        if not self.security.allowed_origins:
-            problems.append(
-                "AIMS_ALLOWED_ORIGINS is empty - no browser origin may start a recording.")
+        # An empty AIMS_ALLOWED_ORIGINS is normal: CMED's addresses come from the
+        # AIMS LAB server (core.trusted_origins), so no installer is told them.
         if any("*" in origin for origin in self.security.allowed_origins):
             problems.append("AIMS_ALLOWED_ORIGINS must list exact origins; wildcards are not allowed.")
         if not self.security.local_api_key or self.security.local_api_key.startswith("change-me"):

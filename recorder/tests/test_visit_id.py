@@ -275,3 +275,46 @@ async def test_the_heartbeat_says_which_microphone_records(monkeypatch, spool, d
     ctl._active.recorder.device_name = "Microphone Array (2- Realtek(R) Audio)"
     assert ctl._microphone_report(ctl._active)["microphone_is_clinic"] is False
     await ctl.close()
+
+
+# ---------------------------------------------------------------- a new PC, offline
+
+async def test_a_new_pc_without_internet_records_once_it_can_join(monkeypatch, spool,
+                                                                   device_key):
+    """The first patient arrives before the internet: retried, never refused."""
+    ctl = ctl_with(monkeypatch, spool, device_key, start_retry_seconds=0.05)
+    ctl.device_id = ""
+    online = {"up": False}
+
+    async def register(hospital):
+        if not online["up"]:
+            return "offline: the AIMS LAB server could not be reached"
+        ctl.device_id = "DEV1"
+        return None
+
+    ctl.register = register
+    from core.session_controller import SessionError
+    with pytest.raises(SessionError) as err:
+        await ctl.open_session(visit("VIS-A"))
+    assert err.value.code == "AGENT_NOT_READY"          # not DEVICE_NOT_ENROLLED
+    online["up"] = True
+    assert await wait_for(lambda: ctl.state == "recording", 3.0)
+    assert ctl._active.visit_id == "VIS-A"
+    await ctl.close()
+
+
+async def test_a_refused_registration_is_not_retried(monkeypatch, spool, device_key):
+    ctl = ctl_with(monkeypatch, spool, device_key, start_retry_seconds=0.05)
+    ctl.device_id = ""
+
+    async def register(hospital):
+        return "OTHER_CLINIC"
+
+    ctl.register = register
+    from core.session_controller import SessionError
+    with pytest.raises(SessionError) as err:
+        await ctl.open_session(visit("VIS-A"))
+    assert err.value.code == "DEVICE_NOT_ENROLLED"
+    await asyncio.sleep(0.3)
+    assert ctl.state != "recording"
+    await ctl.close()

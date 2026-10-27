@@ -9,7 +9,7 @@ REM
 REM   Release:  set AIMS_SIGN_PROVIDER=azure ^| thumbprint ^| signpath
 REM             (and its settings - see signing\sign.ps1 and INSTALL_FOR_IT.md)
 REM             set AIMS_BACKEND=https://<the AIMS LAB server>
-REM             set AIMS_ORIGIN=https://<CMED's page>
+REM             (optional) set AIMS_ORIGIN=https://<a bench page> - CMED's come from the server
 REM             BUILD.bat
 REM
 REM   Dev only: set DEV_UNSIGNED=1   (prints a warning; never give it out)
@@ -50,10 +50,8 @@ if "%AIMS_BACKEND%"=="" (
     echo ERROR: set AIMS_BACKEND=https://^<the AIMS LAB server^> - new PCs are pointed at it.
     goto :fail
 )
-if "%AIMS_ORIGIN%"=="" (
-    echo ERROR: set AIMS_ORIGIN=https://^<CMED's page^> - the only page allowed to start a recording.
-    goto :fail
-)
+REM AIMS_ORIGIN is optional: CMED's EHR addresses come from the AIMS LAB server,
+REM so one installer serves every hospital. Set it only for a development bench.
 
 echo [1/9] Installing pinned dependencies (hashes checked)...
 python -m pip install --disable-pip-version-check -q --require-hashes -r requirements.lock

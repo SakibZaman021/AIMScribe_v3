@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 # MUST match recorder/core/crypto.py exactly.
 CHAIN_DOMAIN = b"aimscribe.chain.v2"
 RECEIPT_DOMAIN = b"aimscribe.receipt.v2"
+# The list of CMED's EHR addresses recorders obey: signed with the receipt key,
+# under a domain of its own, so a list can never pass for a receipt.
+ORIGINS_DOMAIN = b"aimscribe.trusted-origins.v1"
 AUDIT_DOMAIN = b"aimscribe.audit.v2"
 
 # "reassign" moves the recording to the patient the prescription was built for,
@@ -513,6 +516,13 @@ class ReceiptSigner:
 
     def _sign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         signature = self._key.sign(digest(RECEIPT_DOMAIN, canonical_json(payload)))
+        return {"payload": payload, "signature": signature.hex()}
+
+    def sign_trusted_origins(self, *, origins: List[str], version: int,
+                             issued_at: datetime) -> Dict[str, Any]:
+        payload = {"scope": "trusted_origins", "origins": sorted(origins),
+                   "version": version, "issued_at": iso_utc(issued_at)}
+        signature = self._key.sign(digest(ORIGINS_DOMAIN, canonical_json(payload)))
         return {"payload": payload, "signature": signature.hex()}
 
 

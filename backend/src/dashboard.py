@@ -249,7 +249,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
         SELECT device_id, hospital_id, machine_name, app_version,
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
-               approval, registered_via, microphone, microphone_is_clinic
+               approval, registered_via, microphone, microphone_is_clinic,
+               blocked_at, revoked_reason
           FROM devices
          WHERE ($1::text IS NULL OR hospital_id = $1)
          ORDER BY hospital_id, machine_name
@@ -300,6 +301,9 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             # 3.8: the microphone it records with, and whether it is the Jabra.
             "microphone": row["microphone"],
             "microphone_is_clinic": row["microphone_is_clinic"],
+            # 033: blocked by the sweep on evidence; an admin may unblock it.
+            "blocked": row["blocked_at"] is not None,
+            "blocked_reason": row["revoked_reason"] if row["blocked_at"] else None,
         })
         if is_silent:
             silent += 1

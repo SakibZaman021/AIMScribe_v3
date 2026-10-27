@@ -71,6 +71,16 @@ def keygen(out: Path) -> Tuple[Path, Dict[str, Any]]:
     return key_file, public
 
 
+def kid_of(public_jwk: Dict[str, Any]) -> str:
+    """The key's id, as AIMS LAB's server computes it (RFC 7638 thumbprint)."""
+    import base64
+    import hashlib
+    members = {"EC": ("crv", "kty", "x", "y"), "RSA": ("e", "kty", "n")}[public_jwk["kty"]]
+    canonical = json.dumps({m: public_jwk[m] for m in members}, separators=(",", ":"),
+                           sort_keys=True)
+    return base64.urlsafe_b64encode(hashlib.sha256(canonical.encode()).digest())         .decode().rstrip("=")
+
+
 def assertion(private_pem: bytes, kid: str, client_id: str, audience: str) -> str:
     import jwt
     now = int(time.time())
@@ -403,6 +413,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+    kd = sub.add_parser("kid", help="print the kid of a public key (.public.json)")
+    kd.add_argument("jwk", type=Path)
     k = sub.add_parser("keygen", help="make one hospital's key pair")
     k.add_argument("--out", required=True, type=Path, help="path prefix for the two files")
     r = sub.add_parser("register", help="AIMS LAB: register a hospital's public key")
@@ -428,6 +440,10 @@ def main(argv=None) -> int:
         key_file, public = keygen(args.out)
         print(f"Private key (stays on CMED's server, never sent): {key_file}")
         print(f"Public key for AIMS LAB to register: {args.out.with_suffix('.public.json')}")
+        print(f"Your kid (AIMS LAB reads the same value back to you): {kid_of(public)}")
+        return 0
+    if args.command == "kid":
+        print(kid_of(json.loads(args.jwk.read_text(encoding="utf-8"))))
         return 0
     if args.command == "register":
         admin = os.getenv(args.admin_key_env, "")
