@@ -147,7 +147,6 @@ class Overlay:
         self.canvas = None
         self._pause_text = "Pause"
         self._height = HEIGHT
-        self._quiet_ticks = 0
 
     # ---- lifecycle ----
 
@@ -430,22 +429,17 @@ class Overlay:
         """
         The one line the card is allowed to say.
 
-        A silent microphone comes first. It is the only fault that is invisible
-        until somebody plays the recording back, by which time the consultation
-        is over, so it outranks anything else waiting to be said.
+        Whatever the recorder has to say (view.note). A pause is never a fault.
         """
-        level = float(status.get("level", 0.0) or 0.0)
-        if recording and not paused:
-            self._quiet_ticks = self._quiet_ticks + 1 if level < 0.02 else 0
-        else:
-            self._quiet_ticks = 0
-        if self._quiet_ticks >= 8:                  # about two seconds of nothing
-            return "no sound from the microphone"
+        # Silence is not a fault: a consultation has long pauses, and a quiet
+        # voice is still a voice. Only a microphone that gives no signal at all
+        # is reported (the recorder's silent_session, in view.note); the level
+        # meter shows the sound itself.
         return view.note or ""
 
     @staticmethod
     def _note_colour(note: str) -> str:
-        if "no sound" in note:
+        if "no signal" in note:
             return RED
         if "Confirmed" in note:
             return TEAL

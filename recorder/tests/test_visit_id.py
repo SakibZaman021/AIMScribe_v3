@@ -10,6 +10,8 @@ arrived, and the recording ends at a pause about two minutes later.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from api import protocol
@@ -149,4 +151,127 @@ async def test_the_page_is_told_which_visit_records_and_which_it_closed(
     closed = nxt["data"]["closed_previous"]
     assert (closed["session_id"], closed["visit_id"]) == (first["data"]["session_id"], "VIS-A")
     assert closed["ended_at"] and nxt["data"]["visit_id"] == "VIS-B"
+    await ctl.close()
+
+
+# ---------------------------------------------------------------- API 1 over HTTP
+
+async def test_api1_over_http_is_the_websocket_start_with_the_same_origin_rule(
+        monkeypatch, spool, device_key, make_security):
+    """Postman's collections cannot carry a WebSocket; the HTTP start is the same command."""
+    from types import SimpleNamespace
+    import httpx
+    from api import websocket_server
+    from api.trigger_server import create_app
+    from api.websocket_server import WebSocketManager
+
+    monkeypatch.setattr(websocket_server, "_same_windows_session", lambda request: True)
+    ctl = ctl_with(monkeypatch, spool, device_key)
+    security = make_security()
+    origin = sorted(security.allowed_origins)[0]
+    cfg = SimpleNamespace(security=security, app_version="3.8.0")
+    ws = WebSocketManager(cfg)
+    ws.set_controller(ctl)
+
+    async def nothing():
+        return None
+
+    runtime = SimpleNamespace(cfg=cfg, ws=ws, controller=ctl, startup=nothing,
+                              shutdown=nothing, health=lambda: {"status": "ok"})
+    app = create_app(runtime)
+    transport = httpx.ASGITransport(app=app)
+
+    def body(visit_id, patient, second):
+        return {"request_id": f"h-{visit_id}", "trigger": {
+            "visit_id": visit_id, "patient_id": patient, "doctor_id": "DR0042",
+            "hospital_id": "CMED-DHK-BANANI-01", "start_time": at(0, second),
+            "date": "2026-09-13"}}
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:5050") as http:
+        url = "/api/v1/session/start"
+        # No Origin, or one not registered: refused, nothing recorded.
+        r = await http.post(url, json=body("VIS-A", "P1", 0))
+        assert r.status_code == 403 and r.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
+        r = await http.post(url, json=body("VIS-A", "P1", 0),
+                            headers={"Origin": "https://evil.example"})
+        assert r.status_code == 403 and ctl.state != "recording"
+
+        first = await http.post(url, json=body("VIS-A", "P1", 0), headers={"Origin": origin})
+        assert first.status_code == 200, first.text
+        assert first.json()["code"] == "RECORDING_STARTED"
+        assert first.json()["request_id"] == "h-VIS-A"
+        assert first.json()["data"]["visit_id"] == "VIS-A"
+
+        nxt = await http.post(url, json=body("VIS-B", "P2", 30), headers={"Origin": origin})
+        closed = nxt.json()["data"]["closed_previous"]
+        assert closed["visit_id"] == "VIS-A"
+        assert closed["session_id"] == first.json()["data"]["session_id"]
+
+        bad = await http.post(url, json=body("VIS_C", "P3", 40), headers={"Origin": origin})
+        assert bad.status_code == 400 and bad.json()["code"] == "INVALID_IDENTIFIER"
+    await ctl.close()
+
+
+async def test_a_start_overtaken_while_it_waits_for_the_server_still_gets_its_reply(
+        monkeypatch, spool, device_key):
+    """
+    Two patients opened a second apart: the first start is still waiting for the
+    server's grant when the second ends its recording. The first must answer,
+    not drop the page's connection (found on a live run, 27 Oct).
+    """
+    from core.session_controller import SessionController  # noqa: F401
+    from core.uploader import AuthOutcome
+    from tests.fakes import ScriptedUploader, make_controller
+    granted = AuthOutcome("granted", "GRANTED", "", None, "confirmed")
+    ctl = make_controller(monkeypatch, spool, device_key,
+                          ScriptedUploader([granted, granted], delay=1.0),
+                          authorise_wait_seconds=1.5, limit_poll_seconds=0.01)
+    first = asyncio.create_task(ctl.open_session(visit("VIS-A", "P1")))
+    await asyncio.sleep(0.2)
+    second = await ctl.open_session(visit("VIS-B", "P2", at(0, 30)))
+    answered = await asyncio.wait_for(first, 3)
+    assert answered["status"] == "recording" and answered["visit_id"] == "VIS-A"
+    assert second["previous_visit_id"] == "VIS-A"
+    assert ctl._active.visit_id == "VIS-B"
+    await ctl.close()
+
+
+# ---------------------------------------------------------------- the microphone
+
+def test_the_jabra_is_found_under_the_name_windows_cuts_short(monkeypatch):
+    """MME lists 'Echo Cancelling Speakerphone (J'; Windows' full name has 'Jabra'."""
+    from core import microphone
+    from core.recorder import AudioRecorder
+    monkeypatch.setattr(microphone, "endpoint_names", lambda: [
+        "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)",
+        "Microphone Array (2- Realtek(R) Audio)"])
+
+    class Handle:
+        devices = [{"name": "Microsoft Sound Mapper - Input", "maxInputChannels": 2, "hostApi": 0},
+                   {"name": "Microphone Array (2- Realtek(R)", "maxInputChannels": 2, "hostApi": 0},
+                   {"name": "Echo Cancelling Speakerphone (J", "maxInputChannels": 1, "hostApi": 0}]
+
+        def get_default_host_api_info(self):
+            return {"index": 0}
+
+        def get_device_count(self):
+            return len(self.devices)
+
+        def get_device_info_by_index(self, i):
+            return self.devices[i]
+
+    assert AudioRecorder._find(Handle(), "Jabra") == 2
+    assert AudioRecorder._name_of(Handle(), 2) == "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"
+    assert not microphone.same_device("Echo", "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)")
+
+
+async def test_the_heartbeat_says_which_microphone_records(monkeypatch, spool, device_key):
+    ctl = ctl_with(monkeypatch, spool, device_key)
+    await ctl.open_session(visit("VIS-A"))
+    ctl.cfg.audio.preferred_microphone = "Jabra"
+    ctl._active.recorder.device_name = "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"
+    beat = ctl._microphone_report(ctl._active)
+    assert beat["microphone"].startswith("Echo Cancelling") and beat["microphone_is_clinic"] is True
+    ctl._active.recorder.device_name = "Microphone Array (2- Realtek(R) Audio)"
+    assert ctl._microphone_report(ctl._active)["microphone_is_clinic"] is False
     await ctl.close()

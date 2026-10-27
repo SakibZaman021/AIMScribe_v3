@@ -343,3 +343,27 @@ async def test_a_grant_remembers_the_visit_id(cmed):
         jti=jti, device_id=cmed.device["device_id"], hospital_id="HOSP003", visit=visit,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=1), visit_id="VIS1001")
     assert (await cmed.dbs.repo.get_authorisation(jti))["visit_id"] == "VIS1001"
+
+
+@postgres
+async def test_the_heartbeat_keeps_which_microphone_records(cmed):
+    sid = uuid.uuid4().hex[:26].upper()
+    opened = datetime.now(timezone.utc) - timedelta(minutes=2)
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                  protocol_version, status, session_date, opened_at)
+            VALUES ($1, 'P1', 'DR0042', 'HOSP003', $2, 2, 'active', $3, $4)
+        """, sid, cmed.device["device_id"], opened.date(), opened)
+    jabra = "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"
+    laptop = "Microphone Array (2- Realtek(R) Audio)"
+    for mic, clinic in ((jabra, True), (jabra, True), (laptop, False)):
+        await api_v2.heartbeat(api_v2.HeartbeatRequest(
+            device_id=str(cmed.device["device_id"]), session_id=sid, microphone=mic,
+            microphone_is_clinic=clinic), device=cmed.device)
+    async with cmed.dbs.rec.acquire() as conn:
+        device = await conn.fetchrow("SELECT microphone, microphone_is_clinic FROM devices "
+                                     "WHERE device_id = $1", cmed.device["device_id"])
+        used = await conn.fetchval("SELECT microphones FROM sessions WHERE session_id = $1", sid)
+    assert (device["microphone"], device["microphone_is_clinic"]) == (laptop, False)
+    assert list(used) == [jabra, laptop]               # each once, in the order used

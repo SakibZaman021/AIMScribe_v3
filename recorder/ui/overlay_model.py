@@ -121,6 +121,12 @@ class OverlayState:
         if event in NOTES and session_id in (None, self.session_id):
             self.note = NOTES[event]
             return
+        if event == "sound_restored" and session_id in (None, self.session_id):
+            # Sound is back: the warning goes, and may come again if it stops.
+            self.shown.discard("silent_session")
+            if self.note.startswith("Microphone gives no signal"):
+                self.note = ""
+            return
         if event == "session_refused":
             self._say("Recording stopped and deleted - the patient did not consent.")
             return
@@ -133,7 +139,7 @@ class OverlayState:
                 return
             if kind == "silent_session":
                 self.shown.add(kind)
-                self.note = "The microphone may be muted or unplugged."
+                self.note = "Microphone gives no signal - is it muted?"
             elif kind in ("microphone_unavailable", "capture_failed"):
                 self.shown.add(kind)
                 self.note = "The microphone is not working. Check that it is connected."

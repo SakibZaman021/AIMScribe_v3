@@ -249,7 +249,7 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
         SELECT device_id, hospital_id, machine_name, app_version,
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
-               approval, registered_via
+               approval, registered_via, microphone, microphone_is_clinic
           FROM devices
          WHERE ($1::text IS NULL OR hospital_id = $1)
          ORDER BY hospital_id, machine_name
@@ -297,6 +297,9 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             "clock_offset_seconds": round(float(offset), 1) if offset is not None else None,
             # V2: below the build every PC should run.
             "outdated": api_v2.recorder_outdated(row["app_version"]),
+            # 3.8: the microphone it records with, and whether it is the Jabra.
+            "microphone": row["microphone"],
+            "microphone_is_clinic": row["microphone_is_clinic"],
         })
         if is_silent:
             silent += 1

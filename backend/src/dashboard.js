@@ -548,6 +548,7 @@ const PC_FILTERS = [
   ["offline", "Offline", (q) => q.silent && !q.revoked],
   ["outdated", "Needs update", (q) => q.outdated && !q.revoked],
   ["unencrypted", "Disk not encrypted", (q) => q.disk_encrypted === false && !q.revoked],
+  ["microphone", "Not on the Jabra", (q) => q.microphone_is_clinic === false && !q.revoked],
   ["holding", "Audio waiting", (q) => (q.pending_segments || 0) > 0],
   ["held", "Holding a recording", (q) => (q.held_count || 0) > 0],
   ["revoked", "Revoked", (q) => q.revoked],
@@ -604,7 +605,7 @@ function drawRooms(d) {
     if (!groups.has(q.hospital_id)) groups.set(q.hospital_id, []);
     groups.get(q.hospital_id).push(q);
   });
-  const COLS = 9;
+  const COLS = 10;
   let body = "";
   groups.forEach((list, hid) => {
     const live = list.filter((q) => !q.revoked);
@@ -628,6 +629,9 @@ function drawRooms(d) {
       const disk = q.disk_encrypted === true ? tag("good", "Encrypted")
         : q.disk_encrypted === false ? tag("bad", "Not encrypted")
         : `<span class="hint">not reported</span>`;
+      const mic = !q.microphone ? `<span class="hint">not reported</span>`
+        : q.microphone_is_clinic ? tag("good", "Jabra", q.microphone)
+        : tag("warn", "PC microphone", `${q.microphone} - the Jabra is not plugged in`);
       const off = q.clock_offset_seconds;
       const clock = off == null ? `<span class="hint">–</span>`
         : Math.abs(off) >= 120 ? tag("warn", `${off > 0 ? "+" : ""}${num(off)} s`, "Server time minus PC time")
@@ -640,7 +644,8 @@ function drawRooms(d) {
         : `<span class="hint">0 · ${num(q.spool_mb)} MB</span>`;
       const rowTone = q.revoked ? "" : q.silent || q.held_count ? "row-bad"
         : waits ? "row-warn"
-        : q.outdated || q.disk_encrypted === false ? "row-warn" : "";
+        : q.outdated || q.disk_encrypted === false || q.microphone_is_clinic === false
+          ? "row-warn" : "";
       return `<tr class="${rowTone}">`
         + td("PC", `<b>${esc(q.machine_name || String(q.device_id).slice(0, 8))}</b>`)
         + td("State", state)
@@ -648,6 +653,7 @@ function drawRooms(d) {
         + td("Version", version)
         + td("Audio waiting", waiting, "num")
         + td("Held", held, "num")
+        + td("Microphone", mic)
         + td("Disk", disk)
         + td("Clock", clock, "num")
         + td("Offline (7 days)", offlineText(q.offline_periods))
@@ -655,7 +661,7 @@ function drawRooms(d) {
     }).join("");
   });
   $("rooms").innerHTML = `<table><thead><tr><th>PC</th><th>State</th><th>Last seen</th>`
-    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Disk</th>`
+    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th>`
     + `<th class="num">Clock</th><th>Offline (7 days)</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 

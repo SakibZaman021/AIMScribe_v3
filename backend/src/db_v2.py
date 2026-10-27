@@ -417,6 +417,7 @@ class V2Repository:
         held_sessions: Optional[List[Dict[str, Any]]] = None,
         held_count: Optional[int] = None, disk_encrypted: Optional[bool] = None,
         clock_offset_seconds: Optional[float] = None,
+        microphone: Optional[str] = None, microphone_is_clinic: Optional[bool] = None,
     ) -> None:
         """
         One heartbeat. Fields an older recorder does not send are left as
@@ -434,11 +435,25 @@ class V2Repository:
                        held_sessions = COALESCE($5::jsonb, held_sessions),
                        held_count = COALESCE($6, held_count),
                        disk_encrypted = COALESCE($7, disk_encrypted),
-                       clock_offset_seconds = COALESCE($8, clock_offset_seconds)
+                       clock_offset_seconds = COALESCE($8, clock_offset_seconds),
+                       microphone = COALESCE($9, microphone),
+                       microphone_is_clinic = COALESCE($10, microphone_is_clinic)
                  WHERE device_id = $1
             """, device_id, spool_bytes, pending_segments, app_version,
                  json.dumps(held_sessions) if held_sessions is not None else None,
-                 held_count, disk_encrypted, clock_offset_seconds)
+                 held_count, disk_encrypted, clock_offset_seconds, microphone,
+                 microphone_is_clinic)
+
+    async def note_session_microphone(self, device_id, session_id: str,
+                                      microphone: str) -> None:
+        """A microphone this PC's open recording used; each name kept once, in order."""
+        async with self._acquire() as conn:
+            await conn.execute("""
+                UPDATE sessions
+                   SET microphones = array_append(COALESCE(microphones, '{}'), $3)
+                 WHERE session_id = $1 AND device_id = $2 AND closed_at IS NULL
+                   AND NOT ($3 = ANY(COALESCE(microphones, '{}')))
+            """, session_id, device_id, microphone)
 
     async def use_device_nonce(self, device_id, nonce: str) -> bool:
         """

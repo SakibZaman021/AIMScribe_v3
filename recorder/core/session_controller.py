@@ -80,6 +80,12 @@ HOLD_MESSAGES = {
 }
 
 
+# Below this mean level (16-bit RMS, 0-32767) a segment is digital silence: what a
+# muted or dead microphone delivers. A quiet room with a working one measures in
+# the tens; 4 is far under any real room.
+DIGITAL_SILENCE_RMS = 4.0
+
+
 class SessionError(RuntimeError):
     """
     A session request that must be refused, with a reason safe to show a user.
@@ -630,6 +636,15 @@ class SessionController:
             try:
                 outcome = await asyncio.wait_for(asyncio.shield(auth_task), timeout=wait)
             except asyncio.TimeoutError:
+                outcome = None
+            except asyncio.CancelledError:
+                # The next patient was opened during this wait: closing this
+                # recording cancelled its grant request. This start still gets
+                # its answer - it did record - rather than a dropped connection.
+                # Only a cancellation of this call itself is passed on.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
                 outcome = None
             # A "no" here no longer stops anything: the recording carries on,
             # is kept on this PC, and is asked about again (see _authorise_live).
@@ -1455,11 +1470,14 @@ class SessionController:
             is_final=sealed.is_final,
         )
 
-        # A run of segments at the noise floor usually means a muted, unplugged or
-        # physically covered microphone. Raised once per session, and only after
-        # two consecutive silent segments: a single quiet clip is unremarkable, and
-        # an alert per segment is noise nobody reads.
-        if sealed.rms_mean < (self.cfg.segment.silence_rms / 4):
+        # Only a microphone that gives no signal at all is a fault. A working one
+        # always hears the room - a fan, the street, a breath - so its level never
+        # reaches true digital silence, however long nobody speaks; a muted or
+        # dead one delivers zeros. Quiet speech and long pauses are a consultation,
+        # not a fault, and are never reported (the old noise-floor test warned
+        # while the doctor was talking into a laptop microphone). Two segments
+        # in a row, and cleared the moment sound comes back.
+        if sealed.rms_mean < DIGITAL_SILENCE_RMS:
             sink.consecutive_silent += 1
             if sink.consecutive_silent >= 2 and not sink.silence_alerted:
                 sink.silence_alerted = True
@@ -1467,11 +1485,14 @@ class SessionController:
                     "session_id": spool.session_id,
                     "seq_no": segment.seq_no,
                     "alert_type": "silent_session",
-                    "detail": (f"{sink.consecutive_silent} consecutive segments at the "
-                               f"noise floor (mean RMS {sealed.rms_mean:.1f}) - check that "
-                               f"the microphone is connected and not muted"),
+                    "detail": (f"{sink.consecutive_silent} consecutive segments of digital "
+                               f"silence (mean RMS {sealed.rms_mean:.1f}): the microphone "
+                               f"gives no signal - muted, or not working"),
                 })
         else:
+            if sink.silence_alerted:
+                sink.silence_alerted = False
+                self._emit("sound_restored", {"session_id": spool.session_id})
             sink.consecutive_silent = 0
 
         if self._loop is not None:
@@ -1592,6 +1613,22 @@ class SessionController:
             except Exception as exc:
                 logger.debug("Heartbeat failed: %s", exc)
 
+    def _microphone_report(self, active) -> Dict[str, Any]:
+        """The open recording's microphone, else the one Windows would record with."""
+        name = getattr(getattr(active, "recorder", None), "device_name", "") if active else ""
+        if not name or name == "microphone":
+            try:
+                from core.microphone import current
+                found = current()
+                name = found.name if found else ""
+            except Exception:
+                name = ""
+        if not name:
+            return {}
+        preferred = getattr(getattr(self.cfg, "audio", None), "preferred_microphone", "") or ""
+        return {"microphone": name[:200],
+                "microphone_is_clinic": bool(preferred) and preferred.lower() in name.lower()}
+
     def heartbeat_payload(self) -> Dict[str, Any]:
         upload = self._uploader.status()
         active = self._active
@@ -1622,6 +1659,9 @@ class SessionController:
             # BitLocker on the drive holding the audio: true, false, or unknown.
             "disk_encrypted": self._drive.encrypted,
             "disk_free_bytes": self._drive.free_bytes(),
+            # Which microphone it records with, and whether that is the clinic's
+            # speakerphone - shown per PC on the dashboard, kept per recording.
+            **self._microphone_report(active),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 

@@ -394,6 +394,10 @@ class HeartbeatRequest(BaseModel):
     held_count: Optional[int] = Field(None, ge=0)
     # BitLocker on the drive holding the PC's audio; None when unknown (X1).
     disk_encrypted: Optional[bool] = None
+    # The microphone it records with now, and whether that is the clinic's
+    # speakerphone (recorder 3.8+).
+    microphone: Optional[str] = Field(None, max_length=200)
+    microphone_is_clinic: Optional[bool] = None
 
 
 class ArchivedPart(BaseModel):
@@ -1790,7 +1794,15 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         else (len(held) if held is not None else None),
         disk_encrypted=body.disk_encrypted,
         clock_offset_seconds=body.clock_offset_seconds,
+        microphone=body.microphone or None,
+        microphone_is_clinic=body.microphone_is_clinic,
     )
+    if body.session_id and body.microphone:
+        try:
+            await _repo().note_session_microphone(device["device_id"],
+                                                  str(body.session_id)[:64], body.microphone)
+        except Exception as exc:
+            logger.warning("Could not note the recording's microphone: %s", exc)
     await _check_recorder(device, body)
     if body.spool_pressure == "critical":
         await _repo().raise_alert(

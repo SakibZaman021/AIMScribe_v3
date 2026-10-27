@@ -263,9 +263,18 @@ class AudioRecorder:
 
     @staticmethod
     def _find(handle, name: str) -> Optional[int]:
-        """The input device whose name contains `name`, on the default host API."""
+        """
+        The input device that is `name` ("Jabra"), on the default host API.
+
+        That API (MME) cuts device names to 31 characters, so the Jabra Speak2
+        55 is listed as "Echo Cancelling Speakerphone (J" and the word Jabra is
+        gone. Each listed name is therefore matched against Windows' full names
+        too (core.microphone): the cut name is the start of the full one.
+        """
         if not name:
             return None
+        from core.microphone import endpoint_names, same_device
+        wanted = [full for full in endpoint_names() if name.lower() in full.lower()]
         try:
             host = handle.get_default_host_api_info()["index"]
         except Exception:
@@ -279,20 +288,25 @@ class AudioRecorder:
                 info = handle.get_device_info_by_index(i)
             except Exception:
                 continue
+            listed = str(info.get("name", ""))
             if (int(info.get("maxInputChannels", 0)) > 0
                     and (host is None or info.get("hostApi") == host)
-                    and name.lower() in str(info.get("name", "")).lower()):
+                    and (name.lower() in listed.lower()
+                         or any(same_device(listed, full) for full in wanted))):
                 return i
         return None
 
     @staticmethod
     def _name_of(handle, index: Optional[int]) -> str:
+        """The device's full Windows name where it can be found, else the listed one."""
         try:
             info = (handle.get_default_input_device_info() if index is None
                     else handle.get_device_info_by_index(index))
-            return str(info.get("name", "microphone"))
+            listed = str(info.get("name", "microphone"))
         except Exception:
             return "microphone"
+        from core.microphone import endpoint_names, same_device
+        return next((full for full in endpoint_names() if same_device(listed, full)), listed)
 
     def _launch(self) -> None:
         """A capture thread for the current stream. Called with the state lock held."""

@@ -19,6 +19,7 @@ doctor visited:
 """
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -36,6 +37,9 @@ from core.uploader import UploadManager
 from api.websocket_server import GrantGuard, WebSocketManager
 
 logger = logging.getLogger(__name__)
+
+# The rate-limit bucket HTTP starts share (each WebSocket has its own).
+_HTTP_CLIENT = object()
 
 
 # ============================================================
@@ -531,8 +535,33 @@ def create_app(runtime: Runtime) -> FastAPI:
             "connected_clients": runtime.ws.client_count,
         }}
 
-    # Note: no /api/v1/session/start over HTTP. Starting a recording requires the
-    # WebSocket, which is where grant verification and origin pinning live.
+    @app.post("/api/v1/session/start")
+    async def session_start(request: Request):
+        """
+        API 1 over plain HTTP, for a page or a test tool that cannot hold a
+        WebSocket (Postman's collections cannot carry one). The same message
+        as the WebSocket's `start` - {"request_id", "trigger": {...}} - goes
+        through the same handler, so the checks, the grant, the recording and
+        the reply are exactly the WebSocket's; the HTTP status is the reply's.
+
+        The origin pinning the WebSocket does is done here too, and stricter
+        than the middleware: a request with no Origin is refused, so only a
+        registered page (or a tool that names one) can start a recording.
+        """
+        origin = request.headers.get("origin")
+        if not origin or not cfg.security.origin_allowed(origin):
+            logger.warning("Rejected HTTP start from origin %r", origin)
+            return _error_response(403, "ORIGIN_NOT_ALLOWED",
+                                   "This page is not allowed to control the recorder.")
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            message = None
+        if isinstance(message, dict):
+            raw = json.dumps({**message, "command": "start"})
+        reply = await runtime.ws.handle_message(_HTTP_CLIENT, raw)
+        return JSONResponse(status_code=int(reply.get("status") or 200), content=reply)
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

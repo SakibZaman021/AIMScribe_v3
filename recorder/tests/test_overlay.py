@@ -90,7 +90,7 @@ def test_a_warning_appears_once_per_consultation():
     state = OverlayState()
     state.on_event("recording_started", {"session_id": "S1"})
     state.on_event("integrity_alert", {"alert_type": "silent_session"})
-    assert "muted or unplugged" in state.view(recording()).note
+    assert "gives no signal" in state.view(recording()).note
     state.note = "Confirmed"
     state.on_event("integrity_alert", {"alert_type": "silent_session"})
     assert state.view(recording()).note == "Confirmed"
@@ -306,18 +306,19 @@ def test_the_window_builds(tmp_path):
         assert overlay._pause_text == "Resume"
         assert overlay.window.state() == "withdrawn"
 
-        # The meter's whole purpose, in one line of words: a muted or
-        # unplugged microphone is invisible until somebody plays the
-        # recording back, and by then the consultation is over. Not on the
-        # first tick - a pause between words is not a fault.
+        # A long pause is a consultation, not a fault: however many quiet ticks,
+        # the card says nothing about the microphone. Only the recorder's own
+        # "no signal" (digital silence) is shown, in red.
         silent = dict(recording(), level=0.0)
-        for _ in range(10):
+        for _ in range(40):
             overlay.apply(OverlayState().view(silent), silent)
-        assert "no sound from the microphone" in drawn(overlay)
+        assert not any("no sound" in w or "no signal" in w for w in drawn(overlay))
 
-        loud = dict(recording(), level=0.6)
-        overlay.apply(OverlayState().view(loud), loud)
-        assert "no sound from the microphone" not in drawn(overlay)
+        state = OverlayState()
+        state.on_event("recording_started", {"session_id": None})
+        state.on_event("integrity_alert", {"alert_type": "silent_session"})
+        overlay.apply(state.view(silent), silent)
+        assert any("gives no signal - is it muted?" in w for w in drawn(overlay))
     finally:
         overlay.root.destroy()
 
@@ -337,3 +338,15 @@ def test_a_paused_consultation_keeps_its_card():
         view = OverlayState().view(paused(reason))
         assert view.visible, f"the card hid while paused for {reason}"
         assert view.stop_enabled, "Stop must stay reachable while paused"
+
+
+def test_the_no_signal_warning_goes_when_sound_comes_back():
+    state = OverlayState()
+    state.on_event("recording_started", {"session_id": "S1"})
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
+    assert "gives no signal" in state.view(recording()).note
+    state.on_event("sound_restored", {"session_id": "S1"})
+    assert "no signal" not in state.view(recording()).note
+    # It may come again if the microphone goes silent again.
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
+    assert "gives no signal" in state.view(recording()).note

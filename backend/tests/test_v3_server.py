@@ -94,6 +94,11 @@ class FakeRepo:
         if session_id in self.sessions:
             self.sessions[session_id]["visit_id"] = visit_id
 
+    async def note_session_microphone(self, device_id, session_id, microphone):
+        s = self.sessions.get(session_id)
+        if s is not None and microphone not in (s.get("microphones") or []):
+            s["microphones"] = (s.get("microphones") or []) + [microphone]
+
     async def note_prescription(self, session_id):
         s = self.sessions.get(session_id)
         if s is not None and s.get("prescription_received_at") is None:
