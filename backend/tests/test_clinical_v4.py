@@ -593,3 +593,29 @@ async def test_gynae_history_is_one_row_per_visit_that_has_it(cmed):
     assert w["has_anc"] and not w["has_pnc"] and w["note"] == "Regular check-ups"
     assert json.loads(w["other_items"]) == {"obs_gyne: Abortion": "None", "anc: TT": "2 doses"}
     assert rows_[wrong["visit_id"]]["sex_mismatch"] is True    # found, not hidden
+
+
+@postgres
+async def test_a_prescription_changed_back_is_a_new_version_and_is_shown(cmed):
+    a = full_api3(issued_at="2025-11-15T12:00:00+06:00")
+    v = a["visit_id"]
+    b = dict(a, issued_at="2025-11-15T12:05:00+06:00",
+             drug_orders=[{"medication_name": "Seclo 20", "generic_name": "Omeprazole"}])
+    assert (await send(cmed, "prescription", a))[1]["version"] == 1
+    assert (await send(cmed, "prescription", b))[1]["version"] == 2
+
+    # A late resend of the first message, byte for byte: still only a resend.
+    code, reply = await send(cmed, "prescription", a)
+    assert (code, reply["code"], reply["version"]) == (200, "ALREADY_RECEIVED", 1)
+
+    # The doctor puts A back: a third version, and the one the visit shows.
+    back = dict(a, issued_at="2025-11-15T12:10:00+06:00")
+    code, reply = await send(cmed, "prescription", back)
+    assert (code, reply["version"]) == (202, 3), reply
+    shown = await rows(cmed, "SELECT medication_name FROM v_drug_orders WHERE visit_id = $1", v)
+    assert [d["medication_name"] for d in shown] == ["Napa One"]
+
+    # The latest again, only its time changed: a resend of version 3.
+    again = dict(a, issued_at="2025-11-15T12:11:00+06:00")
+    code, reply = await send(cmed, "prescription", again)
+    assert (code, reply["code"], reply["version"]) == (200, "ALREADY_RECEIVED", 3)

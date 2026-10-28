@@ -344,11 +344,18 @@ async def file_message(kind: str, body: Dict[str, Any], hospital_id: str, visit_
                 raise _Stop(409, "VISIT_CONFLICT", ["visit_id", "patient_id"],
                             [{"field": "visit_id", "problem": "already belongs to another "
                                                               "patient"}])
+            # The same bytes again are always a resend. The same prescription
+            # with a new issued_at is a resend only of the latest version: a
+            # doctor who corrects A to B and then back to A has made a third
+            # version, and it is the one the visit must show.
+            latest_only = ("AND version = (SELECT max(version) FROM visit_messages "
+                           "WHERE kind = $1 AND hospital_id = $2 AND visit_id = $3)"
+                           if kind == "prescription" else "")
             seen = await conn.fetchrow(
                 "SELECT version FROM visit_messages WHERE kind = $1 AND hospital_id = $2 "
-                "AND visit_id = $3 AND (body_sha256 = $4 OR content_sha256 = $5) "
-                "ORDER BY version DESC LIMIT 1", kind, hospital_id, visit_id, body_sha,
-                content_sha)
+                "AND visit_id = $3 AND (body_sha256 = $4 OR (content_sha256 = $5 "
+                f"{latest_only})) ORDER BY version DESC LIMIT 1",
+                kind, hospital_id, visit_id, body_sha, content_sha)
             if seen is not None and row is not None:
                 return int(row["id"]), True, int(seen["version"])
 
