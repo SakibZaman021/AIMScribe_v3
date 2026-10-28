@@ -77,3 +77,83 @@ def test_the_recorders_origin_check_uses_both_lists(server_key):
     trusted_origins.apply(signed(server_key, ["https://emr.cmed.com.bd"], 9))
     assert security.origin_allowed("https://emr.cmed.com.bd")         # from the server
     assert not security.origin_allowed(None) and not security.origin_allowed("null")
+
+
+# ---- a PC that has not joined yet asks the server itself, before its first API 1
+
+async def serve_list(bundle):
+    from aiohttp import web
+    asked = []
+
+    async def handler(request):
+        asked.append(request.query.get("have"))
+        have = int(request.query.get("have", "0"))
+        newer = bundle if bundle and bundle["payload"]["version"] > have else None
+        return web.json_response({"trusted_origins": newer})
+
+    app = web.Application()
+    app.router.add_get("/api/v2/trusted-origins", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    return runner, f"http://127.0.0.1:{port}", asked
+
+
+def unjoined(base_url):
+    from api.trigger_server import Runtime
+    from config import BackendConfig
+    runtime = Runtime.__new__(Runtime)
+    runtime.cfg = SimpleNamespace(backend=BackendConfig(base_url=base_url))
+    runtime.identity = None
+    runtime._loop = None
+    return runtime
+
+
+async def test_a_new_pc_fetches_the_list_before_it_has_joined(server_key):
+    runner, url, asked = await serve_list(
+        signed(server_key, ["https://postman.aimscribe.test"], 4))
+    try:
+        runtime = unjoined(url)
+        assert not trusted_origins.allowed("https://postman.aimscribe.test")
+        assert await runtime.fetch_trusted_origins()
+        assert trusted_origins.allowed("https://postman.aimscribe.test")
+        # Asked again with the version it holds: nothing new, nothing changes.
+        assert not await runtime.fetch_trusted_origins()
+        assert asked == ["0", "4"]
+    finally:
+        await runner.cleanup()
+
+
+async def test_a_list_not_signed_by_the_server_is_not_taken_from_the_open_endpoint(server_key):
+    stranger = Ed25519PrivateKey.generate()
+    runner, url, _ = await serve_list(signed(stranger, ["https://evil.example"], 9))
+    try:
+        assert not await unjoined(url).fetch_trusted_origins()
+        assert not trusted_origins.allowed("https://evil.example")
+    finally:
+        await runner.cleanup()
+
+
+async def test_no_server_is_not_an_error(server_key):
+    assert not await unjoined("http://127.0.0.1:9").fetch_trusted_origins()
+
+
+async def test_it_stops_asking_once_the_heartbeat_takes_over(server_key, monkeypatch):
+    runtime = unjoined("http://127.0.0.1:9")
+    calls = []
+
+    async def fetch():
+        calls.append(1)
+        if len(calls) == 2:
+            runtime.identity = object()          # joined meanwhile
+        return False
+
+    async def no_wait(_):
+        return None
+
+    runtime.fetch_trusted_origins = fetch
+    monkeypatch.setattr("asyncio.sleep", no_wait)
+    await runtime._fetch_origins_until_joined()
+    assert len(calls) == 2

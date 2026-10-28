@@ -4,8 +4,10 @@ AIMS LAB server rather than fixed at install.
 
 Every installer is the same, for every hospital: none is told CMED's address.
 The server keeps the list (dashboard -> CMED connections) and sends it in its
-heartbeat reply, signed with the key this recorder already trusts for its
-purge receipts, under a domain of its own - so a signed list can never be
+heartbeat reply - and, to a PC that has not joined yet, from GET
+/api/v2/trusted-origins at start-up, since its first API 1 already carries
+CMED's Origin. Either way it is signed with the key this recorder already
+trusts for its purge receipts, under a domain of its own - so a signed list can never be
 mistaken for a deletion receipt, nor a receipt for a list. A list is applied
 only when its signature checks and its version is newer than the one held:
 an old list replayed by anyone on the network is refused.

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -79,6 +80,12 @@ NOT_ENROLLED = ("This device is not enrolled. An administrator must install it w
 # A PC installed while the clinic's internet was down tries its token again this
 # often, instead of waiting for someone to log off and on.
 ENROL_RETRY_SECONDS = 60
+
+# A PC that has not joined yet has no heartbeat to bring CMED's addresses, yet
+# its first API 1 carries one: it asks the server for the list this often, and
+# at once (no more than this often) when a page it does not know knocks.
+ORIGINS_REFRESH_SECONDS = 60
+ORIGINS_KNOCK_SECONDS = 10
 
 class Runtime:
     """
@@ -201,6 +208,7 @@ class Runtime:
         from core.enrollment import read_pending_token
         if self.identity is None and read_pending_token(self.cfg):
             self._enrol_task = asyncio.create_task(self._enrol_until_done())
+        self._origins_task = asyncio.create_task(self._fetch_origins_until_joined())
 
         logger.info("Agent ready - %s at %s, device %s (%s), spool holds %.1f h",
                     self.identity.doctor_id if self.identity else "NO DOCTOR",
@@ -244,6 +252,59 @@ class Runtime:
                 logger.warning("Enrolment still waiting for the server: %s", exc)
                 continue
             self.adopt_identity(identity, load_device_token(self.cfg))
+
+    async def fetch_trusted_origins(self) -> bool:
+        """
+        CMED's addresses from the server, without a device token: what a PC that
+        has not joined yet needs before its first API 1. Taken only when signed
+        and newer, exactly as from a heartbeat. True when a new list came in.
+        """
+        import aiohttp
+        from core import trusted_origins
+        from core.uploader import build_ssl_context
+
+        self._origins_asked = time.monotonic()
+        ssl_context = build_ssl_context(self.cfg)
+        timeout = aiohttp.ClientTimeout(total=self.cfg.backend.request_timeout)
+        connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else None
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(self.cfg.backend.url("/trusted-origins"),
+                                       params={"have": str(trusted_origins.version())}) as reply:
+                    if reply.status != 200:
+                        logger.info("The server did not send CMED's addresses (%s)",
+                                    reply.status)
+                        return False
+                    data = await reply.json(content_type=None)
+        except Exception as exc:
+            logger.info("Could not ask the server for CMED's addresses: %s", exc)
+            return False
+        return isinstance(data, dict) and trusted_origins.apply(data.get("trusted_origins"))
+
+    async def _fetch_origins_until_joined(self) -> None:
+        """At start-up, then every minute until the heartbeat takes over."""
+        import asyncio
+        while True:
+            await self.fetch_trusted_origins()
+            if self.identity is not None:
+                return
+            await asyncio.sleep(ORIGINS_REFRESH_SECONDS)
+
+    def unknown_origin_knocked(self) -> None:
+        """
+        A page this PC does not trust yet called. The address may have been
+        added on the server a moment ago: ask now, so CMED's retry works,
+        rather than at the next minute or heartbeat.
+        """
+        if self._loop is None:
+            return
+        if time.monotonic() - getattr(self, "_origins_asked", -1e9) < ORIGINS_KNOCK_SECONDS:
+            return
+        self._origins_asked = time.monotonic()
+        try:
+            self._loop.call_soon_threadsafe(self._keep, self.fetch_trusted_origins)
+        except RuntimeError:
+            pass
 
     async def register_from_trigger(self, cmed_hospital_id: str) -> Optional[str]:
         """
@@ -298,9 +359,10 @@ class Runtime:
             self.uploader.nudge()
 
     async def shutdown(self) -> None:
-        task = getattr(self, "_enrol_task", None)
-        if task is not None:
-            task.cancel()
+        for name in ("_enrol_task", "_origins_task"):
+            task = getattr(self, name, None)
+            if task is not None:
+                task.cancel()
         if self.controller:
             await self.controller.close()
         if self.uploader:
@@ -416,6 +478,9 @@ def create_app(runtime: Runtime) -> FastAPI:
         origin = request.headers.get("origin")
         if origin is not None and not cfg.security.origin_allowed(origin):
             logger.warning("Rejected request from origin %r", origin)
+            knocked = getattr(runtime, "unknown_origin_knocked", None)
+            if knocked is not None:
+                knocked()
             return _error_response(403, "FORBIDDEN_ORIGIN", "Origin not allowed")
 
         from api.websocket_server import _same_windows_session

@@ -7,7 +7,8 @@
 #
 # What the internet may reach, and what it may not:
 #
-#   recorders      /api/v2/device, /session, /segment, /grant, /heartbeat ...
+#   recorders      /api/v2/device, /session, /segment, /grant, /heartbeat,
+#                  /trusted-origins ...
 #   CMED           /api/v2/oauth/token, /.well-known/smart-configuration,
 #                  /fhir/r4/*, /api/v2/clinical/*
 #   nobody         /api/v1/* (the old pipeline), /docs, /redoc,

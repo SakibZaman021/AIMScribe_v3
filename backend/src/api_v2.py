@@ -1854,6 +1854,23 @@ async def _trusted_origins_bundle() -> Optional[Dict[str, Any]]:
     return _ORIGINS_CACHE["bundle"]
 
 
+@router.get("/trusted-origins")
+async def trusted_origins_for_new_pc(have: int = 0):
+    """
+    The signed list, before a PC has joined. A new PC joins at its first API 1,
+    but that request carries CMED's Origin, which the PC can only check against
+    a list it had no way to receive yet. So the list is open to anyone: it is
+    only addresses, signed with the key every recorder pins, so nobody on the
+    way can change it. Nothing is sent when the PC already holds this version.
+    """
+    if ctx.signer is None:
+        return {"trusted_origins": None}
+    bundle = await _trusted_origins_bundle()
+    if bundle is None or bundle["payload"]["version"] <= have:
+        return {"trusted_origins": None}
+    return {"trusted_origins": bundle}
+
+
 TRUSTED_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 
 

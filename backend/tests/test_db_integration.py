@@ -1697,6 +1697,10 @@ async def test_trusted_origins_are_versioned_and_signed(dbs):
         bundle = await api_v2._trusted_origins_bundle()
         payload = bundle["payload"]
         assert "https://emr.cmed.example" in payload["origins"] and payload["version"] == v1
+        # A PC that has not joined yet gets the same signed list with no token,
+        # and nothing when it already holds this version.
+        assert (await api_v2.trusted_origins_for_new_pc(have=0))["trusted_origins"] == bundle
+        assert (await api_v2.trusted_origins_for_new_pc(have=v1))["trusted_origins"] is None
         key.public_key().verify(bytes.fromhex(bundle["signature"]), integrity.digest(
             integrity.ORIGINS_DOMAIN, integrity.canonical_json(payload)))
         with pytest.raises(Exception):
