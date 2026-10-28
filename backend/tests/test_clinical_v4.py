@@ -405,3 +405,191 @@ async def test_a_person_moves_a_pc_to_another_clinic(cmed):
         await api_v2.admin_move_device(str(uuid.uuid4()), api_v2.DeviceMove(
             moved_by="Tester", hospital_id="HOSP004"), None)
     assert err.value.status_code == 404
+
+
+# ============================================================
+# Every section as rows, and the research views (clinical/005)
+# ============================================================
+
+def full_api3(**changes):
+    rx = api3(**changes)
+    rx["observations"] = rx["observations"] + [
+        {"category": "on_examination", "note": "Flushed face",
+         "items": [{"name": "Blood Pressure", "value": "130/85", "unit": "mm of Hg"},
+                   {"name": "Pulse", "value": 88, "unit": "bpm"},
+                   {"name": "Anaemia", "value": "Absent"}]}]
+    rx["diagnosis"] = rx["diagnosis"] + [{"code": None, "display": "Viral fever",
+                                          "type": "final", "note": None}]
+    rx["drug_orders"] = [dict(rx["drug_orders"][0], generic_name="Paracetamol",
+                              order_id="DRG-1", status="prescribed", brand_new_field="kept")]
+    return rx
+
+
+async def rows(c, sql, *args):
+    async with c.dbs.cli.acquire() as conn:
+        return [dict(r) for r in await conn.fetch(sql, *args)]
+
+
+@postgres
+async def test_every_section_becomes_rows_and_the_views_read_them(cmed):
+    first = api2()
+    second = full_api3(**{k: first[k] for k in ("visit_id", "patient_id")})
+    assert (await send(cmed, "patient_information", first))[0] == 202
+    assert (await send(cmed, "prescription", second))[0] == 202
+    v = first["visit_id"]
+
+    visit = (await rows(cmed, "SELECT * FROM v_visit WHERE visit_id = $1", v))[0]
+    assert (visit["patient_id"], visit["doctor_id"]) == (first["patient_id"], "DR0042")
+    assert visit["has_patient_information"] and visit["has_prescription"]
+    assert (visit["complaints"], visit["diagnoses"], visit["drug_orders"],
+            visit["lab_orders"], visit["radiology_orders"]) == (1, 2, 1, 1, 1)
+
+    drugs = await rows(cmed, "SELECT * FROM v_drug_orders WHERE visit_id = $1", v)
+    assert [(d["medication_name"], d["generic_name"], d["dose"], d["timing"])
+            for d in drugs] == [("Napa One", "Paracetamol", "1+1+1", "after meal")]
+    extra = await rows(cmed, "SELECT x.extra FROM visit_drug_order x JOIN patient_visit pv "
+                             "ON pv.id = x.visit_pk WHERE pv.visit_id = $1", v)
+    assert json.loads(extra[0]["extra"]) == {"brand_new_field": "kept"}   # never lost
+
+    diagnoses = await rows(cmed, "SELECT code, is_icd10, display FROM v_diagnoses "
+                                 "WHERE visit_id = $1 ORDER BY line_no", v)
+    assert [(d["code"], d["is_icd10"]) for d in diagnoses] == [("A97.0", True), (None, None)]
+
+    # Vitals twice: the paramedic's (API 2) and the doctor's (API 3, on examination).
+    vitals = await rows(cmed, "SELECT measured_by, name, value, value_num, systolic, diastolic "
+                              "FROM v_vitals WHERE visit_id = $1 ORDER BY measured_by, name", v)
+    by = {(x["measured_by"], x["name"]): x for x in vitals}
+    assert (by[("paramedic", "Blood Pressure")]["systolic"],
+            by[("paramedic", "Blood Pressure")]["diastolic"]) == (128, 90)
+    assert by[("doctor", "Blood Pressure")]["value"] == "130/85"
+    assert by[("doctor", "Pulse")]["value_num"] == 88                     # a number, as sent
+    assert ("doctor", "Anaemia") not in by                                # a finding, not a vital
+    assert float(by[("paramedic", "Temperature")]["value_num"]) == pytest.approx(98.5)
+
+    notes = await rows(cmed, "SELECT category, note FROM v_observations WHERE visit_id = $1 "
+                             "AND item_no = 0 ORDER BY group_no", v)
+    assert {"drug_history": "paracetamol", "on_examination": "Flushed face"} == \
+        {n["category"]: n["note"] for n in notes}
+    advice = await rows(cmed, "SELECT instruction FROM v_advice WHERE visit_id = $1", v)
+    assert advice[0]["instruction"] == "প্রতিদিন গোসল করবেন"
+
+
+@postgres
+async def test_a_correction_shows_its_own_rows_and_keeps_every_version(cmed):
+    rx = full_api3()
+    v = rx["visit_id"]
+    await send(cmed, "prescription", rx)
+    corrected = dict(rx, issued_at="2025-11-15T12:05:00+06:00",
+                     drug_orders=[{"medication_name": "Seclo 20", "generic_name": "Omeprazole"}])
+    assert (await send(cmed, "prescription", corrected))[1]["version"] == 2
+    older = dict(rx, issued_at="2025-11-15T11:00:00+06:00",
+                 drug_orders=[{"medication_name": "Old drug"}])
+    assert (await send(cmed, "prescription", older))[1]["version"] == 3
+
+    shown = await rows(cmed, "SELECT medication_name FROM v_drug_orders WHERE visit_id = $1", v)
+    assert [d["medication_name"] for d in shown] == ["Seclo 20"]     # the newest, not the replay
+    every = await rows(cmed, "SELECT x.medication_name FROM visit_drug_order x "
+                             "JOIN patient_visit pv ON pv.id = x.visit_pk WHERE pv.visit_id = $1 "
+                             "ORDER BY x.message_id", v)
+    assert [d["medication_name"] for d in every] == ["Napa One", "Seclo 20", "Old drug"]
+    versions = await rows(cmed, "SELECT version, shown FROM v_prescription_versions "
+                                "WHERE visit_id = $1 ORDER BY version", v)
+    assert [(x["version"], x["shown"]) for x in versions] == [(1, False), (2, True), (3, False)]
+
+
+@postgres
+async def test_odd_shapes_are_filed_not_refused(cmed):
+    rx = {**six(), "drug_orders": {"medication_name": "Napa"},        # one object, not a list
+          "advice": "Rest", "chief_complaints": ["Cough", None, ""],  # bare text, null, empty
+          "diagnosis": [{"code": "j45.9", "display": "Asthma"}],
+          "observations": [{"category": "allergy", "items": ["Dust", {"name": "Food"}]}],
+          "lab_orders": [], "radiology_orders": None}
+    code, reply = await send(cmed, "prescription", rx)
+    assert code == 202, reply
+    v = rx["visit_id"]
+    assert [d["medication_name"] for d in
+            await rows(cmed, "SELECT * FROM v_drug_orders WHERE visit_id = $1", v)] == ["Napa"]
+    assert [a["instruction"] for a in
+            await rows(cmed, "SELECT * FROM v_advice WHERE visit_id = $1", v)] == ["Rest"]
+    complaints = await rows(cmed, "SELECT complaint FROM v_complaints WHERE visit_id = $1 "
+                                  "ORDER BY line_no", v)
+    assert [c["complaint"] for c in complaints] == ["Cough", None]     # "" kept as an empty line
+    assert (await rows(cmed, "SELECT code, is_icd10 FROM v_diagnoses WHERE visit_id = $1", v)) \
+        == [{"code": "J45.9", "is_icd10": True}]
+    assert sorted(o["name"] for o in await rows(
+        cmed, "SELECT name FROM v_observations WHERE visit_id = $1", v)) == ["Dust", "Food"]
+
+
+@postgres
+async def test_the_sections_are_rebuilt_from_the_messages(cmed, pg):
+    """Loading twice adds nothing; and the migration fills messages that came before it."""
+    rx = full_api3()
+    await send(cmed, "prescription", rx)
+    old = full_api3()
+    async with cmed.dbs.cli.acquire() as conn:
+        message = await conn.fetchval("SELECT id FROM visit_messages WHERE visit_id = $1",
+                                      rx["visit_id"])
+        assert await conn.fetchval("SELECT load_visit_sections($1)", message) == 0
+
+        # A visit filed before 005: its message is there, its rows are not.
+        await conn.execute("INSERT INTO patient (hospital_id, hospital_patient_id) "
+                           "VALUES ('CMED-DHOLPUR', $1) ON CONFLICT DO NOTHING",
+                           old["patient_id"])
+        await conn.execute("INSERT INTO patient_visit (visit_id, hospital_id, hospital_patient_id,"
+                           " prescription_version, prescription_at) "
+                           "VALUES ($1, 'CMED-DHOLPUR', $2, 1, now())",
+                           old["visit_id"], old["patient_id"])
+        await conn.execute("INSERT INTO visit_messages (kind, hospital_id, visit_id, version, "
+                           "body, body_sha256, content_sha256) "
+                           "VALUES ('prescription', 'CMED-DHOLPUR', $1, 1, $2, $3, $3)",
+                           old["visit_id"], json.dumps(old), uuid.uuid4().bytes)
+    from test_db_integration import _apply, CLINICAL_SCRIPTS
+    await _apply(pg.clinical, [s for s in CLINICAL_SCRIPTS if s.name.startswith("005_")])
+    drugs = await rows(cmed, "SELECT medication_name FROM v_drug_orders WHERE visit_id = $1",
+                       old["visit_id"])
+    assert [d["medication_name"] for d in drugs] == ["Napa One"]
+
+
+@postgres
+async def test_gynae_history_is_one_row_per_visit_that_has_it(cmed):
+    gyne = {"category": "obs_gyne", "note": "Regular check-ups", "items": [
+        {"name": "Age of Menarche", "value": "13 Years"}, {"name": "Cycle", "value": "Regular"},
+        {"name": "Amount of Flow", "value": "Normal"}, {"name": "Days of Period", "value": "7 Days"},
+        {"name": "LMP", "value": "2025-10-16"}, {"name": "Para", "value": "1+1"},
+        {"name": "Age of Last Child", "value": "6 Years"},
+        {"name": "Delivery History", "value": "NVD"},
+        {"name": "Contraceptive History", "value": "Condom"},
+        {"name": "Abortion", "value": "None"}]}
+
+    # A woman: API 2 (her sex) and API 3 with the gynae section.
+    woman = api2()
+    rx = api3(**{k: woman[k] for k in ("visit_id", "patient_id")})
+    rx["observations"] = [gyne, {"category": "anc", "items": [{"name": "TT", "value": "2 doses"}]}]
+    await send(cmed, "patient_information", woman)
+    await send(cmed, "prescription", rx)
+
+    # A man with no gynae section, and a man whose prescription carries one (an error).
+    man = api2(demographics={"sex": "male"})
+    await send(cmed, "patient_information", man)
+    await send(cmed, "prescription", api3(**{k: man[k] for k in ("visit_id", "patient_id")},
+                                          observations=[]))
+    wrong = api2(demographics={"sex": "male"})
+    await send(cmed, "patient_information", wrong)
+    await send(cmed, "prescription", api3(**{k: wrong[k] for k in ("visit_id", "patient_id")},
+                                          observations=[gyne]))
+
+    rows_ = {r["visit_id"]: r for r in await rows(
+        cmed, "SELECT * FROM v_obs_gyne WHERE visit_id = ANY($1)",
+        [woman["visit_id"], man["visit_id"], wrong["visit_id"]])}
+    assert man["visit_id"] not in rows_                  # no section: no row of empty cells
+    w = rows_[woman["visit_id"]]
+    assert (w["sex"], w["sex_mismatch"]) == ("female", False)
+    assert (w["age_of_menarche"], w["cycle"], w["amount_of_flow"], w["days_of_period"]) == \
+        ("13 Years", "Regular", "Normal", "7 Days")
+    assert (w["lmp"], str(w["lmp_date"]), w["para"], w["gravida"]) == \
+        ("2025-10-16", "2025-10-16", "1+1", None)        # gravida was not sent: empty
+    assert (w["age_of_last_child"], w["delivery_history"], w["contraceptive_history"]) == \
+        ("6 Years", "NVD", "Condom")
+    assert w["has_anc"] and not w["has_pnc"] and w["note"] == "Regular check-ups"
+    assert json.loads(w["other_items"]) == {"obs_gyne: Abortion": "None", "anc: TT": "2 doses"}
+    assert rows_[wrong["visit_id"]]["sex_mismatch"] is True    # found, not hidden

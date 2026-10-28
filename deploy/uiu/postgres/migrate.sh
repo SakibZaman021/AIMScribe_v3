@@ -128,6 +128,8 @@ apply aims_clinical "" /aims/scripts/clinical/002_roles.sql
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/003_consultation_findings.sql
 # Interface 4: one patient row, one row per visit by CMED's visit_id.
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/004_patient_visit.sql
+# Every section of a visit as rows, and the research views (v_visit, ...).
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/005_visit_sections.sql
 
 # The clinical database's read-only login, for the database viewer: its
 # password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.

@@ -167,6 +167,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it interface 4 (/api/v4/clinical) cannot file a visit.
     ("clinical/004_patient_visit.sql", "clinical", "table patient_visit",
      _table("patient_visit")),
+    # Without it interface 4 cannot file a message: it loads the sections as rows.
+    ("clinical/005_visit_sections.sql", "clinical", "table visit_drug_order",
+     _table("visit_drug_order")),
     ("clinical/001_aims_clinical.sql", "clinical", "table intake_records",
      _table("intake_records")),
     ("clinical/001_aims_clinical.sql", "clinical", "table prescriptions",

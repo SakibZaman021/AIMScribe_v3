@@ -8,7 +8,8 @@ keyed by CMED's visit_id (CMED_CONNECTION_GUIDE_v4.pdf).
 
 A message is filed in two places. First in AIMS LAB's own layout (patient,
 patient_visit, visit_messages - clinical/004_patient_visit.sql), exactly as
-sent. Then, when its six fields can be read, it is turned into the body
+sent, with each section as rows (visit_drug_order, visit_diagnosis, ... -
+clinical/005_visit_sections.sql). Then, when its six fields can be read, it is turned into the body
 clinical.process takes and goes through that one pipeline, as a FHIR message
 does: that is what confirms and links the recording, writes the archive JSON
 and fills the tables the dashboard reads. So interface 4 changes nothing for
@@ -379,6 +380,7 @@ async def file_message(kind: str, body: Dict[str, Any], hospital_id: str, visit_
             """, visit_id, hospital_id, patient_id, parsed["practitioner_id"],
                 parsed["start_time"], parsed["visit_date"])
 
+            newest = False
             if kind == "patient_information":
                 await conn.execute("""
                     UPDATE patient_visit SET age = $2, age_years = $3, vitals = $4,
@@ -409,14 +411,25 @@ async def file_message(kind: str, body: Dict[str, Any], hospital_id: str, visit_
                     UPDATE patient_visit SET prescription_version = $2,
                            prescription_at = now(), updated_at = now() WHERE id = $1
                 """, visit_row, version)
-            await conn.execute("""
+            message = await conn.fetchval("""
                 INSERT INTO visit_messages (kind, hospital_id, visit_id, version, body,
                                             body_sha256, content_sha256, warnings, client)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 ON CONFLICT ON CONSTRAINT visit_message_once DO NOTHING
+                RETURNING id
             """, kind, hospital_id, visit_id, version, json.dumps(body, ensure_ascii=False),
                 body_sha, content_sha, json.dumps(parsed["warnings"], ensure_ascii=False,
                                                   default=str), client)
+            if message is not None:
+                # Its sections as rows (clinical/005_visit_sections.sql), and the
+                # version the visit now shows.
+                await conn.execute("SELECT load_visit_sections($1)", message)
+                if kind == "patient_information":
+                    await conn.execute("UPDATE patient_visit SET patient_information_message_id"
+                                       " = $2 WHERE id = $1", visit_row, message)
+                elif newest:
+                    await conn.execute("UPDATE patient_visit SET prescription_message_id = $2 "
+                                       "WHERE id = $1", visit_row, message)
             return int(visit_row), False, version
 
 

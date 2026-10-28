@@ -44,7 +44,7 @@ research datasets of *audio + structured prescription* with a provable chain of 
 > operate, extend or audit the system.
 >
 > **Versions described.** Recorder `3.8.x` · device protocol `2` · CMED clinical interface
-> `v4` · database schema through migration `033`.
+> `v4` · database schema through migration `033` (recordings) and `clinical/005`.
 
 ---
 
@@ -1076,15 +1076,142 @@ erDiagram
 
 ### 11.4 `aims_clinical`
 
-Two models coexist: the **v4 visit model** (`patient`, `patient_visit`, keyed by CMED's
-`visit_id`) used by interface v4, and the **encounter model** (`patients`, `encounters`,
-`prescriptions` and child tables) used by the FHIR and legacy channel B paths.
+**The visit model (interface v4) is the clinical record.** Every API 2 and API 3 is kept
+exactly as received in `visit_messages` (the source of truth); each section is then stored
+as **one row per item**, tagged with the message it came from (`message_id`). Rows are
+written by a single database function, `load_visit_sections`, used both live and for
+backfill, so every section table can be rebuilt from the raw messages, and every
+prescription version keeps its own rows. `patient_visit.prescription_message_id` /
+`patient_information_message_id` say which version a visit shows.
 
 ```mermaid
 erDiagram
     patient ||--o{ patient_visit : "visits"
-    visit_messages }o..|| patient_visit : "raw API 2/3 (by visit_id)"
+    patient_visit ||--o{ visit_messages : "raw API 2/3"
+    visit_messages ||--o{ visit_vital : "API 2"
+    visit_messages ||--o{ visit_complaint : "API 3"
+    visit_messages ||--o{ visit_observation : "API 3"
+    visit_messages ||--o{ visit_diagnosis : "API 3"
+    visit_messages ||--o{ visit_lab_order : "API 3"
+    visit_messages ||--o{ visit_radiology_order : "API 3"
+    visit_messages ||--o{ visit_drug_order : "API 3"
+    visit_messages ||--o{ visit_advice : "API 3"
+    patient_visit |o..|| visit_messages : "shown version"
 
+    patient {
+        varchar hospital_id PK
+        varchar hospital_patient_id PK
+        varchar sex
+        date date_of_birth
+        varchar blood_group
+    }
+    patient_visit {
+        bigint id PK
+        varchar visit_id UK "CMED visit"
+        varchar hospital_id FK
+        varchar hospital_patient_id FK
+        varchar aims_id "recording session_id"
+        varchar practitioner_id "doctor_id"
+        bigint patient_information_message_id FK
+        bigint prescription_message_id FK
+        int prescription_version
+        date follow_up
+    }
+    visit_messages {
+        bigint id PK
+        varchar kind "patient_information|prescription"
+        varchar visit_id
+        int version
+        jsonb body "exactly as received"
+        bytea content_sha256
+    }
+    visit_vital {
+        bigint message_id PK
+        int group_no PK
+        int item_no PK
+        text recorded_by "paramedic|doctor"
+        text name
+        text value
+        text unit
+        numeric value_num
+    }
+    visit_complaint {
+        bigint message_id PK
+        int line_no PK
+        text complaint
+        text duration
+        text severity
+    }
+    visit_observation {
+        bigint message_id PK
+        int group_no PK
+        int item_no PK
+        text category "history|allergy|on_examination|obs_gyne..."
+        text name
+        text value
+        text unit
+    }
+    visit_diagnosis {
+        bigint message_id PK
+        int line_no PK
+        text code
+        bool is_icd10
+        text display
+        text type "provisional|final"
+    }
+    visit_lab_order {
+        bigint message_id PK
+        int line_no PK
+        text test_code
+        text test_name
+        text priority
+    }
+    visit_radiology_order {
+        bigint message_id PK
+        int line_no PK
+        text procedure_code
+        text procedure_name
+        text body_site
+    }
+    visit_drug_order {
+        bigint message_id PK
+        int line_no PK
+        text medication_name "brand"
+        text generic_name
+        text strength
+        text dose
+        text frequency
+        text duration
+    }
+    visit_advice {
+        bigint message_id PK
+        int line_no PK
+        text type
+        text instruction
+    }
+```
+
+**Research views (start here).** Current version only, with the same names as the
+recordings database (`patient_id`, `doctor_id`, `session_id`): `v_visit` (one row per visit:
+who, when, recording, completeness, section counts), `v_vitals` (paramedic and doctor
+measurements side by side, blood pressure split into systolic/diastolic), `v_complaints`,
+`v_observations`, `v_diagnoses`, `v_lab_orders`, `v_radiology_orders`, `v_drug_orders`,
+`v_advice`, `v_obs_gyne` (one row per visit that has obstetric/gynaecological history),
+`v_prescription_versions`.
+
+**Why no male/female tables.** Sex-specific sections (obstetric/gynaecological, ANC, PNC)
+are rows that exist only when CMED sends them: a male visit has none, so there are no
+empty columns, and three cases stay distinct: *no row* (not sent), *row without value*
+(left blank), *row with value*. Sex is never a gate, so data arriving before the
+patient's sex, or a corrected sex, loses nothing; `v_obs_gyne.sex_mismatch` surfaces
+data-quality errors instead of hiding them.
+
+**The encounter model** (`patients`, `encounters`, `prescriptions` and child tables) is the
+older pipeline. Interface v4 still feeds it, because it drives recording confirmation and
+the archive JSON. It can be retired once that dependency is moved to the visit model.
+
+```mermaid
+erDiagram
     patients ||--o{ encounters : "has"
     intake_records |o--o{ encounters : "patient information"
     encounters ||--o| encounter_demographics : "snapshot"
@@ -1283,20 +1410,23 @@ Views: `v_devices`, `v_device_requests`, `v_doctors`, `v_doctor_register`, `v_do
 </details>
 
 <details>
-<summary><b>aims_clinical</b> (18 tables, 4 views)</summary>
+<summary><b>aims_clinical</b> (26 tables, 15 views)</summary>
 
 | Table | Purpose |
 |---|---|
-| `visit_messages` / `visit_quarantine` | v4 raw API 2/API 3, and refused input |
-| `patient`, `patient_visit` | v4 relational model keyed by `visit_id` |
+| `visit_messages` / `visit_quarantine` | v4 raw API 2/API 3 (source of truth), and refused input |
+| `patient`, `patient_visit` | v4 patient and visit, keyed by `visit_id` |
+| `visit_vital`, `visit_complaint`, `visit_observation`, `visit_diagnosis`, `visit_lab_order`, `visit_radiology_order`, `visit_drug_order`, `visit_advice` | One row per item of each section, per message (every version kept) |
 | `intake_records` / `intake_quarantine` | Raw FHIR/legacy messages, and refused input |
 | `patients`, `encounters`, `encounter_demographics` | Encounter model |
 | `paramedic_observations`, `male_details`, `female_details` | Vitals and sex-specific details |
 | `prescriptions`, `prescription_items`, `diagnoses`, `investigations`, `consultation_findings` | Prescription content, versioned |
 | `clinical_access_log` | Who read which patient's record |
 
-Views: `current_encounter`, `current_prescription`, `previous_prescription`,
-`latest_prescriptions`.
+Research views: `v_visit`, `v_vitals`, `v_complaints`, `v_observations`, `v_diagnoses`,
+`v_lab_orders`, `v_radiology_orders`, `v_drug_orders`, `v_advice`, `v_obs_gyne`,
+`v_prescription_versions`. Encounter-model views: `current_encounter`,
+`current_prescription`, `previous_prescription`, `latest_prescriptions`.
 </details>
 
 ---
