@@ -1,4 +1,42 @@
-# AIMScribe v3 — System Architecture
+<div align="center">
+
+# AIMScribe v3
+
+**Secure clinical audio capture, joined to the prescription of the same visit.**
+
+[![tests](https://github.com/SakibZaman021/AIMScribe_v3/actions/workflows/tests.yml/badge.svg)](https://github.com/SakibZaman021/AIMScribe_v3/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![Windows](https://img.shields.io/badge/Recorder-Windows-0078D6?logo=windows&logoColor=white)
+![Docker](https://img.shields.io/badge/Deploy-Docker-2496ED?logo=docker&logoColor=white)
+
+[Architecture](#4-high-level-architecture) ·
+[Recorder ↔ server](#7-how-aimscribeexe-communicates-with-the-server) ·
+[Data flows](#9-data-flow-diagrams) ·
+[Databases](#10-database-dbms-architecture) ·
+[ER diagrams](#11-entityrelationship-diagrams) ·
+[Security](#13-security-architecture)
+
+</div>
+
+AIMScribe records doctor–patient consultations in clinics running CMED's EHR, verifies
+every second of audio with a device-signed hash chain, and links each recording to the
+patient information and prescription CMED sends for the same `visit_id` — producing
+research datasets of *audio + structured prescription* with a provable chain of custody.
+
+| | |
+|---|---|
+| 🎙️ **Never loses audio** | Records offline into an encrypted, crash-safe spool; deletes only against server-signed receipts |
+| 🔐 **Zero shared secrets** | TPM-bound PC identities, per-hospital CMED key pairs, 5-minute tokens, signed grants |
+| 🧾 **Tamper-evident** | Ed25519-signed hash chain per recording, append-only audit log, database-level data guard |
+| ✅ **Consent-aware** | Only CMED-confirmed recordings are kept; refusals and unconfirmed audio are erased everywhere |
+| 🏥 **One installer, every hospital** | Clinic identity comes from the data; CMED's addresses are distributed signed from the server |
+| 🚀 **Safe operations** | CI-gated pull deployments, backup before every schema change, automated restore drills |
+
+---
+
+# System Architecture
 
 > **Scope.** This document describes the production architecture of AIMScribe v3: the
 > Windows recorder (`AIMScribe.exe`), the AIMS LAB server, its two PostgreSQL databases,
