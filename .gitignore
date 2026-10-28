@@ -88,3 +88,6 @@ LOCAL_MANUAL.pdf
 CMED_CONNECTION_GUIDE_v*.pdf
 cmed_v4_kit/
 CMED_TEST_PROCEDURE_v*.pdf
+
+# Documents are shared directly, never kept in this public repository
+*.pdf
