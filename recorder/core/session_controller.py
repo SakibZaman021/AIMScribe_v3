@@ -724,19 +724,28 @@ class SessionController:
         SRS-CNF-07 and -08: ask every five seconds whether CMED's API 2 has
         confirmed this recording. After two minutes it is shown as unconfirmed.
         The recording is never cut for this.
+
+        Unconfirmed is not the end: API 2 may come late (an outage at CMED, a
+        tester sending it by hand). The asking goes on, every half minute,
+        while the recording runs, and the screen turns to Confirmed when it
+        arrives. It used to stop at the deadline, so the server showed the
+        recording confirmed while the doctor's screen still said it was not.
         """
         deadline = time.monotonic() + self._knob("confirm_deadline_seconds", 120.0)
-        while active.confirmation == "confirming" and self._active is active:
-            await asyncio.sleep(self._knob("confirm_poll_seconds", 5.0))
+        while active.confirmation != "confirmed" and self._active is active:
+            late = active.confirmation == "unconfirmed"
+            await asyncio.sleep(self._knob("confirm_late_poll_seconds", 30.0) if late
+                                else self._knob("confirm_poll_seconds", 5.0))
+            if self._active is not active:
+                return
             state = await self._uploader.check_confirmation(active.spool)
             if state == "confirmed":
                 active.confirmation = "confirmed"
                 self._emit("session_confirmed", {"session_id": active.session_id})
                 return
-            if state == "unconfirmed" or time.monotonic() >= deadline:
+            if not late and (state == "unconfirmed" or time.monotonic() >= deadline):
                 active.confirmation = "unconfirmed"
                 self._emit("session_unconfirmed", {"session_id": active.session_id})
-                return
 
     def _knob(self, name: str, default: float) -> float:
         security = getattr(self.cfg, "security", None)

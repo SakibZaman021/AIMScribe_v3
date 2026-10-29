@@ -475,6 +475,21 @@ async def test_no_confirmation_is_shown_as_unconfirmed(monkeypatch, spool, devic
     assert ctl.state == "recording"
 
 
+async def test_a_late_api2_turns_unconfirmed_into_confirmed(monkeypatch, spool, device_key):
+    """API 2 after the two minutes: the screen must not stay on 'not confirmed'."""
+    uploader = ScriptedUploader([GRANTED])
+    uploader.confirmations = ["unconfirmed", None, "confirmed"]
+    ctl = make_controller(monkeypatch, spool, device_key, uploader,
+                          confirm_late_poll_seconds=0.01)
+    await ctl.open_session(trigger())
+    await settle()
+    assert ctl.status()["confirmation"] == "confirmed"
+    names = [name for name, _ in ctl.events]
+    assert names.index("session_unconfirmed") < names.index("session_confirmed")
+    assert ctl.state == "recording"
+    await ctl.close()
+
+
 # ============================================================
 # The patient did not consent (SRS §7.8a)
 # ============================================================
