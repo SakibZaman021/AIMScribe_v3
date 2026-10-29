@@ -506,6 +506,23 @@ async def test_bad_assertions_are_refused(hospital, change):
 
 
 @postgres
+async def test_a_refused_token_names_the_exact_cause(hospital):
+    h = hospital
+
+    async def why(private, kid, client_id):
+        status, answer = await get_token(h, assertion(private, kid, client_id))
+        assert (status, answer["error"]) == (401, "invalid_client")
+        return answer["error_description"]
+
+    assert 'no client "cmed-nobody"' in await why(h.private, h.kid, "cmed-nobody")
+    assert f'kid "not-a-kid" is not registered for client "{h.client_id}"' in \
+        await why(h.private, "not-a-kid", h.client_id)
+    assert "signed with a different private key" in await why(_ec_jwk()[0], h.kid, h.client_id)
+    await cmed_auth.revoke_client(h.client_id, None)
+    assert f'client "{h.client_id}" was revoked' in await why(h.private, h.kid, h.client_id)
+
+
+@postgres
 async def test_revoking_a_hospital_stops_its_live_tokens_at_once(hospital):
     _, answer = await get_token(hospital, assertion(hospital.private, hospital.kid,
                                                     hospital.client_id))

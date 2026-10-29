@@ -312,6 +312,13 @@ def _content(kind: str, body: Dict[str, Any]) -> bytes:
     return integrity.sha256_bytes(integrity.canonical_json(body))
 
 
+def _changed_sections(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    """The fields of a prescription that a correction changed, issued_at aside."""
+    keys = (set(before) | set(after)) - {"issued_at"}
+    return sorted(k for k in keys if integrity.canonical_json(before.get(k))
+                  != integrity.canonical_json(after.get(k)))
+
+
 async def _quarantine(kind: str, raw: str, problems: List[Dict], client: Optional[str]) -> None:
     try:
         async with api_v2._clinical()._pool.acquire() as conn:
@@ -344,20 +351,28 @@ async def file_message(kind: str, body: Dict[str, Any], hospital_id: str, visit_
                 raise _Stop(409, "VISIT_CONFLICT", ["visit_id", "patient_id"],
                             [{"field": "visit_id", "problem": "already belongs to another "
                                                               "patient"}])
-            # The same bytes again are always a resend. The same prescription
-            # with a new issued_at is a resend only of the latest version: a
-            # doctor who corrects A to B and then back to A has made a third
-            # version, and it is the one the visit must show.
-            latest_only = ("AND version = (SELECT max(version) FROM visit_messages "
-                           "WHERE kind = $1 AND hospital_id = $2 AND visit_id = $3)"
-                           if kind == "prescription" else "")
+            # Content this visit has already received, in any version, is a
+            # resend: the same bytes, or the same prescription with only a new
+            # issued_at. A then B is two versions; A again after B is
+            # ALREADY_RECEIVED (version 1) and the visit keeps showing B. Only
+            # content never received before makes a new version.
             seen = await conn.fetchrow(
                 "SELECT version FROM visit_messages WHERE kind = $1 AND hospital_id = $2 "
-                "AND visit_id = $3 AND (body_sha256 = $4 OR (content_sha256 = $5 "
-                f"{latest_only})) ORDER BY version DESC LIMIT 1",
+                "AND visit_id = $3 AND (body_sha256 = $4 OR content_sha256 = $5) "
+                "ORDER BY version DESC LIMIT 1",
                 kind, hospital_id, visit_id, body_sha, content_sha)
             if seen is not None and row is not None:
                 return int(row["id"]), True, int(seen["version"])
+
+            # A correction: which sections differ from the version the visit
+            # shows now, for CMED's reply.
+            if kind == "prescription" and row is not None:
+                shown = await conn.fetchval(
+                    "SELECT m.body FROM visit_messages m JOIN patient_visit v "
+                    "ON v.prescription_message_id = m.id WHERE v.id = $1", row["id"])
+                if shown is not None:
+                    parsed["changed_sections"] = _changed_sections(
+                        json.loads(shown) if isinstance(shown, str) else shown, body)
 
             version = 1
             if kind == "prescription" and row is not None:
@@ -534,6 +549,8 @@ async def receive(request: Request, kind: str):
     extra = {"visit_id": visit_id, "record_id": str(record_id)}
     if kind == "prescription":
         extra["version"] = version
+        if not duplicate and "changed_sections" in parsed:
+            extra["changed_sections"] = parsed["changed_sections"]
     extra.update(received_at=clinical._now_iso(),
                  recording="linked" if recording and recording.get("segment_count")
                  else "waiting",

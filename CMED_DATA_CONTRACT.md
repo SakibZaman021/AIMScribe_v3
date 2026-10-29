@@ -444,11 +444,14 @@ both versions. Only a real change is a new version: the same prescription with
 a new `issued_at`, or with its keys in another order, has the same fingerprint
 (see §3) and is answered `200 ALREADY_RECEIVED` with the version already held.
 
-**An old message replayed never rolls a visit back.** If an outbox sends
-version 1 again, byte for byte, after version 2 was stored — the usual thing
-after an outage — it is answered `ALREADY_RECEIVED` for version 1 and version 2
-stays the newest. A doctor who really goes back to the first prescription
-produces a new `issued_at`, and that is stored as version 3.
+**An old message replayed never rolls a visit back.** A prescription whose
+content this visit already received, in any version, is answered
+`200 ALREADY_RECEIVED` with that version's number, whatever its `issued_at`;
+the newest version stays the one shown. So A, then B (version 2), then A again
+is `ALREADY_RECEIVED` for version 1, and the visit keeps B. Only content never
+sent before for the visit becomes a new version, and its `202 ACCEPTED` reply
+lists `changed_sections`: the fields that differ from the version shown before
+(for example `["advice", "drug_orders"]`).
 
 **A late message is never too late.** API 2 and API 3 may arrive hours or days
 after the consultation, after its recording was closed or archived. They are

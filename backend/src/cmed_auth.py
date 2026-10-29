@@ -270,17 +270,31 @@ async def verify_assertion(assertion: str, audiences: List[str], ip: str, *,
     try:
         async with _pool().acquire() as conn:
             client = await conn.fetchrow("""
-                SELECT * FROM cmed_clients
-                 WHERE client_id = $1 AND revoked_at IS NULL AND expires_at > now()
+                SELECT *, expires_at <= now() AS expired FROM cmed_clients
+                 WHERE client_id = $1
             """, client_id)
             key = await conn.fetchrow("""
-                SELECT alg, public_jwk FROM cmed_client_keys
-                 WHERE client_id = $1 AND kid = $2 AND revoked_at IS NULL
+                SELECT alg, public_jwk, revoked_at FROM cmed_client_keys
+                 WHERE client_id = $1 AND kid = $2
             """, client_id, kid) if client else None
     except (asyncpg.exceptions.DataError, UnicodeError):
-        raise AuthError(401, "invalid_client", "unknown, revoked or expired client or key")
-    if client is None or key is None:
-        raise AuthError(401, "invalid_client", "unknown, revoked or expired client or key")
+        raise AuthError(401, "invalid_client", "client_id or kid is not valid text")
+    # Each case named, so whoever sets up the sending side can fix it alone.
+    # Client ids are not secret; every refusal still counts towards the lockout.
+    if client is None:
+        raise AuthError(401, "invalid_client", f'no client "{client_id}" is registered')
+    if client["revoked_at"] is not None:
+        raise AuthError(401, "invalid_client", f'client "{client_id}" was revoked on '
+                                               f'{client["revoked_at"]:%Y-%m-%d}')
+    if client["expired"]:
+        raise AuthError(401, "invalid_client", f'client "{client_id}" expired on '
+                                               f'{client["expires_at"]:%Y-%m-%d}; renew it')
+    if key is None:
+        raise AuthError(401, "invalid_client",
+                        f'kid "{kid}" is not registered for client "{client_id}"')
+    if key["revoked_at"] is not None:
+        raise AuthError(401, "invalid_client",
+                        f'kid "{kid}" of client "{client_id}" was revoked')
     if key["alg"] != alg:
         raise AuthError(401, "invalid_client", "alg does not match the registered key")
     if not security.ip_allowed(ip, client["allowed_cidrs"]):
@@ -300,6 +314,10 @@ async def verify_assertion(assertion: str, audiences: List[str], ip: str, *,
         raise AuthError(400, "invalid_client",
                         f"clock skew: {exc}. This server allows {CLOCK_LEEWAY} s; "
                         "keep the sending server's clock synchronised (NTP)")
+    except jwt.InvalidSignatureError:
+        raise AuthError(401, "invalid_client",
+                        f'signature does not match the public key registered as kid "{kid}" '
+                        f'of client "{client_id}": signed with a different private key')
     except (jwt.PyJWTError, OverflowError, ValueError, TypeError) as exc:
         raise AuthError(401, "invalid_client", f"assertion rejected: {exc}")
     if claims.get("sub") != client_id:
