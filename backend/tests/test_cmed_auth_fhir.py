@@ -545,6 +545,75 @@ async def test_only_the_tokens_hash_is_stored(hospital):
     assert cmed_auth._digest(answer["access_token"]) in {bytes(r["token_sha256"]) for r in rows}
 
 
+async def refresh(refresh_token, **extra):
+    reply = await cmed_auth.token(Req(form={"grant_type": "refresh_token",
+                                            "refresh_token": refresh_token, **extra}))
+    return reply.status_code, json.loads(reply.body)
+
+
+@postgres
+async def test_a_refresh_token_renews_without_signing_and_is_spent_once(hospital):
+    _, first = await get_token(hospital, assertion(hospital.private, hospital.kid,
+                                                   hospital.client_id))
+    assert first["refresh_token"].startswith("crt_")
+    assert 0 < first["refresh_expires_in"] <= cmed_auth.REFRESH_LIFETIME
+
+    status, second = await refresh(first["refresh_token"], client_id=hospital.client_id)
+    assert status == 200, second
+    assert second["access_token"] != first["access_token"]
+    assert second["refresh_token"] != first["refresh_token"]
+    assert second["expires_in"] == 300 and second["hospital_ids"] == ["CMED-DHOLPUR"]
+    # The chain keeps its end: refreshing never extends it.
+    assert second["refresh_expires_in"] <= first["refresh_expires_in"]
+    reply = await clinical.patient_visits("PFHIR1", Req(
+        headers={"authorization": f"Bearer {second['access_token']}"}))
+    assert reply.status_code not in (401, 403), reply.body
+
+    # The spent one, presented again: refused, and the chain it belongs to ends.
+    status, answer = await refresh(first["refresh_token"])
+    assert (status, answer["error"]) == (400, "invalid_grant")
+    assert "already used" in answer["error_description"]
+    assert "client_assertion" in answer["error_description"]
+    status, answer = await refresh(second["refresh_token"])
+    assert (status, answer["error"]) == (400, "invalid_grant")
+    assert "revoked" in answer["error_description"]
+
+    # Signing again always works.
+    status, _ = await get_token(hospital, assertion(hospital.private, hospital.kid,
+                                                    hospital.client_id))
+    assert status == 200
+
+
+@postgres
+async def test_a_refresh_token_is_refused_once_its_chain_or_client_ends(hospital):
+    _, first = await get_token(hospital, assertion(hospital.private, hospital.kid,
+                                                   hospital.client_id))
+    status, answer = await refresh("crt_not-a-token")
+    assert (status, answer["error"]) == (400, "invalid_grant")
+    status, answer = await refresh(first["refresh_token"], client_id="cmed-someone-else")
+    assert "not issued to client" in answer["error_description"]
+
+    async with hospital.dbs.repo._pool.acquire() as conn:
+        await conn.execute("UPDATE cmed_refresh_tokens SET expires_at = now() - interval '1 s' "
+                           "WHERE token_sha256 = $1", cmed_auth._digest(first["refresh_token"]))
+    status, answer = await refresh(first["refresh_token"])
+    assert status == 400 and "expired" in answer["error_description"]
+
+    _, live = await get_token(hospital, assertion(hospital.private, hospital.kid,
+                                                  hospital.client_id))
+    await cmed_auth.revoke_client(hospital.client_id, None)
+    status, answer = await refresh(live["refresh_token"])
+    assert status == 400 and "revoked" in answer["error_description"]
+
+
+@postgres
+async def test_refresh_without_a_token_or_with_another_grant_is_refused(hospital):
+    status, answer = await refresh("")
+    assert (status, answer["error"]) == (400, "invalid_request")
+    reply = await cmed_auth.token(Req(form={"grant_type": "password"}))
+    assert json.loads(reply.body)["error"] == "unsupported_grant_type"
+
+
 # ============================================================
 # A PC cannot take over another PC's recording
 # ============================================================
@@ -624,3 +693,43 @@ FULL_API3 = {**FIELDS, "issued_at": "2026-09-13T10:26:55+06:00",
 def test_the_reference_client_round_trips_exactly(kind, body):
     message = _reference_client().to_fhir(kind, body)
     assert fhir.to_body(fhir.Bundle(message)) == (kind, body)
+
+
+def test_the_reference_token_cache_refreshes_then_signs_then_keeps_the_old_token(monkeypatch):
+    client = _reference_client()
+    now, calls, answers = [1000.0], [], []
+    monkeypatch.setattr(client.time, "time", lambda: now[0])
+
+    def pair(n):
+        return 200, {"access_token": f"cat_{n}", "expires_in": 300,
+                     "refresh_token": f"crt_{n}", "refresh_expires_in": 86400}
+
+    def signed(*args, **kwargs):
+        calls.append("sign")
+        return answers.pop(0)
+
+    def refreshed(server, client_id, refresh):
+        calls.append(f"refresh {refresh}")
+        return answers.pop(0)
+
+    monkeypatch.setattr(client, "get_token", signed)
+    monkeypatch.setattr(client, "refresh_token", refreshed)
+    cache = client.TokenCache("https://aims.example", "cmed-x", "kid", b"")
+
+    answers.append(pair(1))
+    assert cache.get() == "cat_1" and calls == ["sign"]
+    now[0] += 200
+    assert cache.get() == "cat_1" and len(calls) == 1          # reused, nothing sent
+    now[0] += 80                                                # 20 s left
+    answers.append(pair(2))
+    assert cache.get() == "cat_2" and calls[-1] == "refresh crt_1"
+    now[0] += 280
+    answers.extend([(400, {"error": "invalid_grant"}), pair(3)])
+    assert cache.get() == "cat_3" and calls[-2:] == ["refresh crt_2", "sign"]
+    now[0] += 280                                               # no network at all
+    answers.extend([(0, {}), (0, {})])
+    assert cache.get() == "cat_3"                               # still valid 20 s
+    now[0] += 30
+    answers.append((0, {}))
+    with pytest.raises(RuntimeError):
+        cache.get()

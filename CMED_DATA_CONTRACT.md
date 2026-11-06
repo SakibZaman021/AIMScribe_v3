@@ -66,13 +66,21 @@ Implemented in `backend/src/cmed_auth.py` and `backend/src/fhir.py`.
    a clock outside that gets `400 invalid_client` "clock skew", never a lockout.
 4. **It receives a 5-minute access token** for that hospital only
    (`"hospital_ids": [...]` in the reply). Reuse it until ~30 s before expiry.
+   The reply also carries a **refresh token** (`refresh_token`, `crt_…`, and
+   `refresh_expires_in`). To renew without signing, post
+   `grant_type=refresh_token&refresh_token=<it>&client_id=<client id>` to the
+   same URL: the reply is a new access token **and a new refresh token**. Each
+   refresh token is spent once; a spent one presented again revokes every
+   refresh token from that login. All refresh tokens from one signed login end
+   24 hours after it (`AIMS_REFRESH_TOKEN_HOURS`), however often they are used.
+   Any refusal is `400 invalid_grant`: sign a new assertion (step 3).
 5. **Every call carries `Authorization: Bearer <token>`.** A message whose
    `hospital_id` the token does not speak for is refused with
    `403 HOSPITAL_NOT_ALLOWED` and raises an alert here.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/v2/oauth/token` | the token (form-encoded, signed assertion) |
+| `POST /api/v2/oauth/token` | the token (form-encoded: a signed assertion, or a refresh token) |
 | `POST /fhir/r4/$process-message` | API 2 and API 3 as a FHIR message Bundle, `application/fhir+json` |
 | `GET /fhir/r4/Encounter?patient.identifier=<id>&_count=50` | the visits held (§3), as a searchset Bundle |
 | `GET /fhir/r4/Encounter/<id>` | one visit, only if it is at a hospital the token speaks for |

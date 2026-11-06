@@ -15,10 +15,17 @@ hospital is its own client:
      hospital, and is kept here only as a hash.
   4. Every API 2 / API 3b / visits call carries  Authorization: Bearer <token>.
      A message for any other hospital is refused (HOSPITAL_NOT_ALLOWED).
+  5. The reply also carries a refresh token. Posting it (grant_type
+     refresh_token) returns a new access token and a new refresh token without
+     signing; each refresh token is spent once. All of them end a fixed time
+     (AIMS_REFRESH_TOKEN_HOURS, 24 by default) after the signed login they
+     descend from, and then CMED signs again (step 2).
 
 What a thief gets:
   - a copy of our database: public keys and token hashes - nothing that signs;
   - one access token: five minutes, one hospital;
+  - one refresh token: one hospital, until its chain ends; if the thief and
+    CMED both use it, the second use revokes the whole chain;
   - one hospital's private key: that hospital only, until it is revoked here
     (one call), and only from CMED's addresses if an address list is set.
 
@@ -34,6 +41,7 @@ import os
 import re
 import secrets
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
@@ -58,6 +66,18 @@ ASSERTION_MAX_LIFETIME = 300            # exp may be at most this far ahead
 CLOCK_LEEWAY = 60                       # CMED's clock and ours may differ a little
 ALGORITHMS = ("ES384", "RS384", "ES256")
 ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+
+def _env_hours(name: str, default: float) -> float:
+    try:
+        hours = float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return hours if 0 < hours <= 24 * 30 else default
+
+
+# A refresh chain ends this long after the signed login it began with.
+REFRESH_LIFETIME = int(_env_hours("AIMS_REFRESH_TOKEN_HOURS", 24) * 3600)
 
 # SMART v2 scope names (resource.permissions). Sending API 2 or API 3b is
 # creating a message Bundle; the visits list is reading and searching
@@ -190,11 +210,13 @@ async def token(request: Request):
         return security.too_many(wait)
     form = await request.form()
     grant_type = str(form.get("grant_type") or "")
+    if grant_type == "refresh_token":
+        return await _refresh(form, ip)
     assertion_type = str(form.get("client_assertion_type") or "")
     assertion = str(form.get("client_assertion") or "")
     if grant_type != "client_credentials":
         return _oauth_error(400, "unsupported_grant_type",
-                            "grant_type must be client_credentials")
+                            "grant_type must be client_credentials or refresh_token")
     if assertion_type != ASSERTION_TYPE or not assertion:
         return _oauth_error(400, "invalid_request",
                             "client_assertion_type must be jwt-bearer, with client_assertion")
@@ -214,17 +236,40 @@ async def token(request: Request):
             await security.note_credential_failure(failure_key, ip, TOKEN_PATH)
         return _oauth_error(exc.status, exc.code, str(exc))
 
+    content = await _issue(client["client_id"], client["cmed_hospital_ids"], scopes,
+                           claims["_kid"])
+    await security.mark_trusted(ip)
+    return JSONResponse(headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+                        content=content)
+
+
+async def _issue(client_id: str, hospitals: Iterable[str], scopes: Iterable[str], kid: str, *,
+                 chain_id: Optional[uuid.UUID] = None,
+                 chain_ends: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    A new access token and a new refresh token. A signed login starts a new
+    chain; a refresh continues its own, which keeps the chain's end.
+    """
+    now = datetime.now(timezone.utc)
     access = "cat_" + secrets.token_urlsafe(32)
-    expires = datetime.now(timezone.utc) + timedelta(seconds=TOKEN_LIFETIME)
+    refresh = "crt_" + secrets.token_urlsafe(32)
+    chain_id = chain_id or uuid.uuid4()
+    chain_ends = chain_ends or now + timedelta(seconds=REFRESH_LIFETIME)
+    hospitals, scopes = sorted(hospitals), sorted(scopes)
     async with _pool().acquire() as conn:
         await conn.execute("""
             INSERT INTO cmed_access_tokens
                 (token_sha256, client_id, cmed_hospital_ids, scopes, expires_at, kid)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, _digest(access), client["client_id"], list(client["cmed_hospital_ids"]),
-             sorted(scopes), expires, claims["_kid"])
+        """, _digest(access), client_id, hospitals, scopes,
+             now + timedelta(seconds=TOKEN_LIFETIME), kid)
+        await conn.execute("""
+            INSERT INTO cmed_refresh_tokens
+                (token_sha256, chain_id, client_id, kid, cmed_hospital_ids, scopes, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """, _digest(refresh), chain_id, client_id, kid, hospitals, scopes, chain_ends)
         await conn.execute("UPDATE cmed_clients SET last_used_at = now() WHERE client_id = $1",
-                           client["client_id"])
+                           client_id)
         # Housekeeping, a few rows at a time, so the tables never grow.
         await conn.execute("""
             DELETE FROM cmed_access_tokens WHERE token_sha256 IN (
@@ -232,15 +277,88 @@ async def token(request: Request):
                  WHERE expires_at < now() - interval '1 day' LIMIT 500)
         """)
         await conn.execute("""
+            DELETE FROM cmed_refresh_tokens WHERE token_sha256 IN (
+                SELECT token_sha256 FROM cmed_refresh_tokens
+                 WHERE expires_at < now() - interval '1 day' LIMIT 500)
+        """)
+        await conn.execute("""
             DELETE FROM cmed_assertion_jti WHERE (client_id, jti) IN (
                 SELECT client_id, jti FROM cmed_assertion_jti
                  WHERE expires_at < now() - interval '1 hour' LIMIT 500)
         """)
+    return {"access_token": access, "token_type": "bearer", "expires_in": TOKEN_LIFETIME,
+            "refresh_token": refresh,
+            "refresh_expires_in": max(0, int((chain_ends - now).total_seconds())),
+            "scope": " ".join(scopes), "hospital_ids": hospitals}
+
+
+_SIGN_AGAIN = "; sign a new client_assertion (grant_type=client_credentials)"
+
+
+async def _refresh(form, ip: str) -> JSONResponse:
+    """grant_type=refresh_token: spend one refresh token, get the next pair."""
+    supplied = str(form.get("refresh_token") or "").strip()
+    if not supplied:
+        return _oauth_error(400, "invalid_request", "refresh_token is missing")
+    digest = _digest(supplied)
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT r.chain_id, r.client_id, r.kid, r.scopes, r.expires_at, r.used_at,
+                   r.revoked_at, r.expires_at <= now() AS expired,
+                   c.cmed_hospital_ids, c.scopes AS client_scopes, c.allowed_cidrs,
+                   c.revoked_at AS client_revoked_at, c.expires_at <= now() AS client_expired,
+                   k.revoked_at AS key_revoked_at
+              FROM cmed_refresh_tokens r
+              JOIN cmed_clients c USING (client_id)
+              LEFT JOIN cmed_client_keys k ON k.client_id = r.client_id AND k.kid = r.kid
+             WHERE r.token_sha256 = $1
+        """, digest)
+
+        def refused(why: str) -> JSONResponse:
+            logger.warning("Refresh refused for %s: %s", ip, why)
+            return _oauth_error(400, "invalid_grant", why + _SIGN_AGAIN)
+
+        if row is None:
+            return refused("refresh_token is unknown")
+        claimed = str(form.get("client_id") or "").strip()
+        if claimed and claimed != row["client_id"]:
+            return refused(f'this refresh_token was not issued to client "{claimed}"')
+        if row["used_at"] is not None:
+            # Spent tokens come back only from a copy: the chain is no longer
+            # trusted, whichever side holds the copy.
+            await conn.execute("""
+                UPDATE cmed_refresh_tokens SET revoked_at = now()
+                 WHERE chain_id = $1 AND revoked_at IS NULL
+            """, row["chain_id"])
+            return refused("this refresh_token was already used, so every refresh token from "
+                           "the same login is now revoked")
+        if row["revoked_at"] is not None:
+            return refused("this refresh_token was revoked")
+        if row["expired"]:
+            return refused(f'this refresh_token expired at {row["expires_at"]:%Y-%m-%d %H:%M} '
+                           "UTC")
+        if row["client_revoked_at"] is not None or row["client_expired"]:
+            return refused(f'client "{row["client_id"]}" is revoked or expired')
+        if row["key_revoked_at"] is not None:
+            return refused(f'kid "{row["kid"]}" of client "{row["client_id"]}" was revoked')
+        if not security.ip_allowed(ip, row["allowed_cidrs"]):
+            return refused("not allowed from this address")
+        scopes = canonical_scopes(row["scopes"]) & canonical_scopes(row["client_scopes"])
+        if not scopes:
+            return refused("this client no longer holds any of the token's scopes")
+        # Spent here, atomically: of two requests with one token only one wins.
+        spent = await conn.fetchval("""
+            UPDATE cmed_refresh_tokens SET used_at = now()
+             WHERE token_sha256 = $1 AND used_at IS NULL AND revoked_at IS NULL
+            RETURNING 1
+        """, digest)
+        if not spent:
+            return refused("this refresh_token was already used")
+    content = await _issue(row["client_id"], row["cmed_hospital_ids"], scopes, row["kid"],
+                           chain_id=row["chain_id"], chain_ends=row["expires_at"])
     await security.mark_trusted(ip)
     return JSONResponse(headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-                        content={"access_token": access, "token_type": "bearer",
-                                 "expires_in": TOKEN_LIFETIME, "scope": " ".join(sorted(scopes)),
-                                 "hospital_ids": sorted(client["cmed_hospital_ids"])})
+                        content=content)
 
 
 async def verify_assertion(assertion: str, audiences: List[str], ip: str, *,
@@ -590,7 +708,7 @@ async def add_key(client_id: str, body: KeyRequest, _: None = Depends(api_v2.req
 
 @router.post("/api/v2/admin/cmed-client/{client_id}/key/{kid}/revoke")
 async def revoke_key(client_id: str, kid: str, _: None = Depends(api_v2.require_admin)):
-    """The key, and every live token it bought - a stolen key stops at once."""
+    """The key, and every live token it bought (refresh tokens too) - a stolen key stops at once."""
     async with _pool().acquire() as conn:
         async with conn.transaction():
             done = await conn.execute("""
@@ -599,6 +717,10 @@ async def revoke_key(client_id: str, kid: str, _: None = Depends(api_v2.require_
             """, client_id, kid)
             tokens = await conn.execute("""
                 UPDATE cmed_access_tokens SET revoked_at = now()
+                 WHERE client_id = $1 AND kid = $2 AND revoked_at IS NULL
+            """, client_id, kid)
+            await conn.execute("""
+                UPDATE cmed_refresh_tokens SET revoked_at = now()
                  WHERE client_id = $1 AND kid = $2 AND revoked_at IS NULL
             """, client_id, kid)
     if done.endswith(" 0"):
@@ -620,6 +742,8 @@ async def revoke_client(client_id: str, _: None = Depends(api_v2.require_admin))
             tokens = await conn.execute("UPDATE cmed_access_tokens SET revoked_at = now() "
                                         "WHERE client_id = $1 AND revoked_at IS NULL",
                                         client_id)
+            await conn.execute("UPDATE cmed_refresh_tokens SET revoked_at = now() "
+                               "WHERE client_id = $1 AND revoked_at IS NULL", client_id)
     if done.endswith(" 0"):
         raise HTTPException(status_code=404, detail="no active client with that id")
     await api_v2._repo().audit(event_type="cmed_client.revoked", actor_type="admin",

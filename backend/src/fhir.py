@@ -861,7 +861,7 @@ def smart_configuration(request: Request) -> Dict[str, Any]:
         "token_endpoint": _base(request) + cmed_auth.TOKEN_PATH,
         "token_endpoint_auth_methods_supported": ["private_key_jwt"],
         "token_endpoint_auth_signing_alg_values_supported": list(cmed_auth.ALGORITHMS),
-        "grant_types_supported": ["client_credentials"],
+        "grant_types_supported": ["client_credentials", "refresh_token"],
         "scopes_supported": list(cmed_auth.ALL_SCOPES),
         "capabilities": ["client-confidential-asymmetric", "permission-v2"],
     }

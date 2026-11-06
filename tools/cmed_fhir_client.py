@@ -116,11 +116,23 @@ def get_token(server: str, client_id: str, kid: str, private_pem: bytes, *,
                  {"Content-Type": "application/x-www-form-urlencoded"})
 
 
+def refresh_token(server: str, client_id: str, refresh: str) -> Tuple[int, Dict[str, Any]]:
+    """A new access token and a new refresh token, without signing."""
+    form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh,
+                                   "client_id": client_id}).encode()
+    return _call(server.rstrip("/") + TOKEN_PATH, form,
+                 {"Content-Type": "application/x-www-form-urlencoded"})
+
+
 class TokenCache:
     """
     One hospital's token, reused until 30 s before it expires - not one per
-    message. Thread-safe enough for an outbox worker: a race costs one extra
-    token, never a failure.
+    message. Then, in order:
+      1. the refresh token (no signing), while its chain lasts;
+      2. a new signed assertion, when there is no refresh token or it is refused;
+      3. if both fail (no network), the old token while it is still valid.
+    Thread-safe enough for an outbox worker: a race costs one extra token,
+    never a failure.
     """
 
     def __init__(self, server: str, client_id: str, kid: str, private_pem: bytes, *,
@@ -128,21 +140,41 @@ class TokenCache:
         self.args = (server, client_id, kid, private_pem)
         self.audience = audience
         self._token: Optional[str] = None
-        self._until = 0.0
+        self._expires = 0.0                 # when the server stops accepting it
+        self._refresh: Optional[str] = None
+        self._refresh_until = 0.0
 
     def get(self) -> str:
-        if self._token and time.time() < self._until:
+        now = time.time()
+        if self._token and now < self._expires - 30:
             return self._token
-        status, reply = get_token(*self.args, audience=self.audience)
+        status, reply = 0, {}
+        if self._refresh and now < self._refresh_until - 30:
+            try:
+                status, reply = refresh_token(self.args[0], self.args[1], self._refresh)
+            except (urllib.error.URLError, OSError) as exc:
+                status, reply = 0, {"error": str(exc)}
+            self._refresh = None            # spent, or refused: never sent twice
+        if status != 200:
+            try:
+                status, reply = get_token(*self.args, audience=self.audience)
+            except (urllib.error.URLError, OSError) as exc:
+                status, reply = 0, {"error": str(exc)}
         if status != 200 or not reply.get("access_token"):
+            if self._token and time.time() < self._expires:
+                return self._token          # renewal failed; the old one still works
             raise RuntimeError(f"token refused ({status}): {reply.get('error')} "
                                f"{reply.get('error_description', '')}".strip())
+        now = time.time()
         self._token = reply["access_token"]
-        self._until = time.time() + int(reply.get("expires_in", 300)) - 30
+        self._expires = now + int(reply.get("expires_in", 300))
+        self._refresh = reply.get("refresh_token")
+        self._refresh_until = now + int(reply.get("refresh_expires_in", 0))
         return self._token
 
     def forget(self) -> None:
-        self._token, self._until = None, 0.0
+        """After a 401: this access token is no good; the refresh token may still be."""
+        self._token, self._expires = None, 0.0
 
 
 RETRYABLE = {429, 500, 502, 503, 504}
