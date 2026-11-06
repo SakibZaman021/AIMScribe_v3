@@ -193,6 +193,12 @@ def _oauth_error(status: int, error: str, description: str) -> JSONResponse:
 TOKEN_RATE = int(os.getenv("AIMS_TOKEN_RATE_PER_MINUTE", "60") or 60)
 
 
+def _log_note(**fields) -> None:
+    """Who is calling, for CMED's request log (cmed_log.py imports this module)."""
+    import cmed_log
+    cmed_log.note(**fields)
+
+
 def _claimed_client(assertion: str) -> str:
     """The client an assertion says it is from, unverified - only to key its failures."""
     try:
@@ -211,9 +217,13 @@ async def token(request: Request):
     form = await request.form()
     grant_type = str(form.get("grant_type") or "")
     if grant_type == "refresh_token":
+        _log_note(api="API 0 · refresh")
         return await _refresh(form, ip)
+    _log_note(api="API 0 · signed login")
     assertion_type = str(form.get("client_assertion_type") or "")
     assertion = str(form.get("client_assertion") or "")
+    if _claimed_client(assertion) != "-":
+        _log_note(client_id=_claimed_client(assertion))
     if grant_type != "client_credentials":
         return _oauth_error(400, "unsupported_grant_type",
                             "grant_type must be client_credentials or refresh_token")
@@ -320,6 +330,7 @@ async def _refresh(form, ip: str) -> JSONResponse:
 
         if row is None:
             return refused("refresh_token is unknown")
+        _log_note(client_id=row["client_id"])
         claimed = str(form.get("client_id") or "").strip()
         if claimed and claimed != row["client_id"]:
             return refused(f'this refresh_token was not issued to client "{claimed}"')
@@ -479,6 +490,7 @@ async def authenticate(request: Request, scope: str) -> Principal:
         principal = await _from_legacy_key(request.headers["x-cmed-key"])
     else:
         raise AuthError(401, "INVALID_TOKEN", "Send Authorization: Bearer <access token>.")
+    _log_note(client_id=principal.client_id)
     if scope not in principal.scopes:
         raise AuthError(403, "INSUFFICIENT_SCOPE", f"This token does not carry {scope}.")
     return principal

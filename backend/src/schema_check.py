@@ -163,6 +163,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it CMED cannot renew an access token with a refresh token.
     ("034_v3_cmed_refresh_tokens.sql", "recordings", "table cmed_refresh_tokens",
      _table("cmed_refresh_tokens")),
+    # Without it CMED cannot see what happened to its requests.
+    ("035_v3_cmed_request_log.sql", "recordings", "table cmed_request_log",
+     _table("cmed_request_log")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

@@ -1,8 +1,8 @@
 """
 The on-screen Stop and Pause control, drawn with tkinter (SRS 3.2 §7.8).
 
-A small card at the top right of the screen, shown only while a consultation
-is recording or paused. Two controls, the shapes the SRS names (SRS-UIX-03):
+A small card, at the top right of the screen until the doctor drags it
+elsewhere, shown only while a consultation is recording or paused. Two controls, the shapes the SRS names (SRS-UIX-03):
 
     Stop   - a red circle.       Thick ring, white inside. The microphone cuts
                                  on the press (SRS-UIX-08); the reason form
@@ -16,9 +16,11 @@ afternoon is tiring, and a ring reads as a control while a filled shape reads
 as a warning. Beside them, only what has to be there - the state, the elapsed
 time, and a line of words when something needs saying.
 
-It needs nothing from CMED to work (SRS-UIX-12), and it does not move
-(SRS-UIX-02): a control that can be dragged can be dragged off-screen, and
-then Stop is not where anybody left it.
+It needs nothing from CMED to work (SRS-UIX-12). It has no title bar, so no
+minimise or close, but it can be dragged by its background so it does not sit
+over what the doctor is reading. It can never be dragged off the screen - a
+Stop nobody can reach is the reason it used to be fixed (SRS-UIX-02) - and it
+stays where it was left for the next consultation.
 
 tkinter runs on its own thread, which owns every widget. Button presses are
 handed to the agent's event loop, as the tray menu's are; events from the
@@ -55,6 +57,7 @@ FONT = "Segoe UI"
 
 WIDTH, HEIGHT = 258, 84        # grows by one line when there is something to say
 NOTE_HEIGHT = 20
+MARGIN = 20                    # from the screen's edge, where the card starts
 STOP_SIZE = 50
 PAUSE_W, PAUSE_H = 74, 40
 
@@ -147,6 +150,8 @@ class Overlay:
         self.canvas = None
         self._pause_text = "Pause"
         self._height = HEIGHT
+        self._spot: Optional[tuple] = None      # where the doctor left the card
+        self._grab: Optional[tuple] = None      # the pointer's offset while dragging
 
     # ---- lifecycle ----
 
@@ -211,7 +216,7 @@ class Overlay:
             pass
 
         win = tk.Toplevel(self.root, bg=PAPER)
-        win.overrideredirect(True)                  # fixed, not draggable (SRS-UIX-02)
+        win.overrideredirect(True)                  # no title bar: no minimise, no close
         win.attributes("-topmost", True)
         win.withdraw()
         try:
@@ -225,8 +230,14 @@ class Overlay:
         self.window = win
 
         self.canvas = tk.Canvas(win, width=WIDTH, height=HEIGHT + NOTE_HEIGHT,
-                                bg=self._backdrop, highlightthickness=0, bd=0)
+                                bg=self._backdrop, highlightthickness=0, bd=0,
+                                cursor="fleur")
         self.canvas.pack()
+        # Dragged by the card itself; the two controls are their own widgets,
+        # so a press on Stop or Pause is a press, never the start of a drag.
+        self.canvas.bind("<ButtonPress-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
+        self.canvas.bind("<ButtonRelease-1>", self._drag_end)
 
         self.stop_button = self._button(win, "Stop", RED, RED_DEEP, shape="circle",
                                         action=self._on_stop)
@@ -406,8 +417,7 @@ class Overlay:
         height = HEIGHT + (NOTE_HEIGHT if note else 0)
         if height != self._height:
             self._height = height
-            self.window.geometry(f"{WIDTH}x{height}"
-                                 f"+{self.window.winfo_screenwidth() - WIDTH - 20}+20")
+            self._place()                       # where it is, not back to the corner
 
         canvas.create_rectangle(0, 0, WIDTH, height + NOTE_HEIGHT,
                                 fill=self._backdrop, outline=self._backdrop)
@@ -446,9 +456,33 @@ class Overlay:
         return MUTED
 
     def _place(self) -> None:
+        """Where the doctor left it, or the top right; always wholly on the screen."""
         self.window.update_idletasks()
-        x = self.window.winfo_screenwidth() - WIDTH - 20
-        self.window.geometry(f"{WIDTH}x{self._height}+{x}+20")
+        x, y = self._spot or (self.window.winfo_screenwidth() - WIDTH - MARGIN, MARGIN)
+        x, y = self._on_screen(x, y)
+        self.window.geometry(f"{WIDTH}x{self._height}+{x}+{y}")
+
+    def _on_screen(self, x: int, y: int) -> tuple:
+        """The nearest position at which the whole card, Stop included, is visible."""
+        right = self.window.winfo_screenwidth() - WIDTH
+        bottom = self.window.winfo_screenheight() - self._height
+        return max(0, min(int(x), right)), max(0, min(int(y), bottom))
+
+    # ---- dragging ----
+
+    def _drag_start(self, event) -> None:
+        self._grab = (event.x_root - self.window.winfo_rootx(),
+                      event.y_root - self.window.winfo_rooty())
+
+    def _drag_move(self, event) -> None:
+        if self._grab is None:
+            return
+        x, y = self._on_screen(event.x_root - self._grab[0], event.y_root - self._grab[1])
+        self._spot = (x, y)
+        self.window.geometry(f"+{x}+{y}")
+
+    def _drag_end(self, _event=None) -> None:
+        self._grab = None
 
     # ---- refresh ----
 
@@ -649,7 +683,10 @@ class Overlay:
         form.update_idletasks()
         x = self.window.winfo_rootx() + WIDTH - form.winfo_reqwidth()
         y = self.window.winfo_rooty() + self._height + 10
-        form.geometry(f"+{max(0, x)}+{y}")
+        # The card may have been dragged low: then the form opens above it.
+        if y + form.winfo_reqheight() > self.window.winfo_screenheight():
+            y = self.window.winfo_rooty() - form.winfo_reqheight() - 10
+        form.geometry(f"+{max(0, x)}+{max(0, y)}")
         form.grab_set()
         form.focus_force()
 

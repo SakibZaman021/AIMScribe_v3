@@ -250,6 +250,11 @@ app.add_middleware(
     max_age=600,
 )
 
+# CMED's request log (cmed_log.py): installed first, so it sits inside the
+# security middleware and sees the request id that middleware sets.
+import cmed_log  # noqa: E402
+cmed_log.install(app)
+
 # Every request: a per-address rate limit, and errors that never carry
 # internals (stack traces, SQL, file paths) back to the caller.
 security.install(app)
@@ -274,6 +279,8 @@ app.include_router(clinical_router)
 # Interface 4: the same, in plain JSON keyed by CMED's visit_id (clinical_v4.py).
 import clinical_v4  # noqa: E402
 app.include_router(clinical_v4.router)
+# CMED reads its own request log (GET /api/v4/clinical/log).
+app.include_router(cmed_log.router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
 # only, behind the administrator key.
 app.include_router(dashboard_router)
