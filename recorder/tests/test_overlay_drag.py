@@ -11,21 +11,31 @@ import pytest
 from ui import overlay as ov
 
 
-@pytest.fixture
-def card():
-    try:
-        import tkinter as tk
-        tk.Tk().destroy()
-    except Exception:
-        pytest.skip("no display for tkinter")
+@pytest.fixture(scope="module")
+def window():
+    """One real window for the module: creating and destroying a Tk root per
+    test now and then fails on Windows, which would make these tests flaky."""
     runtime = SimpleNamespace(cfg=SimpleNamespace(pause=SimpleNamespace(reasons=[])),
                               controller=None, loop=None)
     o = ov.Overlay(runtime)
-    o.build()
+    try:
+        o.build()
+    except Exception as exc:                     # no display, or no Tcl/Tk
+        pytest.skip(f"no display for tkinter: {exc}")
     o.window.deiconify()
     o.root.update()
     yield o
     o.root.destroy()
+
+
+@pytest.fixture
+def card(window):
+    """The window as a fresh card: no spot remembered, no drag, normal height."""
+    window._spot = window._grab = None
+    window._height = ov.HEIGHT
+    window._place()
+    window.root.update()
+    return window
 
 
 def press(o, widget_x, widget_y):
