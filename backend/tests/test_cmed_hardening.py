@@ -227,6 +227,44 @@ async def test_counters_are_shared_through_redis(monkeypatch):
 
 
 @asyncio
+async def test_limits_off_never_locks_out_or_rate_limits(monkeypatch):
+    """AIMS_LIMITS=off (the development phase): no lockout, no rate limit."""
+    shared = FakeRedis()
+    monkeypatch.setattr(security, "_redis", lambda: shared)
+    monkeypatch.setattr(security, "LIMITS_ON", False)
+    started = [await security.record_failure("cred", "x") for _ in range(50)]
+    assert started == [False] * 50
+    assert await security.locked_for("cred", "x") == 0
+    assert await security.locked_for("ip", "a") == 0
+    allowed = [(await security.rate_allow("token", "a", 3))[0] for _ in range(20)]
+    assert all(allowed)
+    # Switched back on, the same counters work again.
+    monkeypatch.setattr(security, "LIMITS_ON", True)
+    started = [await security.record_failure("cred", "x") for _ in range(10)]
+    assert started == [False] * 9 + [True]
+    assert await security.locked_for("cred", "x") > 800
+
+
+@asyncio
+async def test_limits_off_a_wrong_credential_is_refused_but_never_blocked(monkeypatch):
+    monkeypatch.setattr(security, "LIMITS_ON", False)
+    app = mini_app()
+    for _ in range(security.CREDENTIAL_FAILURES * 3):
+        assert (await call(app, "/device", headers={"X-Device-Token": "stale"}))[0] == 401
+    for _ in range(security.ANONYMOUS_FAILURES + 5):
+        assert (await call(app, "/anon", client="198.51.100.2"))[0] == 401
+    status, _, body = await call(app, "/device", headers={"X-Device-Token": "good"})
+    assert (status, body) == (200, {"ok": True})
+
+
+def test_limits_switch_reads_the_setting():
+    for value, expected in (("off", False), (" OFF ", False), ("0", False), ("no", False),
+                            ("false", False), ("on", True), ("", True), (None, True),
+                            ("anything", True)):
+        assert security.limits_on(value) is expected, value
+
+
+@asyncio
 async def test_a_redis_outage_falls_back_without_failing_requests(monkeypatch):
     class Broken:
         async def incr(self, key):

@@ -318,6 +318,10 @@ services:
       # On once every PC runs recorder 3.5 (signed requests, signed refusals).
       AIMS_REQUIRE_DEVICE_SIGNATURES: ${AIMS_REQUIRE_DEVICE_SIGNATURES:-off}
       AIMS_REQUIRE_SIGNED_REFUSAL: ${AIMS_REQUIRE_SIGNED_REFUSAL:-off}
+      # DEVELOPMENT PHASE: lockouts and rate limits are off so CMED can test
+      # without being blocked. Change this default to on (or set AIMS_LIMITS=on
+      # in .env) before production, then: docker compose up -d --no-deps api
+      AIMS_LIMITS: ${AIMS_LIMITS:-off}
       AIMS_RATE_PER_IP_PER_MINUTE: ${AIMS_RATE_PER_IP_PER_MINUTE:-1200}
       AIMS_TOKEN_RATE_PER_MINUTE: ${AIMS_TOKEN_RATE_PER_MINUTE:-60}
       AIMS_AUTH_FAILURE_LIMIT: ${AIMS_AUTH_FAILURE_LIMIT:-10}

@@ -223,6 +223,20 @@ FAILURE_WINDOW = 300
 LOCKOUT_SECONDS = 900
 TRUSTED_FOR = 900                    # an address that authenticated is trusted this long
 
+# The development switch. AIMS_LIMITS=off turns off every lockout (the
+# 15-minute blocks after repeated wrong credentials) and every rate limit,
+# so CMED's developers can test without being blocked. Refused requests are
+# still refused and still logged with their reason; nothing is counted.
+# Anything else, or unset, keeps them on. Set it back to on before production.
+def limits_on(value: Optional[str]) -> bool:
+    """AIMS_LIMITS: off, 0, false or no turns the limits off; anything else keeps them on."""
+    return (value or "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+LIMITS_ON = limits_on(os.getenv("AIMS_LIMITS"))
+if not LIMITS_ON:
+    logger.warning("AIMS_LIMITS=off: lockouts and rate limits are OFF (development only)")
+
 # The in-process fallbacks. With Redis up these are not consulted.
 PER_ADDRESS = RateLimiter(PER_ADDRESS_RATE)
 AUTH_FAILURES = FailureTracker(limit=CREDENTIAL_FAILURES, window=FAILURE_WINDOW,
@@ -254,6 +268,9 @@ async def _guard(coro, fallback):
 
 async def rate_allow(scope: str, key: str, rate: int, per: float = 60.0) -> Tuple[bool, float]:
     """One request against `rate` per `per` seconds, shared by every process."""
+    if not LIMITS_ON:
+        return True, 0.0
+
     def local():
         limiter = _LOCAL_LIMITERS.setdefault((scope, rate, per), RateLimiter(rate, per))
         return limiter.allow(f"{scope}:{key}")
@@ -279,6 +296,8 @@ def _tracker(kind: str) -> FailureTracker:
 
 async def locked_for(kind: str, key: str) -> float:
     """Seconds of lockout left for this credential or address."""
+    if not LIMITS_ON:
+        return 0.0
     r = _redis()
     if r is None:
         return _tracker(kind).locked(key)
@@ -291,6 +310,8 @@ async def locked_for(kind: str, key: str) -> float:
 
 async def record_failure(kind: str, key: str) -> bool:
     """Count one failure. True when this one started a lockout (raise the alert)."""
+    if not LIMITS_ON:
+        return False
     limit = CREDENTIAL_FAILURES if kind == "cred" else ANONYMOUS_FAILURES
     r = _redis()
     if r is None:
