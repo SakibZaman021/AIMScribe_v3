@@ -158,8 +158,17 @@ PCs that had AIMScribe 3.4 or earlier already carry the Windows Update values
 
 The certificate must name the same publisher every time —
 **AIMS LAB, United International University** — because SmartScreen builds its
-trust per publisher. Options, in order of preference (check current prices
-and eligibility before buying):
+trust per publisher.
+
+> **Decided 9 Nov 2026: an OV certificate from DigiCert, in KeyLocker**
+> (option 2). Azure Trusted Signing (option 1) is not open to organisations
+> in Bangladesh. Section 7.2 has the purchase, the GitHub settings and the
+> dry run. A local build uses the same certificate once DigiCert's KeyLocker
+> tools are installed on the build PC (`smctl windows ksp register`,
+> `smctl windows certsync`), with `AIMS_SIGN_PROVIDER=thumbprint` and the
+> thumbprint below.
+
+The options that were weighed:
 
 1. **Azure Trusted Signing** (Microsoft). Low monthly cost, keys held by
    Microsoft, short-lived certificates, strong SmartScreen standing.
@@ -262,7 +271,7 @@ version after that arrives by itself.
 
 ```
 git tag recorder-v3.8.5          GitHub Actions (recorder-release.yml)          AIMS LAB dashboard
-git push origin recorder-v3.8.5  -> build, test, sign (Azure Trusted Signing)  -> PCs -> Recorder updates:
+git push origin recorder-v3.8.5  -> build, test, sign (DigiCert KeyLocker, OV) -> PCs -> Recorder updates:
                                  -> refuse anything unsigned                       add 3.8.5, pick a stage
                                  -> GitHub Release: AIMScribeSetup.exe + .sha256   (off / test PCs /
                                                                                     hospitals / all, pause)
@@ -303,69 +312,110 @@ Each PC, inside the stage:
   `AIMS_MIN_RECORDER_VERSION` on the server still raises *recorder_outdated*
   for anything older, as before.
 
-### 7.2 For AIMS LAB: the cloud build (once)
+### 7.2 For AIMS LAB: the certificate and the cloud build (once)
 
 > **Status (9 Nov 2026): no code-signing certificate exists yet.** Every
 > AIMScribe build so far, 3.8.3 included, is unsigned, so the updater - which
-> requires an AIMS LAB Authenticode signature - has nothing it may install
-> until one is in place. Azure Trusted Signing (now *Artifact Signing*) issues
-> public-trust certificates only to organisations in the USA, Canada, the EU
-> and the UK, so it is not open to AIMS LAB in Bangladesh as things stand. The
-> routes that are open: a commercial OV certificate with cloud signing, issued
-> to the university's legal name (then `AIMS_SIGN_PUBLISHER` is that name), or
-> SignPath Foundation's free open-source programme (publisher "SignPath
-> Foundation"; its own GitHub integration, not the API route below).
+> requires an Authenticode signature by `AIMS_SIGN_PUBLISHER` - has nothing it
+> may install until the certificate below is in place. (Azure Trusted Signing
+> is not an option: it issues public-trust certificates only to organisations
+> in the USA, Canada, the EU and the UK.)
 
-The repository is public, so **no secret is ever committed**. Everything lives
-in a GitHub *environment*:
+**The chosen route: an OV code-signing certificate from DigiCert, kept in
+DigiCert KeyLocker.** The private key lives in DigiCert's HSM and never
+touches a PC or GitHub; the build signs through it. DigiCert, or a DigiCert
+reseller, sells it with *KeyLocker* as the delivery method (not a USB token).
 
-1. The environment `recorder-release` exists (created 9 Nov 2026) and only
-   tags matching `recorder-v*` may use it; `AIMS_BACKEND` is set. Optionally
-   add yourself as a required reviewer (GitHub -> Settings -> Environments),
-   so each build waits for a click before it can sign anything.
-2. **Azure Trusted Signing** (`AIMS_SIGN_PROVIDER=azure`, if AIMS LAB becomes eligible):
-   - In Azure, the Trusted Signing account and a *Public Trust* certificate
-     profile already used by `signing\sign.ps1`.
-   - Microsoft Entra ID -> App registrations -> **New registration**
-     `aimscribe-github-signing`. Under *Certificates & secrets* -> *Federated
-     credentials* -> **Add**: *GitHub Actions deploying Azure resources*,
-     organisation `SakibZaman021`, repository `AIMScribe_v3`, entity
-     **Environment**, name `recorder-release`. (Subject
-     `repo:SakibZaman021/AIMScribe_v3:environment:recorder-release`.) No client
-     secret is created: GitHub proves who it is with a short-lived OIDC token.
-   - On the Trusted Signing account -> Access control (IAM): give that app the
-     role **Trusted Signing Certificate Profile Signer** - and nothing else.
-3. In the `recorder-release` environment:
+**A. Buy it (AIMS LAB / UIU administration - a purchase only they can make)**
 
-   | Kind | Name | Value |
-   |---|---|---|
-   | secret | `AZURE_CLIENT_ID` | the app registration's Application (client) ID |
-   | secret | `AZURE_TENANT_ID` | the Directory (tenant) ID |
-   | secret | `AZURE_SUBSCRIPTION_ID` | the subscription holding the signing account |
-   | variable | `AZURE_SIGNING_ENDPOINT` | e.g. `https://eus.codesigning.azure.net` (the account's region) |
-   | variable | `AZURE_SIGNING_ACCOUNT` | the Trusted Signing account name |
-   | variable | `AZURE_SIGNING_PROFILE` | the certificate profile name |
-   | variable | `AIMS_SIGN_PUBLISHER` | the certificate's exact CN (or O), e.g. `AIMS LAB` - every PC will require this name on every update |
-   | variable (optional) | `AIMS_SIGN_PROVIDER` | `azure` (default) or `signpath` |
-   | variable (optional) | `AIMS_BACKEND` | default `https://aimscribe.iriic.uiu.ac.bd` (new PCs only) |
-   | variable (optional) | `AZURE_SIGNING_CLIENT_VERSION` | pin `Microsoft.Trusted.Signing.Client`; default the latest, checked to be signed by Microsoft |
-   | variable (optional) | `ALLOW_VULNERABLE_BUILD` | `true` only to release past a pip-audit finding you have reviewed |
+1. Order an **OV Code Signing** certificate with **KeyLocker** delivery. The
+   organisation on the order must be a legal entity the CA can verify -
+   almost certainly *United International University* (AIMS LAB is part of
+   it). The certificate's name is that legal name, and that is the publisher
+   every PC will check. Have ready: the university's registration or charter
+   (UGC), its address and main phone number as listed in a public directory,
+   and an authorised signatory for the verification call.
+2. Ask, before paying: **how many signatures a year are included.** One
+   release uses about **27** (24 Python modules, the program, the setup and
+   its uninstaller; the other 29 files carry their makers' signatures), and
+   each dry run uses as many. 300 a year covers about ten releases.
+3. When it is issued, in **DigiCert ONE -> KeyLocker**:
+   - **Settings -> Users / Service users**: create a service user for GitHub;
+     create its **API key** (shown once).
+   - **Client authentication certificate**: create one for that user; download
+     the `.p12` and keep its **password**.
+   - **Certificates**: note the code-signing certificate's **SHA-1 thumbprint**
+     (40 hexadecimal characters) and its **subject** (`CN=...`, `O=...`).
+   - Note the **host** shown for the API (for example
+     `https://clientauth.one.digicert.com`).
 
-4. **SignPath instead** (`AIMS_SIGN_PROVIDER=signpath`): secret
-   `SIGNPATH_API_TOKEN` (a CI user's token); variables
-   `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_POLICY_SLUG`,
-   `SIGNPATH_ARTIFACT_CONFIG_ZIP` (signs every PE file inside a zip - the
-   program folder) and `SIGNPATH_ARTIFACT_CONFIG_PE` (signs one PE file - the
-   setup and its uninstaller). The signing policy must accept API submissions;
-   SignPath's free open-source policy, which requires its GitHub origin
-   verification, does not, and needs a different workflow. This path has not
-   been run yet: Azure is the one to use first.
+**B. Give it to the build (GitHub -> Settings -> Environments -> `recorder-release`)**
 
-The certificate's name matters twice: the build refuses a setup whose signer's
-CN/O is not `AIMS_SIGN_PUBLISHER`, and the installer writes the same name into
-each PC's `.env` (`AIMS_UPDATE_PUBLISHER`), which its updater then requires. A
-PC keeps that value across updates. Changing the certificate's name later
-means one manual install of a release carrying the new name.
+The repository is public, so **no secret is ever committed**. The environment
+already exists (created 9 Nov 2026): only tags matching `recorder-v*` may use
+it, and `AIMS_BACKEND` is set. Optionally add yourself as a required reviewer,
+so each build waits for a click before it can sign anything.
+
+| Kind | Name | Value |
+|---|---|---|
+| secret | `SM_API_KEY` | the service user's API key |
+| secret | `SM_CLIENT_CERT_FILE_B64` | the `.p12`, base64: PowerShell `[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\client.p12'))` |
+| secret | `SM_CLIENT_CERT_PASSWORD` | the `.p12` password |
+| variable | `SM_HOST` | the DigiCert ONE host from A3 |
+| variable | `SM_CODE_SIGNING_CERT_SHA1_HASH` | the certificate's SHA-1 thumbprint (public, not a secret) |
+| variable | `AIMS_SIGN_PUBLISHER` | the certificate's **exact** CN (or O), e.g. `United International University` |
+| variable (optional) | `AIMS_SIGN_PROVIDER` | `keylocker` (default); `azure` or `signpath` only if one of those ever becomes the route |
+| variable (optional) | `ALLOW_VULNERABLE_BUILD` | `true` only to release past a pip-audit finding you have reviewed |
+
+The same from a terminal, if `gh` is signed in as the repository's owner:
+
+```powershell
+gh secret set SM_API_KEY --env recorder-release
+gh secret set SM_CLIENT_CERT_PASSWORD --env recorder-release
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\client.p12')) | gh secret set SM_CLIENT_CERT_FILE_B64 --env recorder-release
+gh variable set SM_HOST --env recorder-release --body "https://clientauth.one.digicert.com"
+gh variable set SM_CODE_SIGNING_CERT_SHA1_HASH --env recorder-release --body "<40 hex characters>"
+gh variable set AIMS_SIGN_PUBLISHER --env recorder-release --body "<the certificate's exact CN>"
+```
+
+(`gh secret set` without `--body` asks for the value, so it is never typed
+on a command line or kept in shell history.)
+
+**C. Prove it with a dry run, then release**
+
+```powershell
+git tag recorder-v3.8.4-dryrun
+git push origin recorder-v3.8.4-dryrun
+```
+
+The *recorder-release* run installs DigiCert's tools (checked to be signed by
+DigiCert), syncs the certificate from KeyLocker, prints **Signing
+certificate: CN=...**, builds, runs the tests, signs, and checks every file -
+and publishes nothing; the signed setup is kept as a build artefact for a
+week. If it fails on the publisher, it prints the certificate's actual
+subject: set `AIMS_SIGN_PUBLISHER` to its CN exactly and push another dry-run
+tag. When a dry run is green, push the real tag `recorder-v3.8.4`.
+
+**How the name is used.** The build refuses a setup whose signer's CN/O is
+not `AIMS_SIGN_PUBLISHER`, and the installer writes the same name into each
+PC's `.env` (`AIMS_UPDATE_PUBLISHER`), which its updater then requires. A PC
+keeps that value across updates. Changing the certificate's name later (a
+different legal entity) means one manual install of a release carrying the
+new name. A renewed certificate with the same name needs nothing: only the
+thumbprint variable changes.
+
+**Alternatives kept in the workflow** (not the route now):
+*Azure Trusted Signing* (`AIMS_SIGN_PROVIDER=azure`) needs secrets
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` (an app
+registration with a federated credential for
+`repo:SakibZaman021/AIMScribe_v3:environment:recorder-release` and the role
+*Trusted Signing Certificate Profile Signer*) and variables
+`AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`.
+*SignPath* (`AIMS_SIGN_PROVIDER=signpath`) needs secret `SIGNPATH_API_TOKEN`
+and variables `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`,
+`SIGNPATH_POLICY_SLUG`, `SIGNPATH_ARTIFACT_CONFIG_ZIP`,
+`SIGNPATH_ARTIFACT_CONFIG_PE`, and a policy that accepts API submissions.
+Neither has been run.
 
 ### 7.3 For IT: the one manual install (3.8.4)
 
@@ -407,7 +457,7 @@ updates. Use two bench PCs first (A and B), then one clinic PC.
 | # | Do | Expect |
 |---|---|---|
 | 1 | Install 3.8.4 by hand on bench PCs A and B (7.3). | Both on the dashboard at 3.8.4; `updater.log` says idle. |
-| 2 | Push tag `recorder-v3.8.5` (any harmless change). | The *recorder-release* run is green; the GitHub Release has `AIMScribeSetup.exe` and `.sha256`; the run's *Refuse anything unsigned* step lists `OK ... AIMS LAB` for the setup and the program. |
+| 2 | Push tag `recorder-v3.8.5-dryrun`, then `recorder-v3.8.5` (any harmless change). | The *recorder-release* run is green; the GitHub Release has `AIMScribeSetup.exe` and `.sha256`; the run's *Refuse anything unsigned* step lists `OK ... AIMS LAB` for the setup and the program. |
 | 3 | Dashboard -> PCs -> Recorder updates: **Add release** 3.8.5, leave SHA-256 and address empty. | The release appears at stage *off*, with the SHA-256 read from the GitHub Release - compare it with the Release page. No PC is offered it. |
 | 4 | **Set rollout**: stage *Test PCs only*, Test PCs = A's name. | Within a minute A shows *Will update* / *Notice received*; B shows nothing. `C:\ProgramData\AIMScribe\state\update_notice.json` exists on A only. |
 | 5 | On A, start a consultation from CMED's test page and keep it recording; run `schtasks /Run /TN "AIMScribe Updater"`. | A's updater reports **Waiting** ("a consultation is recording"); the recording is not interrupted; nothing is downloaded. |

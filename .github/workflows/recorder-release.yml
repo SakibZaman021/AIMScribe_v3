@@ -2,10 +2,19 @@
 #
 #     git tag recorder-v3.8.4 && git push origin recorder-v3.8.4
 #
+# A dry run builds and signs without publishing anything:
+#
+#     git tag recorder-v3.8.4-dryrun && git push origin recorder-v3.8.4-dryrun
+#
+# Use one once the certificate is in place, to see the publisher name before
+# the first real tag. (A tag, so the signing secrets stay reachable from
+# recorder-v* tags only.)
+#
 # On windows-latest: the version is taken from the tag and written into
 # recorder/config.py (APP_VERSION), recorder/version_info.txt and
 # recorder/installer.iss; recorder/BUILD.bat builds and signs every program
-# file and the setup (Azure Trusted Signing through GitHub OIDC, or SignPath);
+# file and the setup (the OV certificate in DigiCert KeyLocker by default;
+# Azure Trusted Signing or SignPath are kept as alternatives);
 # the job fails if the setup or any shipped file is unsigned or signed by
 # anyone but AIMS LAB; then dist/AIMScribeSetup.exe and its SHA-256 are
 # published as a GitHub Release. Nothing reaches a PC from here: an admin adds
@@ -15,8 +24,7 @@
 #
 # The repository is public. No secret is in this file or anywhere in the
 # repository: they live in the "recorder-release" environment's secrets and
-# variables. recorder/INSTALL_FOR_IT.md ("Automatic updates") lists each one
-# and how to make the Azure federated credential.
+# variables. recorder/INSTALL_FOR_IT.md section 7.2 lists each one.
 name: recorder-release
 
 on:
@@ -34,15 +42,15 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 90
-    # Its secrets are given only to jobs on this environment; it can be limited
-    # to recorder-v* tags and made to wait for a reviewer (Settings ->
-    # Environments). The Azure federated credential trusts this environment.
+    # Its secrets are given only to jobs on this environment, which only
+    # recorder-v* tags may use; it can also be made to wait for a reviewer
+    # (Settings -> Environments).
     environment: recorder-release
     permissions:
       contents: write        # create the GitHub Release
-      id-token: write        # sign in to Azure with OIDC: no stored Azure secret
+      id-token: write        # Azure only: sign in with OIDC, no stored Azure secret
     env:
-      AIMS_SIGN_PROVIDER: ${{ vars.AIMS_SIGN_PROVIDER || 'azure' }}
+      AIMS_SIGN_PROVIDER: ${{ vars.AIMS_SIGN_PROVIDER || 'keylocker' }}
       AIMS_SIGN_PUBLISHER: ${{ vars.AIMS_SIGN_PUBLISHER || 'AIMS LAB' }}
       AIMS_BACKEND: ${{ vars.AIMS_BACKEND || 'https://aimscribe.iriic.uiu.ac.bd' }}
       ALLOW_VULNERABLE_BUILD: ${{ vars.ALLOW_VULNERABLE_BUILD || 'false' }}
@@ -55,12 +63,18 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^recorder-v(\d{1,4}\.\d{1,4}\.\d{1,4})$') {
-            throw "The tag must be recorder-v<major>.<minor>.<patch>, e.g. recorder-v3.8.4 (got '$tag')"
+          if ($tag -notmatch '^recorder-v(\d{1,4}\.\d{1,4}\.\d{1,4})(-dryrun)?$') {
+            throw "The tag must be recorder-v<major>.<minor>.<patch>, e.g. recorder-v3.8.4 (or ...-dryrun) (got '$tag')"
           }
           $v = $Matches[1]
+          $dry = [bool]$Matches[2]
           "version=$v" >> $env:GITHUB_OUTPUT
-          Write-Host "Releasing AIMScribe recorder $v"
+          "dry_run=$($dry.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($dry) {
+            Write-Host "DRY RUN of AIMScribe recorder ${v}: built and signed, published nowhere"
+          } else {
+            Write-Host "Releasing AIMScribe recorder $v"
+          }
 
       - name: Write the version into the program and the installer
         shell: pwsh
@@ -96,7 +110,62 @@ jobs:
             Where-Object { Test-Path $_ }
           if (-not $found) { choco install innosetup --no-progress -y; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
 
-      # ---------------------------------------------------------------- Azure Trusted Signing
+      # ---------------------------------------------------------------- DigiCert KeyLocker (default)
+      # The OV certificate's key never leaves DigiCert's HSM. DigiCert's key
+      # storage provider (KSP) puts the certificate into this runner's user
+      # certificate store; signtool then signs by thumbprint through it - the
+      # ordinary "thumbprint" route of signing\sign.ps1, nothing special.
+      - name: DigiCert KeyLocker tools
+        if: env.AIMS_SIGN_PROVIDER == 'keylocker'
+        shell: pwsh
+        env:
+          SM_HOST: ${{ vars.SM_HOST }}
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          THUMBPRINT: ${{ vars.SM_CODE_SIGNING_CERT_SHA1_HASH }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($n in 'SM_HOST', 'SM_API_KEY', 'SM_CLIENT_CERT_FILE_B64', 'SM_CLIENT_CERT_PASSWORD', 'THUMBPRINT') {
+            if (-not [Environment]::GetEnvironmentVariable($n)) { throw "Set $n in the recorder-release environment (INSTALL_FOR_IT.md 7.2)" }
+          }
+          $thumb = ($env:THUMBPRINT -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+          if ($thumb.Length -ne 40) { throw "SM_CODE_SIGNING_CERT_SHA1_HASH must be the certificate's 40-character SHA-1 thumbprint" }
+
+          # The client authentication certificate that proves this runner to DigiCert ONE.
+          $p12 = Join-Path $env:RUNNER_TEMP 'keylocker-client.p12'
+          [IO.File]::WriteAllBytes($p12, [Convert]::FromBase64String($env:SM_CLIENT_CERT_FILE_B64))
+
+          $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
+          Invoke-WebRequest -Uri 'https://one.digicert.com/signingmanager/api-ui/v1/releases/Keylockertools-windows-x64.msi/download' `
+            -Headers @{ 'x-api-key' = $env:SM_API_KEY } -OutFile $msi
+          # Only DigiCert's own installer is run with the build's signing credentials in reach.
+          $sig = Get-AuthenticodeSignature -LiteralPath $msi
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'DigiCert') {
+            throw "The KeyLocker tools installer is not signed by DigiCert: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/quiet', '/qn') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "KeyLocker tools did not install (msiexec $($p.ExitCode))" }
+          $tools = 'C:\Program Files\DigiCert\DigiCert Keylocker Tools'
+          if (-not (Test-Path (Join-Path $tools 'smctl.exe'))) { throw "smctl.exe not found in $tools" }
+          $tools >> $env:GITHUB_PATH
+
+          # The settings smctl and the KSP read, for this step and every later one.
+          "SM_HOST=$env:SM_HOST" >> $env:GITHUB_ENV
+          "SM_CLIENT_CERT_FILE=$p12" >> $env:GITHUB_ENV
+          $env:SM_CLIENT_CERT_FILE = $p12
+          & "$tools\smctl.exe" healthcheck
+          & "$tools\smctl.exe" windows ksp register
+          if ($LASTEXITCODE) { throw "smctl windows ksp register failed ($LASTEXITCODE)" }
+          & "$tools\smctl.exe" windows certsync
+          if ($LASTEXITCODE) { throw "smctl windows certsync failed ($LASTEXITCODE)" }
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object Thumbprint -eq $thumb
+          if (-not $cert) { throw "The certificate $thumb is not in the user store after certsync: check SM_CODE_SIGNING_CERT_SHA1_HASH" }
+          Write-Host "Signing certificate: $($cert.Subject)  (valid until $($cert.NotAfter))"
+          "AIMS_SIGN_THUMBPRINT=$thumb" >> $env:GITHUB_ENV
+          "AIMS_SIGN_TIMESTAMP=http://timestamp.digicert.com" >> $env:GITHUB_ENV
+
+      # ---------------------------------------------------------------- Azure Trusted Signing (alternative)
       - name: Sign in to Azure (OIDC)
         if: env.AIMS_SIGN_PROVIDER == 'azure'
         uses: azure/login@v2
@@ -141,6 +210,9 @@ jobs:
         shell: cmd
         env:
           CI: "true"
+          # Used only when AIMS_SIGN_PROVIDER=keylocker: the KSP signs with them.
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
           # Used only when AIMS_SIGN_PROVIDER=signpath (signing\sign.ps1).
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
           SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -149,9 +221,11 @@ jobs:
           SIGNPATH_ARTIFACT_CONFIG_ZIP: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_ZIP }}
           SIGNPATH_ARTIFACT_CONFIG_PE: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_PE }}
         run: |
-          if not "%AIMS_SIGN_PROVIDER%"=="azure" if not "%AIMS_SIGN_PROVIDER%"=="signpath" (
-            echo AIMS_SIGN_PROVIDER must be azure or signpath in the cloud build & exit /b 1
+          if not "%AIMS_SIGN_PROVIDER%"=="keylocker" if not "%AIMS_SIGN_PROVIDER%"=="azure" if not "%AIMS_SIGN_PROVIDER%"=="signpath" (
+            echo AIMS_SIGN_PROVIDER must be keylocker, azure or signpath in the cloud build & exit /b 1
           )
+          REM KeyLocker's certificate is in this runner's store: signing\sign.ps1 signs by thumbprint.
+          if "%AIMS_SIGN_PROVIDER%"=="keylocker" set "AIMS_SIGN_PROVIDER=thumbprint"
           set DEV_UNSIGNED=
           call recorder\BUILD.bat
 
@@ -197,6 +271,7 @@ jobs:
           Write-Host "SHA-256 $h"
 
       - name: Publish the GitHub Release
+        if: steps.version.outputs.dry_run != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -222,7 +297,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: aimscribe-recorder-${{ steps.version.outputs.version }}
+          name: aimscribe-recorder-${{ steps.version.outputs.version }}${{ steps.version.outputs.dry_run == 'true' && '-dry-run' || '' }}
           path: |
             recorder/dist/AIMScribeSetup.exe
             recorder/dist/AIMScribeSetup.exe.sha256
