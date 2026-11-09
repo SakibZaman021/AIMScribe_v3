@@ -305,14 +305,25 @@ Each PC, inside the stage:
 
 ### 7.2 For AIMS LAB: the cloud build (once)
 
+> **Status (9 Nov 2026): no code-signing certificate exists yet.** Every
+> AIMScribe build so far, 3.8.3 included, is unsigned, so the updater - which
+> requires an AIMS LAB Authenticode signature - has nothing it may install
+> until one is in place. Azure Trusted Signing (now *Artifact Signing*) issues
+> public-trust certificates only to organisations in the USA, Canada, the EU
+> and the UK, so it is not open to AIMS LAB in Bangladesh as things stand. The
+> routes that are open: a commercial OV certificate with cloud signing, issued
+> to the university's legal name (then `AIMS_SIGN_PUBLISHER` is that name), or
+> SignPath Foundation's free open-source programme (publisher "SignPath
+> Foundation"; its own GitHub integration, not the API route below).
+
 The repository is public, so **no secret is ever committed**. Everything lives
 in a GitHub *environment*:
 
-1. GitHub -> Settings -> Environments -> **New environment** `recorder-release`.
-   Under *Deployment branches and tags* allow only tags matching `recorder-v*`.
-   Optionally add yourself as a required reviewer, so each build waits for a
-   click before it can sign anything.
-2. **Azure Trusted Signing** (the default, `AIMS_SIGN_PROVIDER=azure`):
+1. The environment `recorder-release` exists (created 9 Nov 2026) and only
+   tags matching `recorder-v*` may use it; `AIMS_BACKEND` is set. Optionally
+   add yourself as a required reviewer (GitHub -> Settings -> Environments),
+   so each build waits for a click before it can sign anything.
+2. **Azure Trusted Signing** (`AIMS_SIGN_PROVIDER=azure`, if AIMS LAB becomes eligible):
    - In Azure, the Trusted Signing account and a *Public Trust* certificate
      profile already used by `signing\sign.ps1`.
    - Microsoft Entra ID -> App registrations -> **New registration**
