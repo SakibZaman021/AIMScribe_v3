@@ -627,9 +627,9 @@ function drawRooms(d) {
           + `<br><button type="button" class="chip" data-decide="approve" data-device="${esc(q.device_id)}">Approve</button>`
           + ` <button type="button" class="chip" data-decide="reject" data-device="${esc(q.device_id)}">Reject</button>`
           : "");
-      const version = q.outdated
+      const version = (q.outdated
         ? tag("warn", `${q.app_version || "?"} · update`, `Below ${minV}`)
-        : esc(q.app_version || "–");
+        : esc(q.app_version || "–")) + updateText(q.update_status);
       const disk = q.disk_encrypted === true ? tag("good", "Encrypted")
         : q.disk_encrypted === false ? tag("bad", "Not encrypted")
         : `<span class="hint">not reported</span>`;
@@ -1077,6 +1077,8 @@ async function whoAmI() {
       $("clientsPanel").hidden = false;
       $("navCmed").hidden = false;
       loadCmed();
+      $("updatesPanel").hidden = false;
+      loadUpdates();
     }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
@@ -1138,6 +1140,118 @@ async function loadCmed() {
     $("clients").innerHTML = empty("Connections could not be loaded", err.message, true);
   }
 }
+
+/* ============================================================
+   Recorder updates: the release in force, its rollout stage, and what
+   every PC's updater last said.
+   ============================================================ */
+const UPDATE_WORDS = {
+  idle: ["quiet", "Up to date"], notice: ["quiet", "Notice received"],
+  waiting: ["warn", "Waiting for the consultation to end"], downloading: ["quiet", "Downloading"],
+  installing: ["warn", "Installing"], installed: ["good", "Installed"],
+  failed: ["bad", "Failed"], gave_up: ["bad", "Gave up"], refused: ["bad", "Refused the notice"],
+};
+
+function updateText(u) {
+  if (!u || !u.state || u.state === "idle") return "";
+  const [tone, words] = UPDATE_WORDS[u.state] || ["quiet", u.state];
+  const what = `${words}${u.version ? ` ${u.version}` : ""}`;
+  const why = [u.reason, u.attempts ? `try ${u.attempts} of 3` : "", u.at ? dhaka(u.at) : ""]
+    .filter(Boolean).join(" · ");
+  return "<br>" + tag(tone, what, why);
+}
+
+let RELEASE = null;
+
+async function loadUpdates() {
+  let d;
+  try { d = await adminCall("GET", "/api/v2/admin/recorder-releases"); }
+  catch (err) {
+    $("release").innerHTML = empty("Updates could not be loaded", err.message, true);
+    return;
+  }
+  RELEASE = d.current;
+  const r = d.current;
+  if (!r) {
+    $("release").innerHTML = empty("No release yet",
+      "Push a tag recorder-v<version>; when GitHub has published it, add the version here.", true);
+    $("rolloutForm").hidden = true;
+  } else {
+    const stage = { off: "no PC", test: "the test PCs", hospitals: "the test PCs and named hospitals",
+      all: "every PC" }[r.stage] || r.stage;
+    $("release").innerHTML = `<p><b>${esc(r.version)}</b>${r.rollback ? " " + tag("warn", "rollback") : ""}`
+      + ` · offered to ${esc(stage)}${r.paused ? " " + tag("bad", "Paused") : ""}`
+      + `<br><span class="hint">SHA-256 <code>${esc(r.sha256)}</code><br>${esc(r.download_url)}`
+      + `<br>added by ${esc(r.created_by)} ${esc(dhaka(r.created_at))}`
+      + (r.changed_by ? ` · last changed by ${esc(r.changed_by)} ${esc(dhaka(r.changed_at))}` : "")
+      + `</span></p>`
+      + (d.signing ? "" : `<p>${tag("bad", "Not signing", "The server has no receipt key: no PC is told of any update")}</p>`);
+    $("rolloutForm").hidden = false;
+    $("rStage").value = r.stage;
+    $("rTests").value = (r.test_devices || []).join(", ");
+    $("rHospitals").value = (r.hospitals || []).join(", ");
+    $("rPause").textContent = r.paused ? "Resume" : "Pause";
+  }
+  const pcs = d.devices || [];
+  const onIt = r ? pcs.filter((p) => p.app_version === r.version).length : 0;
+  $("updateDevices").innerHTML = !pcs.length ? ""
+    : (r ? `<div class="body hint">${num(onIt)} of ${plural(pcs.length, "PC")} run ${esc(r.version)}.</div>` : "")
+      + `<table><thead><tr><th>PC</th><th>Clinic</th><th>Version</th><th>In this stage</th><th>Updater</th></tr></thead><tbody>`
+      + pcs.map((p) => `<tr>`
+        + td("PC", `<b>${esc(p.machine_name || p.device_id.slice(0, 8))}</b><br><span class="hint">${esc(p.device_id)}</span>`)
+        + td("Clinic", esc(clinicName(p.hospital_id)))
+        + td("Version", esc(p.app_version || "–"))
+        + td("In this stage", p.offered ? tag("warn", "Will update") : p.in_stage ? tag("good", "Yes, up to date") : `<span class="hint">no</span>`)
+        + td("Updater", updateText(p.update_status).replace(/^<br>/, "") || `<span class="hint">nothing reported</span>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+const listOf = (text) => text.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean);
+
+$("releaseForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const by = adminName();
+  if (by.length < 2) return;
+  const rollback = $("rRollback").value === "yes";
+  if (rollback && !window.confirm("Offer this OLDER version as a rollback? PCs on a newer version will go back to it.")) return;
+  $("releaseMsg").textContent = "Adding...";
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/recorder-releases", {
+      version: $("rVersion").value.trim(), sha256: $("rSha").value.trim(),
+      url: $("rUrl").value.trim(), rollback, by });
+    $("releaseMsg").textContent = `${r.release.version} added, offered to no PC yet: choose a stage.`;
+    $("rVersion").value = $("rSha").value = $("rUrl").value = "";
+    $("rRollback").value = "no";
+    loadUpdates();
+  } catch (err) { $("releaseMsg").textContent = `Not added: ${err.message}`; }
+});
+
+$("rolloutForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!RELEASE) return;
+  const stage = $("rStage").value;
+  if (stage === "all" && !window.confirm(`Offer ${RELEASE.version} to every PC?`)) return;
+  const by = adminName();
+  if (by.length < 2) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/recorder-releases/${RELEASE.release_id}/rollout`, {
+      stage, test_devices: listOf($("rTests").value), hospitals: listOf($("rHospitals").value), by });
+    $("rolloutMsg").textContent = "Set. PCs in the stage hear of it within a minute.";
+    loadUpdates();
+  } catch (err) { $("rolloutMsg").textContent = `Not set: ${err.message}`; }
+});
+
+$("rPause").addEventListener("click", async () => {
+  if (!RELEASE) return;
+  const by = adminName();
+  if (by.length < 2) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/recorder-releases/${RELEASE.release_id}/pause`,
+      { paused: !RELEASE.paused, by });
+    $("rolloutMsg").textContent = RELEASE.paused ? "Resumed." : "Paused: PCs not yet installing drop it.";
+    loadUpdates();
+  } catch (err) { $("rolloutMsg").textContent = `Not done: ${err.message}`; }
+});
 
 function adminName() {
   return (PORTAL && PORTAL.email) || (window.prompt("Your name, for the audit log:") || "").trim();

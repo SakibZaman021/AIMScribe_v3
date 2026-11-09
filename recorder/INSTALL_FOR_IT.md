@@ -117,6 +117,10 @@ delivered to the server are deliberately kept in `C:\ProgramData\AIMScribe`.
    because Windows only gives a signed-in user the microphone).
 4. Registers the task **AIMScribe Agent**: at sign-in, least privilege,
    restarted up to 3 times if it fails.
+5. Registers the task **AIMScribe Updater** (3.8.4+): SYSTEM, at start-up and
+   every 30 minutes, installing only updates the AIMS LAB server offers that
+   are signed by AIMS LAB, between consultations (section 7). Uninstalling
+   removes both tasks.
 
 Nothing else. No registry policy, no services, no firewall rules (the agent
 listens on 127.0.0.1:5050 only, which never leaves the PC), no drivers.
@@ -244,3 +248,165 @@ and add `SignTool=aimssign $f` / `SignedUninstaller=yes` (under
 `#ifdef SignedBuild`) to its Inno Setup script, compiled with the same `/S`
 option BUILD.bat uses. Better still, move those PCs to 3.5: an upgrade keeps
 their settings and enrolment.
+
+---
+
+## 7. Automatic updates (3.8.4 and later)
+
+From 3.8.4 a PC updates itself. Nobody visits it and nobody runs a setup: a
+version reaches the PCs an AIMS LAB admin chooses, and each PC installs it
+between consultations. IT installs by hand **once** (section 7.3); every
+version after that arrives by itself.
+
+### 7.1 How it works, and what it will not do
+
+```
+git tag recorder-v3.8.5          GitHub Actions (recorder-release.yml)          AIMS LAB dashboard
+git push origin recorder-v3.8.5  -> build, test, sign (Azure Trusted Signing)  -> PCs -> Recorder updates:
+                                 -> refuse anything unsigned                       add 3.8.5, pick a stage
+                                 -> GitHub Release: AIMScribeSetup.exe + .sha256   (off / test PCs /
+                                                                                    hospitals / all, pause)
+Each PC, inside the stage:
+  agent (the doctor, least privilege)   heartbeat reply carries a notice signed by the server
+                                        -> C:\ProgramData\AIMScribe\state\update_notice.json
+  task "AIMScribe Updater" (SYSTEM,     installs only when ALL hold, else does nothing:
+   at start-up and every 30 minutes)     1. the notice's signature checks against the server key
+                                            pinned under Program Files, under its own signing
+                                            domain (a CMED address list or a purge receipt
+                                            signed with the same key is refused)
+                                         2. it names this PC, is from the last 7 days, and its
+                                            release number is not older than one already seen
+                                         3. the version is newer than the installed one, or the
+                                            server signed it as a rollback
+                                         4. the download's SHA-256 is the notice's
+                                         5. its Authenticode signature is valid and its signer
+                                            (certificate CN or O) is exactly AIMS LAB
+                                         6. no consultation is recording (it waits)
+                                        then: AIMScribeSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+- The setup stops the agent politely (an open recording is closed and kept),
+  keeps the PC's enrolment, TPM key and settings, and starts the agent again
+  for the signed-in doctor - exactly as a manual upgrade does.
+- The download is kept in SYSTEM's own profile folder
+  (`C:\Windows\System32\config\systemprofile\AppData\Local\AIMScribe\updater`),
+  which no ordinary user can open: the file checked is the file run.
+- A version that fails three times is not tried again on that PC; the
+  dashboard shows **Gave up** with the reason and raises one alert a day.
+  Adding the version again (a new release number) gives it three new tries.
+- **Pause** stops every PC that has not started installing within a minute.
+  A PC already running setup finishes.
+- The updater's own log: `C:\ProgramData\AIMScribe\logs\updater.log`. Setup's
+  log of the last install: `setup.log` in the SYSTEM folder above.
+- The dashboard's **PCs** table shows every PC's version and what its updater
+  last said (Waiting, Installing, Installed, Failed, Gave up, Refused).
+  `AIMS_MIN_RECORDER_VERSION` on the server still raises *recorder_outdated*
+  for anything older, as before.
+
+### 7.2 For AIMS LAB: the cloud build (once)
+
+The repository is public, so **no secret is ever committed**. Everything lives
+in a GitHub *environment*:
+
+1. GitHub -> Settings -> Environments -> **New environment** `recorder-release`.
+   Under *Deployment branches and tags* allow only tags matching `recorder-v*`.
+   Optionally add yourself as a required reviewer, so each build waits for a
+   click before it can sign anything.
+2. **Azure Trusted Signing** (the default, `AIMS_SIGN_PROVIDER=azure`):
+   - In Azure, the Trusted Signing account and a *Public Trust* certificate
+     profile already used by `signing\sign.ps1`.
+   - Microsoft Entra ID -> App registrations -> **New registration**
+     `aimscribe-github-signing`. Under *Certificates & secrets* -> *Federated
+     credentials* -> **Add**: *GitHub Actions deploying Azure resources*,
+     organisation `SakibZaman021`, repository `AIMScribe_v3`, entity
+     **Environment**, name `recorder-release`. (Subject
+     `repo:SakibZaman021/AIMScribe_v3:environment:recorder-release`.) No client
+     secret is created: GitHub proves who it is with a short-lived OIDC token.
+   - On the Trusted Signing account -> Access control (IAM): give that app the
+     role **Trusted Signing Certificate Profile Signer** - and nothing else.
+3. In the `recorder-release` environment:
+
+   | Kind | Name | Value |
+   |---|---|---|
+   | secret | `AZURE_CLIENT_ID` | the app registration's Application (client) ID |
+   | secret | `AZURE_TENANT_ID` | the Directory (tenant) ID |
+   | secret | `AZURE_SUBSCRIPTION_ID` | the subscription holding the signing account |
+   | variable | `AZURE_SIGNING_ENDPOINT` | e.g. `https://eus.codesigning.azure.net` (the account's region) |
+   | variable | `AZURE_SIGNING_ACCOUNT` | the Trusted Signing account name |
+   | variable | `AZURE_SIGNING_PROFILE` | the certificate profile name |
+   | variable | `AIMS_SIGN_PUBLISHER` | the certificate's exact CN (or O), e.g. `AIMS LAB` - every PC will require this name on every update |
+   | variable (optional) | `AIMS_SIGN_PROVIDER` | `azure` (default) or `signpath` |
+   | variable (optional) | `AIMS_BACKEND` | default `https://aimscribe.iriic.uiu.ac.bd` (new PCs only) |
+   | variable (optional) | `AZURE_SIGNING_CLIENT_VERSION` | pin `Microsoft.Trusted.Signing.Client`; default the latest, checked to be signed by Microsoft |
+   | variable (optional) | `ALLOW_VULNERABLE_BUILD` | `true` only to release past a pip-audit finding you have reviewed |
+
+4. **SignPath instead** (`AIMS_SIGN_PROVIDER=signpath`): secret
+   `SIGNPATH_API_TOKEN` (a CI user's token); variables
+   `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_POLICY_SLUG`,
+   `SIGNPATH_ARTIFACT_CONFIG_ZIP` (signs every PE file inside a zip - the
+   program folder) and `SIGNPATH_ARTIFACT_CONFIG_PE` (signs one PE file - the
+   setup and its uninstaller). The signing policy must accept API submissions;
+   SignPath's free open-source policy, which requires its GitHub origin
+   verification, does not, and needs a different workflow. This path has not
+   been run yet: Azure is the one to use first.
+
+The certificate's name matters twice: the build refuses a setup whose signer's
+CN/O is not `AIMS_SIGN_PUBLISHER`, and the installer writes the same name into
+each PC's `.env` (`AIMS_UPDATE_PUBLISHER`), which its updater then requires. A
+PC keeps that value across updates. Changing the certificate's name later
+means one manual install of a release carrying the new name.
+
+### 7.3 For IT: the one manual install (3.8.4)
+
+3.8.3 and earlier have no updater, so each PC needs 3.8.4 installed once, the
+way every release has been installed until now (section 3). Then:
+
+1. **Check the file** as in section 2: `Get-AuthenticodeSignature` says
+   `Valid` and *AIMS LAB*; `Get-FileHash` equals the `.sha256` on the GitHub
+   Release page.
+2. Install it - by hand or silently - while no consultation is recording.
+3. On the PC, as administrator:
+
+   ```powershell
+   schtasks /Query /TN "AIMScribe Updater" /V /FO LIST | Select-String "Run As User|Task To Run|Repeat|Status"
+   ```
+
+   Expected: *Run As User* `SYSTEM`; *Task To Run* `"C:\Program Files\AIMScribe\AIMScribe_Agent.exe" --update`;
+   repeats every 30 minutes; also *At system start up*.
+
+   ```powershell
+   Select-String -Path "C:\Program Files\AIMScribe\.env" -Pattern "AIMS_UPDATE_PUBLISHER"
+   schtasks /Run /TN "AIMScribe Updater"
+   Get-Content C:\ProgramData\AIMScribe\logs\updater.log -Tail 5
+   ```
+
+   Expected: `AIMS_UPDATE_PUBLISHER=AIMS LAB` (the certificate's name), and
+   `Update: idle` in the log (no release is offered yet).
+4. On the dashboard the PC shows version **3.8.4**.
+
+Nothing else changes for the doctor. A PC that misses this step keeps working
+on its old version and shows *recorder_outdated* once the server's minimum is
+raised.
+
+### 7.4 Test plan: the first automatic update (a canary)
+
+Done once with a throwaway version, before any clinic depends on automatic
+updates. Use two bench PCs first (A and B), then one clinic PC.
+
+| # | Do | Expect |
+|---|---|---|
+| 1 | Install 3.8.4 by hand on bench PCs A and B (7.3). | Both on the dashboard at 3.8.4; `updater.log` says idle. |
+| 2 | Push tag `recorder-v3.8.5` (any harmless change). | The *recorder-release* run is green; the GitHub Release has `AIMScribeSetup.exe` and `.sha256`; the run's *Refuse anything unsigned* step lists `OK ... AIMS LAB` for the setup and the program. |
+| 3 | Dashboard -> PCs -> Recorder updates: **Add release** 3.8.5, leave SHA-256 and address empty. | The release appears at stage *off*, with the SHA-256 read from the GitHub Release - compare it with the Release page. No PC is offered it. |
+| 4 | **Set rollout**: stage *Test PCs only*, Test PCs = A's name. | Within a minute A shows *Will update* / *Notice received*; B shows nothing. `C:\ProgramData\AIMScribe\state\update_notice.json` exists on A only. |
+| 5 | On A, start a consultation from CMED's test page and keep it recording; run `schtasks /Run /TN "AIMScribe Updater"`. | A's updater reports **Waiting** ("a consultation is recording"); the recording is not interrupted; nothing is downloaded. |
+| 6 | End the consultation. Run the task again (or wait up to 30 min). | **Installing**, then about a minute later **Installed 3.8.5**; the agent is back in the tray; A shows 3.8.5. Records again normally. |
+| 7 | **Tamper test** on B: quit AIMScribe from B's tray (its next heartbeat would remove the file), copy A's `update_notice.json` into B's state folder, run the task on B. | B reports **Refused**: "addressed to another PC". Edit one character of the version inside the copied file and run again: "signature does not check". B installs nothing. |
+| 8 | **Pause**, then set stage *Test PCs and named hospitals* with B's hospital. | While paused nothing is offered. Resume: B updates as A did (5-6). |
+| 9 | **Bad file test** (optional): add release 3.8.6 with a wrong SHA-256 (any 64 hex characters) for test PC A only. | A reports **Failed** ("SHA-256 ... not ... as the server said") three times, then **Gave up**; one *recorder_update_failed* alert; 3.8.5 still runs. |
+| 10 | **Rollback test**: add release 3.8.4 with *Rollback: yes*, stage Test PCs = A. | A installs 3.8.4 (it is signed as a rollback) and reports Installed 3.8.4. A rollback not marked as one is refused by the dashboard. |
+| 11 | One clinic PC: add the current version, stage *Test PCs* with that PC, during clinic hours. | It waits through consultations and installs between them; the doctor sees at most the tray icon restart. |
+| 12 | All clinics: stage *Test PCs and named hospitals* one hospital at a time, then *Every PC*. | Each PC shows Installed; anything else shows its reason. |
+
+If any step does not behave as written, **Pause** and tell AIMS LAB: a paused
+release reaches no further PC, and every PC keeps recording on what it has.

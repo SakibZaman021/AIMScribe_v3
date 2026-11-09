@@ -1,0 +1,230 @@
+# Builds, signs and publishes the recorder installer for a release tag.
+#
+#     git tag recorder-v3.8.4 && git push origin recorder-v3.8.4
+#
+# On windows-latest: the version is taken from the tag and written into
+# recorder/config.py (APP_VERSION), recorder/version_info.txt and
+# recorder/installer.iss; recorder/BUILD.bat builds and signs every program
+# file and the setup (Azure Trusted Signing through GitHub OIDC, or SignPath);
+# the job fails if the setup or any shipped file is unsigned or signed by
+# anyone but AIMS LAB; then dist/AIMScribeSetup.exe and its SHA-256 are
+# published as a GitHub Release. Nothing reaches a PC from here: an admin adds
+# the version on the dashboard (PCs -> Recorder updates) and picks a rollout
+# stage; each PC's updater then checks the signed notice, the SHA-256 and the
+# publisher before it installs.
+#
+# The repository is public. No secret is in this file or anywhere in the
+# repository: they live in the "recorder-release" environment's secrets and
+# variables. recorder/INSTALL_FOR_IT.md ("Automatic updates") lists each one
+# and how to make the Azure federated credential.
+name: recorder-release
+
+on:
+  push:
+    tags: ["recorder-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recorder-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    # Its secrets are given only to jobs on this environment; it can be limited
+    # to recorder-v* tags and made to wait for a reviewer (Settings ->
+    # Environments). The Azure federated credential trusts this environment.
+    environment: recorder-release
+    permissions:
+      contents: write        # create the GitHub Release
+      id-token: write        # sign in to Azure with OIDC: no stored Azure secret
+    env:
+      AIMS_SIGN_PROVIDER: ${{ vars.AIMS_SIGN_PROVIDER || 'azure' }}
+      AIMS_SIGN_PUBLISHER: ${{ vars.AIMS_SIGN_PUBLISHER || 'AIMS LAB' }}
+      AIMS_BACKEND: ${{ vars.AIMS_BACKEND || 'https://aimscribe.iriic.uiu.ac.bd' }}
+      ALLOW_VULNERABLE_BUILD: ${{ vars.ALLOW_VULNERABLE_BUILD || 'false' }}
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version from the tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^recorder-v(\d{1,4}\.\d{1,4}\.\d{1,4})$') {
+            throw "The tag must be recorder-v<major>.<minor>.<patch>, e.g. recorder-v3.8.4 (got '$tag')"
+          }
+          $v = $Matches[1]
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing AIMScribe recorder $v"
+
+      - name: Write the version into the program and the installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $v = $env:VERSION
+          $parts = $v.Split('.')
+          $quad = "$v.0"
+          $tuple = "($($parts[0]), $($parts[1]), $($parts[2]), 0)"
+          function Set-Once([string] $Path, [string] $Pattern, [string] $Value, [int] $Count = 1) {
+            $text = [IO.File]::ReadAllText($Path)
+            $found = [regex]::Matches($text, $Pattern).Count
+            if ($found -ne $Count) { throw "$Path : expected $Count match(es) of $Pattern, found $found" }
+            [IO.File]::WriteAllText($Path, [regex]::Replace($text, $Pattern, $Value))
+          }
+          Set-Once 'recorder/config.py' '(?m)^APP_VERSION = "[^"]*"' "APP_VERSION = `"$v`""
+          Set-Once 'recorder/installer.iss' '(?m)^#define AppVersion\s+"[^"]*"' "#define AppVersion     `"$v`""
+          Set-Once 'recorder/version_info.txt' 'filevers=\([^)]*\)' "filevers=$tuple"
+          Set-Once 'recorder/version_info.txt' 'prodvers=\([^)]*\)' "prodvers=$tuple"
+          Set-Once 'recorder/version_info.txt' "StringStruct\('FileVersion', '[^']*'\)" "StringStruct('FileVersion', '$quad')"
+          Set-Once 'recorder/version_info.txt' "StringStruct\('ProductVersion', '[^']*'\)" "StringStruct('ProductVersion', '$quad')"
+          git diff --stat
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $found = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+            Where-Object { Test-Path $_ }
+          if (-not $found) { choco install innosetup --no-progress -y; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+
+      # ---------------------------------------------------------------- Azure Trusted Signing
+      - name: Sign in to Azure (OIDC)
+        if: env.AIMS_SIGN_PROVIDER == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Trusted Signing client
+        if: env.AIMS_SIGN_PROVIDER == 'azure'
+        shell: pwsh
+        env:
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          CLIENT_VERSION: ${{ vars.AZURE_SIGNING_CLIENT_VERSION }}
+        run: |
+          foreach ($n in 'ENDPOINT', 'ACCOUNT', 'PROFILE') {
+            if (-not [Environment]::GetEnvironmentVariable($n)) { throw "Set the variable AZURE_SIGNING_$n (INSTALL_FOR_IT.md)" }
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'trusted-signing'
+          $nugetArgs = @('install', 'Microsoft.Trusted.Signing.Client', '-OutputDirectory', $dir, '-NonInteractive')
+          if ($env:CLIENT_VERSION) { $nugetArgs += @('-Version', $env:CLIENT_VERSION) }
+          nuget @nugetArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $dlib = Get-ChildItem $dir -Recurse -Filter Azure.CodeSigning.Dlib.dll |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          if (-not $dlib) { throw 'Azure.CodeSigning.Dlib.dll (x64) not found in the package' }
+          # Only Microsoft's own signing library may hold the build's Azure token.
+          $sig = Get-AuthenticodeSignature $dlib.FullName
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "The Trusted Signing library is not signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+          $meta = Join-Path $env:RUNNER_TEMP 'metadata.json'
+          @{ Endpoint = $env:ENDPOINT; CodeSigningAccountName = $env:ACCOUNT; CertificateProfileName = $env:PROFILE } |
+            ConvertTo-Json | Set-Content -Encoding utf8 $meta
+          "AIMS_SIGN_DLIB=$($dlib.FullName)" >> $env:GITHUB_ENV
+          "AIMS_SIGN_METADATA=$meta" >> $env:GITHUB_ENV
+
+      # ---------------------------------------------------------------- build, test, sign
+      - name: Build and sign (BUILD.bat)
+        shell: cmd
+        env:
+          CI: "true"
+          # Used only when AIMS_SIGN_PROVIDER=signpath (signing\sign.ps1).
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIG_ZIP: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_ZIP }}
+          SIGNPATH_ARTIFACT_CONFIG_PE: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_PE }}
+        run: |
+          if not "%AIMS_SIGN_PROVIDER%"=="azure" if not "%AIMS_SIGN_PROVIDER%"=="signpath" (
+            echo AIMS_SIGN_PROVIDER must be azure or signpath in the cloud build & exit /b 1
+          )
+          set DEV_UNSIGNED=
+          call recorder\BUILD.bat
+
+      - name: Refuse anything unsigned
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Every .exe, .dll and .pyd: validly signed (ours, or its own maker's).
+          & recorder\signing\sign.ps1 -Folder recorder\dist\AIMScribe_Agent -VerifyOnly
+          # The program and the setup: AIMS LAB exactly (common name or organisation),
+          # timestamped - the rule each PC's updater applies (core/updater.py).
+          function Assert-Ours([string] $Path) {
+            $s = Get-AuthenticodeSignature -LiteralPath $Path
+            $names = @{}
+            foreach ($m in [regex]::Matches([string]$s.SignerCertificate.Subject, '\s*([A-Za-z0-9.]+)=("(?:[^"]|"")*"|[^,]*)\s*(?:,|$)')) {
+              $k = $m.Groups[1].Value.ToUpper(); $v = $m.Groups[2].Value.Trim()
+              if ($v.StartsWith('"') -and $v.EndsWith('"')) { $v = $v.Substring(1, $v.Length - 2).Replace('""', '"') }
+              if (-not $names.ContainsKey($k)) { $names[$k] = $v }
+            }
+            $who = $env:AIMS_SIGN_PUBLISHER
+            if ($s.Status -ne 'Valid') { throw "$Path is not validly signed ($($s.Status))" }
+            if ($names['CN'] -ne $who -and $names['O'] -ne $who) {
+              throw "$Path is signed by '$($s.SignerCertificate.Subject)', whose CN or O is not '$who'. Set the variable AIMS_SIGN_PUBLISHER to the certificate's exact name."
+            }
+            if ($null -eq $s.TimeStamperCertificate) { throw "$Path has no timestamp" }
+            Write-Host "OK  $Path  $($s.SignerCertificate.Subject)"
+          }
+          Assert-Ours recorder\dist\AIMScribeSetup.exe
+          Assert-Ours recorder\dist\AIMScribe_Agent\AIMScribe_Agent.exe
+          $shipped = (Get-Item recorder\dist\AIMScribe_Agent\AIMScribe_Agent.exe).VersionInfo.ProductVersion
+          if ($shipped -ne "$env:VERSION.0") { throw "The program says it is $shipped, not $env:VERSION" }
+
+      - name: SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash -Algorithm SHA256 recorder\dist\AIMScribeSetup.exe).Hash.ToLowerInvariant()
+          # The format sha256sum reads; the dashboard reads the first 64 hex characters.
+          Set-Content -NoNewline -Encoding ascii recorder\dist\AIMScribeSetup.exe.sha256 "$h  AIMScribeSetup.exe`n"
+          "sha256=$h" >> $env:GITHUB_OUTPUT
+          Write-Host "SHA-256 $h"
+
+      - name: Publish the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          $notes = @"
+          AIMScribe recorder $env:VERSION, built and signed by GitHub Actions from $env:GITHUB_SHA.
+
+          SHA-256 of AIMScribeSetup.exe: ``$env:SHA``
+
+          No PC installs this until an AIMS LAB admin adds $env:VERSION on the dashboard
+          (PCs -> Recorder updates) and chooses a rollout stage.
+          "@
+          # --verify-tag: only the tag that started this build. A release that
+          # already exists is not replaced: a version, once out, never changes.
+          gh release create $env:GITHUB_REF_NAME `
+            recorder\dist\AIMScribeSetup.exe recorder\dist\AIMScribeSetup.exe.sha256 `
+            --verify-tag --title "AIMScribe recorder $env:VERSION" --notes $notes
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Keep the build for a week
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimscribe-recorder-${{ steps.version.outputs.version }}
+          path: |
+            recorder/dist/AIMScribeSetup.exe
+            recorder/dist/AIMScribeSetup.exe.sha256
+          retention-days: 7
+          if-no-files-found: ignore

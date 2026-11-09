@@ -400,6 +400,9 @@ class HeartbeatRequest(BaseModel):
     microphone_is_clinic: Optional[bool] = None
     # The version of CMED's address list it holds (recorder 3.8+).
     trusted_origins_version: Optional[int] = None
+    # What this PC's updater last did (recorder 3.8.4+): installed, waiting,
+    # failed and why, gave up. Shown per PC on the dashboard.
+    update_status: Optional[Dict[str, Any]] = None
 
 
 class ArchivedPart(BaseModel):
@@ -1798,6 +1801,7 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         clock_offset_seconds=body.clock_offset_seconds,
         microphone=body.microphone or None,
         microphone_is_clinic=body.microphone_is_clinic,
+        update_status=update_report(body.update_status),
     )
     if body.session_id and body.microphone:
         try:
@@ -1835,6 +1839,18 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
                 reply["trusted_origins"] = bundle
         except Exception as exc:
             logger.warning("Could not send the trusted origins: %s", exc)
+    # A new recorder version, signed and named to this PC, while it is inside
+    # the release's rollout stage and not already running it. An absent
+    # "update" tells the recorder to drop any notice it holds: that is how a
+    # pause, or a PC taken out of the stage, stops an install not yet begun.
+    if ctx.signer is not None:
+        try:
+            notice = await recorder_update_for(device, body.app_version)
+            if notice is not None:
+                reply["update"] = notice
+        except Exception as exc:
+            logger.warning("Could not offer a recorder update: %s", exc)
+    await _check_update_report(device, body.update_status)
     return reply
 
 
@@ -1919,6 +1935,277 @@ async def admin_remove_trusted_origin(body: TrustedOriginRequest,
                         actor_id=body.by, detail={"origin": origin})
     return {"status": "removed", "origin": origin,
             "version": await _repo().trusted_origins_version()}
+
+
+# ============================================================
+# Recorder updates (036)
+#
+# A release is a version the cloud build published (recorder-release.yml):
+# where AIMScribeSetup.exe is, and its SHA-256. It reaches PCs in stages -
+# named test PCs, then named hospitals, then all - and can be paused at any
+# stage. A PC inside the stage receives, in its heartbeat reply, a notice
+# signed with the key it pins and named to it; its updater (running as SYSTEM)
+# installs only what such a notice names, only a newer version unless the
+# notice is a signed rollback, and only a file whose hash and Authenticode
+# publisher both check.
+# ============================================================
+
+ROLLOUT_STAGES = ("off", "test", "hospitals", "all")
+RELEASE_VERSION = re.compile(r"^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$")
+SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+DEFAULT_RELEASE_URL = ("https://github.com/SakibZaman021/AIMScribe_v3/releases/download/"
+                       "recorder-v{version}/AIMScribeSetup.exe")
+UPDATE_STATES = ("idle", "notice", "waiting", "downloading", "installing", "installed",
+                 "failed", "gave_up", "refused")
+
+
+def release_url(version: str) -> str:
+    """Where the cloud build publishes a version, unless the admin names another place."""
+    template = os.getenv("AIMS_RECORDER_RELEASE_URL", "").strip() or DEFAULT_RELEASE_URL
+    return template.replace("{version}", version)
+
+
+def _names(values) -> Set[str]:
+    return {str(v).strip().lower() for v in (values or []) if str(v).strip()}
+
+
+def release_reaches(release: Optional[Dict[str, Any]], device: Dict[str, Any]) -> bool:
+    """
+    Whether this PC is inside the release's rollout stage. The stages widen:
+    the test PCs are in every stage after "off", the named hospitals' PCs from
+    "hospitals" on. A paused release reaches nobody.
+    """
+    if not release or release.get("paused"):
+        return False
+    stage = release.get("stage") or "off"
+    if stage == "off":
+        return False
+    if stage == "all":
+        return True
+    tests = _names(release.get("test_devices"))
+    if str(device.get("device_id", "")).lower() in tests or \
+            str(device.get("machine_name") or "").strip().lower() in tests:
+        return True
+    if stage == "hospitals":
+        return str(device.get("hospital_id") or "").lower() in _names(release.get("hospitals"))
+    return False
+
+
+def release_offered(release: Optional[Dict[str, Any]], device: Dict[str, Any],
+                    app_version: Optional[str]) -> bool:
+    """Inside the stage, and the PC is not already on that version."""
+    if not release_reaches(release, device):
+        return False
+    running = version_tuple(app_version or device.get("app_version"))
+    target = version_tuple(release["version"])
+    if release.get("rollback"):
+        return running != target
+    return running < target
+
+
+async def recorder_update_for(device: Dict[str, Any],
+                              app_version: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The signed notice for this PC, or None when it has nothing to install."""
+    if ctx.signer is None:
+        return None
+    release = await _repo().current_recorder_release()
+    if not release_offered(release, device, app_version):
+        return None
+    return ctx.signer.sign_recorder_update(
+        device_id=str(device["device_id"]), release_id=release["release_id"],
+        version=release["version"], url=release["download_url"],
+        sha256_hex=release["sha256"], rollback=bool(release["rollback"]),
+        issued_at=datetime.now(timezone.utc))
+
+
+def update_report(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """What a PC said of its updater, cut to known fields and sizes before it is kept."""
+    if not isinstance(raw, dict):
+        return None
+    state = str(raw.get("state") or "")[:16]
+    if state not in UPDATE_STATES:
+        return None
+    report: Dict[str, Any] = {"state": state}
+    for key, size in (("version", 32), ("reason", 300), ("at", 40)):
+        if raw.get(key) is not None:
+            report[key] = str(raw[key])[:size]
+    for key in ("release_id", "attempts"):
+        try:
+            if raw.get(key) is not None:
+                report[key] = max(0, min(int(raw[key]), 2 ** 31))
+        except (TypeError, ValueError):
+            pass
+    return report
+
+
+async def _check_update_report(device, raw: Optional[Dict[str, Any]]) -> None:
+    """A PC that gave up on a version is said once a day, not on every heartbeat."""
+    report = update_report(raw)
+    if not report or report["state"] not in ("gave_up", "refused"):
+        return
+    repo = _repo()
+    since = datetime.now(timezone.utc) - RECORDER_ALERT_REPEAT
+    try:
+        if await repo.alert_raised_since("recorder_update_failed", device["device_id"], since):
+            return
+        await repo.raise_alert(
+            alert_type="recorder_update_failed", severity="warning",
+            device_id=device["device_id"],
+            detail={**report, "detail": "This PC did not install the recorder update. "
+                                        "See the reason; IT may need to install it by hand."})
+    except Exception as exc:
+        logger.warning("Could not raise the update alert: %s", exc)
+
+
+def _release_view(r: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if r is None:
+        return None
+    return {k: (v.isoformat() if isinstance(v, datetime) else
+                list(v) if isinstance(v, (list, tuple)) else v) for k, v in r.items()}
+
+
+class RecorderReleaseRequest(BaseModel):
+    version: str = Field(..., min_length=5, max_length=32)
+    # Empty: the GitHub Release the cloud build made for this version.
+    url: str = Field("", max_length=500)
+    # Empty: read from the .sha256 file published beside the setup.
+    sha256: str = Field("", max_length=200)
+    rollback: bool = False
+    note: str = Field("", max_length=300)
+    by: str = Field(..., min_length=2, max_length=128)
+
+
+class RolloutRequest(BaseModel):
+    stage: str = Field(..., max_length=16)
+    test_devices: List[str] = Field(default_factory=list, max_length=200)
+    hospitals: List[str] = Field(default_factory=list, max_length=200)
+    by: str = Field(..., min_length=2, max_length=128)
+
+
+class PauseRequest(BaseModel):
+    paused: bool
+    by: str = Field(..., min_length=2, max_length=128)
+
+
+async def _published_sha256(url: str) -> str:
+    """The hash the cloud build published beside the setup (<url>.sha256)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            reply = await client.get(url + ".sha256")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=422, detail=f"could not read {url}.sha256 ({exc}); "
+                                                    f"give the SHA-256")
+    if reply.status_code != 200:
+        raise HTTPException(status_code=422, detail=f"no SHA-256 published at {url}.sha256 "
+                                                    f"(HTTP {reply.status_code}); give it")
+    found = SHA256_HEX.search(reply.text)
+    if not found:
+        raise HTTPException(status_code=422, detail=f"{url}.sha256 holds no SHA-256")
+    return found.group(0).lower()
+
+
+@router.get("/admin/recorder-releases")
+async def admin_recorder_releases(_: None = Depends(require_admin)):
+    """The release in force, the ones before it, and what every PC runs and reports."""
+    repo = _repo()
+    rows = await repo.recorder_releases()
+    current = rows[0] if rows else None
+    devices = []
+    for d in await repo.recorder_update_states():
+        devices.append({
+            "device_id": str(d["device_id"]), "hospital_id": d["hospital_id"],
+            "machine_name": d["machine_name"], "app_version": d["app_version"],
+            "update_status": d["update_status"],
+            "update_status_at": d["update_status_at"].isoformat()
+            if d["update_status_at"] else None,
+            "in_stage": release_reaches(current, d),
+            "offered": release_offered(current, d, d["app_version"]),
+        })
+    return {"current": _release_view(current), "releases": [_release_view(r) for r in rows],
+            "devices": devices, "stages": list(ROLLOUT_STAGES),
+            "minimum_version": min_recorder_version(), "signing": ctx.signer is not None}
+
+
+@router.post("/admin/recorder-releases")
+async def admin_add_recorder_release(body: RecorderReleaseRequest,
+                                     _: None = Depends(require_admin)):
+    """
+    Make a version available. It starts at stage "off": nothing installs until
+    a stage is chosen. A version older than the newest release is refused
+    unless it is marked rollback - recorders install an older version only
+    when the server has signed that it is one.
+    """
+    version = body.version.strip().lstrip("v")
+    if not RELEASE_VERSION.match(version):
+        raise HTTPException(status_code=422, detail="a version such as 3.8.4")
+    url = body.url.strip() or release_url(version)
+    if not url.startswith("https://"):
+        raise HTTPException(status_code=422, detail="the download address must be https://")
+    sha = body.sha256.strip().lower()
+    if sha:
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise HTTPException(status_code=422, detail="SHA-256 is 64 hexadecimal characters")
+    else:
+        sha = await _published_sha256(url)
+    repo = _repo()
+    newest = await repo.current_recorder_release()
+    if newest and not body.rollback and \
+            version_tuple(version) < version_tuple(newest["version"]):
+        raise HTTPException(status_code=422, detail=(
+            f"{version} is older than {newest['version']}: mark it as a rollback"))
+    release = await repo.add_recorder_release(version=version, download_url=url, sha256=sha,
+                                              rollback=body.rollback, note=body.note,
+                                              by=body.by)
+    await repo.audit(event_type="recorder_release.added", actor_type="admin", actor_id=body.by,
+                     detail={"release_id": release["release_id"], "version": version,
+                             "url": url, "sha256": sha, "rollback": body.rollback})
+    return {"status": "added", "release": _release_view(release)}
+
+
+async def _the_current(release_id: int) -> Dict[str, Any]:
+    newest = await _repo().current_recorder_release()
+    if newest is None or newest["release_id"] != release_id:
+        raise HTTPException(status_code=409, detail="only the newest release can be rolled out; "
+                                                    "add the version again to use it")
+    return newest
+
+
+@router.post("/admin/recorder-releases/{release_id}/rollout")
+async def admin_recorder_rollout(release_id: int, body: RolloutRequest,
+                                 _: None = Depends(require_admin)):
+    """Choose who receives the release: off, the test PCs, named hospitals, or all."""
+    if body.stage not in ROLLOUT_STAGES:
+        raise HTTPException(status_code=422, detail=f"stage is one of {', '.join(ROLLOUT_STAGES)}")
+    tests = sorted({t.strip()[:128] for t in body.test_devices if t.strip()})
+    hospitals = sorted({h.strip()[:64] for h in body.hospitals if h.strip()})
+    if body.stage == "test" and not tests:
+        raise HTTPException(status_code=422, detail="name at least one test PC")
+    if body.stage == "hospitals" and not hospitals:
+        raise HTTPException(status_code=422, detail="name at least one hospital")
+    await _the_current(release_id)
+    release = await _repo().set_recorder_rollout(release_id, stage=body.stage,
+                                                 test_devices=tests, hospitals=hospitals,
+                                                 by=body.by)
+    await _repo().audit(event_type="recorder_release.rollout", actor_type="admin",
+                        actor_id=body.by, detail={"release_id": release_id, "stage": body.stage,
+                                                  "test_devices": tests, "hospitals": hospitals})
+    return {"status": "rolled_out", "release": _release_view(release)}
+
+
+@router.post("/admin/recorder-releases/{release_id}/pause")
+async def admin_recorder_pause(release_id: int, body: PauseRequest,
+                               _: None = Depends(require_admin)):
+    """
+    Stop (or resume) the rollout. PCs that have not started installing drop
+    the notice at their next heartbeat; one already installing finishes.
+    """
+    await _the_current(release_id)
+    release = await _repo().pause_recorder_release(release_id, paused=body.paused, by=body.by)
+    await _repo().audit(event_type="recorder_release.paused" if body.paused
+                        else "recorder_release.resumed", actor_type="admin",
+                        actor_id=body.by, detail={"release_id": release_id})
+    return {"status": "paused" if body.paused else "resumed", "release": _release_view(release)}
 
 
 def min_recorder_version() -> str:

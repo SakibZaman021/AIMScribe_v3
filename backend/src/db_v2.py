@@ -290,7 +290,7 @@ class V2Repository:
         async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT device_id, hospital_id, tpm_pubkey, app_version, revoked_at,
-                       signs_requests, approval
+                       signs_requests, approval, machine_name
                 FROM devices WHERE token_sha256 = $1
             """, hash_token(token))
         return dict(row) if row else None
@@ -547,6 +547,82 @@ class V2Repository:
             """, origin, by)
         return result.endswith(" 1")
 
+    # ---- recorder updates (036) ----
+
+    _RELEASE_COLUMNS = """release_id, version, download_url, sha256, rollback, stage,
+                          test_devices, hospitals, paused, note, created_by, created_at,
+                          changed_by, changed_at"""
+
+    async def current_recorder_release(self) -> Optional[Dict[str, Any]]:
+        """The newest release: the one in force. None before the first."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(f"""
+                SELECT {self._RELEASE_COLUMNS} FROM recorder_releases
+                 ORDER BY release_id DESC LIMIT 1
+            """)
+        return dict(row) if row else None
+
+    async def recorder_releases(self, limit: int = 20) -> List[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT {self._RELEASE_COLUMNS} FROM recorder_releases
+                 ORDER BY release_id DESC LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def add_recorder_release(self, *, version: str, download_url: str, sha256: str,
+                                   rollback: bool, note: str, by: str) -> Dict[str, Any]:
+        """A new release, rolled out to nobody until someone chooses a stage."""
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(f"""
+                INSERT INTO recorder_releases (version, download_url, sha256, rollback,
+                                               note, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING {self._RELEASE_COLUMNS}
+            """, version, download_url, sha256, rollback, note, by)
+        return dict(row)
+
+    async def set_recorder_rollout(self, release_id: int, *, stage: str,
+                                   test_devices: List[str], hospitals: List[str],
+                                   by: str) -> Optional[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(f"""
+                UPDATE recorder_releases
+                   SET stage = $2, test_devices = $3, hospitals = $4,
+                       changed_by = $5, changed_at = now()
+                 WHERE release_id = $1
+             RETURNING {self._RELEASE_COLUMNS}
+            """, release_id, stage, test_devices, hospitals, by)
+        return dict(row) if row else None
+
+    async def pause_recorder_release(self, release_id: int, *, paused: bool,
+                                     by: str) -> Optional[Dict[str, Any]]:
+        async with self._acquire() as conn:
+            row = await conn.fetchrow(f"""
+                UPDATE recorder_releases
+                   SET paused = $2, changed_by = $3, changed_at = now()
+                 WHERE release_id = $1
+             RETURNING {self._RELEASE_COLUMNS}
+            """, release_id, paused, by)
+        return dict(row) if row else None
+
+    async def recorder_update_states(self) -> List[Dict[str, Any]]:
+        """Every PC still in use: its version and what its updater last said."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT device_id, hospital_id, machine_name, app_version,
+                       update_status, update_status_at, last_seen_at
+                  FROM devices WHERE revoked_at IS NULL
+                 ORDER BY hospital_id, machine_name
+            """)
+        out = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d["update_status"], str):
+                d["update_status"] = json.loads(d["update_status"])
+            out.append(d)
+        return out
+
     async def approvals_to_audit(self) -> List[Dict[str, Any]]:
         """PCs the database approved (two confirmed recordings) not yet in the audit log."""
         async with self._acquire() as conn:
@@ -564,6 +640,7 @@ class V2Repository:
         held_count: Optional[int] = None, disk_encrypted: Optional[bool] = None,
         clock_offset_seconds: Optional[float] = None,
         microphone: Optional[str] = None, microphone_is_clinic: Optional[bool] = None,
+        update_status: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         One heartbeat. Fields an older recorder does not send are left as
@@ -583,12 +660,16 @@ class V2Repository:
                        disk_encrypted = COALESCE($7, disk_encrypted),
                        clock_offset_seconds = COALESCE($8, clock_offset_seconds),
                        microphone = COALESCE($9, microphone),
-                       microphone_is_clinic = COALESCE($10, microphone_is_clinic)
+                       microphone_is_clinic = COALESCE($10, microphone_is_clinic),
+                       update_status = COALESCE($11::jsonb, update_status),
+                       update_status_at = CASE WHEN $11::jsonb IS NULL THEN update_status_at
+                                               ELSE now() END
                  WHERE device_id = $1
             """, device_id, spool_bytes, pending_segments, app_version,
                  json.dumps(held_sessions) if held_sessions is not None else None,
                  held_count, disk_encrypted, clock_offset_seconds, microphone,
-                 microphone_is_clinic)
+                 microphone_is_clinic,
+                 json.dumps(update_status) if update_status is not None else None)
 
     async def note_session_microphone(self, device_id, session_id: str,
                                       microphone: str) -> None:

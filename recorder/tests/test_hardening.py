@@ -227,3 +227,19 @@ def test_the_agent_runs_without_elevation():
     text = _installer()
     assert "<RunLevel>LeastPrivilege</RunLevel>" in text
     assert "HighestAvailable" not in text
+
+
+def test_the_updater_task_runs_as_system_and_goes_with_the_program():
+    text = _installer()
+    start = text.index("function RegisterUpdaterTask")
+    task = text[start:text.index("end;", text.index("does not exist", start))]
+    assert "<UserId>S-1-5-18</UserId>" in task                 # SYSTEM, the only one that may install
+    assert "<BootTrigger>" in task and "<Interval>PT30M</Interval>" in task
+    assert "<Arguments>--update</Arguments>" in task
+    assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in task
+    assert "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>" in task
+    assert "InstallProblem := RegisterUpdaterTask();" in text
+    assert '/Delete /TN ""AIMScribe Updater"" /F' in text      # removed on uninstall
+    # The agent's own task is untouched: the doctor's account, least privilege.
+    agent = text[text.index("function RegisterLogonTask"):start]
+    assert "<GroupId>S-1-5-32-545</GroupId>" in agent and "LeastPrivilege" in agent

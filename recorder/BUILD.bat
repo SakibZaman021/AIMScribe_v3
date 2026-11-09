@@ -126,6 +126,9 @@ if errorlevel 1 (
 )
 
 echo [8/9] Building the installer...
+REM The publisher the program files are verified against is the one the
+REM updater on each PC will require of every update (installer.iss).
+if "%AIMS_SIGN_PUBLISHER%"=="" set "AIMS_SIGN_PUBLISHER=AIMS LAB"
 set "ISCC="
 REM Outside the loop: the ")" in ProgramFiles(x86) would end a ( ) block.
 set "PF86=%ProgramFiles(x86)%"
@@ -144,7 +147,7 @@ if "%DEV_UNSIGNED%"=="1" (
         "%ISCC%" /Q "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" "/DKeysDir=%AIMS_KEYS_DIR%" installer.iss
     )
 ) else (
-    "%ISCC%" /Q /DSignedBuild "/Saimssign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File %~dp0signing\sign.ps1 -File $f" "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
+    "%ISCC%" /Q /DSignedBuild "/DUpdatePublisher=%AIMS_SIGN_PUBLISHER%" "/Saimssign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File %~dp0signing\sign.ps1 -File $f" "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
 )
 if errorlevel 1 (
     echo ERROR: the installer did not build.

@@ -145,6 +145,38 @@
           <div class="chips small" id="pcFilters" role="group" aria-label="Filter PCs"></div></div>
         <div class="scroll"><div id="rooms"></div></div>
       </section>
+      <section class="panel" aria-labelledby="h-updates" id="updatesPanel" hidden>
+        <div class="head wrap"><h3 id="h-updates">Recorder updates</h3>
+          <span class="hint">A version the cloud build published reaches PCs in stages: the test PCs,
+            then named hospitals, then all. Each PC installs it by itself, between consultations,
+            only if the file is signed by AIMS LAB and matches its SHA-256.</span></div>
+        <div id="release" class="body"></div>
+        <form id="releaseForm" class="peopleform">
+          <label>Version <input id="rVersion" required autocomplete="off" placeholder="3.8.4"></label>
+          <label>SHA-256 <input id="rSha" autocomplete="off" placeholder="empty: read from the GitHub Release"></label>
+          <label>Download address <input id="rUrl" autocomplete="off" placeholder="empty: the GitHub Release"></label>
+          <label>Rollback <select id="rRollback">
+            <option value="no">No - a newer version</option>
+            <option value="yes">Yes - go back to this older version</option>
+          </select></label>
+          <button type="submit" class="primary">Add release</button>
+          <span id="releaseMsg" class="hint" role="status"></span>
+        </form>
+        <form id="rolloutForm" class="peopleform" hidden>
+          <label>Stage <select id="rStage">
+            <option value="off">Off - no PC</option>
+            <option value="test">Test PCs only</option>
+            <option value="hospitals">Test PCs and named hospitals</option>
+            <option value="all">Every PC</option>
+          </select></label>
+          <label>Test PCs <input id="rTests" autocomplete="off" placeholder="PC names or device ids, comma-separated"></label>
+          <label>Hospitals <input id="rHospitals" autocomplete="off" placeholder="HOSP001, HOSP003"></label>
+          <button type="submit" class="primary">Set rollout</button>
+          <button type="button" class="chip" id="rPause">Pause</button>
+          <span id="rolloutMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="updateDevices"></div></div>
+      </section>
     </section>
 
     <!-- ============================== Downloads -->
