@@ -63,9 +63,9 @@ _LABEL = {
 # Logging
 # ============================================================
 
-def setup_logging() -> None:
+def setup_logging(file_name: str = "agent.log") -> None:
     config.paths.logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = config.paths.logs_dir / "agent.log"
+    log_file = config.paths.logs_dir / file_name
 
     handlers: list[logging.Handler] = []
     rotating = logging.handlers.TimedRotatingFileHandler(
@@ -603,6 +603,16 @@ def _ensure_std_streams() -> None:
 
 
 def main() -> int:
+    if "--update" in sys.argv[1:]:
+        # The scheduled task "AIMScribe Updater", as SYSTEM: install a new
+        # version the server offered, if every check passes (core/updater.py).
+        # Its own log file: the agent may be writing agent.log at the same time.
+        config.ensure_directories()
+        _ensure_std_streams()
+        setup_logging("updater.log")
+        from core.updater import run_from_task
+        return run_from_task(config)
+
     if "--provision-device-key" in sys.argv[1:]:
         # The installer, as administrator: create this PC's key in its TPM.
         config.ensure_directories()

@@ -36,9 +36,19 @@
                   Windows key storage provider (SSL.com eSigner, DigiCert
                   KeyLocker, Sectigo). AIMS_SIGN_THUMBPRINT=<40 hex characters>.
 
-      signpath    SignPath (free for open-source projects). Signing happens in
-                  SignPath's CI, not here: the build artefact is uploaded and
-                  comes back signed. This script then only verifies.
+      signpath    SignPath. The files are submitted to SignPath through its
+                  PowerShell module (installed from the PowerShell Gallery if
+                  missing) and come back signed: the program folder as one
+                  zip, the setup and its uninstaller one file at a time.
+                    SIGNPATH_API_TOKEN          a CI user's API token (a secret)
+                    SIGNPATH_ORGANIZATION_ID
+                    SIGNPATH_PROJECT_SLUG
+                    SIGNPATH_POLICY_SLUG        e.g. release-signing
+                    SIGNPATH_ARTIFACT_CONFIG_ZIP  signs every PE file in a zip
+                    SIGNPATH_ARTIFACT_CONFIG_PE   signs one PE file
+                  The signing policy must accept API submissions; a policy that
+                  requires SignPath's GitHub origin verification needs its own
+                  workflow instead (see INSTALL_FOR_IT.md).
 
     AIMS_SIGN_TIMESTAMP  timestamp server (default: the provider's, or
                          http://timestamp.digicert.com for a store certificate)
@@ -101,11 +111,65 @@ function Test-OurSignature([string] $Path) {
             $null -ne $sig.TimeStamperCertificate)
 }
 
-function Invoke-Sign([string[]] $Paths) {
+function Invoke-SignPath([string[]] $Paths, [string] $Root) {
+    foreach ($name in 'SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG',
+                      'SIGNPATH_POLICY_SLUG') {
+        if (-not [Environment]::GetEnvironmentVariable($name)) {
+            throw "AIMS_SIGN_PROVIDER=signpath needs $name (see INSTALL_FOR_IT.md)"
+        }
+    }
+    if (-not (Get-Module -ListAvailable -Name SignPath)) {
+        Install-Module -Name SignPath -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module SignPath
+    $common = @{
+        ApiToken          = $env:SIGNPATH_API_TOKEN
+        OrganizationId    = $env:SIGNPATH_ORGANIZATION_ID
+        ProjectSlug       = $env:SIGNPATH_PROJECT_SLUG
+        SigningPolicySlug = $env:SIGNPATH_POLICY_SLUG
+    }
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('aimssign-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        if ($Paths.Count -eq 1 -or -not $Root) {
+            foreach ($p in $Paths) {
+                $out = Join-Path $work ([IO.Path]::GetFileName($p))
+                Submit-SigningRequest @common -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIG_PE `
+                    -InputArtifactPath $p -OutputArtifactPath $out -WaitForCompletion -Force
+                Copy-Item -LiteralPath $out -Destination $p -Force
+            }
+            return
+        }
+        # The whole folder in one request: a zip that keeps each file's place.
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $zip = Join-Path $work 'unsigned.zip'
+        $signed = Join-Path $work 'signed.zip'
+        $archive = [IO.Compression.ZipFile]::Open($zip, 'Create')
+        try {
+            foreach ($p in $Paths) {
+                $rel = $p.Substring($Root.Length).TrimStart('')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $p, $rel) | Out-Null
+            }
+        } finally { $archive.Dispose() }
+        Submit-SigningRequest @common -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIG_ZIP `
+            -InputArtifactPath $zip -OutputArtifactPath $signed -WaitForCompletion -Force
+        $back = Join-Path $work 'signed'
+        [IO.Compression.ZipFile]::ExtractToDirectory($signed, $back)
+        foreach ($p in $Paths) {
+            $rel = $p.Substring($Root.Length).TrimStart('')
+            $from = Join-Path $back $rel
+            if (-not (Test-Path -LiteralPath $from)) { throw "SignPath did not return $rel" }
+            Copy-Item -LiteralPath $from -Destination $p -Force
+        }
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-Sign([string[]] $Paths, [string] $Root = '') {
     if ($Provider -eq 'signpath') {
-        throw ("AIMS_SIGN_PROVIDER=signpath: signing is done in SignPath's CI. Upload " +
-               "dist\AIMScribe_Agent as the artefact, download the signed result, then run " +
-               "sign.ps1 -Folder ... -VerifyOnly.")
+        Invoke-SignPath $Paths $Root
+        return
     }
     $signtool = Find-SignTool
     $common = @('sign', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'AIMScribe',
@@ -182,7 +246,7 @@ $ours = @($all | Where-Object { -not (Test-VendorSigned $_) })
 Write-Host ("{0} program files: {1} already signed by their makers, {2} to sign" -f
             $all.Count, ($all.Count - $ours.Count), $ours.Count) -ForegroundColor Cyan
 
-if (-not $VerifyOnly -and $ours) { Invoke-Sign $ours }
+if (-not $VerifyOnly -and $ours) { Invoke-Sign $ours $root }
 
 Assert-Verified $all
 $main = Join-Path $root 'AIMScribe_Agent.exe'

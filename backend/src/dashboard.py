@@ -250,7 +250,7 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
                approval, registered_via, microphone, microphone_is_clinic,
-               blocked_at, revoked_reason
+               blocked_at, revoked_reason, update_status, update_status_at
           FROM devices
          WHERE ($1::text IS NULL OR hospital_id = $1)
          ORDER BY hospital_id, machine_name
@@ -304,6 +304,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             # 033: blocked by the sweep on evidence; an admin may unblock it.
             "blocked": row["blocked_at"] is not None,
             "blocked_reason": row["revoked_reason"] if row["blocked_at"] else None,
+            # 036: what its updater last reported (installed, waiting, failed...).
+            "update_status": _json(row["update_status"]),
+            "update_status_at": row["update_status_at"].isoformat()
+                                if row["update_status_at"] else None,
         })
         if is_silent:
             silent += 1
@@ -318,6 +322,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                                      if r["approval"] == "pending" and not r["revoked"]),
             "unencrypted": sum(1 for r in rooms
                                if r["disk_encrypted"] is False and not r["revoked"])}
+
+
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
 
 
 REVIEW_ALERTS = ("labelling_review", "relabelled_after_archive")

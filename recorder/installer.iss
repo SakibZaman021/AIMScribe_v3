@@ -9,6 +9,9 @@
 ;   * writes the program's settings (.env) beside it
 ;   * creates the four data folders under ProgramData
 ;   * registers the logon task that starts the agent
+;   * registers the "AIMScribe Updater" task (SYSTEM, at start-up and every
+;     30 minutes) that installs the updates the AIMS LAB server offers -
+;     only ones signed by AIMS LAB, between consultations (core/updater.py)
 ;
 ; What it no longer does. Machine policy - Windows Update active hours, the
 ; power plan, the time service - used to be changed here, and an unsigned
@@ -30,10 +33,15 @@
 ;       /BACKEND=https://<server> /ORIGIN=https://<cmed page>
 ;       /TOKEN=<enrolment token> [/PIN=<sha256 SPKI pin>[,<backup pin>]]
 ;       /LOG="%TEMP%\aimscribe-setup.log"
-;   Exit code 0 only when the program is installed AND the logon task exists.
+;   Exit code 0 only when the program is installed AND both tasks exist.
+;
+; The updater runs this same file silently to update a PC; an upgrade keeps
+; the PC's settings, enrolment and TPM key, as it always has.
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
+; Set from the release tag by .github/workflows/recorder-release.yml, with
+; config.py APP_VERSION and version_info.txt.
 #define AppVersion     "3.8.3"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
@@ -65,6 +73,13 @@
 ; /DDefaultOrigin= or /ORIGIN= adds one more, for a development bench only.
 #ifndef DefaultOrigin
   #define DefaultOrigin ""
+#endif
+; Whose Authenticode signature an update must carry before the updater runs
+; it: the signing certificate's common name or organisation, exactly. The
+; release build passes the same name it signs and verifies with
+; (AIMS_SIGN_PUBLISHER). A PC keeps the value it has across upgrades.
+#ifndef UpdatePublisher
+  #define UpdatePublisher "AIMS LAB"
 #endif
 
 [Setup]
@@ -170,6 +185,8 @@ Filename: "{app}\{#AppExe}"; Description: "Start AIMScribe now"; \
 [UninstallRun]
 Filename: "schtasks.exe"; Parameters: "/Delete /TN ""AIMScribe Agent"" /F"; \
     Flags: runhidden; RunOnceId: "RemoveTask"
+Filename: "schtasks.exe"; Parameters: "/Delete /TN ""AIMScribe Updater"" /F"; \
+    Flags: runhidden; RunOnceId: "RemoveUpdaterTask"
 
 [Code]
 const
@@ -430,6 +447,8 @@ begin
     Env.Add('# The server''s public keys, trusted from Program Files only.');
     Env.Add('AIMS_GRANT_PUBLIC_KEY_PATH=' + ExpandConstant('{app}\keys\aimslab_grant_pub.pem'));
     Env.Add('AIMS_RECEIPT_PUBLIC_KEY_PATH=' + ExpandConstant('{app}\keys\aimslab_receipt_pub.pem'));
+    Env.Add('# The publisher an update must be signed by (exact certificate CN or O).');
+    Env.Add('AIMS_UPDATE_PUBLISHER=' + Choose('PUBLISHER', 'AIMS_UPDATE_PUBLISHER', '{#UpdatePublisher}'));
     Env.Add('# This file is the only source of these settings: the recorder ignores');
     Env.Add('# AIMS_* environment variables, which any program on the PC can set.');
     Env.Add('');
@@ -548,6 +567,83 @@ begin
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if ResultCode <> 0 then
     Result := 'The startup task was reported as created but does not exist.';
+end;
+
+{ ------------------------------------------------------------ the updater task }
+
+{ '' on success, otherwise why the task is not there. }
+function RegisterUpdaterTask(): String;
+var
+  ResultCode: Integer;
+  Xml: TArrayOfString;
+  XmlPath: String;
+begin
+  { The agent runs as the doctor, with least privilege, and so cannot install
+    software. This task can: SYSTEM, at start-up and every 30 minutes. It
+    installs only what a notice signed by the AIMS LAB server names, only a
+    file with that SHA-256 and AIMS LAB's Authenticode signature, and only
+    while no consultation is recording (core/updater.py). One run at a time;
+    an hour at most. }
+  Result := '';
+  XmlPath := ExpandConstant('{tmp}\aimscribe_updater_task.xml');
+  SetArrayLength(Xml, 0);
+  Append(Xml, '<?xml version="1.0"?>');
+  Append(Xml, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
+  Append(Xml, '  <RegistrationInfo>');
+  Append(Xml, '    <Author>AIMS LAB</Author>');
+  Append(Xml, '    <Description>Installs AIMScribe updates offered by the AIMS LAB server: only signed by AIMS LAB, only between consultations.</Description>');
+  Append(Xml, '  </RegistrationInfo>');
+  Append(Xml, '  <Triggers>');
+  Append(Xml, '    <BootTrigger><Enabled>true</Enabled><Delay>PT3M</Delay></BootTrigger>');
+  Append(Xml, '    <TimeTrigger>');
+  Append(Xml, '      <Repetition><Interval>PT30M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
+  Append(Xml, '      <StartBoundary>2026-01-01T00:00:00</StartBoundary>');
+  Append(Xml, '      <Enabled>true</Enabled>');
+  Append(Xml, '    </TimeTrigger>');
+  Append(Xml, '  </Triggers>');
+  Append(Xml, '  <Principals><Principal id="Author">');
+    { LocalSystem has no reduced token to raise, so no run level is asked for. }
+  Append(Xml, '    <UserId>S-1-5-18</UserId>');
+  Append(Xml, '  </Principal></Principals>');
+  Append(Xml, '  <Settings>');
+  Append(Xml, '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+  Append(Xml, '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+  Append(Xml, '    <AllowHardTerminate>true</AllowHardTerminate>');
+  Append(Xml, '    <StartWhenAvailable>true</StartWhenAvailable>');
+  Append(Xml, '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>');
+  Append(Xml, '    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>');
+  Append(Xml, '    <AllowStartOnDemand>true</AllowStartOnDemand>');
+  Append(Xml, '    <Enabled>true</Enabled>');
+  Append(Xml, '    <Hidden>false</Hidden>');
+  Append(Xml, '    <RunOnlyIfIdle>false</RunOnlyIfIdle>');
+  Append(Xml, '    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>');
+  Append(Xml, '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+  Append(Xml, '  </Settings>');
+  Append(Xml, '  <Actions Context="Author"><Exec>');
+  Append(Xml, '    <Command>"' + ExpandConstant('{app}\{#AppExe}') + '"</Command>');
+  Append(Xml, '    <Arguments>--update</Arguments>');
+  Append(Xml, '  </Exec></Actions>');
+  Append(Xml, '</Task>');
+  SaveStringsToUTF8FileWithoutBOM(XmlPath, Xml, False);
+
+  Exec('schtasks.exe', '/Delete /TN "AIMScribe Updater" /F', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Exec('schtasks.exe', '/Create /TN "AIMScribe Updater" /XML "' + XmlPath + '" /F',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'Could not run schtasks.exe to register the updater task.';
+    Exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Result := 'Registering the updater task failed (schtasks returned ' +
+              IntToStr(ResultCode) + ').';
+    Exit;
+  end;
+  Exec('schtasks.exe', '/Query /TN "AIMScribe Updater"', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode <> 0 then
+    Result := 'The updater task was reported as created but does not exist.';
 end;
 
 { ------------------------------------------------------------ stopping a running agent }
@@ -673,6 +769,8 @@ begin
   InstallProblem := ProvisionDeviceKey();
   if InstallProblem = '' then
     InstallProblem := RegisterLogonTask();
+  if InstallProblem = '' then
+    InstallProblem := RegisterUpdaterTask();
   if InstallProblem <> '' then
   begin
     Log('INSTALL INCOMPLETE: ' + InstallProblem);
