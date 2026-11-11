@@ -367,7 +367,21 @@ so each build waits for a click before it can sign anything.
 | variable (optional) | `AIMS_SIGN_PROVIDER` | `keylocker` (default); `azure` or `signpath` only if one of those ever becomes the route |
 | variable (optional) | `ALLOW_VULNERABLE_BUILD` | `true` only to release past a pip-audit finding you have reviewed |
 
-The same from a terminal, if `gh` is signed in as the repository's owner:
+**The easy way:** `signing\set-github-signing.ps1` asks for the API key and
+the `.p12` password without showing them, checks that the `.p12` opens, that
+the thumbprint is 40 characters and is the code-signing certificate's (not the
+`.p12`'s), then sets all six. Run it with `-Check` first to see what it would
+set; nothing is sent then.
+
+```powershell
+cd recorder
+.\signing\set-github-signing.ps1 -ClientCertificate C:\keys\github-signer.p12 `
+    -Thumbprint <code-signing certificate's SHA-1> `
+    -Publisher "<the certificate's exact CN>" -Check
+# then the same without -Check
+```
+
+Or by hand, if `gh` is signed in as the repository's owner:
 
 ```powershell
 gh secret set SM_API_KEY --env recorder-release
