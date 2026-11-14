@@ -42,7 +42,7 @@ import smtplib
 import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -379,7 +379,7 @@ async def list_people(_: None = _admin()):
     return {"people": [{**{k: (v.isoformat() if hasattr(v, "isoformat") else v)
                            for k, v in dict(r).items()},
                         "owner": r["email"] == owner} for r in rows],
-            "google": configured(), "mail": _mail_configured()}
+            "google": configured(), "mail": _mail_configured(), "mail_status": _mail_status()}
 
 
 @router.post("/api/v2/admin/people")
@@ -403,9 +403,16 @@ async def add_person(body: PersonRequest, request: Request, _: None = _admin()):
         """, email, body.role, by, place_id)
     await _audit("portal.person_added", by, {"email": email, "role": body.role,
                                              "place_id": place_id})
-    invited = await _invite(email, body.role, by)
+    place_name = None
+    if place_id is not None:
+        async with _pool().acquire() as conn:
+            place_name = await conn.fetchval("SELECT name FROM places WHERE place_id = $1",
+                                             place_id)
+    invited, invite_error = await _invite(email, body.role, by, place_name)
     answer = {"status": "added", "email": email, "role": body.role, "invited": invited,
               "link": _base() + "/dashboard"}
+    if not invited:
+        answer["invite_error"] = invite_error
     if body.role == "researcher":
         # A researcher's own read-only login, from the start.
         try:
@@ -513,22 +520,58 @@ async def set_db_login(body: RemoveRequest, request: Request, _: None = _admin()
 
 # ------------------------------------------------------------------ the invitation
 
+def _mail_status() -> Dict[str, Any]:
+    import collectors
+    return collectors.mail_status()
+
+
 def _mail_configured() -> bool:
-    return bool(_env("AIMS_SMTP_HOST") and _env("AIMS_SMTP_FROM"))
+    """Mail can leave this server: through Resend (DigitalOcean), or plain SMTP elsewhere."""
+    return bool(_env("AIMS_RESEND_API_KEY")
+                or (_env("AIMS_SMTP_HOST") and _env("AIMS_SMTP_FROM")))
 
 
-async def _invite(email: str, role: str, by: str) -> bool:
-    """An email like a shared document's: who gave access, and the link."""
-    if not _mail_configured():
-        return False
+def _invitation_text(email: str, role: str, by: str, place: Optional[str]) -> str:
+    link = f"{_base()}/dashboard"
+    if role == "collector":
+        return (f"{by} has made you a data collector for AIMScribe"
+                + (f" at {place}" if place else "") + ".\n\n"
+                f"Open {link} and sign in with this Google account ({email}).\n\n"
+                "When you arrive for your shift, open My shift and press Start my shift. "
+                "While you are on shift you get an email whenever the Jabra is unplugged, "
+                "a recording has a problem, a PC stops reporting, or a recording is saved. "
+                "Press End my shift when you leave: your shifts are recorded for your salary.\n\n"
+                "You can see the recordings of your place's hospitals, but not download "
+                "or play them.\n\n"
+                "If you did not expect this, you can ignore this email.\n")
+    return (f"{by} has given you {role} access to the AIMScribe research portal.\n\n"
+            f"Open {link} and sign in with this Google account ({email}).\n\n"
+            "If you did not expect this, you can ignore this email.\n")
+
+
+async def _invite(email: str, role: str, by: str,
+                  place: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """
+    An email like a shared document's: who gave access, and the link. Sent
+    through Resend when the server has its key (DigitalOcean closes the SMTP
+    ports), else by SMTP. Returns whether it went, and why not.
+    """
+    subject = ("You are an AIMScribe data collector" if role == "collector"
+               else "You have been given access to AIMScribe")
+    text = _invitation_text(email, role, by, place)
+    if _env("AIMS_RESEND_API_KEY"):
+        import collectors
+        ok, error = await collectors.send_mail(email, subject, text)
+        if not ok:
+            logger.warning("The invitation to %s was not sent: %s", email, error)
+        return ok, error
+    if not (_env("AIMS_SMTP_HOST") and _env("AIMS_SMTP_FROM")):
+        return False, "mail is not set up on this server (AIMS_RESEND_API_KEY)"
     message = EmailMessage()
     message["From"] = _env("AIMS_SMTP_FROM")
     message["To"] = email
-    message["Subject"] = "You have been given access to AIMScribe"
-    message.set_content(
-        f"{by} has given you {role} access to the AIMScribe research portal.\n\n"
-        f"Open {_base()}/dashboard and sign in with this Google account ({email}).\n\n"
-        "If you did not expect this, you can ignore this email.\n")
+    message["Subject"] = subject
+    message.set_content(text)
 
     def send() -> None:
         port = int(_env("AIMS_SMTP_PORT") or "587")
@@ -540,10 +583,10 @@ async def _invite(email: str, role: str, by: str) -> bool:
 
     try:
         await asyncio.to_thread(send)
-        return True
+        return True, None
     except Exception as exc:
         logger.warning("The invitation to %s was not sent: %s", email, exc)
-        return False
+        return False, f"SMTP: {exc}"[:300]
 
 
 __all__ = ["router", "person_for", "check_csrf", "Person", "configured", "safe_next",

@@ -2756,3 +2756,45 @@ async def test_a_forgotten_shift_closes_itself_and_is_marked_auto(dbs, monkeypat
         assert row["ended_by"] == "auto" and row["summary_sent_at"] is not None
         assert (row["ended_at"] - row["started_at"]) == timedelta(hours=6)
     _unserve()
+
+
+async def test_a_new_collector_is_invited_by_email_through_resend(dbs, monkeypatch):
+    import collectors
+    sent = []
+
+    async def fake_send(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_send)
+    monkeypatch.setenv("AIMS_RESEND_API_KEY", "re_test")
+    monkeypatch.setenv("AIMS_COLLECTOR_MAIL_FROM", "AIMScribe <alerts@aims.example>")
+    monkeypatch.delenv("AIMS_SMTP_HOST", raising=False)
+    who = {"value": "owner@uiu.example"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _two_hospitals(dbs)
+        await _make_collector(client, who, "invited@gmail.example")
+        invitation = [m for m in sent if m[0] == "invited@gmail.example"]
+        assert len(invitation) == 1
+        assert invitation[0][1] == "You are an AIMScribe data collector"
+        assert "Start my shift" in invitation[0][2] and "Place " in invitation[0][2]
+
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        people = (await client.get("/api/v2/admin/people")).json()
+        assert people["mail"] is True and people["mail_status"]["ready"] is True
+        test = (await client.post("/api/v2/admin/mail-test", json={},
+                                  headers={"X-AIMS-Portal": "1"})).json()
+        assert test["sent"] is True and test["to"] == "owner@uiu.example"
+
+        # When Resend refuses, the admin is told why instead of a silent nothing.
+        async def refused(to, subject, text):
+            return False, "Resend answered 403: You can only send testing emails to your own address"
+
+        monkeypatch.setattr(collectors, "send_mail", refused)
+        added = (await client.post("/api/v2/admin/people", headers={"X-AIMS-Portal": "1"},
+                                   json={"email": "late@uni.example", "role": "researcher"})
+                 ).json()
+        assert added["invited"] is False and "403" in added["invite_error"]
+    _unserve()

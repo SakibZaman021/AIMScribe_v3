@@ -51,3 +51,17 @@ def test_the_shift_is_the_one_whose_start_is_nearest():
     assert collectors.shift_for(place, at(13, 45)) == "evening"   # the evening collector, early
     assert collectors.shift_for(place, at(16)) == "evening"
     assert collectors.shift_for(place, at(21, 30)) == "other"
+
+
+def test_the_mail_status_says_what_to_set(monkeypatch):
+    monkeypatch.delenv("AIMS_RESEND_API_KEY", raising=False)
+    status = collectors.mail_status()
+    assert status["ready"] is False and "set-alerts.sh" in status["problem"]
+    monkeypatch.setenv("AIMS_RESEND_API_KEY", "re_x")
+    monkeypatch.delenv("AIMS_COLLECTOR_MAIL_FROM", raising=False)
+    monkeypatch.delenv("AIMS_ALERT_FROM", raising=False)
+    status = collectors.mail_status()            # Resend's test sender: the owner only
+    assert status["ready"] is False and "verify a domain" in status["problem"]
+    monkeypatch.setenv("AIMS_COLLECTOR_MAIL_FROM", "AIMScribe <alerts@aims.example>")
+    assert collectors.mail_status() == {"ready": True, "sender": "AIMScribe <alerts@aims.example>",
+                                        "problem": None}

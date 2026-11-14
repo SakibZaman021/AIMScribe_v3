@@ -1236,9 +1236,11 @@ $("clients").addEventListener("click", async (e) => {
 
 async function loadPeople() {
   try {
-    const { people, mail } = await adminCall("GET", "/api/v2/admin/people");
-    $("peopleHint").textContent = mail ? "An invitation email is sent when you give access"
-      : "No mail account is set, so send them the link yourself";
+    const { people, mail, mail_status } = await adminCall("GET", "/api/v2/admin/people");
+    $("peopleHint").textContent = mail_status && mail_status.ready
+      ? "An invitation email is sent when you give access"
+      : "Invitation emails are not working yet, so send them the link yourself. "
+        + ((mail_status && mail_status.problem) || "");
     const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
       + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th></th></tr></thead><tbody>`
@@ -1275,7 +1277,8 @@ $("peopleForm").addEventListener("submit", async (e) => {
     }
     const r = await adminCall("POST", "/api/v2/admin/people", body);
     $("peopleMsg").textContent = r.invited ? `Invitation sent to ${r.email}.`
-      : `${r.email} can now sign in at ${r.link}`;
+      : `${r.email} can now sign in at ${r.link} - send them this link yourself; `
+        + `no invitation email was sent (${r.invite_error || "mail is not set up"}).`;
     if (r.db_login) showDbLogin(r.email, r.db_login);
     else if (r.db_login_error) $("peopleMsg").textContent += ` (No database login: ${r.db_login_error})`;
     $("pEmail").value = "";
@@ -1600,7 +1603,8 @@ async function loadShift() {
   $("shiftEnd").hidden = !on;
   $("shiftHint").textContent = me.mail_ready
     ? "While you are on shift you get an email for every Jabra unplugged, recording problem, silent PC and finished recording at your place."
-    : "Email is not set up on this server yet: your alerts are listed below, but no mail is sent.";
+    : "Emails are not reaching you yet: AIMS LAB is finishing the mail set-up. Until then every alert "
+      + "is listed below as soon as it happens, so keep this page open during your shift.";
   const mails = me.notifications || [];
   const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
   const badge = $("badge-shift");
@@ -1649,10 +1653,12 @@ $("myMails").addEventListener("click", async (e) => {
 let PLACES = [];
 async function loadPlaces() {
   try {
-    const { places, hospitals, mail_ready } = await adminCall("GET", "/api/v2/admin/places");
+    const { places, hospitals, mail } = await adminCall("GET", "/api/v2/admin/places");
     PLACES = places || [];
-    $("placesHint").textContent = "A place is a group of hospitals. Its data collectors see only these hospitals."
-      + (mail_ready ? "" : " Email is not set up on this server yet (AIMS_RESEND_API_KEY), so no alerts are mailed.");
+    $("placesHint").textContent = "A place is a group of hospitals. Its data collectors see only these hospitals.";
+    $("mailState").innerHTML = mail && mail.ready
+      ? tag("good", "Email works") + ` <span class="hint">sent as ${esc(mail.sender)}</span>`
+      : tag("bad", "Email not working") + ` <span class="hint">${esc((mail && mail.problem) || "")}</span>`;
     const options = (hospitals || []).map((h) =>
       `<option value="${esc(h.hospital_id)}">${esc(h.name || h.hospital_id)}</option>`).join("");
     $("pPlace").innerHTML = `<option value="">Pick a place</option>`
@@ -1725,3 +1731,18 @@ function setShiftLogLink() {
 $("slMonth").value = today().slice(0, 7);
 setShiftLogLink();
 $("slMonth").addEventListener("change", setShiftLogLink);
+
+/* 036: one test mail, with Resend's exact answer, so mail problems are found at once. */
+$("mailTest").addEventListener("click", async () => {
+  $("mailTest").disabled = true;
+  $("mailState").innerHTML = `<span class="hint">Sending a test mail to you...</span>`;
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/mail-test", {});
+    $("mailState").innerHTML = r.sent
+      ? tag("good", "Test mail sent") + ` <span class="hint">to ${esc(r.to)}: check the inbox and spam folder</span>`
+      : tag("bad", "Test mail not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("mailState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("mailTest").disabled = false;
+});

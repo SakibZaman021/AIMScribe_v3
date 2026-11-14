@@ -241,7 +241,7 @@ async def me(request: Request):
                       "evening": [place["evening_start"].strftime("%H:%M"),
                                   place["evening_end"].strftime("%H:%M")]},
             "hospitals": hospitals, "shift": _shift_view(shift),
-            "mail_ready": mail_ready(),
+            "mail_ready": mail_status()["ready"], "mail": mail_status(),
             "notifications": [{k: _iso(v) for k, v in dict(n).items()} for n in notes]}
 
 
@@ -339,7 +339,25 @@ async def list_places(_: None = Depends(api_v2.require_admin)):
             "on_shift": [{"email": r["email"], "shift": r["shift"],
                           "since": _iso(r["started_at"])} for r in on_shift
                          if r["place_id"] == pid]})
-    return {"places": out, "hospitals": [dict(h) for h in hospitals], "mail_ready": mail_ready()}
+    return {"places": out, "hospitals": [dict(h) for h in hospitals],
+            "mail_ready": mail_status()["ready"], "mail": mail_status()}
+
+
+class MailTestRequest(BaseModel):
+    to: Optional[str] = Field(None, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@admin_router.post("/mail-test")
+async def mail_test(body: MailTestRequest, request: Request,
+                    _: None = Depends(api_v2.require_admin)):
+    """One test mail, to the admin or to the address given, with Resend's exact answer."""
+    person = await portal.person_for(request)
+    to = (body.to or (person.email if person else "")).strip().lower()
+    if not to:
+        raise HTTPException(status_code=422, detail="give an address to send the test to")
+    ok, error = await send_mail(to, "Test mail", "This is a test mail from the AIMScribe "
+                                "server. If you can read it, mail to data collectors works.")
+    return {"to": to, "sent": ok, "error": error, "mail": mail_status()}
 
 
 @admin_router.post("/places")
@@ -471,6 +489,23 @@ async def shifts_csv(month: Optional[str] = None, _: None = Depends(api_v2.requi
 
 def mail_ready() -> bool:
     return bool(os.getenv("AIMS_RESEND_API_KEY", "").strip())
+
+
+def mail_status() -> Dict[str, Any]:
+    """Whether mail can reach people, and if not, exactly what to set on the server."""
+    if not mail_ready():
+        return {"ready": False, "sender": None,
+                "problem": "The server has no Resend key, so no email is sent. On the server, "
+                           "in deploy/uiu, run ./set-alerts.sh (or set AIMS_RESEND_API_KEY in "
+                           ".env), then: docker compose up -d --no-deps api"}
+    sender = _sender()
+    if "resend.dev" in sender.lower():
+        return {"ready": False, "sender": sender,
+                "problem": "Email goes only to the Resend account's own address. To reach "
+                           "everyone, verify a domain in Resend and set AIMS_COLLECTOR_MAIL_FROM "
+                           "(e.g. AIMScribe <alerts@your-domain>) in .env, then: "
+                           "docker compose up -d --no-deps api"}
+    return {"ready": True, "sender": sender, "problem": None}
 
 
 def _sender() -> str:
