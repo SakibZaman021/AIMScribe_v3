@@ -63,9 +63,12 @@ GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 COOKIE = "aims_portal"
 SESSION_SECONDS = 8 * 3600
 LOGIN_MINUTES = 10
-ROLES = ("admin", "researcher")
+ROLES = ("admin", "researcher", "collector")
 CSRF_HEADER = "x-aims-portal"
 ADMIN_PATHS = ("/api/v2/admin",)
+# 036: what a data collector may never open - the database viewer and the
+# admin routes. Downloads refuse them in downloads.py and bulk.py.
+COLLECTOR_REFUSED = ("/db", "/api/v2/admin", "/api/v2/dashboard/bulk")
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,8 @@ class Person:
     email: str
     role: str
     db_user: Optional[str] = None
+    # 036: a data collector's place; None for admins and researchers.
+    place_id: Optional[int] = None
 
 
 def _env(name: str) -> str:
@@ -143,12 +148,12 @@ async def person_for(request: Request) -> Optional[Person]:
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT p.email, p.role, p.db_user FROM portal_sessions s
+            SELECT p.email, p.role, p.db_user, p.place_id FROM portal_sessions s
               JOIN portal_people p ON p.email = s.email
              WHERE s.token_sha256 = $1 AND s.ended_at IS NULL AND s.expires_at > now()
                AND p.removed_at IS NULL
         """, _sha(token))
-    return Person(row["email"], row["role"], row["db_user"]) if row else None
+    return Person(row["email"], row["role"], row["db_user"], row["place_id"]) if row else None
 
 
 def check_csrf(request: Request) -> None:
@@ -309,7 +314,8 @@ async def me(request: Request):
     if person is None:
         return JSONResponse(status_code=401, content={"signed_in": False,
                                                       "google": configured()})
-    return {"signed_in": True, "email": person.email, "role": person.role}
+    return {"signed_in": True, "email": person.email, "role": person.role,
+            "place_id": person.place_id}
 
 
 @router.get("/auth/check")
@@ -328,6 +334,8 @@ async def check(request: Request):
         return JSONResponse(status_code=401, content={"detail": "sign in first"})
     if uri.startswith(ADMIN_PATHS) and person.role != "admin":
         return JSONResponse(status_code=403, content={"detail": "this needs an administrator"})
+    if person.role == "collector" and uri.startswith(COLLECTOR_REFUSED):
+        return JSONResponse(status_code=403, content={"detail": "a data collector views only"})
     headers = {"X-Portal-Email": person.email, "X-Portal-Role": person.role}
     if person.db_user:
         headers["X-Portal-Db-User"] = person.db_user
@@ -339,7 +347,9 @@ async def check(request: Request):
 class PersonRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=254,
                        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    role: str = Field("researcher", pattern=r"^(admin|researcher)$")
+    role: str = Field("researcher", pattern=r"^(admin|researcher|collector)$")
+    # 036: required for a data collector, ignored for the other roles.
+    place_id: Optional[int] = None
 
 
 class RemoveRequest(BaseModel):
@@ -360,9 +370,10 @@ def _admin():
 async def list_people(_: None = _admin()):
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
-            SELECT email, role, display_name, added_by, added_at, last_signed_in,
-                   db_user, db_password_set_at
-              FROM portal_people WHERE removed_at IS NULL ORDER BY role, email
+            SELECT p.email, p.role, p.display_name, p.added_by, p.added_at, p.last_signed_in,
+                   p.db_user, p.db_password_set_at, p.place_id, pl.name AS place
+              FROM portal_people p LEFT JOIN places pl ON pl.place_id = p.place_id
+             WHERE p.removed_at IS NULL ORDER BY p.role, p.email
         """)
     owner = owner_email()
     return {"people": [{**{k: (v.isoformat() if hasattr(v, "isoformat") else v)
@@ -375,14 +386,23 @@ async def list_people(_: None = _admin()):
 async def add_person(body: PersonRequest, request: Request, _: None = _admin()):
     email = body.email.strip().lower()
     by = await _actor(request)
+    place_id = body.place_id if body.role == "collector" else None
+    if email == owner_email() and body.role != "admin":
+        raise HTTPException(status_code=409, detail="the owner is always an admin")
     async with _pool().acquire() as conn:
+        if body.role == "collector":
+            if place_id is None or not await conn.fetchval(
+                    "SELECT 1 FROM places WHERE place_id = $1", place_id):
+                raise HTTPException(status_code=422,
+                                    detail="a data collector needs a place (Places panel)")
         await conn.execute("""
-            INSERT INTO portal_people (email, role, added_by) VALUES ($1, $2, $3)
+            INSERT INTO portal_people (email, role, added_by, place_id) VALUES ($1, $2, $3, $4)
             ON CONFLICT (email) DO UPDATE
                SET role = EXCLUDED.role, added_by = EXCLUDED.added_by, added_at = now(),
-                   removed_at = NULL, removed_by = NULL
-        """, email, body.role, by)
-    await _audit("portal.person_added", by, {"email": email, "role": body.role})
+                   place_id = EXCLUDED.place_id, removed_at = NULL, removed_by = NULL
+        """, email, body.role, by, place_id)
+    await _audit("portal.person_added", by, {"email": email, "role": body.role,
+                                             "place_id": place_id})
     invited = await _invite(email, body.role, by)
     answer = {"status": "added", "email": email, "role": body.role, "invited": invited,
               "link": _base() + "/dashboard"}
@@ -484,6 +504,10 @@ async def set_db_login(body: RemoveRequest, request: Request, _: None = _admin()
                                     "AND removed_at IS NULL", email)
     if not known:
         raise HTTPException(status_code=404, detail="no such person")
+    async with _pool().acquire() as conn:
+        role = await conn.fetchval("SELECT role FROM portal_people WHERE email = $1", email)
+    if role == "collector":
+        raise HTTPException(status_code=409, detail="a data collector has no database login")
     return {"email": email, **await _set_db_login(email, await _actor(request))}
 
 

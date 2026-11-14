@@ -166,6 +166,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it CMED cannot see what happened to its requests.
     ("035_v3_cmed_request_log.sql", "recordings", "table cmed_request_log",
      _table("cmed_request_log")),
+    # Without it there are no data collectors, places, shifts or their mails.
+    ("036_v3_data_collectors.sql", "recordings", "table collector_shifts",
+     _table("collector_shifts")),
+    ("036_v3_data_collectors.sql", "recordings", "role 'collector' allowed",
+     _check_allows("portal_people", "role", "collector")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

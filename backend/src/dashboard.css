@@ -480,3 +480,11 @@ dialog::backdrop { background: rgba(8, 10, 12, .55); }
   .bgo button.primary { width: 100%; white-space: normal; padding: 8px 12px; }
   .bnums { gap: 8px 16px; }
 }
+
+/* 036: data collectors - their shift page, and the admin's places and shift log */
+a.button.primary { background: var(--accent); border-color: var(--accent);
+                   color: var(--on-accent); font-weight: 600; }
+.shiftbody { display: flex; flex-direction: column; gap: 12px; }
+.shiftbody .row, .body.row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: end; }
+.shiftstate { font-size: 16px; font-weight: 600; margin: 0; }
+.placehosp { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }

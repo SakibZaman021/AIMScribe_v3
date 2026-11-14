@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 
 import api_v2
+import collectors
 from api_v2 import require_admin, require_viewer
 from integrity import safe_identifier
 
@@ -100,7 +101,8 @@ def _clinic(value: Optional[str]) -> Optional[str]:
 async def summary(from_date: Optional[str] = Query(None, alias="from"),
                   to_date: Optional[str] = Query(None, alias="to"),
                   hospital_id: Optional[str] = None,
-                  _: None = Depends(require_viewer)):
+                  _: None = Depends(require_viewer),
+                  scope: Any = Depends(collectors.hospital_scope)):
     """
     Everything §8.9 asks for, for a span of days: volume, confirmation,
     integrity, recorder health, reconciliation and the state of the copies.
@@ -110,19 +112,21 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
     end = _day(to_date, today)
     if end < start:
         start, end = end, start
-    clinic = _clinic(hospital_id)
+    # 036: a data collector sees their place's hospitals only.
+    clinic = collectors.narrow(scope, _clinic(hospital_id))
 
     async with _pool().acquire() as conn:
         return {
             "from": start.isoformat(), "to": end.isoformat(),
-            "hospital_id": clinic,
+            "hospital_id": _clinic(hospital_id),
+            "scope": clinic if isinstance(scope, list) else None,
             "volume": await _volume(conn, start, end, clinic),
             "confirmation": await _confirmation(conn, start, end, clinic),
             "integrity": await _integrity(conn, start, end, clinic),
             "recorders": await _recorders(conn, clinic),
             "review": await _review(conn, clinic),
             "reconciliation": await _reconciliation(conn, start, end, clinic),
-            "copies": await _copies(conn),
+            "copies": await _copies(conn, clinic),
         }
 
 
@@ -134,7 +138,7 @@ async def _volume(conn, start: date, end: date, clinic: Optional[str]) -> Dict[s
                COALESCE(sum(total_duration_seconds), 0) / 3600.0 AS hours
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND confirmation <> 'refused'
          GROUP BY session_date, hospital_id, doctor_id
          ORDER BY session_date, hospital_id, doctor_id
@@ -175,7 +179,7 @@ async def _confirmation(conn, start: date, end: date,
         SELECT session_date, hospital_id, confirmation, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
          GROUP BY session_date, hospital_id, confirmation
          ORDER BY session_date, hospital_id
     """, start, end, clinic)
@@ -205,7 +209,7 @@ async def _integrity(conn, start: date, end: date,
         SELECT hospital_id, doctor_id, quarantine_reason, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND quarantine_reason IS NOT NULL
          GROUP BY hospital_id, doctor_id, quarantine_reason
          ORDER BY n DESC
@@ -215,7 +219,7 @@ async def _integrity(conn, start: date, end: date,
         SELECT hospital_id, doctor_id, close_reason, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND close_reason IS NOT NULL
            AND close_reason NOT IN """ + _ENDED_NORMALLY + """
          GROUP BY hospital_id, doctor_id, close_reason
@@ -225,10 +229,12 @@ async def _integrity(conn, start: date, end: date,
     alerts = await conn.fetch("""
         SELECT a.alert_type, a.severity, count(*) AS n
           FROM integrity_alerts a
+          LEFT JOIN devices d ON d.device_id = a.device_id
          WHERE a.raised_at >= $1::date AND a.raised_at < ($2::date + 1)
+           AND ($3::text[] IS NULL OR d.hospital_id = ANY($3::text[]))
          GROUP BY a.alert_type, a.severity
          ORDER BY n DESC
-    """, start, end)
+    """, start, end, clinic)
 
     return {
         "quarantined": [dict(r) for r in quarantined],
@@ -252,7 +258,7 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                approval, registered_via, microphone, microphone_is_clinic,
                blocked_at, revoked_reason
           FROM devices
-         WHERE ($1::text IS NULL OR hospital_id = $1)
+         WHERE ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
          ORDER BY hospital_id, machine_name
     """, clinic)
 
@@ -336,7 +342,7 @@ async def _review(conn, clinic: Optional[str]) -> Dict[str, Any]:
           FROM integrity_alerts a
           LEFT JOIN sessions s ON s.session_id = a.session_id
          WHERE a.alert_type = ANY($1::text[]) AND a.resolved_at IS NULL
-           AND ($2::text IS NULL OR s.hospital_id = $2)
+           AND ($2::text[] IS NULL OR s.hospital_id = ANY($2::text[]))
          ORDER BY a.raised_at DESC
          LIMIT 100
     """, list(REVIEW_ALERTS), clinic)
@@ -427,7 +433,7 @@ async def _reconciliation(conn, start: date, end: date,
     without_record = await conn.fetchval("""
         SELECT count(*) FROM sessions s
          WHERE s.session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR s.hospital_id = $3)
+           AND ($3::text[] IS NULL OR s.hospital_id = ANY($3::text[]))
            AND s.confirmation IN ('pending', 'unconfirmed')
     """, start, end, clinic)
 
@@ -435,7 +441,7 @@ async def _reconciliation(conn, start: date, end: date,
         SELECT n.hospital_id, n.visit_date, count(*) AS n
           FROM confirmation_notices n
          WHERE n.visit_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR n.hospital_id = $3)
+           AND ($3::text[] IS NULL OR n.hospital_id = ANY($3::text[]))
            AND n.claimed_by_jti IS NULL
            AND n.received_at < now() - interval '15 minutes'
          GROUP BY n.hospital_id, n.visit_date
@@ -449,7 +455,7 @@ async def _reconciliation(conn, start: date, end: date,
     }
 
 
-async def _copies(conn) -> Dict[str, Any]:
+async def _copies(conn, clinic: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     `SRS-DSH-09`: what is not yet safe in two places - recordings without a
     cloud copy, pieces still in the segment store after 48 hours, and when
@@ -461,12 +467,15 @@ async def _copies(conn) -> Dict[str, Any]:
           FROM sessions
          WHERE archived_at IS NOT NULL AND copied_at IS NULL
            AND quarantine_reason IS NULL AND confirmation = 'confirmed'
-    """)
+           AND ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
+    """, clinic)
     stale_pieces = await conn.fetchval("""
-        SELECT count(*) FROM segments
-         WHERE object_deleted_at IS NULL
-           AND committed_at < now() - interval '48 hours'
-    """)
+        SELECT count(*) FROM segments g
+         WHERE g.object_deleted_at IS NULL
+           AND g.committed_at < now() - interval '48 hours'
+           AND ($1::text[] IS NULL OR g.session_id IN (
+                SELECT session_id FROM sessions WHERE hospital_id = ANY($1::text[])))
+    """, clinic)
     restore = await conn.fetchrow("""
         SELECT occurred_at, detail FROM audit_log
          WHERE event_type = 'operations.restore_tested'
@@ -506,18 +515,19 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                      state: Optional[str] = None,
                      search: Optional[str] = None,
                      limit: int = 100,
-                     _: None = Depends(require_viewer)):
+                     _: None = Depends(require_viewer),
+                     scope: Any = Depends(collectors.hospital_scope)):
     """
     Clinic, then doctor, then date, then patient - and a recording at any
     level (`SRS-DSH-02`). `state` opens one of the summary's counts:
 
         confirmed | pending | unconfirmed | refused | expired | legacy
-        quarantined | stopped_early | unarchived | uncopied
+        quarantined | stopped_early | unarchived | uncopied | not_jabra
     """
     today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
     end = _day(to_date, today)
-    clinic = _clinic(hospital_id)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
     doctor = _clinic(doctor_id) if doctor_id else None
     patient = _clinic(patient_id) if patient_id else None
     limit = max(1, min(limit if isinstance(limit, int) else 100, 500))
@@ -529,8 +539,8 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         args.append(value)
         where.append(clause.replace("$N", f"${len(args)}"))
 
-    if clinic:
-        add("s.hospital_id = $N", clinic)
+    if clinics is not None:
+        add("s.hospital_id = ANY($N::text[])", clinics)
     if doctor:
         add("s.doctor_id = $N", doctor)
     if patient:
@@ -546,6 +556,10 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
         "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
                     "AND s.confirmation = 'confirmed'",
+        # 036: any part recorded on something other than the Jabra.
+        "not_jabra": "EXISTS (SELECT 1 FROM unnest(s.microphones) m "
+                     "WHERE m NOT ILIKE '%jabra%' "
+                     "AND m NOT ILIKE 'echo cancelling speakerphone (j%')",
     }
     if state in states:
         where.append(states[state])
@@ -559,7 +573,10 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    s.patient_id, s.file_stem, s.local_start, s.local_end,
                    s.confirmation, s.status, s.total_duration_seconds,
                    s.segment_count, s.opened_at, s.closed_at, s.archived_at,
-                   s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason
+                   s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
+                   s.microphones,
+                   (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
+                      AND a.alert_type = 'microphone_switched') AS mic_switches
               FROM sessions s
              WHERE {' AND '.join(where)}
              ORDER BY s.opened_at DESC NULLS LAST
@@ -611,24 +628,34 @@ def _recording_row(row) -> Dict[str, Any]:
         "archive_relpath": row["archive_relpath"],
         "quarantine_reason": row["quarantine_reason"],
         "close_reason": row["close_reason"],
+        # 036: which microphone(s) the recording used, and how often it switched.
+        "microphone": collectors.microphone_label(
+            row["microphones"] if "microphones" in row.keys() else None,
+            int(row["mic_switches"] or 0) if "mic_switches" in row.keys() else 0),
     }
 
 
 @router.get("/clinics")
-async def clinics(_: None = Depends(require_viewer)):
-    """The clinics and doctors a dashboard filter can offer."""
+async def clinics(_: None = Depends(require_viewer),
+                  scope: Any = Depends(collectors.hospital_scope)):
+    """The clinics and doctors a dashboard filter can offer (a collector: their place's)."""
+    allowed = collectors.narrow(scope, None)
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
             SELECT h.hospital_id, h.name, h.timezone,
                    (SELECT count(*) FROM devices d
                      WHERE d.hospital_id = h.hospital_id AND d.revoked_at IS NULL)
                    AS recorders
-              FROM hospitals h ORDER BY h.hospital_id
-        """)
+              FROM hospitals h
+             WHERE ($1::text[] IS NULL OR h.hospital_id = ANY($1::text[]))
+             ORDER BY h.hospital_id
+        """, allowed)
         doctors = await conn.fetch("""
             SELECT DISTINCT hospital_id, doctor_id FROM sessions
-             WHERE session_date > now()::date - 90 ORDER BY hospital_id, doctor_id
-        """)
+             WHERE session_date > now()::date - 90
+               AND ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
+             ORDER BY hospital_id, doctor_id
+        """, allowed)
     return {"clinics": [dict(r) for r in rows], "doctors": [dict(r) for r in doctors]}
 
 

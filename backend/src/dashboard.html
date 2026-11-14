@@ -33,6 +33,7 @@
     <a href="#overview" data-view="overview"><span class="ico ico-overview" aria-hidden="true"></span><span class="label">Overview</span><b class="badge" id="badge-overview" hidden></b></a>
     <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
     <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
+    <a href="#shift" data-view="shift" id="navShift" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My shift</span><b class="badge" id="badge-shift" hidden></b></a>
     <a href="#downloads" data-view="downloads" id="navDownloads" hidden><span class="ico ico-dl" aria-hidden="true"></span><span class="label">Downloads</span></a>
     <a href="#cmed" data-view="cmed" id="navCmed" hidden><span class="ico ico-pc" aria-hidden="true"></span><span class="label">CMED</span></a>
     <a href="#people" data-view="people" id="navPeople" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">People</span></a>
@@ -147,6 +148,29 @@
       </section>
     </section>
 
+    <!-- ============================== My shift (data collectors, 036) -->
+    <section class="view" data-view="shift" aria-label="My shift" hidden>
+      <section class="panel" aria-labelledby="h-shift">
+        <div class="head wrap"><h3 id="h-shift">My shift</h3>
+          <span class="hint" id="shiftPlace"></span></div>
+        <div class="body shiftbody">
+          <p id="shiftState" class="shiftstate" role="status">Loading</p>
+          <div class="row">
+            <button type="button" class="primary" id="shiftStart" hidden>Start my shift</button>
+            <button type="button" class="ghost" id="shiftEnd" hidden>End my shift</button>
+          </div>
+          <p class="hint" id="shiftHint">While you are on shift you get an email for every Jabra
+            unplugged, recording problem, silent PC and finished recording at your place.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-mails">
+        <div class="head wrap"><h3 id="h-mails">My alerts</h3>
+          <span class="hint">Urgent alerts not marked seen in 15 minutes also go to the
+            other collectors of your place and to AIMS LAB.</span></div>
+        <div class="scroll"><div id="myMails"></div></div>
+      </section>
+    </section>
+
     <!-- ============================== Downloads -->
     <section class="view" data-view="downloads" aria-label="Downloads" hidden>
       <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
@@ -219,11 +243,36 @@
           <label>Role <select id="pRole">
             <option value="researcher">Researcher - look, never change</option>
             <option value="admin">Admin - everything, and people</option>
+            <option value="collector">Data collector - view only, own place</option>
           </select></label>
+          <label id="pPlaceLabel" hidden>Place <select id="pPlace"></select></label>
           <button type="submit" class="primary">Give access</button>
           <span id="peopleMsg" class="hint" role="status"></span>
         </form>
         <div class="scroll"><div id="people"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-places" id="placesPanel" hidden>
+        <div class="head wrap"><h3 id="h-places">Places</h3>
+          <span class="hint" id="placesHint">A place is a group of hospitals. Its data
+            collectors see only these hospitals.</span></div>
+        <form id="placeForm" class="peopleform">
+          <label>Place <input id="plName" required autocomplete="off" placeholder="Mirpur"></label>
+          <label>Morning <input id="plMs" type="time" value="08:00" required> to
+            <input id="plMe" type="time" value="14:00" required></label>
+          <label>Evening <input id="plEs" type="time" value="14:00" required> to
+            <input id="plEe" type="time" value="20:00" required></label>
+          <button type="submit" class="primary">Add place</button>
+          <span id="placeMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="places"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-shiftlog" id="shiftLogPanel" hidden>
+        <div class="head wrap"><h3 id="h-shiftlog">Shift log</h3>
+          <span class="hint">Every shift each data collector started and ended, for salaries.</span></div>
+        <div class="body row">
+          <label class="field"><span>Month</span> <input type="month" id="slMonth"></label>
+          <a class="button primary" id="slDownload" href="/api/v2/admin/shifts.csv">Download shift log (CSV)</a>
+        </div>
       </section>
     </section>
   </main>

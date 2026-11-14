@@ -2049,12 +2049,25 @@ async def device_health(body: HealthLogRequest, device=Depends(require_device)):
             continue
         kind = str(e["data"].get("alert_type") or "recorder_alert")[:64]
         late = (now - e["at"]).total_seconds() > 120
+        detail = {"detail": e["data"].get("detail"), "from": "recorder",
+                  "occurred_at": e["at"].isoformat(), "reported_late": late}
+        microphone = e["data"].get("device")
+        if kind == "microphone_switched" and isinstance(microphone, str) and microphone:
+            # 036: the microphone it moved to, so the recording's Microphone
+            # column also shows an unplug shorter than one heartbeat.
+            detail["microphone"] = microphone[:200]
+            session_id = e["data"].get("session_id")
+            if session_id:
+                try:
+                    await repo.note_session_microphone(device["device_id"],
+                                                       str(session_id)[:64], microphone[:200])
+                except Exception as exc:
+                    logger.warning("Could not note the switched microphone: %s", exc)
         await repo.raise_alert(
             alert_type=kind,
             severity="critical" if kind in RECORDER_CRITICAL else "warning",
             session_id=e["data"].get("session_id"), device_id=device["device_id"],
-            detail={"detail": e["data"].get("detail"), "from": "recorder",
-                    "occurred_at": e["at"].isoformat(), "reported_late": late})
+            detail=detail)
     return {"status": "stored", "stored": len(new), "last_seq": max(e["seq"] for e in entries)}
 
 

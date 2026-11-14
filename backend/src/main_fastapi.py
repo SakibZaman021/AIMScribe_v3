@@ -206,8 +206,12 @@ async def lifespan(app: FastAPI):
     pools = _schema_pools()
     if pools[0] is not None:
         await schema_check.at_startup(*pools, repo=api_v2.ctx.repo)
+    # Mails the data collector on shift (036); one API process at a time.
+    import collectors
+    collectors.start()
     yield
     # Shutdown
+    await collectors.stop()
     await ctx.close()
 
 
@@ -284,6 +288,11 @@ app.include_router(cmed_log.router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
 # only, behind the administrator key.
 app.include_router(dashboard_router)
+# Data collectors (036): their shifts and mails, and the admin's places and
+# monthly shift log (collectors.py).
+import collectors  # noqa: E402
+app.include_router(collectors.router)
+app.include_router(collectors.admin_router)
 
 
 # ============================================================================

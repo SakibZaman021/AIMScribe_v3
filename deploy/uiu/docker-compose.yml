@@ -256,6 +256,14 @@ services:
       AIMS_SMTP_USER: ${AIMS_SMTP_USER:-}
       AIMS_SMTP_PASSWORD: ${AIMS_SMTP_PASSWORD:-}
       AIMS_SMTP_FROM: ${AIMS_SMTP_FROM:-}
+      # Data collectors (036): mails to the collector on shift, through Resend
+      # (the same key and sender as the monitor's alerts). AIMS_ALERT_EMAIL also
+      # receives an urgent alert nobody marked seen in 15 minutes.
+      AIMS_RESEND_API_KEY: ${AIMS_RESEND_API_KEY:-}
+      AIMS_ALERT_FROM: ${AIMS_ALERT_FROM:-}
+      AIMS_ALERT_EMAIL: ${AIMS_ALERT_EMAIL:-}
+      AIMS_COLLECTOR_MAIL_FROM: ${AIMS_COLLECTOR_MAIL_FROM:-}
+      AIMS_COLLECTOR_MAILER: ${AIMS_COLLECTOR_MAILER:-on}
       # Downloads from the portal (downloads.py): the archive worker decrypts
       # one copy and streams it back, on the internal network. The limits are
       # per person.

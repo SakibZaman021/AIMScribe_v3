@@ -233,6 +233,7 @@ const STATE_LABELS = {
   stopped_early: "Stopped early",
   unarchived: "Not archived",
   uncopied: "No cloud copy",
+  not_jabra: "Not on the Jabra",
   refused: "Refused",
   expired: "Expired",
   legacy: "Legacy",
@@ -328,6 +329,7 @@ const VIEWS = {
   overview: ["Overview", "How the clinics, the recordings and the server are doing", true],
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
+  shift: ["My shift", "Your shift, and the alerts mailed to you", false],
   downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
   cmed: ["CMED", "CMED's EHR addresses and the key each hospital signs with", false],
   people: ["People", "Who may sign in, and their database logins", false],
@@ -821,6 +823,7 @@ function storedTag(r) {
    Only for someone signed in: each download is logged against their email.
    One link per patient file when a recording was cut into several. */
 function audioLinks(r) {
+  if (PORTAL && PORTAL.role === "collector") return `<span class="hint">view only</span>`;
   if (!r.copied || r.confirmation !== "confirmed") return `<span class="hint">–</span>`;
   if (!PORTAL) return `<span class="hint">sign in</span>`;
   const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/audio`;
@@ -834,6 +837,13 @@ function audioLinks(r) {
   return link(base, "Download", "Download the WAV");
 }
 
+/* 036: which microphone a recording used - the Jabra, the PC's own, or both. */
+function micTag(m) {
+  if (!m || m.kind === "unknown") return `<span class="hint">not reported</span>`;
+  const names = (m.names || []).join(", ");
+  return tag(m.kind === "jabra" ? "good" : "warn", m.label, names);
+}
+
 function recordingsTable(list) {
   if (!list.length) {
     return STATE
@@ -842,7 +852,8 @@ function recordingsTable(list) {
   }
   const showClinic = !$("clinic").value;
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
-    + `<th>Patient files and rule</th><th class="num">Length</th><th>CMED</th><th>Status</th>`
+    + `<th>Patient files and rule</th><th class="num">Length</th><th>Microphone</th>`
+    + `<th>CMED</th><th>Status</th>`
     + `<th>Stored</th><th>Audio</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
@@ -863,6 +874,7 @@ function recordingsTable(list) {
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
           + td("Length", `${num(r.minutes || 0)} min`, "num")
+          + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
@@ -895,7 +907,7 @@ function drawStateFilters() {
     refused: c.refused, expired: c.expired, legacy: c.legacy,
   };
   const order = ["", "pending", "unconfirmed", "confirmed", "quarantined", "stopped_early",
-                 "unarchived", "uncopied", "refused", "expired", "legacy"];
+                 "not_jabra", "unarchived", "uncopied", "refused", "expired", "legacy"];
   $("stateFilters").innerHTML = order.map((s) => {
     const n = counts[s];
     if (["refused", "expired", "legacy"].includes(s) && !n && STATE !== s) return "";
@@ -984,6 +996,7 @@ async function refresh() {
     LAST = d;
     drawAll(d);
     await loadRecordings();
+    if (PORTAL && PORTAL.role === "collector") loadShift();
     FAILED = false;
     UPDATED_AT = Date.now();
     if (!(d.volume.total_recordings)) {
@@ -1065,7 +1078,7 @@ async function whoAmI() {
   if (reply.status === 404) return;                 // the loopback door: the admin key
   const me = await reply.json().catch(() => ({}));
   if (reply.ok && me.signed_in) {
-    PORTAL = { email: me.email, role: me.role };
+    PORTAL = { email: me.email, role: me.role, place_id: me.place_id };
     $("who").textContent = `${me.email} \u00b7 ${me.role}`;
     $("who").hidden = false;
     $("signout").hidden = false;
@@ -1077,6 +1090,13 @@ async function whoAmI() {
       $("clientsPanel").hidden = false;
       $("navCmed").hidden = false;
       loadCmed();
+      $("placesPanel").hidden = false;
+      $("shiftLogPanel").hidden = false;
+      loadPlaces();
+    }
+    if (me.role === "collector") {
+      $("navShift").hidden = false;
+      loadShift();
     }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
@@ -1224,10 +1244,14 @@ async function loadPeople() {
       + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
         + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
-        + td("Role", p.role === "admin" ? tag("warn", "Admin") : tag("good", "Researcher"))
+        + td("Role", p.role === "admin" ? tag("warn", "Admin")
+          : p.role === "collector" ? tag("info", "Data collector")
+            + (p.place ? `<br><span class="hint">${esc(p.place)}</span>` : "")
+          : tag("good", "Researcher"))
         + td("Given by", esc(p.added_by || ""))
         + td("Last signed in", esc(when(p.last_signed_in)))
-        + td("Database login", (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
+        + td("Database login", p.role === "collector" ? `<span class="hint">none (view only)</span>`
+          : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
         + td("", p.owner ? `<span class="hint">owner</span>`
@@ -1243,7 +1267,13 @@ $("peopleForm").addEventListener("submit", async (e) => {
   const email = $("pEmail").value.trim();
   if (!email) return;
   try {
-    const r = await adminCall("POST", "/api/v2/admin/people", { email, role: $("pRole").value });
+    const role = $("pRole").value;
+    const body = { email, role };
+    if (role === "collector") {
+      if (!$("pPlace").value) { $("peopleMsg").textContent = "Pick the collector's place first (add places below)."; return; }
+      body.place_id = Number($("pPlace").value);
+    }
+    const r = await adminCall("POST", "/api/v2/admin/people", body);
     $("peopleMsg").textContent = r.invited ? `Invitation sent to ${r.email}.`
       : `${r.email} can now sign in at ${r.link}`;
     if (r.db_login) showDbLogin(r.email, r.db_login);
@@ -1523,9 +1553,175 @@ async function start() {
       + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
-  if (PORTAL) startBulk();
+  if (PORTAL && PORTAL.role !== "collector") startBulk();
   showView(location.hash.slice(1));
   await refresh();
 }
 
 start();
+
+/* ============================================================
+   036: data collectors. Their own shift page, and the admin's
+   places and monthly shift log.
+   ============================================================ */
+async function collectorCall(method, path) {
+  const response = await fetch(`/api/v2/dashboard/collector${path}`, {
+    method, headers: { ...portalHeaders(), Accept: "application/json" } });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+const EVENT_LABELS = {
+  jabra_unplugged: "Jabra unplugged", jabra_back: "Jabra back", jabra_not_plugged: "Jabra not plugged in",
+  recording_problem: "Recording problem", pc_silent: "PC not reporting",
+  recording_finished: "Recording saved", shift_summary: "Shift summary",
+  no_shift_started: "Nobody on shift", escalation: "Not yet seen",
+};
+
+let shiftSeq = 0;
+async function loadShift() {
+  const seq = ++shiftSeq;
+  let me;
+  try { me = await collectorCall("GET", "/me"); }
+  catch (err) {
+    $("shiftState").textContent = `Could not load your shift: ${err.message}`;
+    return;
+  }
+  if (seq !== shiftSeq) return;
+  const p = me.place || {};
+  $("shiftPlace").textContent = `${p.name || ""} · morning ${(p.morning || []).join("–")}`
+    + ` · evening ${(p.evening || []).join("–")} · ${(me.hospitals || []).map(clinicName).join(", ") || "no hospitals yet"}`;
+  const on = me.shift;
+  $("shiftState").textContent = on
+    ? `On shift (${on.shift}) since ${dhaka(on.started_at)}.`
+    : "You are not on shift.";
+  $("shiftStart").hidden = !!on;
+  $("shiftEnd").hidden = !on;
+  $("shiftHint").textContent = me.mail_ready
+    ? "While you are on shift you get an email for every Jabra unplugged, recording problem, silent PC and finished recording at your place."
+    : "Email is not set up on this server yet: your alerts are listed below, but no mail is sent.";
+  const mails = me.notifications || [];
+  const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
+  const badge = $("badge-shift");
+  badge.textContent = unseen ? String(unseen) : "";
+  badge.hidden = !unseen;
+  $("myMails").innerHTML = !mails.length
+    ? empty("No alerts yet", "They appear here, and by email, while you are on shift.", true)
+    : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th>`
+      + `<th>Email</th><th></th></tr></thead><tbody>`
+      + mails.map((n) => `<tr class="${n.urgent && !n.seen_at ? "row-bad" : ""}">`
+        + td("When", esc(dhaka(n.happened_at || n.created_at)))
+        + td("What", tag(n.urgent ? "bad" : "good", EVENT_LABELS[n.event] || human(n.event)))
+        + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
+        + td("Message", esc(n.subject), "wrap")
+        + td("Email", n.delivered ? tag("good", "sent") : tag("warn", "not sent", n.error || ""))
+        + td("", n.seen_at ? `<span class="hint">seen</span>`
+          : `<button type="button" class="chip" data-seen="${esc(n.id)}">Mark seen</button>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+$("shiftStart").addEventListener("click", async () => {
+  $("shiftStart").disabled = true;
+  try { await collectorCall("POST", "/shift/start"); }
+  catch (err) { window.alert(`Not started: ${err.message}`); }
+  $("shiftStart").disabled = false;
+  loadShift();
+});
+$("shiftEnd").addEventListener("click", async () => {
+  if (!window.confirm("End your shift now? A summary of the shift is emailed to you.")) return;
+  $("shiftEnd").disabled = true;
+  try { await collectorCall("POST", "/shift/end"); }
+  catch (err) { window.alert(`Not ended: ${err.message}`); }
+  $("shiftEnd").disabled = false;
+  loadShift();
+});
+$("myMails").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-seen]");
+  if (!b) return;
+  b.disabled = true;
+  try { await collectorCall("POST", `/notifications/${encodeURIComponent(b.dataset.seen)}/seen`); }
+  catch (err) { window.alert(`Not marked: ${err.message}`); }
+  loadShift();
+});
+
+/* Places (admins): which hospitals each place's collectors see. */
+let PLACES = [];
+async function loadPlaces() {
+  try {
+    const { places, hospitals, mail_ready } = await adminCall("GET", "/api/v2/admin/places");
+    PLACES = places || [];
+    $("placesHint").textContent = "A place is a group of hospitals. Its data collectors see only these hospitals."
+      + (mail_ready ? "" : " Email is not set up on this server yet (AIMS_RESEND_API_KEY), so no alerts are mailed.");
+    const options = (hospitals || []).map((h) =>
+      `<option value="${esc(h.hospital_id)}">${esc(h.name || h.hospital_id)}</option>`).join("");
+    $("pPlace").innerHTML = `<option value="">Pick a place</option>`
+      + PLACES.map((p) => `<option value="${esc(p.place_id)}">${esc(p.name)}</option>`).join("");
+    $("places").innerHTML = !PLACES.length
+      ? empty("No places yet", "Add one above, then put its hospitals in it.", true)
+      : `<table><thead><tr><th>Place</th><th>Shifts</th><th>Hospitals</th><th>Data collectors</th>`
+        + `<th>On shift now</th></tr></thead><tbody>`
+        + PLACES.map((p) => `<tr>`
+          + td("Place", `<b>${esc(p.name)}</b>`)
+          + td("Shifts", `morning ${esc(p.morning.join("–"))}<br>evening ${esc(p.evening.join("–"))}`)
+          + td("Hospitals", `<span class="placehosp">`
+            + p.hospitals.map((h) => `${tag("info", clinicName(h))}`
+              + `<button type="button" class="chip" data-unhosp="${esc(h)}" data-place="${esc(p.place_id)}" `
+              + `title="Take ${esc(h)} out of ${esc(p.name)}">×</button>`).join("")
+            + ` <select data-addfor="${esc(p.place_id)}" aria-label="Add a hospital to ${esc(p.name)}">`
+            + `<option value="">Add hospital…</option>${options}</select></span>`)
+          + td("Data collectors", p.collectors.length
+            ? p.collectors.map((c) => esc(c.name || c.email)).join("<br>") : `<span class="hint">none yet</span>`)
+          + td("On shift now", p.on_shift.length
+            ? p.on_shift.map((c) => `${esc(c.email)} (${esc(c.shift)})`).join("<br>") : `<span class="hint">nobody</span>`)
+          + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    $("places").innerHTML = empty("Places could not be loaded", err.message, true);
+  }
+}
+
+$("placeForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await adminCall("POST", "/api/v2/admin/places", {
+      name: $("plName").value.trim(), morning_start: $("plMs").value, morning_end: $("plMe").value,
+      evening_start: $("plEs").value, evening_end: $("plEe").value });
+    $("placeMsg").textContent = `Added ${$("plName").value.trim()}. Now add its hospitals.`;
+    $("plName").value = "";
+    loadPlaces();
+  } catch (err) { $("placeMsg").textContent = `Not added: ${err.message}`; }
+});
+
+$("places").addEventListener("change", async (e) => {
+  const sel = e.target.closest("select[data-addfor]");
+  if (!sel || !sel.value) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/places/${encodeURIComponent(sel.dataset.addfor)}/hospitals`,
+                    { hospital_id: sel.value });
+  } catch (err) { window.alert(`Not added: ${err.message}`); }
+  loadPlaces();
+});
+
+$("places").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-unhosp]");
+  if (!b) return;
+  if (!window.confirm(`Take ${b.dataset.unhosp} out of this place? Its collectors stop seeing it.`)) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/places/${encodeURIComponent(b.dataset.place)}/hospitals`,
+                    { hospital_id: b.dataset.unhosp, remove: true });
+  } catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadPlaces();
+});
+
+$("pRole").addEventListener("change", () => {
+  $("pPlaceLabel").hidden = $("pRole").value !== "collector";
+});
+
+/* The shift log: one month, as a CSV for salaries. */
+function setShiftLogLink() {
+  const month = $("slMonth").value;
+  $("slDownload").href = "/api/v2/admin/shifts.csv" + (month ? `?month=${encodeURIComponent(month)}` : "");
+}
+$("slMonth").value = today().slice(0, 7);
+setShiftLogLink();
+$("slMonth").addEventListener("change", setShiftLogLink);

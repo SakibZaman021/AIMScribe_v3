@@ -171,6 +171,10 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
     person = await portal.person_for(request)
     if person is None:
         return _refusal(request, 401, "Sign in with Google to download recordings.")
+    if person.role == "collector":
+        # 036: data collectors view only - no file, no batch, no playback.
+        return _refusal(request, 403, "A data collector can view recordings but not "
+                                      "download or play them.")
     # A link on another site may not start a download in this browser's name.
     if (request.headers.get("sec-fetch-site") or "same-origin") not in ("same-origin", "none"):
         return _refusal(request, 403, "Downloads start from the dashboard only.")
