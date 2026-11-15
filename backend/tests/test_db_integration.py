@@ -3247,3 +3247,84 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         assert sorted(s[1].split(",")[0] for s in reports) == \
             ["Daily report: HOSP555", "Daily report: HOSP556"]
     _unserve()
+
+
+async def test_an_unusual_stop_is_told_with_the_doctor_the_pc_and_the_consultation(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "stops@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "stopwatch@uni.example")
+        left = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=12))
+        broke = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=8))
+        done = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=6))
+        declined = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=3))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO doctors (doctor_id, hospital_id, full_name)
+                VALUES ('DR0042', 'HOSP003', 'Dr Nusrat Jahan')
+                ON CONFLICT (doctor_id, hospital_id) DO UPDATE SET full_name = EXCLUDED.full_name
+            """)
+            await conn.execute("UPDATE devices SET machine_name = 'ROOM-2' WHERE device_id = $1",
+                               device["device_id"])
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", left, "doctor_stopped:patient_left")
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", broke, "doctor_stopped:technical_problem")
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", done, "doctor_stopped")
+            notifier = collectors.Notifier()
+            await notifier.alerts(conn)
+        for sid, reason in ((left, "doctor_stopped:patient_left"),
+                            (broke, "doctor_stopped:technical_problem"),
+                            (done, "consultation_finished")):
+            await dbs.repo.raise_alert(alert_type="abnormal_close", session_id=sid,
+                                       device_id=device["device_id"],
+                                       detail={"reason": reason, "duration_seconds": 540})
+        async with dbs.rec.acquire() as conn:
+            await notifier.alerts(conn)
+            await conn.execute("""
+                INSERT INTO session_refusals (session_id, device_id, hospital_id, doctor_id)
+                VALUES ($1, $2, 'HOSP003', 'DR0042')
+            """, declined, device["device_id"])
+            await notifier.refusals(conn)
+            notes = {(r["session_id"], r["email"]): r for r in await conn.fetch(
+                "SELECT * FROM collector_notifications WHERE session_id = ANY($1::text[])",
+                [left, broke, done, declined])}
+
+        patient_left = notes[(left, "stops@gmail.example")]
+        assert patient_left["event"] == "stopped_unusually" and not patient_left["urgent"]
+        assert patient_left["subject"] == \
+            "Recording stopped: the patient left the room - Dr Nusrat Jahan"
+        body = patient_left["body"]
+        assert "Doctor: Dr Nusrat Jahan (DR0042)" in body and "PC: ROOM-2" in body
+        assert "Hospital: HOSP003" in body and "Consultation: " in body
+        technical = notes[(broke, "stops@gmail.example")]
+        assert technical["event"] == "stopped_technical" and technical["urgent"]
+        assert (done, "stops@gmail.example") not in notes            # an ordinary end
+        refused = notes[(declined, "stops@gmail.example")]
+        assert refused["subject"].startswith("Recording stopped: the patient did not consent")
+        # The researcher gets each one too, with the same details.
+        copy = notes[(left, "stopwatch@uni.example")]
+        assert copy["audience"] == "watcher" and "Doctor: Dr Nusrat Jahan" in copy["body"]
+        assert (declined, "stopwatch@uni.example") in notes
+
+        today = datetime.now(collectors.zone()).date()
+        async with dbs.rec.acquire() as conn:
+            text = await watchers.hospital_report(conn, "HOSP003", today)
+        assert "stopped unusually" in text and "Stopped because:" in text
+        assert "the patient left the room" in text
+    _unserve()

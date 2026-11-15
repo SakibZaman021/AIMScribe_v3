@@ -102,3 +102,14 @@ def test_the_report_time_and_what_problems_only_keeps(monkeypatch):
     assert "escalation" in watchers.PROBLEMS_ONLY and "daily_report" in watchers.PROBLEMS_ONLY
     assert "jabra_back" not in watchers.PROBLEMS_ONLY
     assert collectors.PROBLEMS["silent_session"].startswith("the microphone gives no sound")
+
+
+def test_only_the_two_ordinary_ends_are_left_untold():
+    for ordinary in ("superseded_by_new_patient", "doctor_stopped", "consultation_finished",
+                     "counselling_limit", ""):
+        assert collectors.stop_kind(ordinary) is None, ordinary
+    assert collectors.stop_kind("doctor_stopped:patient_left") == "patient_left"
+    assert collectors.stop_kind("pc_shutdown") == "pc_shutdown"
+    assert collectors.stop_label("doctor_stopped:urgent_interruption") ==         "an emergency or urgent interruption"
+    assert collectors.stop_label("doctor_stopped:something_new") == "something new"
+    assert "technical_problem" in collectors.TECHNICAL_ENDS

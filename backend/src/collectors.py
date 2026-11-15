@@ -96,6 +96,46 @@ PROBLEMS = {
     "silent_session": "the microphone gives no sound (muted, or not working)",
 }
 
+# How a recording ends. Two ends are ordinary and need nobody: the next
+# patient came in (superseded_by_new_patient), or the consultation finished
+# (the doctor's Stop in CMED or "Consultation finished" on the PC, the
+# counselling time after the prescription running out). Every other end is
+# told to the collectors on shift and the researchers: a technical one as
+# urgent, the rest as information. The recorder's form sends
+# "doctor_stopped:<reason>" for anything but "Consultation finished".
+ORDINARY_ENDS = {"doctor_stopped", "consultation_finished", "superseded_by_new_patient",
+                 "counselling_limit", "prescription_built", "software_update", ""}
+TECHNICAL_ENDS = {"technical_problem", "recovered_after_unclean_shutdown", "pc_shutdown",
+                  "agent_shutdown"}
+STOP_LABELS = {
+    "patient_did_not_consent": "the patient did not consent (the recording was deleted)",
+    "patient_left": "the patient left the room",
+    "urgent_interruption": "an emergency or urgent interruption",
+    "technical_problem": "a problem with the recorder or microphone",
+    "other": "another reason the doctor gave",
+    "recovered_after_unclean_shutdown": "the recorder stopped unexpectedly (crash or power "
+                                        "cut); what was recorded was recovered",
+    "pc_shutdown": "the PC was shut down during the consultation",
+    "agent_shutdown": "the recorder was closed during the consultation",
+    "no_activity_limit": "nobody pressed Stop; it ended after the no-activity limit",
+}
+
+
+def stop_kind(reason: Optional[str]) -> Optional[str]:
+    """None for an ordinary end; otherwise the reason, without "doctor_stopped:"."""
+    text = (reason or "").strip()
+    if text in ORDINARY_ENDS:
+        return None
+    return text.split(":", 1)[1] if text.startswith("doctor_stopped:") else text
+
+
+def stop_label(reason: Optional[str]) -> str:
+    kind = stop_kind(reason)
+    if kind is None:
+        return "ended normally"
+    return STOP_LABELS.get(kind, kind.replace("_", " "))
+
+
 # How Windows names the Jabra Speak2 55, including the 31-character form.
 CLINIC_MIC_WORDS = ("jabra", "echo cancelling speakerphone (j")
 
@@ -801,6 +841,55 @@ async def collectors_of(conn, place_id: int) -> List[str]:
     return [r["email"] for r in rows]
 
 
+async def consultation_context(conn, *, session_id: Optional[str] = None, device_id=None,
+                               hospital_id: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """
+    Which doctor, which PC, which hospital and which consultation an alert is
+    about - so a collector knows which room to go to when two doctors share a
+    clinic. Returns (the doctor's name or ID for the subject, the lines).
+    No patient details: Telegram keeps its messages on its own servers.
+    """
+    s = None
+    explicit = False
+    if session_id:
+        s = await conn.fetchrow("SELECT doctor_id, hospital_id, device_id, opened_at, closed_at "
+                                "FROM sessions WHERE session_id = $1", session_id)
+        explicit = s is not None
+    if s is None and device_id is not None:
+        s = await conn.fetchrow("""
+            SELECT doctor_id, hospital_id, device_id, opened_at, closed_at FROM sessions
+             WHERE device_id = $1 AND opened_at > now() - interval '12 hours'
+             ORDER BY opened_at DESC LIMIT 1
+        """, device_id)
+    dev_id = (s["device_id"] if s else None) or device_id
+    dev = await conn.fetchrow("SELECT machine_name, hospital_id, doctor_id FROM devices "
+                              "WHERE device_id = $1", dev_id) if dev_id is not None else None
+    hid = (s["hospital_id"] if s else None) or (dev["hospital_id"] if dev else None) or hospital_id
+    doctor_id = (s["doctor_id"] if s else None) or (dev["doctor_id"] if dev else None)
+    name = await conn.fetchval("SELECT full_name FROM doctors WHERE doctor_id = $1 "
+                               "AND hospital_id = $2", doctor_id, hid) \
+        if doctor_id and hid else None
+    hospital = await conn.fetchval("SELECT name FROM hospitals WHERE hospital_id = $1",
+                                   hid) if hid else None
+    lines = []
+    if doctor_id:
+        lines.append(f"Doctor: {name} ({doctor_id})" if name else f"Doctor: {doctor_id}")
+    if dev is not None:
+        lines.append(f"PC: {dev['machine_name'] or 'unnamed'}")
+    if hid:
+        lines.append(f"Hospital: {hid}" + (f" {hospital}" if hospital else ""))
+    if s is not None and s["opened_at"]:
+        what = "Consultation" if explicit else "Last consultation on this PC"
+        if s["closed_at"]:
+            minutes = round((s["closed_at"] - s["opened_at"]).total_seconds() / 60)
+            lines.append(f"{what}: {_hhmm(s['opened_at'])} to {_hhmm(s['closed_at'])} "
+                         f"({minutes} min)")
+        else:
+            minutes = round((datetime.now(timezone.utc) - s["opened_at"]).total_seconds() / 60)
+            lines.append(f"{what}: started {_hhmm(s['opened_at'])}, {minutes} min so far")
+    return (name or doctor_id), "\n".join(lines)
+
+
 async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, body: str,
                  event_key: str, urgent: bool = False, everyone_if_nobody: bool = False,
                  device_id=None, session_id: Optional[str] = None,
@@ -819,6 +908,14 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
         """, device_id, event, THROTTLE)
         if recent:
             return 0
+    # Which doctor, PC and consultation: in the subject and above the footer.
+    doctor, context = await consultation_context(conn, session_id=session_id,
+                                                 device_id=device_id, hospital_id=hospital_id)
+    if doctor:
+        subject = f"{subject} - {doctor}"
+    if context:
+        main, mark, foot = body.partition(_FOOTER_MARK)
+        body = main.rstrip() + "\n\n" + context + (mark + foot if mark else "")
     sent = 0
     told: List[str] = []
     on_shift = False
@@ -880,7 +977,7 @@ async def send_shift_summary(conn, shift: Dict[str, Any]) -> None:
     end = shift["ended_at"] or datetime.now(timezone.utc)
     recordings = await conn.fetch("""
         SELECT s.session_id, s.hospital_id, s.doctor_id, s.opened_at, s.closed_at,
-               s.total_duration_seconds, s.microphones, s.quarantine_reason,
+               s.total_duration_seconds, s.microphones, s.quarantine_reason, s.close_reason,
                (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
                   AND a.alert_type = 'microphone_switched') AS switches
           FROM sessions s
@@ -907,7 +1004,9 @@ async def send_shift_summary(conn, shift: Dict[str, Any]) -> None:
         mic = microphone_label(r["microphones"], r["switches"])["label"]
         minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
         state = "quarantined" if r["quarantine_reason"] else \
-            ("finished" if r["closed_at"] else "still open")
+            ("still open" if not r["closed_at"] else
+             "finished" if stop_kind(r["close_reason"]) is None else
+             "stopped: " + stop_label(r["close_reason"]))
         lines.append(f"{_hhmm(r['opened_at'])}  {r['hospital_id']}  doctor {r['doctor_id']}  "
                      f"{minutes} min  {mic}  {state}")
     body = "\n".join(lines) + "\n\n- AIMScribe"
@@ -958,7 +1057,8 @@ class Notifier:
         import watchers
         for step in (self.telegram_updates, self.close_forgotten_shifts, self.alerts,
                      self.idle_microphones, self.recordings_without_jabra,
-                     self.recordings_too_long, self.silent_pcs, self.no_shift_started,
+                     self.recordings_too_long, self.refusals, self.silent_pcs,
+                     self.no_shift_started,
                      self.escalate, watchers.handled_followups, watchers.daily_reports,
                      self.retry_failed, self.failure_alarm):
             try:
@@ -1038,6 +1138,21 @@ class Notifier:
                         f"Jabra" + (f" to {to}" if to else "") + ".\n"
                         f"{text}\n\nPlease go to the room and plug the Jabra back in. "
                         "The recording carries on meanwhile.")
+        elif kind == "abnormal_close":
+            reason = detail.get("reason")
+            stopped = stop_kind(reason)
+            if stopped is None:
+                return                       # an ordinary end the server also flagged
+            technical = stopped in TECHNICAL_ENDS
+            event = "stopped_technical" if technical else "stopped_unusually"
+            urgent = technical
+            minutes = round(float(detail.get("duration_seconds") or 0) / 60)
+            subject = f"Recording stopped: {stop_label(reason)}"
+            body = (f"At {_hhmm(happened)}{late} the recording at {where} was stopped, after "
+                    f"{minutes} min, because {stop_label(reason)}."
+                    + ("\n\nPlease check the PC and the Jabra before the next patient, and "
+                       "call AIMS LAB if it happens again." if technical else
+                       "\n\nNothing to do now; it is kept for the review."))
         elif kind in PROBLEMS:
             event, urgent = "recording_problem", True
             subject = f"Recording problem: {where}"
@@ -1138,6 +1253,27 @@ class Notifier:
                          event_key=f"nojabra:{r['session_id']}", urgent=True,
                          everyone_if_nobody=True, device_id=r["device_id"],
                          session_id=r["session_id"], happened_at=r["opened_at"])
+
+    # -- the patient did not consent: the recording was deleted
+    async def refusals(self, conn) -> None:
+        rows = await conn.fetch("""
+            SELECT r.session_id, r.device_id, r.hospital_id, r.refused_at
+              FROM session_refusals r
+             WHERE r.refused_at > now() - interval '12 hours'
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.event_key = 'refused:' || r.session_id)
+             ORDER BY r.refused_at LIMIT 100
+        """)
+        for r in rows:
+            label = STOP_LABELS["patient_did_not_consent"]
+            await notify(conn, hospital_id=r["hospital_id"], event="stopped_unusually",
+                         subject=f"Recording stopped: {label}",
+                         body=(f"At {_hhmm(r['refused_at'])} the doctor stopped the recording "
+                               f"because {label}. Its audio is erased everywhere, as the "
+                               "patient asked.\n\nNothing to do now.") + _footer(),
+                         event_key=f"refused:{r['session_id']}", urgent=False,
+                         device_id=r["device_id"], session_id=r["session_id"],
+                         happened_at=r["refused_at"])
 
     # -- a recording left running: the doctor forgot to press Stop (038)
     async def recordings_too_long(self, conn) -> None:

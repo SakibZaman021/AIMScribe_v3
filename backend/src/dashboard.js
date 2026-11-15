@@ -1627,6 +1627,7 @@ const EVENT_LABELS = {
   no_shift_started: "Nobody on shift", escalation: "Not yet seen",
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
   recording_too_long: "Recording not stopped", handled: "Handled", daily_report: "Daily report",
+  stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
 };
 
 let tgWaiting = false;   // 037: Connect Telegram was pressed; watch for the link

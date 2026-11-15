@@ -39,7 +39,7 @@ admin_router = APIRouter(prefix="/api/v2/admin", tags=["researchers"])
 
 # What a researcher on 'problems' still gets.
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
-                 "recording_too_long", "daily_report"}
+                 "recording_too_long", "stopped_technical", "daily_report"}
 MODES = ("everything", "problems")
 UNHANDLED_AFTER = timedelta(minutes=15)
 SHORT_SECONDS = 60
@@ -198,6 +198,8 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
         SELECT s.session_id, s.doctor_id, s.device_id, s.opened_at, s.closed_at,
                s.total_duration_seconds, s.microphones, s.quarantine_reason, s.close_reason,
                s.confirmation, s.segment_count, s.archived_at, s.copied_at,
+               EXISTS (SELECT 1 FROM session_refusals x
+                        WHERE x.session_id = s.session_id) AS refused,
                (SELECT count(*) FROM segments g WHERE g.session_id = s.session_id) AS received,
                (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
                   AND a.alert_type = 'microphone_switched') AS switches,
@@ -236,6 +238,29 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
         body.append(", ".join(e for e in extra if e))
     else:
         body.append("No recordings today.")
+    # How they ended: the two ordinary ends, and every other one by its reason.
+    if n:
+        ends = Counter()
+        for r in recs:
+            if not r["refused"] and r["closed_at"] is None:
+                continue                                  # still recording
+            kind = "patient_did_not_consent" if r["refused"] else collectors.stop_kind(
+                r["close_reason"])
+            ends[kind or ("next_patient" if r["close_reason"] == "superseded_by_new_patient"
+                          else "finished")] += 1
+        unusual = {k: v for k, v in ends.items() if k not in ("next_patient", "finished")}
+        body.append(f"Ended: next patient came in {ends.get('next_patient', 0)}, consultation "
+                    f"finished {ends.get('finished', 0)}, stopped unusually "
+                    f"{sum(unusual.values())}")
+        if unusual:
+            body.append("Stopped because: " + "; ".join(
+                f"{collectors.STOP_LABELS.get(k, k.replace('_', ' '))} {v}"
+                for k, v in sorted(unusual.items(), key=lambda kv: -kv[1])))
+            technical = sum(v for k, v in unusual.items() if k in collectors.TECHNICAL_ENDS)
+            if technical:
+                amber.append(f"{technical} stopped by a technical problem")
+                todo.append(f"{technical} recording(s) stopped because of a technical problem: "
+                            "check that PC and its Jabra before the first patient.")
     if len(short) >= 3:
         amber.append(f"{len(short)} recordings under 1 minute")
         todo.append(f"{len(short)} recordings were under 1 minute: started by mistake, or "
@@ -289,17 +314,14 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
     if n:
         conf = Counter(r["confirmation"] for r in recs)
         quarantined = [r for r in recs if r["quarantine_reason"]]
-        ended_normally = {"prescription_built", "superseded_by_new_patient",
-                          "counselling_limit", "", None}
-        stopped_early = [r for r in closed if r["close_reason"] not in ended_normally]
         incomplete = [r for r in closed if (r["received"] or 0) < (r["segment_count"] or 0)]
         body.append("")
         body.append("WHAT WILL BE KEPT")
         body.append(f"CMED confirmed {conf.get('confirmed', 0)}, waiting {conf.get('pending', 0)}, "
                     f"not confirmed {conf.get('unconfirmed', 0)}, refused {conf.get('refused', 0)}"
                     + (f", before CMED {conf.get('legacy', 0)}" if conf.get("legacy") else ""))
-        body.append(f"Quarantined {len(quarantined)}, stopped early {len(stopped_early)}, "
-                    f"audio not all on the server {len(incomplete)}")
+        body.append(f"Quarantined {len(quarantined)}, audio not all on the server "
+                    f"{len(incomplete)}")
         body.append(f"Archived {sum(1 for r in recs if r['archived_at'])}, "
                     f"cloud copy {sum(1 for r in recs if r['copied_at'])}")
         if conf.get("unconfirmed"):
@@ -461,6 +483,7 @@ ALERT_NAMES = {
     "jabra_not_plugged": "Jabra not plugged in", "recording_problem": "recording problem",
     "pc_silent": "PC not reporting", "recording_without_jabra": "recorded without the Jabra",
     "recording_too_long": "recording not stopped",
+    "stopped_unusually": "stopped unusually", "stopped_technical": "stopped: technical problem",
 }
 
 
