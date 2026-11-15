@@ -176,6 +176,21 @@ def is_clinic_mic(name: Optional[str]) -> bool:
     return any(word in text for word in CLINIC_MIC_WORDS)
 
 
+def person_label(p: Any) -> str:
+    """A collector as the lab names them (040): "Md. Sakib Zaman (DC-07)" - or,
+    until they save their details, their Google name or email."""
+    name = p.get("official_name") or p.get("display_name") or p.get("email") or ""
+    code = p.get("collector_code")
+    return f"{name} ({code})" if code else name
+
+
+def label_sql(alias: str = "p", email: Optional[str] = None) -> str:
+    """The same name in SQL, for a portal_people row under this alias."""
+    email = email or f"{alias}.email"
+    return (f"(COALESCE({alias}.official_name, {alias}.display_name, {email}) "
+            f"|| COALESCE(' (' || {alias}.collector_code || ')', ''))")
+
+
 def microphone_label(names: Optional[List[str]], switches: int = 0) -> Dict[str, Any]:
     """What the Microphone column shows for one recording."""
     names = [n for n in (names or []) if n]
@@ -304,9 +319,10 @@ async def me(request: Request):
         """, person.email)
         chat = await conn.fetchrow("SELECT username, linked_at FROM collector_telegram "
                                    "WHERE email = $1", person.email)
-        phone = await conn.fetchval("SELECT phone FROM portal_people WHERE email = $1",
-                                    person.email)
-    return {"email": person.email, "phone": phone,
+        mine = await conn.fetchrow("SELECT phone, official_name, collector_code "
+                                   "FROM portal_people WHERE email = $1", person.email)
+    return {"email": person.email, "phone": mine["phone"],
+            "official_name": mine["official_name"], "collector_code": mine["collector_code"],
             "place": {"place_id": place["place_id"], "name": place["name"],
                       "morning": [place["morning_start"].strftime("%H:%M"),
                                   place["morning_end"].strftime("%H:%M")],
@@ -398,6 +414,27 @@ class OwnPhoneRequest(BaseModel):
     phone: str = Field("", max_length=40)
 
 
+class DetailsRequest(BaseModel):
+    official_name: Optional[str] = Field(None, max_length=200)
+    collector_code: Optional[str] = Field(None, max_length=60)
+    phone: Optional[str] = Field(None, max_length=40)
+
+
+@router.post("/details")
+async def own_details(body: DetailsRequest, request: Request):
+    """The collector's official name, lab ID and phone (040): researchers see them
+    with every alert, and the attendance CSV carries them."""
+    import watchers
+    person = await _collector(request, write=True)
+    async with _pool().acquire() as conn:
+        saved = await watchers.save_details(conn, person.email, body.official_name,
+                                            body.collector_code, body.phone)
+    await portal._audit("collector.details", person.email,
+                        {"name": bool(saved["official_name"]),
+                         "id": saved["collector_code"], "phone": bool(saved["phone"])})
+    return {"status": "saved", **saved}
+
+
 @router.post("/phone")
 async def own_phone(body: OwnPhoneRequest, request: Request):
     """The collector's phone number, given to their hospitals' researchers (039)."""
@@ -444,7 +481,8 @@ async def list_places(_: None = Depends(api_v2.require_admin)):
         links = await conn.fetch("SELECT place_id, hospital_id FROM place_hospitals "
                                  "WHERE removed_at IS NULL ORDER BY hospital_id")
         people = await conn.fetch("""
-            SELECT place_id, email, display_name FROM portal_people
+            SELECT place_id, email, display_name, official_name, collector_code
+              FROM portal_people
              WHERE role = 'collector' AND removed_at IS NULL ORDER BY email
         """)
         on_shift = await conn.fetch("SELECT place_id, email, shift, started_at "
@@ -458,7 +496,7 @@ async def list_places(_: None = Depends(api_v2.require_admin)):
             "morning": [p["morning_start"].strftime("%H:%M"), p["morning_end"].strftime("%H:%M")],
             "evening": [p["evening_start"].strftime("%H:%M"), p["evening_end"].strftime("%H:%M")],
             "hospitals": [r["hospital_id"] for r in links if r["place_id"] == pid],
-            "collectors": [{"email": r["email"], "name": r["display_name"]}
+            "collectors": [{"email": r["email"], "name": person_label(r)}
                            for r in people if r["place_id"] == pid],
             "on_shift": [{"email": r["email"], "shift": r["shift"],
                           "since": _iso(r["started_at"])} for r in on_shift
@@ -545,8 +583,9 @@ async def place_hospital(place_id: int, body: PlaceHospitalRequest, request: Req
 
 # ============================================================ admin: the shift log
 
-CSV_COLUMNS = ["date", "collector", "email", "place", "shift", "started", "ended", "hours",
-               "ended_by", "recordings_in_shift", "alerts_in_shift"]
+CSV_COLUMNS = ["date", "collector_id", "official_name", "collector", "email", "place",
+               "shift", "started", "ended", "hours", "ended_by", "recordings_in_shift",
+               "alerts_in_shift"]
 
 
 def _month(text: Optional[str]) -> Tuple[date, date]:
@@ -563,7 +602,7 @@ def _month(text: Optional[str]) -> Tuple[date, date]:
 
 async def shift_rows(conn, first: date, nxt: date) -> List[Dict[str, Any]]:
     rows = await conn.fetch("""
-        SELECT s.*, p.name AS place, pp.display_name,
+        SELECT s.*, p.name AS place, pp.display_name, pp.official_name, pp.collector_code,
                (SELECT count(*) FROM sessions x
                  WHERE x.hospital_id IN (SELECT hospital_id FROM place_hospitals h
                                           WHERE h.place_id = s.place_id AND h.removed_at IS NULL)
@@ -585,7 +624,10 @@ async def shift_rows(conn, first: date, nxt: date) -> List[Dict[str, Any]]:
         end = r["ended_at"]
         hours = round(((end or datetime.now(timezone.utc)) - r["started_at"]).total_seconds()
                       / 3600, 2)
-        out.append({"date": r["shift_date"].isoformat(), "collector": r["display_name"] or "",
+        out.append({"date": r["shift_date"].isoformat(),
+                    "collector_id": r["collector_code"] or "",
+                    "official_name": r["official_name"] or "",
+                    "collector": r["display_name"] or "",
                     "email": r["email"], "place": r["place"], "shift": r["shift"],
                     "started": _hhmm(r["started_at"]), "ended": _hhmm(end),
                     "hours": f"{hours:.2f}", "ended_by": r["ended_by"] or "still on shift",
@@ -653,6 +695,24 @@ async def _pace(channel: str) -> None:
 
 
 _NEXT_SEND: Dict[str, float] = {}
+
+# Telegram asks a bot to send one chat at most about one message a second, and
+# refuses for a while past that. When many alerts arrive at once (a clinic's
+# internet coming back), a researcher who looks after every hospital would get
+# several a second: so each chat is spaced on its own as well (load test, 16 Nov).
+CHAT_GAP = 1.05
+_NEXT_TO_CHAT: Dict[int, float] = {}
+
+
+async def _pace_chat(chat_id: int) -> None:
+    now = time.monotonic()
+    slot = max(now, _NEXT_TO_CHAT.get(chat_id, 0.0))
+    _NEXT_TO_CHAT[chat_id] = slot + CHAT_GAP
+    if len(_NEXT_TO_CHAT) > 5000:                  # forget chats long quiet
+        for old in [c for c, t in _NEXT_TO_CHAT.items() if t < now]:
+            _NEXT_TO_CHAT.pop(old, None)
+    if slot > now:
+        await asyncio.sleep(slot - now)
 
 
 async def send_mail(to: str, subject: str, text: str) -> Tuple[bool, Optional[str]]:
@@ -762,6 +822,7 @@ async def send_telegram(chat_id: int, text: str,
     if note_id is not None:
         payload["reply_markup"] = {"inline_keyboard": [[
             {"text": "\u2705 Seen - I am on it", "callback_data": f"seen:{note_id}"}]]}
+    await _pace_chat(chat_id)
     await _pace("telegram")
     result, error = await _telegram("sendMessage", payload)
     return (True, None) if result is not None else (False, error)
@@ -908,7 +969,9 @@ async def consultation_context(conn, *, session_id: Optional[str] = None, device
                          f"({minutes} min)")
         else:
             minutes = round((datetime.now(timezone.utc) - s["opened_at"]).total_seconds() / 60)
-            lines.append(f"{what}: started {_hhmm(s['opened_at'])}, {minutes} min so far")
+            lines.append(f"{what}: started {_hhmm(s['opened_at'])}, {minutes} min so far"
+                         if explicit else
+                         f"{what}: started {_hhmm(s['opened_at'])}, not ended yet")
     return (name or doctor_id), "\n".join(lines)
 
 
@@ -1061,6 +1124,10 @@ class Notifier:
         """, self.owner, timedelta(seconds=LEASE_SECONDS))
         return bool(got)
 
+    async def keep_lease(self, conn) -> None:
+        await conn.execute("UPDATE collector_notifier_state SET updated_at = now() "
+                           "WHERE name = 'lease' AND owner = $1", self.owner)
+
     async def run(self) -> None:
         while True:
             try:
@@ -1083,6 +1150,7 @@ class Notifier:
                      watchers.repeated_stops, watchers.daily_reports,
                      self.retry_failed, self.failure_alarm):
             try:
+                await self.keep_lease(conn)
                 await step(conn)
             except Exception as exc:
                 logger.warning("Collector mailer step %s failed: %s", step.__name__, exc)
@@ -1119,6 +1187,7 @@ class Notifier:
              WHERE a.id > $1 ORDER BY a.id LIMIT 200
         """, last)
         for row in rows:
+            await self.keep_lease(conn)
             await self.one_alert(conn, row)
             await conn.execute("UPDATE collector_notifier_state SET last_id = $1, "
                                "updated_at = now() WHERE name = 'alerts'", row["id"])
@@ -1156,8 +1225,8 @@ class Notifier:
                 event, urgent = "jabra_unplugged", True
                 subject = f"Jabra unplugged: {where}"
                 body = (f"At {_hhmm(happened)}{late} the recording at {where} moved off the "
-                        f"Jabra" + (f" to {to}" if to else "") + ".\n"
-                        f"{text}\n\nPlease go to the room and plug the Jabra back in. "
+                        f"Jabra" + (f" to {to}" if to else f": {text}" if text else "") + "."
+                        "\n\nPlease go to the room and plug the Jabra back in. "
                         "The recording carries on meanwhile.")
         elif kind == "abnormal_close":
             reason = detail.get("reason")
@@ -1390,9 +1459,11 @@ class Notifier:
                 "SELECT email FROM collector_notifications WHERE event_key = $1", n["event_key"])}
             others = [e for e in await collectors_of(conn, n["place_id"]) if e not in already] \
                 if n["place_id"] else []
+            import watchers
+            now_body = await watchers.fresh_context(conn, dict(n))
             subject = f"Not yet seen: {n['subject']}"
             body = (f"This urgent alert was sent at {_hhmm(n['created_at'])} and nobody has "
-                    f"marked it seen in 15 minutes.\n\n{n['body']}")
+                    f"marked it seen in 15 minutes.\n\n{now_body}")
             hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
             targets = [(e, f"esc:{n['event_key']}", "collector") for e in others]
             # The lab is mailed at most once an hour; the rest are on the dashboard.
@@ -1407,14 +1478,13 @@ class Notifier:
                     await _deliver(conn, note_id, email, subject, body)
             # 038/039: the hospital's researchers hear that nobody pressed Seen,
             # with who to call.
-            import watchers
             await watchers.copy_to_watchers(
                 conn, hospital_id=n["hospital_id"], event="escalation",
                 subject=f"Not seen in 15 min: {n['subject']}",
                 body=(f"The alert went out at {_hhmm(n['created_at'])} and nobody has pressed "
                       "Seen in 15 minutes. The place's other collectors and AIMS LAB are now "
                       "told.\n\n" + watchers.researcher_body(
-                          n["body"], await watchers.contact_text(conn, n["hospital_id"]))),
+                          now_body, await watchers.contact_text(conn, n["hospital_id"]))),
                 event_key=f"esc:{n['event_key']}", urgent=True, device_id=n["device_id"],
                 session_id=n["session_id"])
             await conn.execute("UPDATE collector_notifications SET escalated_at = now() "

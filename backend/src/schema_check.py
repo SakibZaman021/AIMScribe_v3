@@ -186,6 +186,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("collector_notifications", "resolved_at")),
     ("039_v3_collector_contacts.sql", "recordings", "column portal_people.phone",
      _column("portal_people", "phone")),
+    # Without it a collector cannot save their official name and lab ID.
+    ("040_v3_collector_identity.sql", "recordings", "column portal_people.collector_code",
+     _column("portal_people", "collector_code")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

@@ -153,6 +153,24 @@
 
     <!-- ============================== My shift (data collectors, 036) -->
     <section class="view" data-view="shift" aria-label="My shift" hidden>
+      <section class="panel" aria-labelledby="h-details" id="detailsPanel">
+        <div class="head wrap"><h3 id="h-details">Your details</h3>
+          <span id="detailsState" role="status"></span></div>
+        <div class="body shiftbody">
+          <div class="row">
+            <label class="field"><span>Official name</span>
+              <input type="text" id="myName" autocomplete="name" maxlength="80" placeholder="Md. Sakib Zaman"></label>
+            <label class="field"><span>Your ID</span>
+              <input type="text" id="myCode" autocomplete="off" maxlength="20" placeholder="DC-07"></label>
+            <label class="field"><span>Your phone</span>
+              <input type="tel" id="myPhone" autocomplete="tel" placeholder="01XXX-XXXXXX" maxlength="40"></label>
+            <button type="button" class="primary" id="myDetailsSave">Save</button>
+          </div>
+          <p class="hint">Your official name, the ID AIMS LAB gave you, and your phone. The
+            researchers who look after your hospitals see them with every alert, so they can
+            call you; the attendance sheet for salaries uses them too.</p>
+        </div>
+      </section>
       <section class="panel" aria-labelledby="h-shift">
         <div class="head wrap"><h3 id="h-shift">My shift</h3>
           <span class="hint" id="shiftPlace"></span></div>
@@ -178,14 +196,6 @@
           <p class="hint">Install Telegram from the Play Store, press Connect Telegram, then
             press Start in Telegram. Keep Telegram's notifications on. For an urgent alert,
             press Seen in Telegram when you are dealing with it.</p>
-          <div class="row">
-            <label class="field"><span>Your phone</span>
-              <input type="tel" id="myPhone" autocomplete="tel" placeholder="01XXX-XXXXXX" maxlength="40"></label>
-            <button type="button" class="ghost" id="myPhoneSave">Save</button>
-            <span id="myPhoneState" role="status"></span>
-          </div>
-          <p class="hint">The researchers who look after your hospitals see your phone number
-            and Telegram with each alert, so they can call you about it.</p>
         </div>
       </section>
       <section class="panel" aria-labelledby="h-mails">
@@ -210,8 +220,8 @@
             every evening at <b id="wReportAt">20:30</b>.</p>
           <label class="field"><span>Alerts</span>
             <select id="wMode">
-              <option value="everything">Everything: every alert with who to call, Seen, still not fixed, fixed, and the report</option>
-              <option value="problems">Only problems: urgent alerts, not seen in 15 min, still not fixed, fixed, and the report</option>
+              <option value="everything">Everything</option>
+              <option value="problems">Only problems (urgent alerts, follow-ups, report)</option>
             </select></label>
         </div>
       </section>

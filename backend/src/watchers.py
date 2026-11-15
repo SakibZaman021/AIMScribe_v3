@@ -94,6 +94,92 @@ def clean_phone(text: Optional[str]) -> Optional[str]:
     return text
 
 
+NAME_CHARS = re.compile(r"^[^\x00-\x1f<>{}\[\]\\|@#$%^*=+~`]{2,80}$")
+CODE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,18}[A-Za-z0-9])?$")
+
+
+def clean_name(text: Optional[str]) -> Optional[str]:
+    """An official name as given, spaces tidied; None for empty; ValueError if not a name."""
+    text = " ".join((text or "").split())
+    if not text:
+        return None
+    if not NAME_CHARS.match(text) or not any(c.isalpha() for c in text):
+        raise ValueError("an official name has 2 to 80 letters, spaces, dots or dashes")
+    return text
+
+
+def clean_code(text: Optional[str]) -> Optional[str]:
+    """A lab ID such as DC-07, in capitals; None for empty; ValueError if not one."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if not CODE.match(text):
+        raise ValueError("an ID has up to 20 letters, digits and dashes, like DC-07")
+    return text.upper()
+
+
+async def save_details(conn, email: str, official_name: Optional[str] = None,
+                       collector_code: Optional[str] = None,
+                       phone: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Save what was given of a person's official name, lab ID and phone (None:
+    leave as is; empty: clear). Two people still in the lab never hold the
+    same ID. Returns the three as saved.
+    """
+    import asyncpg
+    sets, args = [], [email]
+    try:
+        for column, value, clean in (("official_name", official_name, clean_name),
+                                     ("collector_code", collector_code, clean_code),
+                                     ("phone", phone, clean_phone)):
+            if value is not None:
+                args.append(clean(value))
+                sets.append(f"{column} = ${len(args)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if sets:
+        try:
+            done = await conn.fetchval(f"UPDATE portal_people SET {', '.join(sets)} "
+                                       "WHERE email = $1 AND removed_at IS NULL "
+                                       "RETURNING email", *args)
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(status_code=409, detail="this ID belongs to another data "
+                                "collector; check the ID the lab gave you")
+        if done is None:
+            raise HTTPException(status_code=404, detail="no such person")
+    row = await conn.fetchrow("SELECT official_name, collector_code, phone FROM portal_people "
+                              "WHERE email = $1", email)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such person")
+    return dict(row)
+
+
+def missing_details(p: Any) -> List[str]:
+    """What a collector has not saved yet, of official name, ID and phone."""
+    return [what for what, key in (("official name", "official_name"),
+                                   ("ID", "collector_code"), ("phone", "phone"))
+            if not p.get(key)]
+
+
+CONTEXT_STARTS = ("Doctor: ", "PC: ", "Hospital: ", "Consultation: ",
+                  "Last consultation on this PC: ")
+
+
+async def fresh_context(conn, note: Dict[str, Any]) -> str:
+    """The alert's body with its doctor/PC/consultation lines as they are now - a
+    reminder 30 minutes on must not say "4 min so far"."""
+    body = note["body"]
+    main, mark, foot = body.partition(collectors._FOOTER_MARK)
+    kept = [line for line in main.split("\n") if not line.startswith(CONTEXT_STARTS)]
+    _, context = await collectors.consultation_context(
+        conn, session_id=note.get("session_id"), device_id=note.get("device_id"),
+        hospital_id=note.get("hospital_id"))
+    main = "\n".join(kept).rstrip()
+    if context:
+        main += "\n\n" + context
+    return main + (mark + foot if mark else "")
+
+
 def _first_up(text: str) -> str:
     return text[:1].upper() + text[1:]
 
@@ -132,7 +218,9 @@ async def _hospitals_for(conn, hospital_id: Optional[str], place_id: Optional[in
 # ============================================================ who to call
 
 def _person_line(p: Dict[str, Any], *, since: bool) -> str:
-    name = p.get("display_name") or p["email"]
+    name = collectors.person_label(p)
+    if not p.get("official_name") or not p.get("collector_code"):
+        name += " (official name or ID not saved)"
     phone = f"phone {p['phone']}" if p.get("phone") else "no phone given"
     if p.get("username"):
         tg = f"Telegram @{p['username']}"
@@ -157,14 +245,15 @@ async def on_shift(conn, hospital_id: Optional[str] = None,
         name = await conn.fetchval("SELECT name FROM places WHERE place_id = $1", pid)
         duty = await conn.fetch("""
             SELECT s.email, s.started_at, s.shift, p.display_name, p.phone,
-                   t.username, t.chat_id
+                   p.official_name, p.collector_code, t.username, t.chat_id
               FROM collector_shifts s
               JOIN portal_people p ON p.email = s.email AND p.removed_at IS NULL
               LEFT JOIN collector_telegram t ON t.email = s.email
              WHERE s.place_id = $1 AND s.ended_at IS NULL ORDER BY s.started_at
         """, pid)
         everyone = [] if duty else await conn.fetch("""
-            SELECT p.email, p.display_name, p.phone, t.username, t.chat_id
+            SELECT p.email, p.display_name, p.phone, p.official_name, p.collector_code,
+                   t.username, t.chat_id
               FROM portal_people p LEFT JOIN collector_telegram t ON t.email = p.email
              WHERE p.role = 'collector' AND p.place_id = $1 AND p.removed_at IS NULL
              ORDER BY p.email
@@ -209,7 +298,7 @@ def researcher_body(body: str, contacts: str) -> str:
 
 async def _seen_text(conn, keys: List[str], first_at: datetime, prefix: str = "") -> str:
     row = await conn.fetchrow("""
-        SELECT n.seen_at, COALESCE(p.display_name, n.email) AS who
+        SELECT n.seen_at, """ + collectors.label_sql("p", "n.email") + """ AS who
           FROM collector_notifications n LEFT JOIN portal_people p ON p.email = n.email
          WHERE (n.event_key = ANY($1::text[])
                 OR ($2 <> '' AND left(n.event_key, length($2)) = $2))
@@ -312,7 +401,7 @@ async def _still_wrong(conn, family: str, first: Dict[str, Any],
         return "still", f"the recording is still running ({minutes} min)"
     if family == "noshift":
         r = await conn.fetchrow("""
-            SELECT s.started_at, COALESCE(p.display_name, s.email) AS who
+            SELECT s.started_at, """ + collectors.label_sql("p", "s.email") + """ AS who
               FROM collector_shifts s LEFT JOIN portal_people p ON p.email = s.email
              WHERE s.place_id = $1 AND s.started_at > $2::timestamptz - interval '1 hour'
              ORDER BY s.started_at LIMIT 1
@@ -403,10 +492,11 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                 for d in await collectors.on_duty(conn, pid)}
         if not duty:
             duty = {n["email"]: n["place_id"] for n in notes}
+        now_body = await fresh_context(conn, first)
         for email, pid in sorted(duty.items()):
             text = (f"{_first_up(how)}. The first alert was at "
                     f"{collectors._hhmm(first['created_at'])}, {minutes} min ago.\n\n"
-                    + first["body"])
+                    + now_body)
             note_id = await collectors._record(
                 conn, email=email, event="still_not_fixed", subject=subject, body=text,
                 event_key=key, urgent=True, place_id=pid, hospital_id=first["hospital_id"],
@@ -420,7 +510,7 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                 f"{collectors._hhmm(first['created_at'])}, {minutes} min ago; the collector "
                 "on shift has been reminded.\n"
                 + await _seen_text(conn, keys, first["created_at"], prefix) + "\n\n"
-                + researcher_body(first["body"], contacts)
+                + researcher_body(now_body, contacts)
                 + "\n\nPlease call or message them." + last)
         await _to_watchers(conn, await _hospitals_for(conn, first["hospital_id"],
                                                       first["place_id"]),
@@ -486,7 +576,8 @@ async def handled_followups(conn) -> None:
     """A collector pressed Seen: the researchers who had the alert hear who, and how fast."""
     rows = await conn.fetch("""
         SELECT w.id, w.email, w.event_key, w.subject, w.created_at, w.hospital_id,
-               p.alert_mode, c.email AS by_email, c.seen_at, cp.display_name
+               p.alert_mode, c.email AS by_email, c.seen_at, cp.display_name,
+               cp.official_name, cp.collector_code
           FROM collector_notifications w
           JOIN portal_people p ON p.email = w.email
           JOIN LATERAL (
@@ -506,7 +597,10 @@ async def handled_followups(conn) -> None:
         if (r["alert_mode"] or "everything") != "everything":
             continue
         minutes = max(0, round((r["seen_at"] - r["created_at"]).total_seconds() / 60))
-        who = r["display_name"] or r["by_email"]
+        who = collectors.person_label({"official_name": r["official_name"],
+                                       "collector_code": r["collector_code"],
+                                       "display_name": r["display_name"],
+                                       "email": r["by_email"]})
         subject = f"Seen: {r['subject']}"
         body = (f"{who} pressed Seen at {collectors._hhmm(r['seen_at'])}, "
                 f"{minutes} min after the alert. You will hear again if it is still not "
@@ -727,13 +821,14 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
     uncovered = 0
     for place in places:
         shifts = [dict(s) for s in await conn.fetch("""
-            SELECT s.*, p.display_name FROM collector_shifts s
+            SELECT s.*, p.display_name, p.official_name, p.collector_code
+              FROM collector_shifts s
               LEFT JOIN portal_people p ON p.email = s.email
              WHERE s.place_id = $1 AND s.shift_date = $2 ORDER BY s.started_at
         """, place["place_id"], day)]
         shown = []
         for sh in shifts:
-            who = sh["display_name"] or sh["email"]
+            who = collectors.person_label(sh)
             note = ""
             if sh["shift"] in ("morning", "evening"):
                 due = datetime.combine(day, place[f"{sh['shift']}_start"], tzinfo=tz)
@@ -759,6 +854,17 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
                 todo.append(f"Nobody was on the {kind} shift at {place['name']} for "
                             f"{len(lost)} recording(s).")
         people = await collectors.collectors_of(conn, place["place_id"])
+        # 040: a collector the researchers could not call, or name.
+        for r in await conn.fetch("SELECT email, display_name, official_name, "
+                                  "collector_code, phone FROM portal_people "
+                                  "WHERE email = ANY($1::text[]) ORDER BY email", people):
+            lack = missing_details(r)
+            if lack:
+                body.append(f"Details missing: {collectors.person_label(r)} has not saved "
+                            + " or ".join(lack))
+                amber.append("a collector without their details")
+                todo.append(f"Ask {collectors.person_label(r)} to save their "
+                            + ", ".join(lack) + " on My shift.")
         linked = {r["email"] for r in await conn.fetch(
             "SELECT email FROM collector_telegram WHERE email = ANY($1::text[])", people)}
         missing = [e for e in people if e not in linked]
@@ -936,7 +1042,10 @@ async def watch_me(request: Request):
                 contacts.append({
                     "hospital_id": h["hospital_id"], "place": p["place"],
                     "on_shift": bool(p["on_shift"]),
-                    "people": [{"name": c.get("display_name") or c["email"],
+                    "people": [{"name": c.get("official_name") or c.get("display_name")
+                                        or c["email"],
+                                "code": c.get("collector_code"),
+                                "missing": missing_details(c),
                                 "email": c["email"], "phone": c.get("phone"),
                                 "telegram": c.get("username"),
                                 "telegram_linked": c.get("chat_id") is not None,
@@ -1055,6 +1164,26 @@ async def assign(body: WatchRequest, request: Request, _: None = Depends(api_v2.
     return {"status": "removed" if body.remove else "added"}
 
 
+class DetailsRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    official_name: Optional[str] = Field(None, max_length=200)
+    collector_code: Optional[str] = Field(None, max_length=60)
+    phone: Optional[str] = Field(None, max_length=40)
+
+
+@admin_router.post("/people/details")
+async def set_details(body: DetailsRequest, request: Request,
+                      _: None = Depends(api_v2.require_admin)):
+    """Correct a person's official name, lab ID or phone (040)."""
+    email = body.email.strip().lower()
+    by = await portal._actor(request)
+    async with _pool().acquire() as conn:
+        saved = await save_details(conn, email, body.official_name, body.collector_code,
+                                   body.phone)
+    await portal._audit("person.details", by, {"email": email, "id": saved["collector_code"]})
+    return {"status": "saved", **saved}
+
+
 class PhoneRequest(BaseModel):
     email: str = Field(..., max_length=254)
     phone: str = Field("", max_length=40)
@@ -1081,5 +1210,6 @@ async def set_phone(body: PhoneRequest, request: Request,
 
 __all__ = ["router", "admin_router", "watched_hospitals", "watchers_of", "copy_to_watchers",
            "persisting", "repeated_stops", "handled_followups", "contact_text", "on_shift",
-           "clean_phone", "researcher_body", "PROBLEMS_ONLY",
+           "clean_phone", "clean_name", "clean_code", "save_details", "missing_details",
+           "researcher_body", "PROBLEMS_ONLY",
            "daily_reports", "hospital_report", "report_time"]

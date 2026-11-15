@@ -492,3 +492,6 @@ a.button.primary { background: var(--accent); border-color: var(--accent);
 /* 038: the evening report, as Telegram shows it */
 pre.report { white-space: pre-wrap; font: inherit; font-size: 0.92em; line-height: 1.5; margin: 0; max-width: 72ch; }
 pre.report:empty { display: none; }
+
+/* 040: a collector's details not all saved yet */
+.panel.needs { border-color: var(--warn); background: var(--warn-bg); }

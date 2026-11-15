@@ -3195,8 +3195,10 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         device = await dbs.repo.device_by_token(enrolled["device_token"])
         await _make_collector(client, who, "reporter@gmail.example", hospitals=("HOSP555",))
         await _watching_researcher(client, who, "boss@uni.example", hospitals=("HOSP555", "HOSP556"))
+        # Both a few seconds apart, and the report for their day: a test run just
+        # after midnight in Dhaka would otherwise split them over two days.
         quiet = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=30))
-        brief = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=20))
+        brief = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=30, seconds=-10))
         async with dbs.rec.acquire() as conn:
             await conn.execute("UPDATE sessions SET hospital_id = 'HOSP555' "
                                "WHERE session_id = ANY($1::text[])", [quiet, brief])
@@ -3209,7 +3211,7 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
                                    device_id=device["device_id"],
                                    detail={"detail": "2 consecutive segments of digital silence"})
 
-        today = datetime.now(collectors.zone()).date()
+        today = (datetime.now(collectors.zone()) - timedelta(minutes=30)).date()
         async with dbs.rec.acquire() as conn:
             text = await watchers.hospital_report(conn, "HOSP555", today)
             other = await watchers.hospital_report(conn, "HOSP556", today)
@@ -3435,7 +3437,7 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             assert await conn.fetchval("SELECT resolution FROM collector_notifications "
                                        "WHERE event_key = $1 LIMIT 1", key) == \
                 "the Jabra is back in use"
-            today = datetime.now(collectors.zone()).date()
+            today = (datetime.now(collectors.zone()) - timedelta(minutes=31)).date()
             text = await watchers.hospital_report(conn, "HOSP003", today)
             assert "Not fixed within 30 min:" in text and "the Jabra is back in use" in text
 
@@ -3462,4 +3464,97 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
         caller = next(p for p in people if p["email"] == "caller@gmail.example")
         assert caller["phone"] == "+880 1711 000000" and caller["telegram"] == "caller_tg"
         assert any(g["on_shift"] for g in me["contacts"])
+    _unserve()
+
+
+async def test_a_collector_saves_their_official_name_and_lab_id(dbs, monkeypatch):
+    """
+    040: the collector saves official name, lab ID and phone on My shift; no two
+    collectors hold one ID; an admin corrects them; researchers' alerts, the
+    evening report and the attendance CSV name them so.
+    """
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _make_collector(client, who, "first@gmail.example")
+        mine = await client.post("/api/v2/dashboard/collector/details", headers=h, json={
+            "official_name": "Md.  Sakib Zaman", "collector_code": "dc-907",
+            "phone": "01711-000000"})
+        assert mine.status_code == 200, mine.text
+        assert mine.json()["official_name"] == "Md. Sakib Zaman"
+        assert mine.json()["collector_code"] == "DC-907"
+        me = (await client.get("/api/v2/dashboard/collector/me")).json()
+        assert (me["official_name"], me["collector_code"], me["phone"]) == \
+            ("Md. Sakib Zaman", "DC-907", "01711-000000")
+        # Nonsense is refused, and leaves what was saved.
+        assert (await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                  json={"collector_code": "DC 907"})).status_code == 422
+        # Saving only the phone keeps the name and ID.
+        only = await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                 json={"phone": "01811-111111"})
+        assert only.json()["collector_code"] == "DC-907"
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+
+        # A second collector cannot take the same ID, in any case.
+        await _make_collector(client, who, "second@gmail.example")
+        taken = await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                  json={"official_name": "Rahim Uddin",
+                                        "collector_code": "Dc-907"})
+        assert taken.status_code == 409 and "another data collector" in taken.json()["detail"]
+        assert (await client.get("/api/v2/dashboard/collector/me")).json()["official_name"] \
+            is None                                           # nothing half-saved
+
+        # An admin corrects them.
+        await _watching_researcher(client, who, "boss@uni.example")
+        fixed = await client.post("/api/v2/admin/people/details", headers=h, json={
+            "email": "second@gmail.example", "official_name": "Md. Rahim Uddin",
+            "collector_code": "DC-908"})
+        assert fixed.status_code == 200, fixed.text
+        assert (await client.post("/api/v2/admin/people/details", headers=h, json={
+            "email": "second@gmail.example", "collector_code": "DC-907"})).status_code == 409
+        people = {p["email"]: p for p in (await client.get("/api/v2/admin/people")).json()["people"]}
+        assert people["second@gmail.example"]["collector_code"] == "DC-908"
+        assert people["first@gmail.example"]["official_name"] == "Md. Sakib Zaman"
+
+        # The researcher's alert names them so.
+        key = f"t-identity-{len(sent)}"
+        async with dbs.rec.acquire() as conn:
+            await collectors.notify(conn, hospital_id="HOSP003", event="recording_problem",
+                                    subject="Recording problem: HOSP003, PC",
+                                    body="b" + collectors._footer(), event_key=key, urgent=True)
+            copy = await conn.fetchval("SELECT body FROM collector_notifications "
+                                       "WHERE email = 'boss@uni.example' AND event_key = $1",
+                                       key)
+            assert "- Md. Sakib Zaman (DC-907): phone 01811-111111" in copy
+            today = datetime.now(collectors.zone()).date()
+            text = await watchers.hospital_report(conn, "HOSP003", today)
+            assert "Md. Sakib Zaman (DC-907)" in text
+            # The second never started a shift and has no phone: the report says so.
+            assert "Details missing: Md. Rahim Uddin (DC-908) has not saved phone" in text
+
+        # The attendance sheet carries the ID and the official name.
+        log = await client.get(f"/api/v2/admin/shifts.csv?month={today:%Y-%m}")
+        lines = log.text.splitlines()
+        assert lines[0].lstrip("\ufeff").startswith("date,collector_id,official_name,")
+        assert any(",DC-907,Md. Sakib Zaman," in line for line in lines[1:])
+
+        # Who to call now, on the researcher's page.
+        client.cookies.clear()
+        who["value"] = "boss@uni.example"
+        await _sign_in(client)
+        page = (await client.get("/api/v2/dashboard/watch/me")).json()
+        found = [p for g in page["contacts"] for p in g["people"]
+                 if p["email"] == "first@gmail.example"]
+        assert found and found[0]["name"] == "Md. Sakib Zaman" and found[0]["code"] == "DC-907"
+        assert found[0]["missing"] == []
     _unserve()

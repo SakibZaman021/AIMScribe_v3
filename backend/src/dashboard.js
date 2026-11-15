@@ -1280,7 +1280,15 @@ async function loadPeople() {
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
       + `<th>Looks after</th><th>Given by</th><th>Last signed in</th><th>Database login</th><th>Telegram</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
-        + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
+        + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`
+          + (p.role === "collector"
+            ? `<br>${p.official_name ? esc(p.official_name) : tag("warn", "no official name")} `
+              + `${p.collector_code ? `<code>${esc(p.collector_code)}</code>` : tag("warn", "no ID")} `
+              + `<button type="button" class="chip" data-detail="official_name" data-who="${esc(p.email)}" `
+              + `data-current="${esc(p.official_name || "")}">Name</button> `
+              + `<button type="button" class="chip" data-detail="collector_code" data-who="${esc(p.email)}" `
+              + `data-current="${esc(p.collector_code || "")}">ID</button>`
+            : ""))
         + td("Role", p.role === "admin" ? tag("warn", "Admin")
           : p.role === "collector" ? tag("info", "Data collector")
             + (p.place ? `<br><span class="hint">${esc(p.place)}</span>` : "")
@@ -1354,6 +1362,19 @@ $("people").addEventListener("click", async (e) => {
       await adminCall("POST", "/api/v2/admin/people/watch",
                       { email: w.dataset.unwatch, hospital_id: w.dataset.hospital, remove: true });
     } catch (err) { window.alert(`Not done: ${err.message}`); }
+    loadPeople();
+    return;
+  }
+  const dt = e.target.closest("[data-detail]");
+  if (dt) {
+    const what = dt.dataset.detail === "official_name" ? "Official name" : "ID (like DC-07)";
+    const value = window.prompt(`${what} for ${dt.dataset.who} (empty to clear):`,
+                                dt.dataset.current || "");
+    if (value === null) return;
+    try {
+      await adminCall("POST", "/api/v2/admin/people/details",
+                      { email: dt.dataset.who, [dt.dataset.detail]: value });
+    } catch (err) { window.alert(`Not saved: ${err.message}`); }
     loadPeople();
     return;
   }
@@ -1701,10 +1722,7 @@ async function loadShift() {
   $("tgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
   $("tgTest").hidden = !tg.linked;
   if (tg.linked && tgWaiting) { tgWaiting = false; clearInterval(tgTimer); }
-  if (document.activeElement !== $("myPhone")) $("myPhone").value = me.phone || "";
-  if (!me.phone && !$("myPhoneState").textContent) {
-    $("myPhoneState").innerHTML = tag("warn", "No phone number yet");
-  }
+  showDetails(me);
   const mails = me.notifications || [];
   const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
   const badge = $("badge-shift");
@@ -1872,15 +1890,30 @@ $("tgLink").addEventListener("click", async () => {
   }
   $("tgLink").disabled = false;
 });
-$("myPhoneSave").addEventListener("click", async () => {
-  $("myPhoneSave").disabled = true;
-  try {
-    const r = await collectorCall("POST", "/phone", { phone: $("myPhone").value });
-    $("myPhoneState").innerHTML = r.phone ? tag("good", "Saved") : tag("warn", "No phone number");
-  } catch (err) {
-    $("myPhoneState").innerHTML = tag("bad", "Not saved") + ` <span class="hint">${esc(err.message)}</span>`;
+/* 040: official name, lab ID and phone - yellow until all three are saved. */
+function showDetails(d, saved) {
+  const fields = [["myName", "official_name"], ["myCode", "collector_code"], ["myPhone", "phone"]];
+  for (const [id, key] of fields) {
+    if (document.activeElement !== $(id)) $(id).value = d[key] || "";
   }
-  $("myPhoneSave").disabled = false;
+  const missing = [["official name", d.official_name], ["ID", d.collector_code],
+                   ["phone", d.phone]].filter((x) => !x[1]).map((x) => x[0]);
+  $("detailsPanel").classList.toggle("needs", missing.length > 0);
+  $("detailsState").innerHTML = missing.length
+    ? tag("warn", "Fill in your details") + ` <span class="hint">Missing: ${esc(missing.join(", "))}</span>`
+    : tag("good", saved ? "Saved" : "Complete");
+}
+$("myDetailsSave").addEventListener("click", async () => {
+  $("myDetailsSave").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/details", {
+      official_name: $("myName").value, collector_code: $("myCode").value,
+      phone: $("myPhone").value });
+    showDetails(r, true);
+  } catch (err) {
+    $("detailsState").innerHTML = tag("bad", "Not saved") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("myDetailsSave").disabled = false;
 });
 $("tgTest").addEventListener("click", async () => {
   $("tgTest").disabled = true;
@@ -1951,7 +1984,9 @@ async function loadWatch(first) {
       + groups.map((g) => (g.people.length ? g.people : [null]).map((c) => `<tr>`
         + td("Hospital", esc(clinicName(g.hospital_id)))
         + td("Place", esc(g.place))
-        + td("Data collector", c ? esc(c.name) : tag("bad", "No collector"))
+        + td("Data collector", c ? esc(c.name) + (c.code ? ` <code>${esc(c.code)}</code>` : "")
+          + ((c.missing || []).length ? ` ${tag("warn", "missing: " + c.missing.join(", "))}` : "")
+          : tag("bad", "No collector"))
         + td("Phone", c && c.phone
           ? `<a href="tel:${esc(c.phone.replace(/[^0-9+]/g, ""))}">${esc(c.phone)}</a>`
           : (c ? tag("warn", "not given") : ""))

@@ -124,9 +124,13 @@ def test_the_researcher_reads_what_the_collector_was_asked_and_who_to_call():
     assert "The collector was asked to: go to the room and plug the Jabra back in." in text
     assert "Please" not in text and "mark this as seen" not in text
     assert text.endswith("- Rahim")
-    line = watchers._person_line({"email": "r@x", "display_name": "Rahim", "phone": "01711",
-                                  "username": "rahim_u"}, since=False)
-    assert line == "- Rahim: phone 01711, Telegram @rahim_u"
+    line = watchers._person_line({"email": "r@x", "display_name": "Rahim",
+                                  "official_name": "Md. Rahim Uddin", "collector_code": "DC-07",
+                                  "phone": "01711", "username": "rahim_u"}, since=False)
+    assert line == "- Md. Rahim Uddin (DC-07): phone 01711, Telegram @rahim_u"
+    # Until they save their details, the Google name, and that it is missing.
+    assert watchers._person_line({"email": "r@x", "display_name": "Rahim"}, since=False) \
+        .startswith("- Rahim (official name or ID not saved): ")
     assert "no phone given, Telegram not connected" in watchers._person_line(
         {"email": "r@x", "chat_id": None}, since=False)
 
@@ -139,3 +143,43 @@ def test_a_phone_number_is_checked():
     for bad in ("call me", "123", "+880 1711 000000 ext 5"):
         with pytest.raises(ValueError):
             watchers.clean_phone(bad)
+
+
+def test_an_official_name_and_a_lab_id_are_checked():
+    import pytest
+    import watchers
+    assert watchers.clean_name("  Md.  Sakib   Zaman ") == "Md. Sakib Zaman"
+    assert watchers.clean_name("সাকিব") == "সাকিব"   # Bengali
+    assert watchers.clean_name("") is None
+    for bad in ("A", "<script>", "12345", "x" * 81):
+        with pytest.raises(ValueError):
+            watchers.clean_name(bad)
+    assert watchers.clean_code(" dc-07 ") == "DC-07"
+    assert watchers.clean_code("") is None
+    for bad in ("DC 07", "-DC07", "DC07-", "DC/07", "D" * 21):
+        with pytest.raises(ValueError):
+            watchers.clean_code(bad)
+    assert watchers.missing_details({"official_name": "A B", "phone": "1"}) == ["ID"]
+    assert collectors.person_label({"official_name": "Md. Sakib Zaman", "collector_code": "DC-07",
+                                    "display_name": "sakib"}) == "Md. Sakib Zaman (DC-07)"
+    assert collectors.person_label({"display_name": None, "email": "s@x"}) == "s@x"
+
+
+def test_one_telegram_chat_gets_at_most_one_message_a_second():
+    """Load test, 16 Nov: a burst of alerts must not break Telegram's per-chat limit."""
+    import asyncio
+    import time
+
+    async def go():
+        collectors._NEXT_TO_CHAT.clear()
+        start = time.monotonic()
+        await collectors._pace_chat(1)
+        await collectors._pace_chat(2)            # another chat: no wait
+        other = time.monotonic() - start
+        await collectors._pace_chat(1)            # the same chat: waits its second
+        same = time.monotonic() - start
+        return other, same
+
+    other, same = asyncio.run(go())
+    assert other < 0.2
+    assert same >= collectors.CHAT_GAP - 0.05

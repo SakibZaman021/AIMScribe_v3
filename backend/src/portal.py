@@ -373,6 +373,7 @@ async def list_people(_: None = _admin()):
             SELECT p.email, p.role, p.display_name, p.added_by, p.added_at, p.last_signed_in,
                    p.db_user, p.db_password_set_at, p.place_id, pl.name AS place,
                    (t.email IS NOT NULL) AS telegram, p.alert_mode, p.phone,
+                   p.official_name, p.collector_code,
                    (SELECT array_agg(r.hospital_id ORDER BY r.hospital_id)
                       FROM researcher_hospitals r
                      WHERE r.email = p.email AND r.removed_at IS NULL) AS watching
@@ -404,7 +405,12 @@ async def add_person(body: PersonRequest, request: Request, _: None = _admin()):
             INSERT INTO portal_people (email, role, added_by, place_id) VALUES ($1, $2, $3, $4)
             ON CONFLICT (email) DO UPDATE
                SET role = EXCLUDED.role, added_by = EXCLUDED.added_by, added_at = now(),
-                   place_id = EXCLUDED.place_id, removed_at = NULL, removed_by = NULL
+                   place_id = EXCLUDED.place_id, removed_at = NULL, removed_by = NULL,
+                   collector_code = CASE WHEN EXISTS (
+                       SELECT 1 FROM portal_people o
+                        WHERE o.email <> portal_people.email AND o.removed_at IS NULL
+                          AND upper(o.collector_code) = upper(portal_people.collector_code))
+                       THEN NULL ELSE portal_people.collector_code END
         """, email, body.role, by, place_id)
     await _audit("portal.person_added", by, {"email": email, "role": body.role,
                                              "place_id": place_id})
