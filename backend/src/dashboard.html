@@ -178,6 +178,14 @@
           <p class="hint">Install Telegram from the Play Store, press Connect Telegram, then
             press Start in Telegram. Keep Telegram's notifications on. For an urgent alert,
             press Seen in Telegram when you are dealing with it.</p>
+          <div class="row">
+            <label class="field"><span>Your phone</span>
+              <input type="tel" id="myPhone" autocomplete="tel" placeholder="01XXX-XXXXXX" maxlength="40"></label>
+            <button type="button" class="ghost" id="myPhoneSave">Save</button>
+            <span id="myPhoneState" role="status"></span>
+          </div>
+          <p class="hint">The researchers who look after your hospitals see your phone number
+            and Telegram with each alert, so they can call you about it.</p>
         </div>
       </section>
       <section class="panel" aria-labelledby="h-mails">
@@ -196,14 +204,22 @@
         <div class="body shiftbody">
           <p id="wHospitals" role="status">Loading</p>
           <p class="hint" id="wState">You see and download every hospital as before. For these
-            you also get the data collectors' alerts, whether they dealt with them, and a report
+            you also get every alert the data collectors get, with the collector on shift and
+            their phone and Telegram; word when they press Seen; a reminder when a problem is
+            still not fixed after 30, 60 and 90 minutes; word when it is fixed; and a report
             every evening at <b id="wReportAt">20:30</b>.</p>
           <label class="field"><span>Alerts</span>
             <select id="wMode">
-              <option value="everything">Everything: every alert, handled or not, and the report</option>
-              <option value="problems">Only problems: not handled in 15 min, PC down, recording problems, and the report</option>
+              <option value="everything">Everything: every alert with who to call, Seen, still not fixed, fixed, and the report</option>
+              <option value="problems">Only problems: urgent alerts, not seen in 15 min, still not fixed, fixed, and the report</option>
             </select></label>
         </div>
+      </section>
+      <section class="panel" aria-labelledby="h-wcall">
+        <div class="head wrap"><h3 id="h-wcall">Who to call now</h3>
+          <span class="hint">The data collector on shift at each of your hospitals; with
+            nobody on shift, all of the place's collectors.</span></div>
+        <div class="scroll"><div id="wContacts"></div></div>
       </section>
       <section class="panel" aria-labelledby="h-wtg">
         <div class="head wrap"><h3 id="h-wtg">Alerts on your phone</h3>

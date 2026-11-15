@@ -504,7 +504,7 @@ function drawProblems(d) {
   if (s.length) {
     html += `<div class="group-title">Stopped early</div><ul class="list">`
       + s.map((r) => `<li><span class="n">${num(r.n)}</span>`
-        + `<span>${tag("warn", human(r.close_reason))} ${who(r)}</span></li>`).join("")
+        + `<span>${tag("warn", (ENDED[r.close_reason] || [0, human(r.close_reason)])[1])} ${who(r)}</span></li>`).join("")
       + `</ul>`;
   }
   if (a.length) {
@@ -791,16 +791,28 @@ const confirmTag = (v) => {
   const m = CONFIRM[v] || ["quiet", v || "–"];
   return tag(m[0], m[1]);
 };
-// How a recording ended. The first three are the normal ends (dashboard.py,
-// _ENDED_NORMALLY); the others are "stopped early".
+// How a recording ended. Green: the two ordinary ends - the next patient, or
+// the consultation finished (dashboard.py, _ENDED_NORMALLY). Everything else is
+// "stopped early", and alerts the collectors and researchers.
 const ENDED = {
   superseded_by_new_patient: ["good", "Next patient"],
   counselling_limit: ["good", "2 min after prescription"],
   prescription_built: ["good", "Prescription"],
-  doctor_stopped: ["warn", "Stopped by the doctor"],
+  doctor_stopped: ["good", "Consultation finished"],
+  consultation_finished: ["good", "Consultation finished"],
+  patient_did_not_consent: ["bad", "Patient did not consent"],
+  "doctor_stopped:patient_left": ["warn", "Patient left the room"],
+  "doctor_stopped:urgent_interruption": ["warn", "Emergency or urgent interruption"],
+  "doctor_stopped:technical_problem": ["bad", "Recorder or microphone problem"],
+  "doctor_stopped:other": ["warn", "Stopped: other reason"],
+  patient_left: ["warn", "Patient left the room"],
+  urgent_interruption: ["warn", "Emergency or urgent interruption"],
+  technical_problem: ["bad", "Recorder or microphone problem"],
+  recovered_after_unclean_shutdown: ["bad", "Recorder crashed, recovered"],
+  no_activity_limit: ["warn", "Nobody pressed Stop"],
   stopped_from_tray: ["warn", "Stopped by the doctor"],
-  pc_shutdown: ["warn", "PC shut down"],
-  agent_shutdown: ["warn", "Recorder closed"],
+  pc_shutdown: ["bad", "PC shut down"],
+  agent_shutdown: ["bad", "Recorder closed"],
   software_update: ["quiet", "Recorder updated"],
 };
 const timeOf = (v) => { const m = /(\d{2}:\d{2})/.exec(String(v || "")); return m ? m[1] : ""; };
@@ -1280,8 +1292,13 @@ async function loadPeople() {
           : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
-        + td("Telegram", p.telegram ? tag("good", "connected")
+        + td("Telegram", (p.telegram ? tag("good", "connected")
           : tag(p.role === "collector" || (p.watching || []).length ? "warn" : "quiet", "not connected"))
+          + (p.role === "collector"
+            ? `<br>${p.phone ? esc(p.phone) : tag("warn", "no phone")} `
+              + `<button type="button" class="chip" data-phone="${esc(p.email)}" `
+              + `data-current="${esc(p.phone || "")}">Phone</button>`
+            : ""))
         + td("", p.owner ? `<span class="hint">owner</span>`
           : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1337,6 +1354,16 @@ $("people").addEventListener("click", async (e) => {
       await adminCall("POST", "/api/v2/admin/people/watch",
                       { email: w.dataset.unwatch, hospital_id: w.dataset.hospital, remove: true });
     } catch (err) { window.alert(`Not done: ${err.message}`); }
+    loadPeople();
+    return;
+  }
+  const ph = e.target.closest("[data-phone]");
+  if (ph) {
+    const phone = window.prompt(`Phone number for ${ph.dataset.phone} (empty to clear):`,
+                                ph.dataset.current || "");
+    if (phone === null) return;
+    try { await adminCall("POST", "/api/v2/admin/people/phone", { email: ph.dataset.phone, phone }); }
+    catch (err) { window.alert(`Not saved: ${err.message}`); }
     loadPeople();
     return;
   }
@@ -1612,9 +1639,11 @@ start();
    036: data collectors. Their own shift page, and the admin's
    places and monthly shift log.
    ============================================================ */
-async function collectorCall(method, path) {
+async function collectorCall(method, path, body) {
   const response = await fetch(`/api/v2/dashboard/collector${path}`, {
-    method, headers: { ...portalHeaders(), Accept: "application/json" } });
+    method, headers: { ...portalHeaders(), Accept: "application/json",
+                       ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
   return data;
@@ -1626,7 +1655,8 @@ const EVENT_LABELS = {
   recording_finished: "Recording saved", shift_summary: "Shift summary",
   no_shift_started: "Nobody on shift", escalation: "Not yet seen",
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
-  recording_too_long: "Recording not stopped", handled: "Handled", daily_report: "Daily report",
+  recording_too_long: "Recording not stopped", handled: "Seen", daily_report: "Daily report",
+  still_not_fixed: "Still not fixed", problem_fixed: "Fixed", repeated_stops: "Repeated stops",
   stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
 };
 
@@ -1671,6 +1701,10 @@ async function loadShift() {
   $("tgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
   $("tgTest").hidden = !tg.linked;
   if (tg.linked && tgWaiting) { tgWaiting = false; clearInterval(tgTimer); }
+  if (document.activeElement !== $("myPhone")) $("myPhone").value = me.phone || "";
+  if (!me.phone && !$("myPhoneState").textContent) {
+    $("myPhoneState").innerHTML = tag("warn", "No phone number yet");
+  }
   const mails = me.notifications || [];
   const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
   const badge = $("badge-shift");
@@ -1838,6 +1872,16 @@ $("tgLink").addEventListener("click", async () => {
   }
   $("tgLink").disabled = false;
 });
+$("myPhoneSave").addEventListener("click", async () => {
+  $("myPhoneSave").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/phone", { phone: $("myPhone").value });
+    $("myPhoneState").innerHTML = r.phone ? tag("good", "Saved") : tag("warn", "No phone number");
+  } catch (err) {
+    $("myPhoneState").innerHTML = tag("bad", "Not saved") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("myPhoneSave").disabled = false;
+});
 $("tgTest").addEventListener("click", async () => {
   $("tgTest").disabled = true;
   try {
@@ -1899,13 +1943,33 @@ async function loadWatch(first) {
   $("wTgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
   $("wTgTest").hidden = !tg.linked;
   if (tg.linked && watchWaiting) { watchWaiting = false; clearInterval(watchTimer); }
+  const groups = me.contacts || [];
+  $("wContacts").innerHTML = !groups.length
+    ? empty("Nobody to show", "No place holds your hospitals yet, so no collector is alerted for them.", true)
+    : `<table><thead><tr><th>Hospital</th><th>Place</th><th>Data collector</th><th>Phone</th>`
+      + `<th>Telegram</th><th>On shift</th></tr></thead><tbody>`
+      + groups.map((g) => (g.people.length ? g.people : [null]).map((c) => `<tr>`
+        + td("Hospital", esc(clinicName(g.hospital_id)))
+        + td("Place", esc(g.place))
+        + td("Data collector", c ? esc(c.name) : tag("bad", "No collector"))
+        + td("Phone", c && c.phone
+          ? `<a href="tel:${esc(c.phone.replace(/[^0-9+]/g, ""))}">${esc(c.phone)}</a>`
+          : (c ? tag("warn", "not given") : ""))
+        + td("Telegram", c && c.telegram
+          ? `<a href="https://t.me/${esc(c.telegram)}" target="_blank" rel="noopener">@${esc(c.telegram)}</a>`
+          : (c ? tag(c.telegram_linked ? "quiet" : "warn",
+                     c.telegram_linked ? "connected, no username" : "not connected") : ""))
+        + td("On shift", g.on_shift && c
+          ? tag("good", `${c.shift || ""} since ${dhaka(c.since)}`)
+          : tag("bad", "Nobody on shift"))
+        + `</tr>`).join("")).join("") + `</tbody></table>`;
   const notes = me.notifications || [];
   $("wAlerts").innerHTML = !notes.length
     ? empty("No alerts yet", "Alerts for your hospitals appear here, and on Telegram.", true)
     : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th><th>Sent</th></tr></thead><tbody>`
       + notes.map((n) => `<tr>`
         + td("When", esc(dhaka(n.happened_at || n.created_at)))
-        + td("What", tag(n.urgent ? "bad" : (n.event === "handled" ? "good" : "info"),
+        + td("What", tag(n.urgent ? "bad" : (["handled", "problem_fixed"].includes(n.event) ? "good" : "info"),
                          EVENT_LABELS[n.event] || human(n.event)))
         + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
         + td("Message", esc(n.subject), "wrap")

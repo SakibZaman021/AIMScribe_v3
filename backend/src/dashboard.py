@@ -42,10 +42,20 @@ SILENT_AFTER = timedelta(seconds=3 * HEARTBEAT_SECONDS)
 
 # How a recording ends when nothing went wrong: the next patient opened, or
 # two minutes after the prescription (older recorders: at the prescription).
-# Anything else - the doctor's forced Stop, a shutdown, a reset - is "stopped
-# early" on the dashboard. Constants only, so safe to put in the SQL.
-_ENDED_NORMALLY = ("('prescription_built', 'superseded_by_new_patient', "
-                   "'counselling_limit', '')")
+# The lab's rule (15 Nov 2026): only two ends are ordinary - the next patient
+# came in, or the consultation finished (the doctor's Stop in CMED or
+# "Consultation finished" on the PC included). Everything else - the patient
+# left, did not consent, an emergency, a technical problem, a crash, a
+# shutdown - is "stopped early", the same list that alerts the collectors
+# (collectors.ORDINARY_ENDS). Constants only, so safe to put in the SQL.
+_ENDED_NORMALLY = "(" + ", ".join(f"'{r}'" for r in sorted(collectors.ORDINARY_ENDS)) + ")"
+
+
+def _stopped_early(alias: str = "") -> str:
+    """SQL: this recording ended in any way but the two ordinary ones."""
+    return (f"(({alias}close_reason IS NOT NULL AND {alias}close_reason NOT IN "
+            f"{_ENDED_NORMALLY}) OR EXISTS (SELECT 1 FROM session_refusals x "
+            f"WHERE x.session_id = {alias}session_id))")
 
 
 def _pool():
@@ -216,13 +226,16 @@ async def _integrity(conn, start: date, end: date,
     """, start, end, clinic)
 
     stopped = await conn.fetch("""
-        SELECT hospital_id, doctor_id, close_reason, count(*) AS n
+        SELECT hospital_id, doctor_id,
+               CASE WHEN EXISTS (SELECT 1 FROM session_refusals x
+                                  WHERE x.session_id = sessions.session_id)
+                    THEN 'patient_did_not_consent' ELSE close_reason END AS close_reason,
+               count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
-           AND close_reason IS NOT NULL
-           AND close_reason NOT IN """ + _ENDED_NORMALLY + """
-         GROUP BY hospital_id, doctor_id, close_reason
+           AND """ + _stopped_early("sessions.") + """
+         GROUP BY 1, 2, 3
          ORDER BY n DESC
     """, start, end, clinic)
 
@@ -551,8 +564,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
 
     states = {
         "quarantined": "s.quarantine_reason IS NOT NULL",
-        "stopped_early": "s.close_reason IS NOT NULL AND "
-                         "s.close_reason NOT IN " + _ENDED_NORMALLY,
+        "stopped_early": _stopped_early("s."),
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
         "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
                     "AND s.confirmation = 'confirmed'",

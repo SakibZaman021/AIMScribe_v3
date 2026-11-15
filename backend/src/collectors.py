@@ -304,7 +304,9 @@ async def me(request: Request):
         """, person.email)
         chat = await conn.fetchrow("SELECT username, linked_at FROM collector_telegram "
                                    "WHERE email = $1", person.email)
-    return {"email": person.email,
+        phone = await conn.fetchval("SELECT phone FROM portal_people WHERE email = $1",
+                                    person.email)
+    return {"email": person.email, "phone": phone,
             "place": {"place_id": place["place_id"], "name": place["name"],
                       "morning": [place["morning_start"].strftime("%H:%M"),
                                   place["morning_end"].strftime("%H:%M")],
@@ -390,6 +392,26 @@ async def telegram_test(request: Request):
     ok, error = await send_telegram(chat, "Test alert from AIMScribe.\n\nIf your phone "
                                     "made a sound, alerts will reach you during your shift.")
     return {"sent": ok, "error": error}
+
+
+class OwnPhoneRequest(BaseModel):
+    phone: str = Field("", max_length=40)
+
+
+@router.post("/phone")
+async def own_phone(body: OwnPhoneRequest, request: Request):
+    """The collector's phone number, given to their hospitals' researchers (039)."""
+    import watchers
+    person = await _collector(request, write=True)
+    try:
+        phone = watchers.clean_phone(body.phone)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    async with _pool().acquire() as conn:
+        await conn.execute("UPDATE portal_people SET phone = $2 WHERE email = $1",
+                           person.email, phone)
+    await portal._audit("collector.phone", person.email, {"set": phone is not None})
+    return {"status": "saved", "phone": phone}
 
 
 # ============================================================ admin: places
@@ -936,18 +958,16 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
                 told.append(email)
                 await _deliver(conn, note_id, email, subject, body)
                 sent += 1
-    # 038: the researchers who look after this hospital get a copy, saying who
-    # was told - so they know whether anyone is there to act.
+    # 038/039: the researchers who look after this hospital get it too, written
+    # for supervision: what the collector was asked to do, and the collector on
+    # shift - or, with nobody on shift, all the place's collectors - with phone
+    # and Telegram, so they can call them.
     import watchers
-    if told:
-        who = ("the collector on shift: " if on_shift else
-               "nobody was on shift, so all the place's collectors: ") + ", ".join(told)
-    else:
-        who = "no collector (nobody on shift)" if not everyone_if_nobody else \
-            "no collector - no data collector covers this hospital"
+    contacts = await watchers.contact_text(conn, hospital_id)
     sent += await watchers.copy_to_watchers(
-        conn, hospital_id=hospital_id, event=event, subject=subject,
-        body=body.split(_FOOTER_MARK)[0] + f"\n\nSent to {who}.", event_key=event_key,
+        conn, hospital_id=hospital_id, event=event,
+        subject=(subject if on_shift else f"Nobody on shift: {subject}"),
+        body=watchers.researcher_body(body, contacts), event_key=event_key,
         urgent=urgent, device_id=device_id, session_id=session_id, happened_at=happened_at)
     return sent
 
@@ -1059,7 +1079,8 @@ class Notifier:
                      self.idle_microphones, self.recordings_without_jabra,
                      self.recordings_too_long, self.refusals, self.silent_pcs,
                      self.no_shift_started,
-                     self.escalate, watchers.handled_followups, watchers.daily_reports,
+                     self.escalate, watchers.handled_followups, watchers.persisting,
+                     watchers.repeated_stops, watchers.daily_reports,
                      self.retry_failed, self.failure_alarm):
             try:
                 await step(conn)
@@ -1340,18 +1361,22 @@ class Notifier:
                     if note_id is not None:
                         await _deliver(conn, note_id, email, subject, body)
                 import watchers
+                watch_body = (f"The {kind} shift at {place['name']} began at "
+                              f"{place[f'{kind}_start']:%H:%M} and no data collector has "
+                              "pressed Start my shift. The PCs are on.\n\n"
+                              + await watchers.contact_text(conn, place_id=place["place_id"]))
                 for hospital_id in hospitals:
                     await watchers.copy_to_watchers(
                         conn, hospital_id=hospital_id, event="no_shift_started",
-                        subject=subject, body=body.split(_FOOTER_MARK)[0], event_key=key,
-                        urgent=True)
+                        subject=subject, body=watch_body, event_key=key, urgent=True)
 
     # -- an urgent mail nobody marked seen
     async def escalate(self, conn) -> None:
         rows = await conn.fetch("""
             SELECT DISTINCT ON (n.event_key) n.*
               FROM collector_notifications n
-             WHERE n.urgent AND n.escalated_at IS NULL AND n.event <> 'escalation'
+             WHERE n.urgent AND n.escalated_at IS NULL
+               AND n.event NOT IN ('escalation', 'still_not_fixed')
                AND n.audience = 'collector'
                AND n.created_at < now() - $1::interval
                AND n.created_at > now() - interval '12 hours'
@@ -1380,14 +1405,16 @@ class Notifier:
                                         audience=audience)
                 if note_id is not None:
                     await _deliver(conn, note_id, email, subject, body)
-            # 038: the hospital's researchers hear that it was not handled.
+            # 038/039: the hospital's researchers hear that nobody pressed Seen,
+            # with who to call.
             import watchers
             await watchers.copy_to_watchers(
                 conn, hospital_id=n["hospital_id"], event="escalation",
-                subject=f"Not handled in 15 min: {n['subject']}",
-                body=(f"Sent to {n['email']} at {_hhmm(n['created_at'])}; nobody has marked it "
-                      f"seen in 15 minutes. The place's other collectors are now told.\n\n"
-                      + n["body"].split(_FOOTER_MARK)[0]),
+                subject=f"Not seen in 15 min: {n['subject']}",
+                body=(f"The alert went out at {_hhmm(n['created_at'])} and nobody has pressed "
+                      "Seen in 15 minutes. The place's other collectors and AIMS LAB are now "
+                      "told.\n\n" + watchers.researcher_body(
+                          n["body"], await watchers.contact_text(conn, n["hospital_id"]))),
                 event_key=f"esc:{n['event_key']}", urgent=True, device_id=n["device_id"],
                 session_id=n["session_id"])
             await conn.execute("UPDATE collector_notifications SET escalated_at = now() "
@@ -1504,8 +1531,11 @@ class Notifier:
                                 "hospitals you look after come here"
                                 + (f" ({', '.join(mine)})" if mine else
                                    " (none assigned yet: ask an admin)")
-                                + ", with whether the collector dealt with them, and a report "
-                                f"every evening at {watchers.report_time():%H:%M}.")
+                                + ", each with the data collector on shift and their phone "
+                                "and Telegram, so you can call them. You also hear when they "
+                                "press Seen, when a problem is still not fixed after 30 "
+                                "minutes, when it is fixed, and get a report every evening at "
+                                f"{watchers.report_time():%H:%M}.")
             return
         await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "
                             f"shift{' at ' + place if place else ''}, AIMScribe alerts come here. "

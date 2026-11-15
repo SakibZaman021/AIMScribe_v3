@@ -113,3 +113,29 @@ def test_only_the_two_ordinary_ends_are_left_untold():
     assert collectors.stop_label("doctor_stopped:urgent_interruption") ==         "an emergency or urgent interruption"
     assert collectors.stop_label("doctor_stopped:something_new") == "something new"
     assert "technical_problem" in collectors.TECHNICAL_ENDS
+
+
+def test_the_researcher_reads_what_the_collector_was_asked_and_who_to_call():
+    import watchers
+    collector = ("At 10:05 the recording moved off the Jabra.\n\nPlease go to the room and "
+                 "plug the Jabra back in." + collectors._footer())
+    text = watchers.researcher_body(collector, "Data collector on shift at Karail:\n- Rahim")
+    assert text.startswith("At 10:05 the recording moved off the Jabra.")
+    assert "The collector was asked to: go to the room and plug the Jabra back in." in text
+    assert "Please" not in text and "mark this as seen" not in text
+    assert text.endswith("- Rahim")
+    line = watchers._person_line({"email": "r@x", "display_name": "Rahim", "phone": "01711",
+                                  "username": "rahim_u"}, since=False)
+    assert line == "- Rahim: phone 01711, Telegram @rahim_u"
+    assert "no phone given, Telegram not connected" in watchers._person_line(
+        {"email": "r@x", "chat_id": None}, since=False)
+
+
+def test_a_phone_number_is_checked():
+    import pytest
+    import watchers
+    assert watchers.clean_phone(" +880  1711-000000 ") == "+880 1711-000000"
+    assert watchers.clean_phone("") is None
+    for bad in ("call me", "123", "+880 1711 000000 ext 5"):
+        with pytest.raises(ValueError):
+            watchers.clean_phone(bad)

@@ -1,26 +1,32 @@
 """
-Researchers who look after hospitals (migration 038).
+Researchers who look after hospitals (migrations 038, 039).
 
 Researchers see and download every hospital, as before. An admin also gives
-each researcher the hospitals they look after, and for those:
+each researcher the hospitals they look after. The collector on shift acts in
+the room; the researcher supervises - so for their hospitals a researcher gets
+each alert written for supervision, with who to call:
 
-    copies    every alert the data collectors get (the Jabra unplugged, a
-              patient recorded without it, no sound, a recording problem, a PC
-              gone quiet, a recording nobody stopped, nobody on shift), saying
-              who was told - without the Seen button: the collector acts
-    handled   "handled by <collector> after N min" when the collector presses
-              Seen, or "not handled in 15 min" when nobody does
-    report    one message per hospital every evening (AIMS_REPORT_AT, 20:30):
-              recordings, the Jabra, what will be kept, the collectors, the PCs,
-              and what to do tomorrow
+    alert          every alert the collectors get, as it happens: what
+                   happened, the doctor, PC and consultation, what the
+                   collector was asked to do, and the collector on shift (or,
+                   with nobody on shift, all the place's collectors) with
+                   their phone and Telegram - without the Seen button
+    seen           "<collector> pressed Seen at 10:09 (4 min)"
+    not seen       an urgent alert nobody pressed Seen for in 15 minutes
+    still          a problem still there 30, 60 and 90 minutes after the
+                   alert - also sent again to the collector on shift
+    fixed / ended  once that problem is gone: how, and how long it took
+    pattern        three unusual stops by one doctor within two hours
+    report         one message per hospital every evening (AIMS_REPORT_AT)
 
-A researcher who wants less chooses 'problems': only what went wrong and
+A researcher who wants less chooses 'problems': the urgent alerts, what
 stayed wrong, and the report. Everything goes through the collectors'
 Telegram bot and mailer (collectors.py); nothing here deletes anything.
 """
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from collections import Counter
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -37,13 +43,33 @@ import portal
 router = APIRouter(prefix="/api/v2/dashboard/watch", tags=["researchers"])
 admin_router = APIRouter(prefix="/api/v2/admin", tags=["researchers"])
 
-# What a researcher on 'problems' still gets.
+# What a researcher on 'problems' gets besides every urgent alert.
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
-                 "recording_too_long", "stopped_technical", "daily_report"}
+                 "recording_too_long", "stopped_technical", "daily_report",
+                 "still_not_fixed", "problem_fixed", "repeated_stops"}
 MODES = ("everything", "problems")
 UNHANDLED_AFTER = timedelta(minutes=15)
 SHORT_SECONDS = 60
 LATE_MINUTES = 15
+
+# A problem still there this long after the alert is sent again - to the
+# collector on shift and the researchers - every STILL_AFTER, STILL_TIMES times.
+STILL_AFTER = timedelta(minutes=30)
+STILL_TIMES = 3
+WATCH_FOR = timedelta(hours=6)
+OFF_AFTER = timedelta(minutes=15)         # a PC not heard from: its problem has ended
+# Unusual stops by one doctor that make a pattern worth a call.
+PATTERN_STOPS = 3
+PATTERN_WINDOW = timedelta(hours=2)
+
+# Which urgent alerts are one problem that can last, and what it is about:
+# a PC's Jabra, a PC, a PC's recordings, one recording, one shift.
+FAMILY = {"jabra_unplugged": "jabra", "jabra_not_plugged": "jabra",
+          "recording_without_jabra": "jabra", "pc_silent": "pc",
+          "recording_problem": "recording", "stopped_technical": "recording",
+          "recording_too_long": "long", "no_shift_started": "noshift"}
+
+PHONE = re.compile(r"^\+?[0-9][0-9 -]{5,20}[0-9]$")
 
 
 def report_time() -> dtime:
@@ -56,6 +82,20 @@ def report_time() -> dtime:
 
 def _pool():
     return collectors._pool()
+
+
+def clean_phone(text: Optional[str]) -> Optional[str]:
+    """A phone number as given, or None for empty; ValueError if it is not one."""
+    text = " ".join((text or "").split())
+    if not text:
+        return None
+    if not PHONE.match(text):
+        raise ValueError("a phone number has digits, spaces or dashes, and may start with +")
+    return text
+
+
+def _first_up(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 # ============================================================ who looks after what
@@ -83,14 +123,115 @@ async def watchers_of(conn, hospital_id: Optional[str]) -> List[Tuple[str, str]]
     return [(r["email"], r["alert_mode"] or "everything") for r in rows]
 
 
+async def _hospitals_for(conn, hospital_id: Optional[str], place_id: Optional[int]) -> List[str]:
+    if hospital_id:
+        return [hospital_id]
+    return await collectors.place_hospitals(place_id, conn) if place_id else []
+
+
+# ============================================================ who to call
+
+def _person_line(p: Dict[str, Any], *, since: bool) -> str:
+    name = p.get("display_name") or p["email"]
+    phone = f"phone {p['phone']}" if p.get("phone") else "no phone given"
+    if p.get("username"):
+        tg = f"Telegram @{p['username']}"
+    elif p.get("chat_id") is not None:
+        tg = "Telegram connected, no username (call instead)"
+    else:
+        tg = "Telegram not connected"
+    line = f"- {name}: {phone}, {tg}"
+    if since and p.get("started_at"):
+        line += (f"\n  on the {p.get('shift') or ''} shift since "
+                 f"{collectors._hhmm(p['started_at'])}")
+    return line
+
+
+async def on_shift(conn, hospital_id: Optional[str] = None,
+                   place_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Per place holding this hospital: the collectors on shift now, or all of its
+    collectors when nobody is - with phone and Telegram."""
+    places = [place_id] if place_id else await collectors.places_of(conn, hospital_id)
+    out = []
+    for pid in places:
+        name = await conn.fetchval("SELECT name FROM places WHERE place_id = $1", pid)
+        duty = await conn.fetch("""
+            SELECT s.email, s.started_at, s.shift, p.display_name, p.phone,
+                   t.username, t.chat_id
+              FROM collector_shifts s
+              JOIN portal_people p ON p.email = s.email AND p.removed_at IS NULL
+              LEFT JOIN collector_telegram t ON t.email = s.email
+             WHERE s.place_id = $1 AND s.ended_at IS NULL ORDER BY s.started_at
+        """, pid)
+        everyone = [] if duty else await conn.fetch("""
+            SELECT p.email, p.display_name, p.phone, t.username, t.chat_id
+              FROM portal_people p LEFT JOIN collector_telegram t ON t.email = p.email
+             WHERE p.role = 'collector' AND p.place_id = $1 AND p.removed_at IS NULL
+             ORDER BY p.email
+        """, pid)
+        out.append({"place_id": pid, "place": name or f"place {pid}",
+                    "on_shift": [dict(r) for r in duty],
+                    "collectors": [dict(r) for r in everyone]})
+    return out
+
+
+async def contact_text(conn, hospital_id: Optional[str] = None,
+                       place_id: Optional[int] = None) -> str:
+    """Who to call about this hospital, for the researcher's message."""
+    places = await on_shift(conn, hospital_id, place_id)
+    if not places:
+        return "No data collector covers this hospital: no place holds it."
+    parts = []
+    for p in places:
+        if p["on_shift"]:
+            parts.append(f"Data collector on shift at {p['place']}:\n"
+                         + "\n".join(_person_line(c, since=True) for c in p["on_shift"]))
+        elif p["collectors"]:
+            parts.append(f"Nobody is on shift at {p['place']}. Its data collectors:\n"
+                         + "\n".join(_person_line(c, since=False) for c in p["collectors"]))
+        else:
+            parts.append(f"{p['place']} has no data collector.")
+    return "\n\n".join(parts)
+
+
+def researcher_body(body: str, contacts: str) -> str:
+    """
+    The collector's alert, rewritten for the researcher: the same facts, the
+    collector's instruction as "The collector was asked to: ...", no footer
+    about pressing Seen, and who to call.
+    """
+    main = body.split(collectors._FOOTER_MARK)[0].strip()
+    main = re.sub(r"(^|\n\n)Please (\w)",
+                  lambda m: m.group(1) + "The collector was asked to: " + m.group(2).lower(),
+                  main)
+    return main + ("\n\n" + contacts if contacts else "")
+
+
+async def _seen_text(conn, keys: List[str], first_at: datetime, prefix: str = "") -> str:
+    row = await conn.fetchrow("""
+        SELECT n.seen_at, COALESCE(p.display_name, n.email) AS who
+          FROM collector_notifications n LEFT JOIN portal_people p ON p.email = n.email
+         WHERE (n.event_key = ANY($1::text[])
+                OR ($2 <> '' AND left(n.event_key, length($2)) = $2))
+           AND n.audience = 'collector' AND n.seen_at IS NOT NULL
+         ORDER BY n.seen_at LIMIT 1
+    """, keys, prefix)
+    if row is None:
+        return "Nobody has pressed Seen."
+    minutes = max(0, round((row["seen_at"] - first_at).total_seconds() / 60))
+    return (f"{row['who']} pressed Seen at {collectors._hhmm(row['seen_at'])} "
+            f"({minutes} min after the alert).")
+
+
 async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subject: str,
                            body: str, event_key: str, urgent: bool = False, device_id=None,
                            session_id: Optional[str] = None,
                            happened_at: Optional[datetime] = None) -> int:
-    """The researchers' copy of an alert; once per person and event, like the collectors'."""
+    """The researchers' version of an alert; once per person and event, like the collectors'.
+    On 'problems', only urgent alerts and PROBLEMS_ONLY."""
     sent = 0
     for email, mode in await watchers_of(conn, hospital_id):
-        if mode == "problems" and event not in PROBLEMS_ONLY:
+        if mode == "problems" and not urgent and event not in PROBLEMS_ONLY:
             continue
         note_id = await collectors._record(
             conn, email=email, event=event, subject=subject, body=body, event_key=event_key,
@@ -102,10 +243,247 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
     return sent
 
 
-# ============================================================ the Notifier's rounds
+async def _to_watchers(conn, hospitals: List[str], **note) -> List[str]:
+    """One researcher message to everyone looking after any of these hospitals."""
+    told: List[str] = []
+    for hid in hospitals:
+        for email, _mode in await watchers_of(conn, hid):
+            if email in told:
+                continue
+            note_id = await collectors._record(conn, email=email, hospital_id=hid,
+                                               audience="watcher", **note)
+            if note_id is not None:
+                await collectors._deliver(conn, note_id)
+                told.append(email)
+    return told
+
+
+# ============================================================ problems that last
+
+async def _still_wrong(conn, family: str, first: Dict[str, Any],
+                       now: datetime) -> Tuple[str, str]:
+    """
+    Is the problem behind this alert 'still' there, 'fixed', or 'ended' some
+    other way (the PC switched off)? And in words, how it stands.
+    """
+    hhmm = collectors._hhmm
+    if family in ("jabra", "pc", "recording"):
+        dev = await conn.fetchrow("SELECT microphone, microphone_is_clinic, last_seen_at, "
+                                  "revoked_at FROM devices WHERE device_id = $1",
+                                  first["device_id"])
+        if dev is None or dev["revoked_at"] is not None:
+            return "ended", "the PC is no longer in use"
+        seen = dev["last_seen_at"]
+        if family == "pc":
+            if seen is not None and seen > first["created_at"]:
+                return "fixed", f"the PC reported again at {hhmm(seen)}"
+            return "still", ("the PC has not reported since "
+                          + (hhmm(seen) if seen else "it was set up"))
+        if seen is None or seen < now - OFF_AFTER:
+            return "ended", ("the PC was switched off or went offline at "
+                           + (hhmm(seen) if seen else "an unknown time"))
+        if family == "jabra":
+            if dev["microphone_is_clinic"]:
+                return "fixed", "the Jabra is back in use"
+            return "still", f"the PC is still on {dev['microphone'] or 'its own microphone'}"
+        # A recording problem is fixed once a recording over a minute was made
+        # with no problem.
+        rows = await conn.fetch("""
+            SELECT s.opened_at, s.close_reason FROM sessions s
+             WHERE s.device_id = $1 AND s.opened_at > $2 AND s.closed_at IS NOT NULL
+               AND s.closed_at - s.opened_at >= interval '1 minute'
+               AND NOT EXISTS (SELECT 1 FROM integrity_alerts a
+                                WHERE a.session_id = s.session_id
+                                  AND a.alert_type = ANY($3::text[]))
+             ORDER BY s.opened_at LIMIT 20
+        """, first["device_id"], first["created_at"], list(collectors.PROBLEMS))
+        for r in rows:
+            if collectors.stop_kind(r["close_reason"]) not in collectors.TECHNICAL_ENDS:
+                return "fixed", f"a good recording was made at {hhmm(r['opened_at'])}"
+        return "still", "no good recording on this PC since the alert"
+    if family == "long":
+        s = await conn.fetchrow("SELECT opened_at, closed_at FROM sessions "
+                                "WHERE session_id = $1", first["session_id"])
+        if s is None:
+            return "ended", "the recording is gone"
+        if s["closed_at"] is not None:
+            return "fixed", f"the recording was stopped at {hhmm(s['closed_at'])}"
+        minutes = int((now - s["opened_at"]).total_seconds() // 60)
+        return "still", f"the recording is still running ({minutes} min)"
+    if family == "noshift":
+        r = await conn.fetchrow("""
+            SELECT s.started_at, COALESCE(p.display_name, s.email) AS who
+              FROM collector_shifts s LEFT JOIN portal_people p ON p.email = s.email
+             WHERE s.place_id = $1 AND s.started_at > $2::timestamptz - interval '1 hour'
+             ORDER BY s.started_at LIMIT 1
+        """, first["place_id"], first["created_at"])
+        if r is not None:
+            return "fixed", f"{r['who']} started the shift at {hhmm(r['started_at'])}"
+        return "still", "nobody has started the shift"
+    return "ended", "it is no longer watched"
+
+
+def _group(note: Dict[str, Any]) -> Tuple[str, str]:
+    family = FAMILY[note["event"]]
+    if family == "long":
+        return family, str(note["session_id"])
+    if family == "noshift":
+        return family, note["event_key"]
+    return family, str(note["device_id"])
+
+
+async def persisting(conn, now: Optional[datetime] = None) -> None:
+    """
+    Every round: each problem the collectors were alerted about in the last six
+    hours, looked at again. Gone: marked, and every researcher who heard about
+    it is told how and when. Still there 30, 60, 90 minutes on: sent again to
+    the collector on shift (with the Seen button) and to the researchers, with
+    whether anyone pressed Seen and who to call.
+    """
+    now = now or datetime.now(timezone.utc)
+    rows = await conn.fetch("""
+        SELECT id, email, event, event_key, subject, body, created_at, place_id,
+               hospital_id, device_id, session_id
+          FROM collector_notifications
+         WHERE audience = 'collector' AND resolved_at IS NULL
+           AND (urgent OR event = 'no_shift_started')
+           AND event = ANY($1::text[]) AND created_at > $2::timestamptz - $3::interval
+         ORDER BY created_at, id
+    """, list(FAMILY), now, WATCH_FOR)
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault(_group(dict(r)), []).append(dict(r))
+    for (family, _), notes in groups.items():
+        first = notes[0]
+        chain = first["event_key"]
+        prefix = f"still:{chain}:"
+        keys = sorted({n["event_key"] for n in notes})
+        state, how = await _still_wrong(conn, family, first, now)
+        minutes = max(0, int((now - first["created_at"]).total_seconds() // 60))
+        what = first["subject"]
+        if state != "still":
+            await conn.execute("UPDATE collector_notifications SET resolved_at = $2, "
+                               "resolution = $3 WHERE id = ANY($1::bigint[])",
+                               [n["id"] for n in notes], now, how[:200])
+            heard = await conn.fetch("""
+                SELECT DISTINCT ON (email) email, hospital_id FROM collector_notifications
+                 WHERE audience = 'watcher'
+                   AND (event_key = ANY($1::text[]) OR left(event_key, length($2)) = $2)
+                 ORDER BY email
+            """, keys + [f"esc:{k}" for k in keys], prefix)
+            for h in heard:
+                note_id = await collectors._record(
+                    conn, email=h["email"], event="problem_fixed",
+                    subject=(f"Fixed after {minutes} min: " if state == "fixed" else
+                             f"Ended after {minutes} min, not fixed: ") + what,
+                    body=(f"{_first_up(how)} - by {collectors._hhmm(now)}, {minutes} min "
+                          f"after the alert at {collectors._hhmm(first['created_at'])}.\n"
+                          + await _seen_text(conn, keys, first["created_at"], prefix)),
+                    event_key=f"fixed:{chain}", hospital_id=h["hospital_id"],
+                    device_id=first["device_id"], session_id=first["session_id"],
+                    audience="watcher")
+                if note_id is not None:
+                    await collectors._deliver(conn, note_id)
+            continue
+        waited = now - first["created_at"] - STILL_AFTER
+        if waited < timedelta(0):
+            continue
+        times = min(STILL_TIMES, 1 + int(waited / STILL_AFTER))
+        key = f"{prefix}{times}"
+        if await conn.fetchval("SELECT 1 FROM collector_notifications WHERE event_key = $1 "
+                               "LIMIT 1", key):
+            continue
+        subject = f"Still not fixed after {minutes} min: {what}"
+        last = ("\n\nThis is the last reminder; it will be in the evening report."
+                if times == STILL_TIMES else "")
+        # The collector on shift now - or, with nobody on shift, whoever had the alert.
+        places = ([first["place_id"]] if first["place_id"]
+                  else await collectors.places_of(conn, first["hospital_id"]))
+        duty = {d["email"]: pid for pid in places
+                for d in await collectors.on_duty(conn, pid)}
+        if not duty:
+            duty = {n["email"]: n["place_id"] for n in notes}
+        for email, pid in sorted(duty.items()):
+            text = (f"{_first_up(how)}. The first alert was at "
+                    f"{collectors._hhmm(first['created_at'])}, {minutes} min ago.\n\n"
+                    + first["body"])
+            note_id = await collectors._record(
+                conn, email=email, event="still_not_fixed", subject=subject, body=text,
+                event_key=key, urgent=True, place_id=pid, hospital_id=first["hospital_id"],
+                device_id=first["device_id"], session_id=first["session_id"])
+            if note_id is not None:
+                await collectors._deliver(conn, note_id)
+        # Every place holding the hospital, not just the one this note went to.
+        contacts = await contact_text(conn, first["hospital_id"],
+                                      None if first["hospital_id"] else first["place_id"])
+        body = (f"{_first_up(how)}. The first alert was at "
+                f"{collectors._hhmm(first['created_at'])}, {minutes} min ago; the collector "
+                "on shift has been reminded.\n"
+                + await _seen_text(conn, keys, first["created_at"], prefix) + "\n\n"
+                + researcher_body(first["body"], contacts)
+                + "\n\nPlease call or message them." + last)
+        await _to_watchers(conn, await _hospitals_for(conn, first["hospital_id"],
+                                                      first["place_id"]),
+                           event="still_not_fixed", subject=subject, body=body,
+                           event_key=key, urgent=True, device_id=first["device_id"],
+                           session_id=first["session_id"])
+
+
+async def repeated_stops(conn, now: Optional[datetime] = None) -> None:
+    """Three unusual stops by one doctor in two hours: a pattern worth a call."""
+    now = now or datetime.now(timezone.utc)
+    rows = await conn.fetch("""
+        SELECT s.session_id, s.hospital_id, s.doctor_id, s.device_id,
+               s.closed_at AS at, s.close_reason AS reason
+          FROM sessions s
+         WHERE s.closed_at > $1::timestamptz - $2::interval AND s.close_reason IS NOT NULL
+           AND s.hospital_id IN (SELECT hospital_id FROM researcher_hospitals
+                                  WHERE removed_at IS NULL)
+        UNION ALL
+        SELECT r.session_id, r.hospital_id, r.doctor_id, r.device_id,
+               r.refused_at, 'patient_did_not_consent'
+          FROM session_refusals r
+         WHERE r.refused_at > $1::timestamptz - $2::interval
+           AND r.hospital_id IN (SELECT hospital_id FROM researcher_hospitals
+                                  WHERE removed_at IS NULL)
+         ORDER BY 5
+    """, now, PATTERN_WINDOW)
+    stops: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    for r in rows:
+        if collectors.stop_kind(r["reason"]) is None or not r["doctor_id"]:
+            continue
+        per = stops.setdefault((r["hospital_id"], r["doctor_id"]), {})
+        if r["reason"] == "patient_did_not_consent" or r["session_id"] not in per:
+            per[r["session_id"]] = dict(r)
+    hours = int(PATTERN_WINDOW.total_seconds() // 3600)
+    day = now.astimezone(collectors.zone()).date().isoformat()
+    for (hid, doctor_id), per in stops.items():
+        if len(per) < PATTERN_STOPS:
+            continue
+        key = f"pattern:{hid}:{doctor_id}:{day}"
+        if await conn.fetchval("SELECT 1 FROM collector_notifications WHERE event_key = $1 "
+                               "LIMIT 1", key):
+            continue
+        items = sorted(per.values(), key=lambda r: r["at"])
+        last = items[-1]
+        doctor, context = await collectors.consultation_context(
+            conn, session_id=last["session_id"], hospital_id=hid)
+        listed = "\n".join(f"- {collectors._hhmm(r['at'])}: {collectors.stop_label(r['reason'])}"
+                           for r in items)
+        body = (f"{len(items)} recordings of {doctor or doctor_id} ended unusually in the "
+                f"last {hours} hours:\n{listed}\n\n{context}\n\n"
+                + await contact_text(conn, hid)
+                + "\n\nPlease ask the collector to check with the doctor between patients: "
+                  "the set-up, the Jabra, or how consent is asked.")
+        await _to_watchers(conn, [hid], event="repeated_stops",
+                           subject=f"{len(items)} unusual stops in {hours} hours - "
+                                   f"{doctor or doctor_id}",
+                           body=body, event_key=key, urgent=False,
+                           device_id=last["device_id"], session_id=last["session_id"])
+
 
 async def handled_followups(conn) -> None:
-    """A collector pressed Seen: the researchers who had the copy hear who, and how fast."""
+    """A collector pressed Seen: the researchers who had the alert hear who, and how fast."""
     rows = await conn.fetch("""
         SELECT w.id, w.email, w.event_key, w.subject, w.created_at, w.hospital_id,
                p.alert_mode, c.email AS by_email, c.seen_at, cp.display_name
@@ -129,9 +507,10 @@ async def handled_followups(conn) -> None:
             continue
         minutes = max(0, round((r["seen_at"] - r["created_at"]).total_seconds() / 60))
         who = r["display_name"] or r["by_email"]
-        subject = f"Handled: {r['subject']}"
-        body = (f"{who} marked it seen at {collectors._hhmm(r['seen_at'])}, "
-                f"{minutes} min after the alert.")
+        subject = f"Seen: {r['subject']}"
+        body = (f"{who} pressed Seen at {collectors._hhmm(r['seen_at'])}, "
+                f"{minutes} min after the alert. You will hear again if it is still not "
+                f"fixed {int(STILL_AFTER.total_seconds() // 60)} min after the alert.")
         note_id = await collectors._record(
             conn, email=r["email"], event="handled", subject=subject, body=body,
             event_key=f"handled:{r['event_key']}", hospital_id=r["hospital_id"],
@@ -139,6 +518,8 @@ async def handled_followups(conn) -> None:
         if note_id is not None:
             await collectors._deliver(conn, note_id)
 
+
+# ============================================================ the evening report
 
 async def daily_reports(conn, now: Optional[datetime] = None) -> None:
     """Every evening, once: one report per hospital to each researcher who looks after it."""
@@ -167,8 +548,6 @@ async def daily_reports(conn, now: Optional[datetime] = None) -> None:
         if note_id is not None:
             await collectors._deliver(conn, note_id)
 
-
-# ============================================================ the evening report
 
 def _pct(part: int, whole: int) -> str:
     return f"{round(100 * part / whole)}%" if whole else "-"
@@ -397,7 +776,8 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
                  WHERE m.audience = 'collector'
                    AND m.event_key IN (n.event_key, 'esc:' || n.event_key)) AS seen
           FROM collector_notifications n
-         WHERE n.hospital_id = $1 AND n.audience = 'collector' AND n.event <> 'escalation'
+         WHERE n.hospital_id = $1 AND n.audience = 'collector'
+           AND n.event NOT IN ('escalation', 'still_not_fixed')
            AND n.created_at >= $2 AND n.created_at < $3
          GROUP BY n.event_key
     """, hospital_id, start, end)
@@ -418,6 +798,34 @@ async def hospital_report(conn, hospital_id: str, day: date) -> str:
         red.append(f"{len(unhandled)} urgent alert(s) not handled")
         todo.insert(0, f"{len(unhandled)} urgent alert(s) were never marked seen: talk to the "
                        "collector on shift.")
+    # 039: problems still there 30 minutes after the alert, and how each ended.
+    lasted = await conn.fetch("""
+        SELECT o.event_key, o.event, o.subject, o.created_at, o.resolved_at, o.resolution
+          FROM (SELECT DISTINCT ON (n.event_key) n.* FROM collector_notifications n
+                 WHERE n.audience = 'collector' AND n.hospital_id = $1
+                   AND n.created_at >= $2 AND n.created_at < $3
+                   AND EXISTS (SELECT 1 FROM collector_notifications m
+                                WHERE m.event = 'still_not_fixed'
+                                  AND m.event_key LIKE 'still:%'
+                                  AND left(m.event_key, length('still:' || n.event_key) + 1)
+                                      = 'still:' || n.event_key || ':')
+                 ORDER BY n.event_key, n.id) o
+         ORDER BY o.created_at
+    """, hospital_id, start, end)
+    if lasted:
+        parts = []
+        for a in lasted:
+            what = ALERT_NAMES.get(a["event"], a["event"])
+            if a["resolved_at"]:
+                took = round((a["resolved_at"] - a["created_at"]).total_seconds() / 60)
+                parts.append(f"{what} {collectors._hhmm(a['created_at'])}, {took} min "
+                             f"({a['resolution'] or 'ended'})")
+            else:
+                parts.append(f"{what} {collectors._hhmm(a['created_at'])}, not fixed")
+        body.append(f"Not fixed within 30 min: {len(lasted)} - " + "; ".join(parts))
+        amber.append(f"{len(lasted)} problem(s) lasted over 30 min")
+        todo.append(f"{len(lasted)} problem(s) lasted over 30 minutes: ask the collector "
+                    "what held them up.")
 
     # ---------------------------------------------------------- the PCs
     body.append("")
@@ -520,8 +928,24 @@ async def watch_me(request: Request):
               FROM collector_notifications WHERE email = $1 AND audience = 'watcher'
              ORDER BY id DESC LIMIT 50
         """, person.email)
+        # 039: who to call at each of their hospitals, right now.
+        contacts = []
+        for h in hospitals:
+            for p in await on_shift(conn, h["hospital_id"]):
+                people = p["on_shift"] or p["collectors"]
+                contacts.append({
+                    "hospital_id": h["hospital_id"], "place": p["place"],
+                    "on_shift": bool(p["on_shift"]),
+                    "people": [{"name": c.get("display_name") or c["email"],
+                                "email": c["email"], "phone": c.get("phone"),
+                                "telegram": c.get("username"),
+                                "telegram_linked": c.get("chat_id") is not None,
+                                "shift": c.get("shift"),
+                                "since": collectors._iso(c.get("started_at"))}
+                               for c in people]})
     return {"email": person.email,
             "hospitals": [dict(h) for h in hospitals],
+            "contacts": contacts,
             "mode": mode or "everything",
             "report_at": report_time().strftime("%H:%M"),
             "telegram": {"ready": collectors.telegram_ready(), "linked": chat is not None,
@@ -631,5 +1055,31 @@ async def assign(body: WatchRequest, request: Request, _: None = Depends(api_v2.
     return {"status": "removed" if body.remove else "added"}
 
 
+class PhoneRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    phone: str = Field("", max_length=40)
+
+
+@admin_router.post("/people/phone")
+async def set_phone(body: PhoneRequest, request: Request,
+                    _: None = Depends(api_v2.require_admin)):
+    """A collector's phone number, for the researchers who may need to call them."""
+    email = body.email.strip().lower()
+    try:
+        phone = clean_phone(body.phone)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    by = await portal._actor(request)
+    async with _pool().acquire() as conn:
+        done = await conn.fetchval("UPDATE portal_people SET phone = $2 WHERE email = $1 "
+                                   "AND removed_at IS NULL RETURNING email", email, phone)
+    if done is None:
+        raise HTTPException(status_code=404, detail="no such person")
+    await portal._audit("person.phone", by, {"email": email, "set": phone is not None})
+    return {"status": "saved", "phone": phone}
+
+
 __all__ = ["router", "admin_router", "watched_hospitals", "watchers_of", "copy_to_watchers",
-           "handled_followups", "daily_reports", "hospital_report", "report_time"]
+           "persisting", "repeated_stops", "handled_followups", "contact_text", "on_shift",
+           "clean_phone", "researcher_body", "PROBLEMS_ONLY",
+           "daily_reports", "hospital_report", "report_time"]

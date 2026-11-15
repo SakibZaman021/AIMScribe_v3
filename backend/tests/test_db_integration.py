@@ -1000,9 +1000,11 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
     device = await enrolled_device(dbs.repo)
     quarantined = await a_session(dbs.repo, device)
     stopped = await a_session(dbs.repo, device)
-    # The two normal ends - the next patient, two minutes after the
-    # prescription - are not "stopped early".
-    normal = [await a_session(dbs.repo, device), await a_session(dbs.repo, device)]
+    # The two ordinary ends - the next patient, the consultation finished
+    # (the doctor's Stop, or the counselling time after the prescription) -
+    # are not "stopped early"; the patient leaving the room is.
+    normal = [await a_session(dbs.repo, device), await a_session(dbs.repo, device),
+              await a_session(dbs.repo, device)]
     # Today, because an alert is stamped when it is raised: the dashboard
     # shows the alerts of the days it is asked about.
     day = datetime.now(timezone.utc).date()
@@ -1011,9 +1013,10 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
                            "quarantine_reason = 'chain_broken' WHERE session_id = $1",
                            quarantined, day)
         await conn.execute("UPDATE sessions SET session_date = $2, "
-                           "close_reason = 'doctor_stopped' WHERE session_id = $1",
+                           "close_reason = 'doctor_stopped:patient_left' WHERE session_id = $1",
                            stopped, day)
-        for sid, reason in zip(normal, ("superseded_by_new_patient", "counselling_limit")):
+        for sid, reason in zip(normal, ("superseded_by_new_patient", "counselling_limit",
+                                        "doctor_stopped")):
             await conn.execute("UPDATE sessions SET session_date = $2, close_reason = $3 "
                                "WHERE session_id = $1", sid, day, reason)
     await dbs.repo.raise_alert(alert_type="dashboard_test_alert", severity="warning",
@@ -1028,8 +1031,11 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
     integrity = result["integrity"]
     assert integrity["quarantined_total"] == 1
     assert integrity["quarantined"][0]["quarantine_reason"] == "chain_broken"
-    assert integrity["stopped_early_total"] == 1
-    assert integrity["stopped_early"][0]["close_reason"] == "doctor_stopped"
+    # Other tests' refusals the same day count too (a refusal is stopped early),
+    # so look for ours and for the absence of the ordinary ends.
+    reasons = {r["close_reason"] for r in integrity["stopped_early"]}
+    assert "doctor_stopped:patient_left" in reasons
+    assert not reasons & {"superseded_by_new_patient", "counselling_limit", "doctor_stopped"}
     assert any(a["alert_type"] == "dashboard_test_alert" for a in integrity["alerts"])
 
 
@@ -3083,7 +3089,7 @@ async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_
             ["HOSP003"]
 
         async with dbs.rec.acquire() as conn:
-            # The collector's alert, and the researcher's copy saying who was told.
+            # The collector's alert, and the researcher's version: who is on shift.
             key = f"t-watch-{mine}"
             await collectors.notify(conn, hospital_id="HOSP003", event="jabra_unplugged",
                                     subject="Jabra unplugged: HOSP003, PC", body="b"
@@ -3092,8 +3098,8 @@ async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_
             copy = await conn.fetchrow("SELECT * FROM collector_notifications "
                                        "WHERE email = 'res@uni.example' AND event_key = $1", key)
             assert copy["audience"] == "watcher" and copy["urgent"] and copy["delivered"]
-            assert "Sent to the collector on shift: " in copy["body"]
-            assert "sentinel@gmail.example" in copy["body"]
+            assert "Data collector on shift at " in copy["body"]
+            assert "no phone given, Telegram not connected" in copy["body"]
             assert "Open " not in copy["body"]           # the collector's footer is left off
             note = await conn.fetchval("SELECT id FROM collector_notifications "
                                        "WHERE email = 'sentinel@gmail.example' AND event_key = $1",
@@ -3110,7 +3116,7 @@ async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_
             await watchers.handled_followups(conn)            # once only
             handled = await conn.fetch("SELECT * FROM collector_notifications "
                                        "WHERE email = 'res@uni.example' AND event = 'handled'")
-            assert len(handled) == 1 and "marked it seen" in handled[0]["body"]
+            assert len(handled) == 1 and "pressed Seen at" in handled[0]["body"]
 
             # One nobody deals with: the researcher hears it was not handled.
             key2 = f"t-watch2-{mine}"
@@ -3123,7 +3129,7 @@ async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_
             assert await conn.fetchval("""
                 SELECT subject FROM collector_notifications
                  WHERE email = 'res@uni.example' AND event_key = $1
-            """, f"esc:{key2}") == "Not handled in 15 min: PC not reporting: HOSP003, PC"
+            """, f"esc:{key2}") == "Not seen in 15 min: PC not reporting: HOSP003, PC"
 
         # 'Only problems': no copy of the routine, still the problems.
         client.cookies.clear()
@@ -3327,4 +3333,133 @@ async def test_an_unusual_stop_is_told_with_the_doctor_the_pc_and_the_consultati
             text = await watchers.hospital_report(conn, "HOSP003", today)
         assert "stopped unusually" in text and "Stopped because:" in text
         assert "the patient left the room" in text
+    _unserve()
+
+
+async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs, monkeypatch):
+    """
+    039: the researcher gets the alert at once with the collector on shift and
+    their phone and Telegram; still wrong 30 minutes on, the collector is
+    reminded and the researcher told again; fixed, the researcher hears how.
+    """
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _make_collector(client, who, "caller@gmail.example")
+        # The collector gives their phone; nonsense is refused.
+        assert (await client.post("/api/v2/dashboard/collector/phone", headers=h,
+                                  json={"phone": "call me"})).status_code == 422
+        saved = await client.post("/api/v2/dashboard/collector/phone", headers=h,
+                                  json={"phone": "01711-000000"})
+        assert saved.status_code == 200 and saved.json()["phone"] == "01711-000000"
+        assert (await client.get("/api/v2/dashboard/collector/me")).json()["phone"] == \
+            "01711-000000"
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "lead@uni.example")
+        # An admin may correct it.
+        fixed = await client.post("/api/v2/admin/people/phone", headers=h,
+                                  json={"email": "caller@gmail.example",
+                                        "phone": "+880 1711 000000"})
+        assert fixed.status_code == 200, fixed.text
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "caller@gmail.example")["phone"] == \
+            "+880 1711 000000"
+
+        key = f"t-last-{device['device_id']}"
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO collector_telegram (email, chat_id, username) "
+                               "VALUES ('caller@gmail.example', 990011, 'caller_tg') "
+                               "ON CONFLICT (email) DO NOTHING")
+            await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE, "
+                               "microphone = 'Laptop mic', last_seen_at = now() "
+                               "WHERE device_id = $1", device["device_id"])
+            await collectors.notify(
+                conn, hospital_id="HOSP003", event="jabra_unplugged",
+                subject="Jabra unplugged: HOSP003, PC",
+                body=("At 10:05 the recording moved off the Jabra.\n\nPlease go to the room "
+                      "and plug the Jabra back in.") + collectors._footer(),
+                event_key=key, urgent=True, everyone_if_nobody=True,
+                device_id=device["device_id"])
+            copy = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'lead@uni.example' AND event_key = $1", key)
+            # At once: what happened, what the collector was asked, who to call.
+            assert copy["audience"] == "watcher" and copy["urgent"]
+            body = copy["body"]
+            assert "At 10:05 the recording moved off the Jabra." in body
+            assert "The collector was asked to: go to the room" in body
+            assert "phone +880 1711 000000, Telegram @caller_tg" in body
+            assert "Open " not in body
+
+            # Fixed within 30 minutes: nothing more yet.
+            await watchers.persisting(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"still:{key}:1")
+            # 31 minutes on and still on the laptop microphone.
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '31 minutes' WHERE event_key = $1", key)
+            await watchers.persisting(conn)
+            await watchers.persisting(conn)                        # once only
+            still = {r["email"]: r for r in await conn.fetch(
+                "SELECT * FROM collector_notifications WHERE event_key = $1", f"still:{key}:1")}
+            reminder = still["caller@gmail.example"]
+            assert reminder["audience"] == "collector" and reminder["urgent"]
+            assert reminder["subject"].startswith("Still not fixed after 31 min: Jabra unplugged")
+            told = still["lead@uni.example"]
+            assert told["audience"] == "watcher"
+            assert "The PC is still on Laptop mic" in told["body"]
+            assert "Nobody has pressed Seen." in told["body"]
+            assert "Telegram @caller_tg" in told["body"]
+            assert await conn.fetchval("SELECT count(*) FROM collector_notifications "
+                                       "WHERE event_key = $1", f"still:{key}:1") == len(still)
+
+            # The Jabra is plugged back in: the researcher hears it is fixed, and how.
+            await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
+                               "WHERE device_id = $1", device["device_id"])
+            await watchers.persisting(conn)
+            done = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'lead@uni.example' AND event_key = $1",
+                                       f"fixed:{key}")
+            assert done["subject"].startswith("Fixed after 31 min: Jabra unplugged")
+            assert done["body"].startswith("The Jabra is back in use")
+            assert await conn.fetchval("SELECT resolution FROM collector_notifications "
+                                       "WHERE event_key = $1 LIMIT 1", key) == \
+                "the Jabra is back in use"
+            today = datetime.now(collectors.zone()).date()
+            text = await watchers.hospital_report(conn, "HOSP003", today)
+            assert "Not fixed within 30 min:" in text and "the Jabra is back in use" in text
+
+            # Three unusual stops by one doctor in two hours: a pattern worth a call.
+            for _ in range(3):
+                sid = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=10))
+                await conn.execute("UPDATE sessions SET closed_at = now(), "
+                                   "close_reason = 'doctor_stopped:patient_left' "
+                                   "WHERE session_id = $1", sid)
+            await watchers.repeated_stops(conn)
+            pattern = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                          "WHERE email = 'lead@uni.example' "
+                                          "AND event = 'repeated_stops'")
+            assert "unusual stops in 2 hours" in pattern["subject"]
+            assert "the patient left the room" in pattern["body"]
+            assert "Telegram @caller_tg" in pattern["body"]
+
+        # The researcher's page: who to call now.
+        client.cookies.clear()
+        who["value"] = "lead@uni.example"
+        await _sign_in(client)
+        me = (await client.get("/api/v2/dashboard/watch/me")).json()
+        people = [p for g in me["contacts"] for p in g["people"]]
+        caller = next(p for p in people if p["email"] == "caller@gmail.example")
+        assert caller["phone"] == "+880 1711 000000" and caller["telegram"] == "caller_tg"
+        assert any(g["on_shift"] for g in me["contacts"])
     _unserve()
