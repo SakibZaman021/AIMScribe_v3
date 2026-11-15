@@ -371,8 +371,10 @@ async def list_people(_: None = _admin()):
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
             SELECT p.email, p.role, p.display_name, p.added_by, p.added_at, p.last_signed_in,
-                   p.db_user, p.db_password_set_at, p.place_id, pl.name AS place
+                   p.db_user, p.db_password_set_at, p.place_id, pl.name AS place,
+                   (t.email IS NOT NULL) AS telegram
               FROM portal_people p LEFT JOIN places pl ON pl.place_id = p.place_id
+              LEFT JOIN collector_telegram t ON t.email = p.email
              WHERE p.removed_at IS NULL ORDER BY p.role, p.email
         """)
     owner = owner_email()
@@ -537,10 +539,16 @@ def _invitation_text(email: str, role: str, by: str, place: Optional[str]) -> st
         return (f"{by} has made you a data collector for AIMScribe"
                 + (f" at {place}" if place else "") + ".\n\n"
                 f"Open {link} and sign in with this Google account ({email}).\n\n"
+                "First, on your phone: install Telegram, open My shift in the dashboard and "
+                "press Connect Telegram, then Start in Telegram. Alerts reach your phone at "
+                "once that way.\n\n"
                 "When you arrive for your shift, open My shift and press Start my shift. "
-                "While you are on shift you get an email whenever the Jabra is unplugged, "
-                "a recording has a problem, a PC stops reporting, or a recording is saved. "
-                "Press End my shift when you leave: your shifts are recorded for your salary.\n\n"
+                "While you are on shift you are alerted whenever the Jabra is unplugged, a "
+                "patient is recorded without the Jabra, a recording has a problem, or a PC "
+                "stops reporting. Recordings that finish normally are on the dashboard; you "
+                "get no message for them. "
+                "Press End my shift when you leave: your shifts are recorded for your salary, "
+                "and the shift's summary is emailed to you.\n\n"
                 "You can see the recordings of your place's hospitals, but not download "
                 "or play them.\n\n"
                 "If you did not expect this, you can ignore this email.\n")

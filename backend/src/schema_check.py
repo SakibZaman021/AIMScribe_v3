@@ -171,6 +171,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _table("collector_shifts")),
     ("036_v3_data_collectors.sql", "recordings", "role 'collector' allowed",
      _check_allows("portal_people", "role", "collector")),
+    # Without it collectors get no Telegram alerts and a failed alert is not retried.
+    ("037_v3_collector_telegram.sql", "recordings", "table collector_telegram",
+     _table("collector_telegram")),
+    ("037_v3_collector_telegram.sql", "recordings", "column collector_notifications.next_try_at",
+     _column("collector_notifications", "next_try_at")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

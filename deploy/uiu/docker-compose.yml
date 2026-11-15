@@ -264,6 +264,7 @@ services:
       AIMS_ALERT_EMAIL: ${AIMS_ALERT_EMAIL:-}
       AIMS_COLLECTOR_MAIL_FROM: ${AIMS_COLLECTOR_MAIL_FROM:-}
       AIMS_COLLECTOR_MAILER: ${AIMS_COLLECTOR_MAILER:-on}
+      AIMS_TELEGRAM_BOT_TOKEN: ${AIMS_TELEGRAM_BOT_TOKEN:-}
       # Downloads from the portal (downloads.py): the archive worker decrypts
       # one copy and streams it back, on the internal network. The limits are
       # per person.

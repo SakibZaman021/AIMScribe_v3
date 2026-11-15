@@ -65,3 +65,27 @@ def test_the_mail_status_says_what_to_set(monkeypatch):
     monkeypatch.setenv("AIMS_COLLECTOR_MAIL_FROM", "AIMScribe <alerts@aims.example>")
     assert collectors.mail_status() == {"ready": True, "sender": "AIMScribe <alerts@aims.example>",
                                         "problem": None}
+
+
+def test_only_a_passing_failure_is_tried_again():
+    assert collectors._transient("Resend could not be reached: ConnectTimeout")
+    assert collectors._transient("telegram: Telegram answered 429: Too Many Requests")
+    assert collectors._transient("Resend answered 503: unavailable")
+    assert not collectors._transient("Resend answered 403: domain not verified")
+    assert not collectors._transient("telegram: Telegram answered 403: bot was blocked by the user")
+    assert not collectors._transient(None)
+
+
+def test_the_bot_token_never_shows_in_an_error(monkeypatch):
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:SECRETSECRETSECRETSECRETSECRET12")
+    assert "SECRET" not in collectors._hide(
+        "error at https://api.telegram.org/bot123456:SECRETSECRETSECRETSECRETSECRET12/x")
+    monkeypatch.delenv("AIMS_TELEGRAM_BOT_TOKEN")
+    status = collectors.telegram_status_now()
+    assert status["ready"] is False and "set-telegram.sh" in status["problem"]
+
+
+def test_an_urgent_telegram_message_is_marked_and_fits():
+    text = collectors._telegram_text("Jabra unplugged: HOSP003, PC-1", "x" * 5000, True)
+    assert text.startswith("\U0001F534 Jabra unplugged") and len(text) <= 4000
+    assert not collectors._telegram_text("Shift summary", "body", False).startswith("\U0001F534")

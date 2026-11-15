@@ -2798,3 +2798,234 @@ async def test_a_new_collector_is_invited_by_email_through_resend(dbs, monkeypat
                  ).json()
         assert added["invited"] is False and "403" in added["invite_error"]
     _unserve()
+
+
+class _FakeTelegram:
+    """Telegram's Bot API, as far as the collectors' alerts use it."""
+
+    def __init__(self):
+        self.calls = []
+        self.updates = []
+
+    async def __call__(self, method, payload, timeout=15):
+        self.calls.append((method, payload))
+        if method == "getMe":
+            return {"username": "AIMScribeTestBot"}, None
+        if method == "getUpdates":
+            return [u for u in self.updates if u["update_id"] >= payload["offset"]], None
+        if method == "sendMessage":
+            return {"message_id": len(self.calls)}, None
+        return True, None
+
+    def sent_to(self, chat):
+        return [p for m, p in self.calls if m == "sendMessage" and p["chat_id"] == chat]
+
+
+async def test_a_collector_connects_telegram_and_urgent_alerts_reach_it(dbs, monkeypatch):
+    import collectors
+    mails = []
+
+    async def fake_mail(to, subject, text):
+        mails.append((to, subject))
+        return True, None
+
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "phone@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        me = (await client.get("/api/v2/dashboard/collector/me")).json()
+        assert me["telegram"] == {"ready": True, "linked": False, "username": None,
+                                  "linked_at": None}
+        link = (await client.post("/api/v2/dashboard/collector/telegram/link", headers=h)).json()
+        assert link["url"].startswith("https://t.me/AIMScribeTestBot?start=")
+        code = link["url"].split("start=")[1]
+
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE collector_notifier_state SET last_id = 0 "
+                               "WHERE name = 'telegram'")
+            fake.updates = [
+                {"update_id": 900001, "message": {"chat": {"id": 555, "type": "private"},
+                                                  "from": {"username": "col_one"},
+                                                  "text": f"/start {code}"}},
+                # the same link pressed again: it is used up
+                {"update_id": 900002, "message": {"chat": {"id": 777, "type": "private"},
+                                                  "text": f"/start {code}"}}]
+            await notifier.telegram_updates(conn)
+            assert await conn.fetchval("SELECT chat_id FROM collector_telegram "
+                                       "WHERE email = 'phone@gmail.example'") == 555
+            assert fake.sent_to(555)[0]["text"].startswith("Connected: phone@gmail.example")
+            assert "expired" in fake.sent_to(777)[0]["text"]
+            assert await conn.fetchval("SELECT last_id FROM collector_notifier_state "
+                                       "WHERE name = 'telegram'") == 900002
+
+            # The Jabra is unplugged: the alert goes to Telegram, with a Seen button.
+            await notifier.alerts(conn)
+            await dbs.repo.raise_alert(
+                alert_type="microphone_switched", session_id=mine, device_id=device["device_id"],
+                detail={"detail": "the microphone stopped", "microphone": "Microphone Array"})
+            await notifier.alerts(conn)
+            alert = fake.sent_to(555)[-1]
+            assert alert["text"].startswith("\U0001F534 Jabra unplugged")
+            button = alert["reply_markup"]["inline_keyboard"][0][0]
+            assert button["callback_data"].startswith("seen:")
+            note = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                       int(button["callback_data"][5:]))
+            assert (note["email"], note["event"]) == ("phone@gmail.example", "jabra_unplugged")
+            assert note["delivered"] and note["channel"] == "telegram"
+            assert not [m for m in mails if m[0] == "phone@gmail.example"]   # not mailed too
+
+            # Someone else's chat cannot mark it; the collector's Seen does.
+            fake.updates = [
+                {"update_id": 900003, "callback_query": {
+                    "id": "q1", "data": f"seen:{note['id']}",
+                    "message": {"message_id": 5, "chat": {"id": 777}}}},
+                {"update_id": 900004, "callback_query": {
+                    "id": "q2", "data": f"seen:{note['id']}",
+                    "message": {"message_id": 6, "chat": {"id": 555}}}}]
+            await notifier.telegram_updates(conn)
+            answers = [p["text"] for m, p in fake.calls if m == "answerCallbackQuery"]
+            assert answers[-2:] == ["Not found", "Marked seen"]
+            assert await conn.fetchval("SELECT seen_at FROM collector_notifications "
+                                       "WHERE id = $1", note["id"]) is not None
+
+        # The shift summary still comes by email.
+        ended = await client.post("/api/v2/dashboard/collector/shift/end", headers=h)
+        assert ended.status_code == 200
+        assert any(m[0] == "phone@gmail.example" and m[1].startswith("Shift summary")
+                   for m in mails)
+        test = (await client.post("/api/v2/dashboard/collector/telegram/test", headers=h)).json()
+        assert test["sent"] is True
+
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "phone@gmail.example")["telegram"] is True
+        places = (await client.get("/api/v2/admin/places")).json()
+        assert places["telegram"] == {"ready": True, "bot": "AIMScribeTestBot", "problem": None}
+    _unserve()
+
+
+async def test_a_patient_recorded_without_the_jabra_alerts_but_a_saved_one_does_not(
+        dbs, monkeypatch):
+    import collectors
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "watcher@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        # The doctor unplugged the Jabra for the last patient and left it out:
+        # the next patient's recording starts on the laptop's microphone.
+        nxt = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=2))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                UPDATE devices SET microphone = 'Microphone Array (Realtek)',
+                       microphone_is_clinic = FALSE, last_seen_at = now()
+                 WHERE device_id = $1
+            """, device["device_id"])
+            # The recording with the switch inside it has finished.
+            await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1",
+                               mine)
+            notifier = collectors.Notifier()
+            await notifier.recordings_without_jabra(conn)
+            alerts = [s for s in sent if s[0] == "watcher@gmail.example"
+                      and s[1].startswith("Patient recorded without the Jabra")]
+            assert len(alerts) == 1
+            row = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                      "WHERE event_key = $1 AND email = 'watcher@gmail.example'",
+                                      f"nojabra:{nxt}")
+            assert row["urgent"] and row["delivered"]
+            # Not again for the same recording, and the one with the switch is not named.
+            await notifier.recordings_without_jabra(conn)
+            assert len([s for s in sent if s[0] == "watcher@gmail.example"
+                        and s[1].startswith("Patient recorded")]) == len(alerts)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"nojabra:{mine}")
+            # A whole round: no "Recording saved" message for anything.
+            await notifier.round(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'recording_finished' "
+                                           "AND email = 'watcher@gmail.example'")
+    _unserve()
+
+
+async def test_an_alert_that_could_not_be_sent_is_tried_again_and_the_lab_is_told(
+        dbs, monkeypatch):
+    import collectors
+    answers = []
+    sent = []
+
+    async def flaky_mail(to, subject, text):
+        sent.append((to, subject))
+        return answers.pop(0) if answers else (True, None)
+
+    monkeypatch.setattr(collectors, "send_mail", flaky_mail)
+    monkeypatch.setenv("AIMS_ALERT_EMAIL", "lab@uiu.example")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "retry@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            # Straight to this collector, so no other test's collector takes the answer.
+            answers[:] = [(False, "Resend could not be reached: ConnectTimeout")]
+            first = await collectors._record(conn, email="retry@gmail.example",
+                                             event="jabra_unplugged", subject="Jabra unplugged: t",
+                                             body="b", event_key=f"t-{mine}-retry", urgent=True)
+            await collectors._deliver(conn, first)
+            note = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                       first)
+            assert note["delivered"] is False and note["attempts"] == 1
+            assert note["next_try_at"] is not None                  # a passing failure
+            await notifier.retry_failed(conn)                      # not yet due
+            assert (await conn.fetchval("SELECT attempts FROM collector_notifications "
+                                        "WHERE id = $1", note["id"])) == 1
+            await conn.execute("UPDATE collector_notifications SET next_try_at = now() "
+                               "- interval '1 second' WHERE id = $1", note["id"])
+            await notifier.retry_failed(conn)
+            again = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                        note["id"])
+            assert again["delivered"] is True and again["attempts"] == 2
+            assert again["next_try_at"] is None and again["error"] is None
+
+            # A refusal that will not pass is not retried.
+            answers[:] = [(False, "Resend answered 403: domain not verified")]
+            nid = await collectors._record(conn, email="retry@gmail.example", event="pc_silent",
+                                           subject="PC not reporting", body="b",
+                                           event_key=f"t-{mine}-403", urgent=True)
+            await collectors._deliver(conn, nid)
+            assert await conn.fetchval("SELECT next_try_at FROM collector_notifications "
+                                       "WHERE id = $1", nid) is None
+
+            # Many failures in half an hour: AIMS LAB is told once.
+            for i in range(collectors.FAILURES_ALARM):
+                await conn.execute("""
+                    INSERT INTO collector_notifications (email, event, subject, body, event_key,
+                                                        delivered, error)
+                    VALUES ('retry@gmail.example', 'pc_silent', 's', 'b', $1, FALSE, 'down')
+                """, f"t-{mine}-fail-{i}")
+            await notifier.failure_alarm(conn)
+            await notifier.failure_alarm(conn)
+            told = [s for s in sent if s[0] == "lab@uiu.example" and "could not be sent" in s[1]]
+            assert len(told) == 1
+    _unserve()

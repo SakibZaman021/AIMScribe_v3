@@ -159,14 +159,28 @@
             <button type="button" class="primary" id="shiftStart" hidden>Start my shift</button>
             <button type="button" class="ghost" id="shiftEnd" hidden>End my shift</button>
           </div>
-          <p class="hint" id="shiftHint">While you are on shift you get an email for every Jabra
-            unplugged, recording problem, silent PC and finished recording at your place.</p>
+          <p class="hint" id="shiftHint">While you are on shift, Telegram alerts you at once
+            about anything unusual at your place.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-telegram">
+        <div class="head wrap"><h3 id="h-telegram">Alerts on your phone</h3>
+          <span class="hint">Telegram, free. Do this once, on your phone.</span></div>
+        <div class="body shiftbody">
+          <p id="tgState" role="status"></p>
+          <div class="row">
+            <button type="button" class="primary" id="tgLink" hidden>Connect Telegram</button>
+            <button type="button" class="ghost" id="tgTest" hidden>Send me a test alert</button>
+          </div>
+          <p class="hint">Install Telegram from the Play Store, press Connect Telegram, then
+            press Start in Telegram. Keep Telegram's notifications on. For an urgent alert,
+            press Seen in Telegram when you are dealing with it.</p>
         </div>
       </section>
       <section class="panel" aria-labelledby="h-mails">
         <div class="head wrap"><h3 id="h-mails">My alerts</h3>
-          <span class="hint">Urgent alerts not marked seen in 15 minutes also go to the
-            other collectors of your place and to AIMS LAB.</span></div>
+          <span class="hint">Urgent alerts not marked seen in 15 minutes (here, or with Seen
+            in Telegram) also go to the other collectors of your place and to AIMS LAB.</span></div>
         <div class="scroll"><div id="myMails"></div></div>
       </section>
     </section>
@@ -258,6 +272,9 @@
         <div class="body row">
           <span id="mailState" role="status"></span>
           <button type="button" class="ghost small" id="mailTest">Send me a test mail</button>
+        </div>
+        <div class="body row">
+          <span id="tgAdminState" role="status"></span>
         </div>
         <form id="placeForm" class="peopleform">
           <label>Place <input id="plName" required autocomplete="off" placeholder="Mirpur"></label>

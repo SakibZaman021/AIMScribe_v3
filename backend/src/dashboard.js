@@ -1243,7 +1243,7 @@ async function loadPeople() {
         + ((mail_status && mail_status.problem) || "");
     const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
-      + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th></th></tr></thead><tbody>`
+      + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th>Telegram</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
         + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
         + td("Role", p.role === "admin" ? tag("warn", "Admin")
@@ -1256,6 +1256,8 @@ async function loadPeople() {
           : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
+        + td("Telegram", p.role !== "collector" ? ""
+          : p.telegram ? tag("good", "connected") : tag("warn", "not connected"))
         + td("", p.owner ? `<span class="hint">owner</span>`
           : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1580,8 +1582,11 @@ const EVENT_LABELS = {
   recording_problem: "Recording problem", pc_silent: "PC not reporting",
   recording_finished: "Recording saved", shift_summary: "Shift summary",
   no_shift_started: "Nobody on shift", escalation: "Not yet seen",
+  recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
 };
 
+let tgWaiting = false;   // 037: Connect Telegram was pressed; watch for the link
+let tgTimer = null;
 let shiftSeq = 0;
 async function loadShift() {
   const seq = ++shiftSeq;
@@ -1601,25 +1606,42 @@ async function loadShift() {
     : "You are not on shift.";
   $("shiftStart").hidden = !!on;
   $("shiftEnd").hidden = !on;
-  $("shiftHint").textContent = me.mail_ready
-    ? "While you are on shift you get an email for every Jabra unplugged, recording problem, silent PC and finished recording at your place."
-    : "Emails are not reaching you yet: AIMS LAB is finishing the mail set-up. Until then every alert "
-      + "is listed below as soon as it happens, so keep this page open during your shift.";
+  const tg = me.telegram || {};
+  $("shiftHint").textContent = tg.linked
+    ? "While you are on shift, Telegram alerts you at once when the Jabra is unplugged, a patient "
+      + "is recorded without the Jabra, a recording has a problem or a PC stops reporting. "
+      + "Recordings that finish normally are only shown on the dashboard."
+    : (me.mail_ready
+      ? "Connect Telegram below so alerts reach your phone at once. Until then they come by email."
+      : "Connect Telegram below so alerts reach your phone at once. Until then every alert is "
+        + "listed below as soon as it happens, so keep this page open during your shift.");
+  $("tgState").innerHTML = !tg.ready
+    ? tag("warn", "Telegram not set up yet") + ` <span class="hint">AIMS LAB is finishing it.</span>`
+    : tg.linked
+      ? tag("good", "Telegram connected")
+        + ` <span class="hint">${tg.username ? "@" + esc(tg.username) + " · " : ""}since ${esc(dhaka(tg.linked_at))}</span>`
+      : tag("bad", "Telegram not connected")
+        + ` <span class="hint">Press Connect Telegram, then Start in Telegram.</span>`;
+  $("tgLink").hidden = !tg.ready;
+  $("tgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
+  $("tgTest").hidden = !tg.linked;
+  if (tg.linked && tgWaiting) { tgWaiting = false; clearInterval(tgTimer); }
   const mails = me.notifications || [];
   const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
   const badge = $("badge-shift");
   badge.textContent = unseen ? String(unseen) : "";
   badge.hidden = !unseen;
   $("myMails").innerHTML = !mails.length
-    ? empty("No alerts yet", "They appear here, and by email, while you are on shift.", true)
+    ? empty("No alerts yet", "They appear here, and on Telegram, while you are on shift.", true)
     : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th>`
-      + `<th>Email</th><th></th></tr></thead><tbody>`
+      + `<th>Sent</th><th></th></tr></thead><tbody>`
       + mails.map((n) => `<tr class="${n.urgent && !n.seen_at ? "row-bad" : ""}">`
         + td("When", esc(dhaka(n.happened_at || n.created_at)))
         + td("What", tag(n.urgent ? "bad" : "good", EVENT_LABELS[n.event] || human(n.event)))
         + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
         + td("Message", esc(n.subject), "wrap")
-        + td("Email", n.delivered ? tag("good", "sent") : tag("warn", "not sent", n.error || ""))
+        + td("Sent", n.delivered ? tag("good", n.channel === "telegram" ? "Telegram" : "email")
+          : tag("warn", "not sent", n.error || ""))
         + td("", n.seen_at ? `<span class="hint">seen</span>`
           : `<button type="button" class="chip" data-seen="${esc(n.id)}">Mark seen</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1653,7 +1675,10 @@ $("myMails").addEventListener("click", async (e) => {
 let PLACES = [];
 async function loadPlaces() {
   try {
-    const { places, hospitals, mail } = await adminCall("GET", "/api/v2/admin/places");
+    const { places, hospitals, mail, telegram } = await adminCall("GET", "/api/v2/admin/places");
+    $("tgAdminState").innerHTML = telegram && telegram.ready
+      ? tag("good", "Telegram works") + ` <span class="hint">bot @${esc(telegram.bot)}</span>`
+      : tag("bad", "Telegram not working") + ` <span class="hint">${esc((telegram && telegram.problem) || "")}</span>`;
     PLACES = places || [];
     $("placesHint").textContent = "A place is a group of hospitals. Its data collectors see only these hospitals.";
     $("mailState").innerHTML = mail && mail.ready
@@ -1745,4 +1770,38 @@ $("mailTest").addEventListener("click", async () => {
     $("mailState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
   }
   $("mailTest").disabled = false;
+});
+
+/* 037: Telegram - a one-time link, then the page watches until it is connected. */
+$("tgLink").addEventListener("click", async () => {
+  $("tgLink").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/telegram/link");
+    window.open(r.url, "_blank", "noopener");
+    $("tgState").innerHTML = `<span class="hint">Telegram opened: press <b>Start</b> there. `
+      + `If it did not open, <a href="${esc(r.url)}" target="_blank" rel="noopener">tap here</a>. `
+      + `This page shows Connected within half a minute.</span>`;
+    tgWaiting = true;
+    clearInterval(tgTimer);
+    let polls = 0;
+    tgTimer = setInterval(() => {
+      if (++polls > 40 || !tgWaiting) { clearInterval(tgTimer); return; }
+      loadShift();
+    }, 5000);
+  } catch (err) {
+    $("tgState").innerHTML = tag("bad", "Could not connect") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("tgLink").disabled = false;
+});
+$("tgTest").addEventListener("click", async () => {
+  $("tgTest").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/telegram/test");
+    $("tgState").innerHTML = r.sent
+      ? tag("good", "Test alert sent") + ` <span class="hint">Your phone should have made a sound. If not, turn on Telegram's notifications.</span>`
+      : tag("bad", "Test alert not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("tgState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("tgTest").disabled = false;
 });

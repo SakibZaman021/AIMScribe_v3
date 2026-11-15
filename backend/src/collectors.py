@@ -11,18 +11,22 @@ sign in with Google like everyone else, and:
     shift     press Start my shift on arrival and End my shift on leaving; each
               press pair is an attendance row an admin downloads as a CSV for
               salaries (`shifts_csv`)
-    mail      while on shift, a mail within about a minute of each event at
-              their place: the Jabra unplugged or back, a recording that could
-              not start or failed, a PC gone silent, a recording finished and
-              safe, and a summary when the shift ends
+    alerts    while on shift, a Telegram message within about a minute of each
+              unusual event at their place (037): the Jabra unplugged or back,
+              a new patient recorded without the Jabra, a recording that could
+              not start or failed, a PC gone silent. A recording that finished
+              normally is shown on the dashboard only - no message. Email
+              carries the invitation and the end-of-shift summary, and any
+              alert of a collector who has not connected Telegram.
 
 A place is a named group of hospitals with two six-hour shifts. Nothing is
 ever deleted: a hospital taken out of a place is marked, a shift left open is
 closed by the server and marked 'auto', and every mail is kept.
 
 The mailer runs in one API process at a time (a lease in
-collector_notifier_state) and sends through Resend's HTTPS API, because
-DigitalOcean closes the mail ports.
+collector_notifier_state). Mail goes through Resend's HTTPS API, because
+DigitalOcean closes the mail ports; Telegram through its Bot API. A message
+that could not be sent is tried again with growing waits for six hours.
 """
 from __future__ import annotations
 
@@ -32,6 +36,8 @@ import io
 import json
 import logging
 import os
+import secrets
+import time
 import uuid
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +52,8 @@ import api_v2
 import portal
 
 logger = logging.getLogger(__name__)
+# httpx logs every request URL at INFO, and a Telegram URL holds the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 router = APIRouter(prefix="/api/v2/dashboard/collector", tags=["collectors"])
 admin_router = APIRouter(prefix="/api/v2/admin", tags=["collectors"])
@@ -59,6 +67,18 @@ NO_SHIFT_AFTER = timedelta(minutes=30)    # nobody pressed Start shift
 SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
 AUTO_CLOSE_AFTER = timedelta(hours=1)     # a shift nobody ended
 OTHER_SHIFT = timedelta(hours=6)          # a shift started outside both windows
+
+TELEGRAM_API = "https://api.telegram.org"
+# Minutes to wait before each new try of a message that could not be sent.
+RETRY_WAITS = (1, 2, 5, 10, 20, 40, 60, 60, 60)
+RETRY_FOR = timedelta(hours=6)
+# Never faster than the services allow: Resend a few mails a second,
+# Telegram about thirty messages a second.
+SEND_GAP = {"email": 0.6, "telegram": 0.05}
+FAILURES_ALARM = 5                        # failed sends in 30 minutes: tell the lab
+LINK_CODE_LASTS = timedelta(days=1)
+# Sent by email first (long, read later); everything else by Telegram first.
+EMAIL_FIRST = {"shift_summary"}
 
 # Recorder alerts that mean a consultation may be missing or damaged
 # (api_v2.RECORDER_CRITICAL): mailed at once, marked urgent.
@@ -231,9 +251,11 @@ async def me(request: Request):
                                     "AND ended_at IS NULL", person.email)
         notes = await conn.fetch("""
             SELECT id, created_at, happened_at, event, urgent, subject, hospital_id,
-                   delivered, error, seen_at
+                   delivered, error, seen_at, channel
               FROM collector_notifications WHERE email = $1 ORDER BY id DESC LIMIT 50
         """, person.email)
+        chat = await conn.fetchrow("SELECT username, linked_at FROM collector_telegram "
+                                   "WHERE email = $1", person.email)
     return {"email": person.email,
             "place": {"place_id": place["place_id"], "name": place["name"],
                       "morning": [place["morning_start"].strftime("%H:%M"),
@@ -242,6 +264,9 @@ async def me(request: Request):
                                   place["evening_end"].strftime("%H:%M")]},
             "hospitals": hospitals, "shift": _shift_view(shift),
             "mail_ready": mail_status()["ready"], "mail": mail_status(),
+            "telegram": {"ready": telegram_ready(), "linked": chat is not None,
+                         "username": chat["username"] if chat else None,
+                         "linked_at": _iso(chat["linked_at"]) if chat else None},
             "notifications": [{k: _iso(v) for k, v in dict(n).items()} for n in notes]}
 
 
@@ -288,6 +313,35 @@ async def mark_seen(note_id: int, request: Request):
              WHERE id = $1 AND email = $2 AND seen_at IS NULL
         """, note_id, person.email)
     return {"status": "seen" if done.endswith("1") else "unchanged"}
+
+
+@router.post("/telegram/link")
+async def telegram_link(request: Request):
+    """A one-time t.me link: pressing Start in Telegram connects this collector's chat."""
+    person = await _collector(request, write=True)
+    bot = await telegram_bot()
+    if bot is None:
+        raise HTTPException(status_code=409, detail=telegram_status_now()["problem"]
+                            or "Telegram is not set up on this server yet")
+    code = secrets.token_urlsafe(18)
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO collector_telegram_codes (code, email) VALUES ($1, $2)",
+                           code, person.email)
+    return {"url": f"https://t.me/{bot}?start={code}", "bot": bot}
+
+
+@router.post("/telegram/test")
+async def telegram_test(request: Request):
+    """One test alert to the collector's own Telegram, with Telegram's exact answer."""
+    person = await _collector(request, write=True)
+    async with _pool().acquire() as conn:
+        chat = await conn.fetchval("SELECT chat_id FROM collector_telegram WHERE email = $1",
+                                   person.email)
+    if chat is None:
+        raise HTTPException(status_code=409, detail="connect Telegram first")
+    ok, error = await send_telegram(chat, "Test alert from AIMScribe.\n\nIf your phone "
+                                    "made a sound, alerts will reach you during your shift.")
+    return {"sent": ok, "error": error}
 
 
 # ============================================================ admin: places
@@ -340,7 +394,8 @@ async def list_places(_: None = Depends(api_v2.require_admin)):
                           "since": _iso(r["started_at"])} for r in on_shift
                          if r["place_id"] == pid]})
     return {"places": out, "hospitals": [dict(h) for h in hospitals],
-            "mail_ready": mail_status()["ready"], "mail": mail_status()}
+            "mail_ready": mail_status()["ready"], "mail": mail_status(),
+            "telegram": await telegram_status()}
 
 
 class MailTestRequest(BaseModel):
@@ -518,17 +573,32 @@ def lab_addresses() -> List[str]:
     return [a.strip() for a in os.getenv("AIMS_ALERT_EMAIL", "").split(",") if a.strip()]
 
 
+async def _pace(channel: str) -> None:
+    """Space sends out so neither service is ever asked too fast."""
+    now = time.monotonic()
+    slot = max(now, _NEXT_SEND.get(channel, 0.0))
+    _NEXT_SEND[channel] = slot + SEND_GAP[channel]
+    if slot > now:
+        await asyncio.sleep(slot - now)
+
+
+_NEXT_SEND: Dict[str, float] = {}
+
+
 async def send_mail(to: str, subject: str, text: str) -> Tuple[bool, Optional[str]]:
     """One mail through Resend. Never raises: the reason is kept with the mail."""
     key = os.getenv("AIMS_RESEND_API_KEY", "").strip()
     if not key:
         return False, "mail is not set up on this server (AIMS_RESEND_API_KEY)"
+    message = {"from": _sender(), "to": [to], "subject": f"[AIMScribe] {subject}"[:200],
+               "text": text}
+    if lab_addresses():
+        message["reply_to"] = lab_addresses()      # replies reach AIMS LAB, not a dead address
+    await _pace("email")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             reply = await client.post(RESEND_URL, headers={"Authorization": f"Bearer {key}"},
-                                      json={"from": _sender(), "to": [to],
-                                            "subject": f"[AIMScribe] {subject}"[:200],
-                                            "text": text})
+                                      json=message)
         if reply.status_code in (200, 201, 202):
             return True, None
         return False, f"Resend answered {reply.status_code}: {reply.text[:300]}"
@@ -536,10 +606,148 @@ async def send_mail(to: str, subject: str, text: str) -> Tuple[bool, Optional[st
         return False, f"Resend could not be reached: {exc}"[:500]
 
 
-async def _deliver(conn, note_id: int, to: str, subject: str, text: str) -> None:
-    ok, error = await send_mail(to, subject, text)
-    await conn.execute("UPDATE collector_notifications SET delivered = $2, error = $3 "
-                       "WHERE id = $1", note_id, ok, error)
+# ------------------------------------------------------------ Telegram
+
+def _token() -> str:
+    return os.getenv("AIMS_TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def telegram_ready() -> bool:
+    return bool(_token())
+
+
+def _hide(text: str) -> str:
+    token = _token()
+    return text.replace(token, "<token>") if token else text
+
+
+async def _telegram(method: str, payload: Dict[str, Any],
+                    timeout: float = 15) -> Tuple[Optional[Any], Optional[str]]:
+    """One Bot API call: (result, None) or (None, why). Never raises; never shows the token."""
+    token = _token()
+    if not token:
+        return None, ("Telegram is not set up on this server (AIMS_TELEGRAM_BOT_TOKEN): "
+                      "run ./set-telegram.sh in deploy/uiu")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            reply = await client.post(f"{TELEGRAM_API}/bot{token}/{method}", json=payload)
+        try:
+            body = reply.json()
+        except ValueError:
+            body = {}
+        if reply.status_code == 200 and body.get("ok"):
+            return body.get("result"), None
+        return None, _hide(f"Telegram answered {reply.status_code}: "
+                           f"{body.get('description') or reply.text[:200]}")[:500]
+    except Exception as exc:
+        return None, _hide(f"Telegram could not be reached: {type(exc).__name__} {exc}")[:500]
+
+
+_BOT: Dict[str, Optional[str]] = {"token": None, "username": None}
+
+
+async def telegram_bot() -> Optional[str]:
+    """The bot's @username (asked once per token), or None when Telegram is not working."""
+    token = _token()
+    if not token:
+        return None
+    if _BOT["token"] == token and _BOT["username"]:
+        return _BOT["username"]
+    configured = os.getenv("AIMS_TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+    result, error = await _telegram("getMe", {})
+    if result and result.get("username"):
+        _BOT.update(token=token, username=result["username"])
+        return result["username"]
+    _BOT.update(token=token, username=None)
+    _BOT["problem"] = error
+    return configured or None
+
+
+def telegram_status_now() -> Dict[str, Any]:
+    if not telegram_ready():
+        return {"ready": False, "bot": None,
+                "problem": "Telegram is not set up on this server. On the server, in "
+                           "deploy/uiu, run ./set-telegram.sh with the token from @BotFather."}
+    if _BOT.get("username") and _BOT.get("token") == _token():
+        return {"ready": True, "bot": _BOT["username"], "problem": None}
+    return {"ready": False, "bot": None,
+            "problem": f"Telegram refused the bot token: {_BOT.get('problem') or 'unknown'}. "
+                       "Run ./set-telegram.sh again with the token from @BotFather."}
+
+
+async def telegram_status() -> Dict[str, Any]:
+    await telegram_bot()
+    return telegram_status_now()
+
+
+def _telegram_text(subject: str, text: str, urgent: bool) -> str:
+    return (("\U0001F534 " if urgent else "") + subject + "\n\n" + text)[:4000]
+
+
+async def send_telegram(chat_id: int, text: str,
+                        note_id: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+    """One message to one chat; an urgent one carries a Seen button. Never raises."""
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:4000],
+                               "disable_web_page_preview": True}
+    if note_id is not None:
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "\u2705 Seen - I am on it", "callback_data": f"seen:{note_id}"}]]}
+    await _pace("telegram")
+    result, error = await _telegram("sendMessage", payload)
+    return (True, None) if result is not None else (False, error)
+
+
+# ------------------------------------------------------------ one alert, any channel
+
+def _transient(error: Optional[str]) -> bool:
+    """Worth trying again: the service was busy, down or unreachable."""
+    text = (error or "").lower()
+    return ("could not be reached" in text or "answered 429" in text
+            or "answered 5" in text)
+
+
+async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Telegram first (email first for a summary); the other if the first fails."""
+    chat = await conn.fetchval("SELECT chat_id FROM collector_telegram WHERE email = $1",
+                               note["email"])
+    order = ["email", "telegram"] if note["event"] in EMAIL_FIRST else ["telegram", "email"]
+    errors: List[Tuple[str, str]] = []
+    for channel in order:
+        if channel == "telegram":
+            if chat is None or not telegram_ready():
+                continue
+            ok, error = await send_telegram(
+                chat, _telegram_text(note["subject"], note["body"], note["urgent"]),
+                note_id=note["id"] if note["urgent"] else None)
+        else:
+            ok, error = await send_mail(note["email"], note["subject"], note["body"])
+        if ok:
+            return True, None, channel
+        errors.append((channel, error or "not sent"))
+    if not errors:
+        return False, "no way to reach this person", None
+    return False, "; ".join(f"{c}: {e}" for c, e in errors)[:500], errors[0][0]
+
+
+async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: str = "") -> bool:
+    """Send one kept alert and keep how it went; an alert that failed for a passing reason
+    gets its next try."""
+    note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body "
+                               "FROM collector_notifications WHERE id = $1", note_id)
+    if note is None:
+        return False
+    ok, error, channel = await _send_to(conn, dict(note))
+    attempts = await conn.fetchval("""
+        UPDATE collector_notifications
+           SET delivered = $2, error = $3, channel = COALESCE($4, channel),
+               attempts = attempts + 1, next_try_at = NULL
+         WHERE id = $1 RETURNING attempts
+    """, note_id, ok, error, channel)
+    if not ok and _transient(error) and attempts <= len(RETRY_WAITS):
+        await conn.execute("UPDATE collector_notifications SET next_try_at = now() + $2::interval "
+                           "WHERE id = $1", note_id,
+                           timedelta(minutes=RETRY_WAITS[attempts - 1]))
+    return ok
 
 
 async def _record(conn, *, email: str, event: str, subject: str, body: str, event_key: str,
@@ -619,14 +827,15 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
     return sent
 
 
-THROTTLED = {"jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem"}
+THROTTLED = {"jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
+             "recording_without_jabra"}
 
 
 def _footer() -> str:
     host = os.getenv("AIMS_PUBLIC_HOST", "").strip()
     link = f"https://{host}/dashboard" if host else "the AIMScribe dashboard"
     return (f"\n\nOpen {link} to see the details and mark this as seen.\n"
-            "You get this mail because you are on shift. - AIMScribe")
+            "You get this because you are on shift. - AIMScribe")
 
 
 # ============================================================ the shift summary
@@ -715,9 +924,10 @@ class Notifier:
             await asyncio.sleep(TICK_SECONDS)
 
     async def round(self, conn) -> None:
-        for step in (self.close_forgotten_shifts, self.alerts, self.idle_microphones,
-                     self.silent_pcs, self.finished_recordings, self.no_shift_started,
-                     self.escalate):
+        for step in (self.telegram_updates, self.close_forgotten_shifts, self.alerts,
+                     self.idle_microphones, self.recordings_without_jabra, self.silent_pcs,
+                     self.no_shift_started, self.escalate, self.retry_failed,
+                     self.failure_alarm):
             try:
                 await step(conn)
             except Exception as exc:
@@ -861,42 +1071,40 @@ class Notifier:
                          urgent=True, everyone_if_nobody=False, device_id=row["device_id"],
                          not_before=row["last_seen_at"])
 
-    # -- a recording that finished with all its audio on the server
-    async def finished_recordings(self, conn) -> None:
+    # -- a new patient recorded while the Jabra is still unplugged
+    async def recordings_without_jabra(self, conn) -> None:
+        """
+        The doctor unplugs the Jabra for a sensitive patient and does not plug it
+        back: every later consultation is on the laptop's microphone, and nothing
+        changes that would raise an alert. A recording that started (and has been
+        heard from since) on a non-Jabra microphone, with no switch inside it, is
+        that case.
+        """
         rows = await conn.fetch("""
-            SELECT s.session_id, s.hospital_id, s.doctor_id, s.device_id, s.opened_at,
-                   s.closed_at, s.total_duration_seconds, s.microphones, d.machine_name,
-                   (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
-                      AND a.alert_type = 'microphone_switched') AS switches
-              FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id
-             WHERE s.closed_at > now() - interval '12 hours'
-               AND s.quarantine_reason IS NULL AND s.segment_count > 0
-               AND (SELECT count(*) FROM segments g WHERE g.session_id = s.session_id)
-                   >= s.segment_count
+            SELECT s.session_id, s.opened_at, s.hospital_id, s.device_id,
+                   d.machine_name, d.microphone
+              FROM sessions s JOIN devices d ON d.device_id = s.device_id
+             WHERE s.closed_at IS NULL AND s.opened_at > now() - interval '3 hours'
+               AND d.revoked_at IS NULL AND d.microphone_is_clinic = FALSE
+               AND d.last_seen_at > s.opened_at + interval '5 seconds'
+               AND NOT EXISTS (SELECT 1 FROM integrity_alerts a
+                                WHERE a.session_id = s.session_id
+                                  AND a.alert_type = 'microphone_switched')
                AND NOT EXISTS (SELECT 1 FROM collector_notifications n
-                                WHERE n.event_key = 'done:' || s.session_id)
-               -- only where someone was already on shift when it finished
-               AND s.hospital_id IN (
-                   SELECT ph.hospital_id FROM place_hospitals ph
-                     JOIN collector_shifts cs ON cs.place_id = ph.place_id
-                    WHERE ph.removed_at IS NULL AND cs.ended_at IS NULL
-                      AND cs.started_at <= s.closed_at)
-             ORDER BY s.closed_at LIMIT 100
+                                WHERE n.event_key = 'nojabra:' || s.session_id)
+             ORDER BY s.opened_at LIMIT 100
         """)
         for r in rows:
-            mic = microphone_label(r["microphones"], r["switches"])["label"]
-            minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
             where = f"{r['hospital_id']}, {r['machine_name'] or 'a PC'}"
-            await notify(conn, hospital_id=r["hospital_id"], event="recording_finished",
-                         subject=f"Recording saved: {where}, {minutes} min",
-                         body=(f"A recording finished and all its audio is on the server.\n"
-                               f"Where: {where}\nDoctor: {r['doctor_id']}\n"
-                               f"Time: {_hhmm(r['opened_at'])} to {_hhmm(r['closed_at'])} "
-                               f"({minutes} min)\nMicrophone: {mic}") + _footer(),
-                         event_key=f"done:{r['session_id']}", urgent=False,
-                         everyone_if_nobody=False, device_id=r["device_id"],
-                         session_id=r["session_id"], happened_at=r["closed_at"],
-                         not_before=r["closed_at"])
+            await notify(conn, hospital_id=r["hospital_id"], event="recording_without_jabra",
+                         subject=f"Patient recorded without the Jabra: {where}",
+                         body=(f"A new recording started at {_hhmm(r['opened_at'])} at {where} on "
+                               f"{r['microphone'] or 'the PC microphone'}, not the Jabra. The "
+                               "Jabra has not been plugged back in.\n\nPlease ask the doctor, "
+                               "between patients, to plug the Jabra in.") + _footer(),
+                         event_key=f"nojabra:{r['session_id']}", urgent=True,
+                         everyone_if_nobody=True, device_id=r["device_id"],
+                         session_id=r["session_id"], happened_at=r["opened_at"])
 
     # -- a shift nobody started, while the place's PCs are on
     async def no_shift_started(self, conn) -> None:
@@ -957,15 +1165,148 @@ class Notifier:
             subject = f"Not yet seen: {n['subject']}"
             body = (f"This urgent alert was sent at {_hhmm(n['created_at'])} and nobody has "
                     f"marked it seen in 15 minutes.\n\n{n['body']}")
-            for email in others + lab_addresses():
+            hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+            targets = [(e, f"esc:{n['event_key']}") for e in others]
+            # The lab is mailed at most once an hour; the rest are on the dashboard.
+            targets += [(e, f"esc-lab:{hour}") for e in lab_addresses()]
+            for email, key in targets:
                 note_id = await _record(conn, email=email, event="escalation", subject=subject,
-                                        body=body, event_key=f"esc:{n['event_key']}",
+                                        body=body, event_key=key, urgent=True,
                                         place_id=n["place_id"], hospital_id=n["hospital_id"],
                                         device_id=n["device_id"], session_id=n["session_id"])
                 if note_id is not None:
                     await _deliver(conn, note_id, email, subject, body)
             await conn.execute("UPDATE collector_notifications SET escalated_at = now() "
                                "WHERE event_key = $1 AND escalated_at IS NULL", n["event_key"])
+
+
+    # -- a message that could not be sent: try again, with growing waits
+    async def retry_failed(self, conn) -> None:
+        rows = await conn.fetch("""
+            SELECT id FROM collector_notifications
+             WHERE delivered = FALSE AND next_try_at IS NOT NULL AND next_try_at <= now()
+               AND created_at > now() - $1::interval
+             ORDER BY id LIMIT 50
+        """, RETRY_FOR)
+        for r in rows:
+            await _deliver(conn, r["id"])
+        await conn.execute("""
+            UPDATE collector_notifications SET next_try_at = NULL
+             WHERE delivered = FALSE AND next_try_at IS NOT NULL
+               AND created_at <= now() - $1::interval
+        """, RETRY_FOR)
+
+    # -- sending keeps failing: tell AIMS LAB, at most every three hours
+    async def failure_alarm(self, conn) -> None:
+        failed = await conn.fetchval("""
+            SELECT count(*) FROM collector_notifications
+             WHERE delivered = FALSE AND created_at > now() - interval '30 minutes'
+               AND event <> 'send_failures'
+        """)
+        if failed < FAILURES_ALARM:
+            return
+        now = datetime.now(timezone.utc)
+        key = f"sendfail:{now:%Y%m%d}:{now.hour // 3}"
+        if getattr(self, "_alarm_key", None) == key:
+            return                                   # already raised in this three hours
+        self._alarm_key = key
+        last = await conn.fetchval("""
+            SELECT error FROM collector_notifications
+             WHERE delivered = FALSE AND event <> 'send_failures' ORDER BY id DESC LIMIT 1
+        """)
+        logger.warning("%s alerts to data collectors failed in 30 minutes: %s", failed, last)
+        subject = f"{failed} alerts to data collectors could not be sent"
+        body = (f"In the last 30 minutes {failed} alerts to data collectors were not sent. "
+                f"The last reason:\n{last}\n\nThey are tried again for six hours, and every "
+                "alert is on the collectors' My shift page.")
+        for email in lab_addresses():
+            note_id = await _record(conn, email=email, event="send_failures", subject=subject,
+                                    body=body, event_key=key, urgent=False)
+            if note_id is not None:
+                await _deliver(conn, note_id)
+
+    # -- what collectors pressed in Telegram: Start (connect) and Seen
+    async def telegram_updates(self, conn) -> None:
+        if not telegram_ready():
+            return
+        await conn.execute("INSERT INTO collector_notifier_state (name, last_id) "
+                           "VALUES ('telegram', 0) ON CONFLICT (name) DO NOTHING")
+        last = await conn.fetchval("SELECT last_id FROM collector_notifier_state "
+                                   "WHERE name = 'telegram'")
+        updates, error = await _telegram("getUpdates", {
+            "offset": int(last) + 1, "timeout": 0, "limit": 100,
+            "allowed_updates": ["message", "callback_query"]})
+        if updates is None:
+            if error and "answered 409" in error:      # a webhook takes the updates: drop it
+                await _telegram("deleteWebhook", {})
+            return
+        for update in updates:
+            try:
+                if update.get("callback_query"):
+                    await self._seen_pressed(conn, update["callback_query"])
+                elif update.get("message"):
+                    await self._message(conn, update["message"])
+            except Exception as exc:
+                logger.warning("A Telegram update could not be handled: %s", _hide(str(exc)))
+            await conn.execute("UPDATE collector_notifier_state SET last_id = $1, "
+                               "updated_at = now() WHERE name = 'telegram'",
+                               int(update["update_id"]))
+
+    async def _message(self, conn, message: Dict[str, Any]) -> None:
+        chat = (message.get("chat") or {})
+        if chat.get("type") != "private":
+            return
+        text = (message.get("text") or "").strip()
+        if not text.startswith("/start"):
+            return
+        parts = text.split()
+        code = parts[1] if len(parts) > 1 else ""
+        row = await conn.fetchrow("""
+            UPDATE collector_telegram_codes SET used_at = now()
+             WHERE code = $1 AND used_at IS NULL AND created_at > now() - $2::interval
+            RETURNING email
+        """, code, LINK_CODE_LASTS) if code else None
+        if row is None:
+            await send_telegram(chat["id"], "This link has expired or was already used. Open "
+                                "the AIMScribe dashboard, go to My shift and press Connect "
+                                "Telegram again.")
+            return
+        username = ((message.get("from") or {}).get("username") or "")[:64] or None
+        await conn.execute("""
+            INSERT INTO collector_telegram (email, chat_id, username) VALUES ($1, $2, $3)
+            ON CONFLICT (email) DO UPDATE SET chat_id = EXCLUDED.chat_id,
+                username = EXCLUDED.username, linked_at = now()
+        """, row["email"], int(chat["id"]), username)
+        place = await conn.fetchval("""
+            SELECT pl.name FROM portal_people p JOIN places pl ON pl.place_id = p.place_id
+             WHERE p.email = $1
+        """, row["email"])
+        await portal._audit("collector.telegram_linked", row["email"], {"username": username})
+        await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "
+                            f"shift{' at ' + place if place else ''}, AIMScribe alerts come here. "
+                            "Keep notifications on for Telegram. For an urgent alert, press "
+                            "Seen when you are dealing with it.")
+
+    async def _seen_pressed(self, conn, query: Dict[str, Any]) -> None:
+        data = str(query.get("data") or "")
+        chat_id = ((query.get("message") or {}).get("chat") or {}).get("id")
+        answer = "Already marked seen" if data == "done" else "Not found"
+        if data.startswith("seen:") and data[5:].isdigit() and chat_id is not None:
+            done = await conn.fetchval("""
+                UPDATE collector_notifications n SET seen_at = COALESCE(n.seen_at, now())
+                  FROM collector_telegram t
+                 WHERE n.id = $1 AND t.email = n.email AND t.chat_id = $2
+                RETURNING n.id
+            """, int(data[5:]), int(chat_id))
+            if done:
+                answer = "Marked seen"
+                message = query.get("message") or {}
+                await _telegram("editMessageReplyMarkup", {
+                    "chat_id": chat_id, "message_id": message.get("message_id"),
+                    "reply_markup": {"inline_keyboard": [[
+                        {"text": "\u2705 Seen", "callback_data": "done"}]]}})
+        await _telegram("answerCallbackQuery", {"callback_query_id": query.get("id"),
+                                                "text": answer})
 
 
 _notifier: Optional[Notifier] = None
@@ -992,4 +1333,5 @@ async def stop() -> None:
 
 
 __all__ = ["router", "admin_router", "hospital_scope", "narrow", "microphone_label",
-           "is_clinic_mic", "Notifier", "start", "stop", "shift_for", "send_mail"]
+           "is_clinic_mic", "Notifier", "start", "stop", "shift_for", "send_mail",
+           "send_telegram", "telegram_ready", "telegram_status"]
