@@ -89,3 +89,16 @@ def test_an_urgent_telegram_message_is_marked_and_fits():
     text = collectors._telegram_text("Jabra unplugged: HOSP003, PC-1", "x" * 5000, True)
     assert text.startswith("\U0001F534 Jabra unplugged") and len(text) <= 4000
     assert not collectors._telegram_text("Shift summary", "body", False).startswith("\U0001F534")
+
+
+def test_the_report_time_and_what_problems_only_keeps(monkeypatch):
+    import watchers
+    monkeypatch.delenv("AIMS_REPORT_AT", raising=False)
+    assert watchers.report_time() == time(20, 30)
+    monkeypatch.setenv("AIMS_REPORT_AT", "21:15")
+    assert watchers.report_time() == time(21, 15)
+    monkeypatch.setenv("AIMS_REPORT_AT", "late")
+    assert watchers.report_time() == time(20, 30)
+    assert "escalation" in watchers.PROBLEMS_ONLY and "daily_report" in watchers.PROBLEMS_ONLY
+    assert "jabra_back" not in watchers.PROBLEMS_ONLY
+    assert collectors.PROBLEMS["silent_session"].startswith("the microphone gives no sound")

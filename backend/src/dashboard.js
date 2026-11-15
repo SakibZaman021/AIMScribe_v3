@@ -89,10 +89,12 @@ $("keyForm").addEventListener("submit", (e) => {
 });
 $("keyDialog").addEventListener("cancel", (e) => e.preventDefault());  // the page needs it
 
+let MINE = false;   // 038: "Only my hospitals" - a researcher's own hospitals
 async function api(path, params, retried) {
   if (!PORTAL && !ADMIN_KEY) await askKey();
   const query = new URLSearchParams(
-    Object.entries(params || {}).filter(([, v]) => v !== "" && v != null));
+    Object.entries({ ...(params || {}), ...(MINE ? { mine: "1" } : {}) })
+      .filter(([, v]) => v !== "" && v != null));
   const response = await fetch(`/api/v2/dashboard${path}?${query}`,
     { headers: portalHeaders() });
   if (PORTAL && response.status === 401) {
@@ -330,6 +332,7 @@ const VIEWS = {
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
   shift: ["My shift", "Your shift, and the alerts mailed to you", false],
+  watch: ["My alerts", "The hospitals you look after: alerts, and the evening report", false],
   downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
   cmed: ["CMED", "CMED's EHR addresses and the key each hospital signs with", false],
   people: ["People", "Who may sign in, and their database logins", false],
@@ -1098,6 +1101,10 @@ async function whoAmI() {
       $("navShift").hidden = false;
       loadShift();
     }
+    if (me.role === "researcher" || me.role === "admin") {
+      $("navWatch").hidden = false;
+      loadWatch(true);
+    }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
     throw new Error("Not signed in.");
@@ -1234,30 +1241,47 @@ $("clients").addEventListener("click", async (e) => {
   loadCmed();
 });
 
+let HOSPITAL_LIST = [];   // 038: for "Looks after"
 async function loadPeople() {
   try {
     const { people, mail, mail_status } = await adminCall("GET", "/api/v2/admin/people");
+    if (!HOSPITAL_LIST.length) {
+      try { HOSPITAL_LIST = (await adminCall("GET", "/api/v2/admin/places")).hospitals || []; }
+      catch (err) { HOSPITAL_LIST = []; }
+    }
+    const watchCell = (p) => {
+      if (p.role === "collector") return `<span class="hint">from their place</span>`;
+      const mine = p.watching || [];
+      return mine.map((h) => `<button type="button" class="chip" title="Stop looking after ${esc(h)}" `
+          + `data-unwatch="${esc(p.email)}" data-hospital="${esc(h)}">${esc(h)} \u00d7</button>`).join(" ")
+        + ` <select class="small" data-watchsel="${esc(p.email)}" aria-label="Give ${esc(p.email)} a hospital">`
+        + `<option value="">+ hospital</option>`
+        + HOSPITAL_LIST.filter((h) => !mine.includes(h.hospital_id)).map((h) =>
+          `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("")
+        + `</select>`;
+    };
     $("peopleHint").textContent = mail_status && mail_status.ready
       ? "An invitation email is sent when you give access"
       : "Invitation emails are not working yet, so send them the link yourself. "
         + ((mail_status && mail_status.problem) || "");
     const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
-      + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th>Telegram</th><th></th></tr></thead><tbody>`
+      + `<th>Looks after</th><th>Given by</th><th>Last signed in</th><th>Database login</th><th>Telegram</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
         + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
         + td("Role", p.role === "admin" ? tag("warn", "Admin")
           : p.role === "collector" ? tag("info", "Data collector")
             + (p.place ? `<br><span class="hint">${esc(p.place)}</span>` : "")
           : tag("good", "Researcher"))
+        + td("Looks after", watchCell(p))
         + td("Given by", esc(p.added_by || ""))
         + td("Last signed in", esc(when(p.last_signed_in)))
         + td("Database login", p.role === "collector" ? `<span class="hint">none (view only)</span>`
           : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
-        + td("Telegram", p.role !== "collector" ? ""
-          : p.telegram ? tag("good", "connected") : tag("warn", "not connected"))
+        + td("Telegram", p.telegram ? tag("good", "connected")
+          : tag(p.role === "collector" || (p.watching || []).length ? "warn" : "quiet", "not connected"))
         + td("", p.owner ? `<span class="hint">owner</span>`
           : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1296,7 +1320,26 @@ function showDbLogin(email, login) {
     + `viewer (/db/) signed in with Google, then use this login.`;
 }
 
+$("people").addEventListener("change", async (e) => {
+  const sel = e.target.closest("[data-watchsel]");
+  if (!sel || !sel.value) return;
+  try {
+    await adminCall("POST", "/api/v2/admin/people/watch",
+                    { email: sel.dataset.watchsel, hospital_id: sel.value });
+  } catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadPeople();
+});
 $("people").addEventListener("click", async (e) => {
+  const w = e.target.closest("[data-unwatch]");
+  if (w) {
+    if (!window.confirm(`${w.dataset.unwatch} stops looking after ${w.dataset.hospital}?`)) return;
+    try {
+      await adminCall("POST", "/api/v2/admin/people/watch",
+                      { email: w.dataset.unwatch, hospital_id: w.dataset.hospital, remove: true });
+    } catch (err) { window.alert(`Not done: ${err.message}`); }
+    loadPeople();
+    return;
+  }
   const k = e.target.closest("[data-dblogin]");
   if (k) {
     const who = k.dataset.dblogin;
@@ -1583,6 +1626,7 @@ const EVENT_LABELS = {
   recording_finished: "Recording saved", shift_summary: "Shift summary",
   no_shift_started: "Nobody on shift", escalation: "Not yet seen",
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
+  recording_too_long: "Recording not stopped", handled: "Handled", daily_report: "Daily report",
 };
 
 let tgWaiting = false;   // 037: Connect Telegram was pressed; watch for the link
@@ -1804,4 +1848,112 @@ $("tgTest").addEventListener("click", async () => {
     $("tgState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
   }
   $("tgTest").disabled = false;
+});
+
+/* ============================================================
+   038: researchers. The hospitals they look after, Telegram, how
+   many alerts they want, the evening report, and their alerts.
+   ============================================================ */
+async function watchCall(method, path, body) {
+  const response = await fetch(`/api/v2/dashboard/watch${path}`, {
+    method, headers: { ...portalHeaders(), Accept: "application/json",
+                       ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+let watchWaiting = false;
+let watchTimer = null;
+async function loadWatch(first) {
+  let me;
+  try { me = await watchCall("GET", "/me"); }
+  catch (err) { $("wState").textContent = `Could not load: ${err.message}`; return; }
+  const hs = me.hospitals || [];
+  $("wHospitals").textContent = hs.length
+    ? hs.map((h) => `${h.hospital_id}${h.name ? " " + h.name : ""}`).join(", ")
+    : "None yet: an admin gives you hospitals in People.";
+  $("mineField").hidden = !hs.length;
+  if (first && hs.length) {          // start on their own hospitals; one click shows all
+    $("mine").checked = true;
+    MINE = true;
+    const again = () => (BUSY ? setTimeout(again, 800) : refresh());
+    again();
+  }
+  $("wMode").value = me.mode || "everything";
+  $("wReportAt").textContent = me.report_at || "20:30";
+  $("wRepHosp").innerHTML = hs.map((h) =>
+    `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("");
+  $("wRepShow").disabled = !hs.length;
+  const tg = me.telegram || {};
+  $("wTgState").innerHTML = !tg.ready
+    ? tag("warn", "Telegram not set up on the server yet")
+    : tg.linked
+      ? tag("good", "Telegram connected")
+        + ` <span class="hint">${tg.username ? "@" + esc(tg.username) + " \u00b7 " : ""}since ${esc(dhaka(tg.linked_at))}</span>`
+      : tag("bad", "Telegram not connected")
+        + ` <span class="hint">Press Connect Telegram, then Start in Telegram.</span>`;
+  $("wTgLink").hidden = !tg.ready;
+  $("wTgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
+  $("wTgTest").hidden = !tg.linked;
+  if (tg.linked && watchWaiting) { watchWaiting = false; clearInterval(watchTimer); }
+  const notes = me.notifications || [];
+  $("wAlerts").innerHTML = !notes.length
+    ? empty("No alerts yet", "Alerts for your hospitals appear here, and on Telegram.", true)
+    : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th><th>Sent</th></tr></thead><tbody>`
+      + notes.map((n) => `<tr>`
+        + td("When", esc(dhaka(n.happened_at || n.created_at)))
+        + td("What", tag(n.urgent ? "bad" : (n.event === "handled" ? "good" : "info"),
+                         EVENT_LABELS[n.event] || human(n.event)))
+        + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
+        + td("Message", esc(n.subject), "wrap")
+        + td("Sent", n.delivered ? tag("good", n.channel === "telegram" ? "Telegram" : "email")
+          : tag("warn", "not sent", n.error || ""))
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+$("mine").addEventListener("change", () => { MINE = $("mine").checked; refresh(); });
+$("wMode").addEventListener("change", async () => {
+  try { await watchCall("POST", "/mode", { mode: $("wMode").value }); }
+  catch (err) { window.alert(`Not saved: ${err.message}`); }
+  loadWatch();
+});
+$("wRepShow").addEventListener("click", async () => {
+  $("wReport").textContent = "Building the report...";
+  try {
+    const r = await watchCall("GET", `/report?hospital_id=${encodeURIComponent($("wRepHosp").value)}`
+      + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : ""));
+    $("wReport").textContent = r.text;
+  } catch (err) { $("wReport").textContent = `Could not build it: ${err.message}`; }
+});
+$("wTgLink").addEventListener("click", async () => {
+  $("wTgLink").disabled = true;
+  try {
+    const r = await watchCall("POST", "/telegram/link");
+    window.open(r.url, "_blank", "noopener");
+    $("wTgState").innerHTML = `<span class="hint">Telegram opened: press <b>Start</b> there. `
+      + `If it did not open, <a href="${esc(r.url)}" target="_blank" rel="noopener">tap here</a>.</span>`;
+    watchWaiting = true;
+    clearInterval(watchTimer);
+    let polls = 0;
+    watchTimer = setInterval(() => {
+      if (++polls > 40 || !watchWaiting) { clearInterval(watchTimer); return; }
+      loadWatch();
+    }, 5000);
+  } catch (err) {
+    $("wTgState").innerHTML = tag("bad", "Could not connect") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("wTgLink").disabled = false;
+});
+$("wTgTest").addEventListener("click", async () => {
+  $("wTgTest").disabled = true;
+  try {
+    const r = await watchCall("POST", "/telegram/test");
+    $("wTgState").innerHTML = r.sent ? tag("good", "Test alert sent")
+      : tag("bad", "Test alert not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("wTgState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("wTgTest").disabled = false;
 });

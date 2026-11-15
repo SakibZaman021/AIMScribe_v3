@@ -66,6 +66,7 @@ ESCALATE_AFTER = timedelta(minutes=15)    # an urgent mail nobody marked seen
 NO_SHIFT_AFTER = timedelta(minutes=30)    # nobody pressed Start shift
 SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
 AUTO_CLOSE_AFTER = timedelta(hours=1)     # a shift nobody ended
+TOO_LONG = timedelta(minutes=60)          # a recording nobody stopped (038)
 OTHER_SHIFT = timedelta(hours=6)          # a shift started outside both windows
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -91,6 +92,8 @@ PROBLEMS = {
     "local_segment_unreadable": "a piece of a recording could not be read on the PC",
     "invalid_purge_receipt": "the recorder refused a server receipt",
     "unexpected_agent_exit": "the recorder stopped unexpectedly",
+    # 038: two clips in a row of digital silence - muted, or not working.
+    "silent_session": "the microphone gives no sound (muted, or not working)",
 }
 
 # How Windows names the Jabra Speak2 55, including the 31-character form.
@@ -168,9 +171,14 @@ async def hospital_scope(request: Request) -> Optional[List[str]]:
     if request.headers.get("x-admin-key"):
         return None
     person = await portal.person_for(request)
-    if person is None or person.role != "collector":
+    if person is None:
         return None
-    return await place_hospitals(person.place_id)
+    if person.role == "collector":
+        return await place_hospitals(person.place_id)
+    if request.query_params.get("mine") == "1":       # 038: "Only my hospitals"
+        import watchers
+        return await watchers.watched_hospitals(person.email) or None
+    return None
 
 
 def narrow(scope: Any, hospital_id: Optional[str]) -> Optional[List[str]]:
@@ -718,7 +726,9 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
                 continue
             ok, error = await send_telegram(
                 chat, _telegram_text(note["subject"], note["body"], note["urgent"]),
-                note_id=note["id"] if note["urgent"] else None)
+                # Only the collector, who must act, gets the Seen button.
+                note_id=note["id"] if note["urgent"] and note["audience"] == "collector"
+                else None)
         else:
             ok, error = await send_mail(note["email"], note["subject"], note["body"])
         if ok:
@@ -732,7 +742,7 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
 async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: str = "") -> bool:
     """Send one kept alert and keep how it went; an alert that failed for a passing reason
     gets its next try."""
-    note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body "
+    note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body, audience "
                                "FROM collector_notifications WHERE id = $1", note_id)
     if note is None:
         return False
@@ -754,17 +764,18 @@ async def _record(conn, *, email: str, event: str, subject: str, body: str, even
                   urgent: bool = False, place_id: Optional[int] = None,
                   hospital_id: Optional[str] = None, device_id=None,
                   session_id: Optional[str] = None,
-                  happened_at: Optional[datetime] = None) -> Optional[int]:
-    """Keep the mail, once per person and event; returns its id, or None if already kept."""
+                  happened_at: Optional[datetime] = None,
+                  audience: str = "collector") -> Optional[int]:
+    """Keep the alert, once per person and event; returns its id, or None if already kept."""
     return await conn.fetchval("""
         INSERT INTO collector_notifications
             (email, place_id, hospital_id, device_id, session_id, event, urgent, subject,
-             body, happened_at, event_key)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             body, happened_at, event_key, audience)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (email, event_key) DO NOTHING
         RETURNING id
     """, email, place_id, hospital_id, device_id, session_id, event, urgent, subject[:300],
-        body, happened_at, event_key[:200])
+        body, happened_at, event_key[:200], audience)
 
 
 async def places_of(conn, hospital_id: Optional[str]) -> List[int]:
@@ -809,11 +820,14 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
         if recent:
             return 0
     sent = 0
+    told: List[str] = []
+    on_shift = False
     for place_id in await places_of(conn, hospital_id):
         duty = await on_duty(conn, place_id)
         if not_before is not None:
             duty = [d for d in duty if d["started_at"] <= not_before]
         recipients = [d["email"] for d in duty]
+        on_shift = on_shift or bool(recipients)
         if not recipients and everyone_if_nobody:
             recipients = await collectors_of(conn, place_id)
         for email in recipients:
@@ -822,13 +836,30 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
                                     hospital_id=hospital_id, device_id=device_id,
                                     session_id=session_id, happened_at=happened_at)
             if note_id is not None:
+                told.append(email)
                 await _deliver(conn, note_id, email, subject, body)
                 sent += 1
+    # 038: the researchers who look after this hospital get a copy, saying who
+    # was told - so they know whether anyone is there to act.
+    import watchers
+    if told:
+        who = ("the collector on shift: " if on_shift else
+               "nobody was on shift, so all the place's collectors: ") + ", ".join(told)
+    else:
+        who = "no collector (nobody on shift)" if not everyone_if_nobody else \
+            "no collector - no data collector covers this hospital"
+    sent += await watchers.copy_to_watchers(
+        conn, hospital_id=hospital_id, event=event, subject=subject,
+        body=body.split(_FOOTER_MARK)[0] + f"\n\nSent to {who}.", event_key=event_key,
+        urgent=urgent, device_id=device_id, session_id=session_id, happened_at=happened_at)
     return sent
 
 
 THROTTLED = {"jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
              "recording_without_jabra"}
+
+
+_FOOTER_MARK = "\n\nOpen "
 
 
 def _footer() -> str:
@@ -924,10 +955,12 @@ class Notifier:
             await asyncio.sleep(TICK_SECONDS)
 
     async def round(self, conn) -> None:
+        import watchers
         for step in (self.telegram_updates, self.close_forgotten_shifts, self.alerts,
-                     self.idle_microphones, self.recordings_without_jabra, self.silent_pcs,
-                     self.no_shift_started, self.escalate, self.retry_failed,
-                     self.failure_alarm):
+                     self.idle_microphones, self.recordings_without_jabra,
+                     self.recordings_too_long, self.silent_pcs, self.no_shift_started,
+                     self.escalate, watchers.handled_followups, watchers.daily_reports,
+                     self.retry_failed, self.failure_alarm):
             try:
                 await step(conn)
             except Exception as exc:
@@ -1106,6 +1139,32 @@ class Notifier:
                          everyone_if_nobody=True, device_id=r["device_id"],
                          session_id=r["session_id"], happened_at=r["opened_at"])
 
+    # -- a recording left running: the doctor forgot to press Stop (038)
+    async def recordings_too_long(self, conn) -> None:
+        rows = await conn.fetch("""
+            SELECT s.session_id, s.opened_at, s.hospital_id, s.device_id, d.machine_name
+              FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id
+             WHERE s.closed_at IS NULL
+               AND s.opened_at < now() - $1::interval
+               AND s.opened_at > now() - interval '12 hours'
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.event_key = 'long:' || s.session_id)
+             ORDER BY s.opened_at LIMIT 100
+        """, TOO_LONG)
+        for r in rows:
+            where = f"{r['hospital_id']}, {r['machine_name'] or 'a PC'}"
+            minutes = int((datetime.now(timezone.utc) - r["opened_at"]).total_seconds() // 60)
+            await notify(conn, hospital_id=r["hospital_id"], event="recording_too_long",
+                         subject=f"Recording running {minutes} min: {where}",
+                         body=(f"A recording at {where} has been running since "
+                               f"{_hhmm(r['opened_at'])} ({minutes} min). The doctor may have "
+                               "forgotten to press Stop, so the next patients would be mixed "
+                               "into it.\n\nPlease ask the doctor, between patients, to stop "
+                               "it.") + _footer(),
+                         event_key=f"long:{r['session_id']}", urgent=True,
+                         everyone_if_nobody=True, device_id=r["device_id"],
+                         session_id=r["session_id"], happened_at=r["opened_at"])
+
     # -- a shift nobody started, while the place's PCs are on
     async def no_shift_started(self, conn) -> None:
         local = datetime.now(zone())
@@ -1137,13 +1196,19 @@ class Notifier:
                         f"{place[f'{kind}_start']:%H:%M} and nobody has pressed Start my shift. "
                         "The PCs are on. If you are at the clinic, open the dashboard and "
                         "press Start my shift.") + _footer()
+                key = f"noshift:{place['place_id']}:{local.date()}:{kind}"
                 for email in await collectors_of(conn, place["place_id"]):
                     note_id = await _record(
                         conn, email=email, event="no_shift_started", subject=subject,
-                        body=body, place_id=place["place_id"],
-                        event_key=f"noshift:{place['place_id']}:{local.date()}:{kind}")
+                        body=body, place_id=place["place_id"], event_key=key)
                     if note_id is not None:
                         await _deliver(conn, note_id, email, subject, body)
+                import watchers
+                for hospital_id in hospitals:
+                    await watchers.copy_to_watchers(
+                        conn, hospital_id=hospital_id, event="no_shift_started",
+                        subject=subject, body=body.split(_FOOTER_MARK)[0], event_key=key,
+                        urgent=True)
 
     # -- an urgent mail nobody marked seen
     async def escalate(self, conn) -> None:
@@ -1151,10 +1216,12 @@ class Notifier:
             SELECT DISTINCT ON (n.event_key) n.*
               FROM collector_notifications n
              WHERE n.urgent AND n.escalated_at IS NULL AND n.event <> 'escalation'
+               AND n.audience = 'collector'
                AND n.created_at < now() - $1::interval
                AND n.created_at > now() - interval '12 hours'
                AND NOT EXISTS (SELECT 1 FROM collector_notifications m
-                                WHERE m.event_key = n.event_key AND m.seen_at IS NOT NULL)
+                                WHERE m.event_key = n.event_key AND m.audience = 'collector'
+                                  AND m.seen_at IS NOT NULL)
              ORDER BY n.event_key, n.id
         """, ESCALATE_AFTER)
         for n in rows:
@@ -1166,16 +1233,27 @@ class Notifier:
             body = (f"This urgent alert was sent at {_hhmm(n['created_at'])} and nobody has "
                     f"marked it seen in 15 minutes.\n\n{n['body']}")
             hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-            targets = [(e, f"esc:{n['event_key']}") for e in others]
+            targets = [(e, f"esc:{n['event_key']}", "collector") for e in others]
             # The lab is mailed at most once an hour; the rest are on the dashboard.
-            targets += [(e, f"esc-lab:{hour}") for e in lab_addresses()]
-            for email, key in targets:
+            targets += [(e, f"esc-lab:{hour}", "lab") for e in lab_addresses()]
+            for email, key, audience in targets:
                 note_id = await _record(conn, email=email, event="escalation", subject=subject,
                                         body=body, event_key=key, urgent=True,
                                         place_id=n["place_id"], hospital_id=n["hospital_id"],
-                                        device_id=n["device_id"], session_id=n["session_id"])
+                                        device_id=n["device_id"], session_id=n["session_id"],
+                                        audience=audience)
                 if note_id is not None:
                     await _deliver(conn, note_id, email, subject, body)
+            # 038: the hospital's researchers hear that it was not handled.
+            import watchers
+            await watchers.copy_to_watchers(
+                conn, hospital_id=n["hospital_id"], event="escalation",
+                subject=f"Not handled in 15 min: {n['subject']}",
+                body=(f"Sent to {n['email']} at {_hhmm(n['created_at'])}; nobody has marked it "
+                      f"seen in 15 minutes. The place's other collectors are now told.\n\n"
+                      + n["body"].split(_FOOTER_MARK)[0]),
+                event_key=f"esc:{n['event_key']}", urgent=True, device_id=n["device_id"],
+                session_id=n["session_id"])
             await conn.execute("UPDATE collector_notifications SET escalated_at = now() "
                                "WHERE event_key = $1 AND escalated_at IS NULL", n["event_key"])
 
@@ -1277,11 +1355,22 @@ class Notifier:
             ON CONFLICT (email) DO UPDATE SET chat_id = EXCLUDED.chat_id,
                 username = EXCLUDED.username, linked_at = now()
         """, row["email"], int(chat["id"]), username)
-        place = await conn.fetchval("""
-            SELECT pl.name FROM portal_people p JOIN places pl ON pl.place_id = p.place_id
-             WHERE p.email = $1
+        person = await conn.fetchrow("""
+            SELECT p.role, pl.name AS place FROM portal_people p
+              LEFT JOIN places pl ON pl.place_id = p.place_id WHERE p.email = $1
         """, row["email"])
+        place = person["place"] if person else None
         await portal._audit("collector.telegram_linked", row["email"], {"username": username})
+        if person is not None and person["role"] != "collector":
+            import watchers
+            mine = await watchers.watched_hospitals(row["email"], conn)
+            await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nAlerts for the "
+                                "hospitals you look after come here"
+                                + (f" ({', '.join(mine)})" if mine else
+                                   " (none assigned yet: ask an admin)")
+                                + ", with whether the collector dealt with them, and a report "
+                                f"every evening at {watchers.report_time():%H:%M}.")
+            return
         await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "
                             f"shift{' at ' + place if place else ''}, AIMScribe alerts come here. "
                             "Keep notifications on for Telegram. For an urgent alert, press "

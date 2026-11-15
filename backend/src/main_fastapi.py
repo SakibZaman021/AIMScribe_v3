@@ -293,6 +293,11 @@ app.include_router(dashboard_router)
 import collectors  # noqa: E402
 app.include_router(collectors.router)
 app.include_router(collectors.admin_router)
+# Researchers who look after hospitals (038): copies of the alerts, whether they
+# were handled, and an evening report (watchers.py).
+import watchers  # noqa: E402
+app.include_router(watchers.router)
+app.include_router(watchers.admin_router)
 
 
 # ============================================================================

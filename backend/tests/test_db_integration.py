@@ -3029,3 +3029,221 @@ async def test_an_alert_that_could_not_be_sent_is_tried_again_and_the_lab_is_tol
             told = [s for s in sent if s[0] == "lab@uiu.example" and "could not be sent" in s[1]]
             assert len(told) == 1
     _unserve()
+
+
+def _with_watchers(client):
+    import watchers
+    _with_collectors(client)
+    app = client._transport.app
+    app.include_router(watchers.router)
+    app.include_router(watchers.admin_router)
+    return client
+
+
+async def _watching_researcher(client, who, email, hospitals=("HOSP003",)):
+    """As the owner: a researcher who looks after these hospitals."""
+    h = {"X-AIMS-Portal": "1"}
+    client.cookies.clear()
+    who["value"] = "owner@uiu.example"
+    await _sign_in(client)
+    added = await client.post("/api/v2/admin/people", headers=h,
+                              json={"email": email, "role": "researcher"})
+    assert added.status_code == 200, added.text
+    for hid in hospitals:
+        given = await client.post("/api/v2/admin/people/watch", headers=h,
+                                  json={"email": email, "hospital_id": hid})
+        assert given.status_code == 200, given.text
+
+
+async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_handled(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "sentinel@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "res@uni.example")
+        # A collector's hospitals come from their place, never from here.
+        refused = await client.post("/api/v2/admin/people/watch", headers=h, json={
+            "email": "sentinel@gmail.example", "hospital_id": "HOSP003"})
+        assert refused.status_code == 409
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "res@uni.example")["watching"] == \
+            ["HOSP003"]
+
+        async with dbs.rec.acquire() as conn:
+            # The collector's alert, and the researcher's copy saying who was told.
+            key = f"t-watch-{mine}"
+            await collectors.notify(conn, hospital_id="HOSP003", event="jabra_unplugged",
+                                    subject="Jabra unplugged: HOSP003, PC", body="b"
+                                    + collectors._footer(), event_key=key, urgent=True,
+                                    everyone_if_nobody=True, device_id=None)
+            copy = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'res@uni.example' AND event_key = $1", key)
+            assert copy["audience"] == "watcher" and copy["urgent"] and copy["delivered"]
+            assert "Sent to the collector on shift: " in copy["body"]
+            assert "sentinel@gmail.example" in copy["body"]
+            assert "Open " not in copy["body"]           # the collector's footer is left off
+            note = await conn.fetchval("SELECT id FROM collector_notifications "
+                                       "WHERE email = 'sentinel@gmail.example' AND event_key = $1",
+                                       key)
+
+        # The collector deals with it: the researcher hears who, and how fast.
+        client.cookies.clear()
+        who["value"] = "sentinel@gmail.example"
+        await _sign_in(client)
+        assert (await client.post(f"/api/v2/dashboard/collector/notifications/{note}/seen",
+                                  headers=h)).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            await watchers.handled_followups(conn)
+            await watchers.handled_followups(conn)            # once only
+            handled = await conn.fetch("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'res@uni.example' AND event = 'handled'")
+            assert len(handled) == 1 and "marked it seen" in handled[0]["body"]
+
+            # One nobody deals with: the researcher hears it was not handled.
+            key2 = f"t-watch2-{mine}"
+            await collectors.notify(conn, hospital_id="HOSP003", event="pc_silent",
+                                    subject="PC not reporting: HOSP003, PC", body="b",
+                                    event_key=key2, urgent=True)
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '20 minutes' WHERE event_key = $1", key2)
+            await collectors.Notifier().escalate(conn)
+            assert await conn.fetchval("""
+                SELECT subject FROM collector_notifications
+                 WHERE email = 'res@uni.example' AND event_key = $1
+            """, f"esc:{key2}") == "Not handled in 15 min: PC not reporting: HOSP003, PC"
+
+        # 'Only problems': no copy of the routine, still the problems.
+        client.cookies.clear()
+        who["value"] = "res@uni.example"
+        await _sign_in(client)
+        assert (await client.post("/api/v2/dashboard/watch/mode", headers=h,
+                                  json={"mode": "problems"})).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            assert await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP003", event="jabra_back", subject="s", body="b",
+                event_key=f"t-back-{mine}") == 0
+            assert await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP003", event="pc_silent", subject="s", body="b",
+                event_key=f"t-down-{mine}") == 1
+
+        # "Only my hospitals" narrows what a researcher sees; without it, all.
+        me = (await client.get("/api/v2/dashboard/watch/me")).json()
+        assert [x["hospital_id"] for x in me["hospitals"]] == ["HOSP003"]
+        assert me["mode"] == "problems"
+        assert any(n["event"] == "handled" for n in me["notifications"])
+        everything = (await client.get("/api/v2/dashboard/recordings")).json()["recordings"]
+        assert {mine, theirs} <= {r["session_id"] for r in everything}
+        narrowed = (await client.get("/api/v2/dashboard/recordings",
+                                     params={"mine": "1"})).json()["recordings"]
+        assert {r["hospital_id"] for r in narrowed} == {"HOSP003"}
+
+        # Taking a hospital away is marked, never deleted.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        assert (await client.post("/api/v2/admin/people/watch", headers=h, json={
+            "email": "res@uni.example", "hospital_id": "HOSP003", "remove": True})
+        ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            assert await watchers.watched_hospitals("res@uni.example", conn) == []
+            assert await conn.fetchval("SELECT removed_at FROM researcher_hospitals "
+                                       "WHERE email = 'res@uni.example'") is not None
+    _unserve()
+
+
+async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        # A hospital of its own, so other tests' places do not crowd the report.
+        await dbs.repo.upsert_hospital("HOSP555", "Report Clinic", "Asia/Dhaka")
+        await dbs.repo.upsert_hospital("HOSP556", "Unplaced Clinic", "Asia/Dhaka")
+        token = await dbs.repo.create_enrollment_token(hospital_id="HOSP555", doctor_id="",
+                                                       created_by="tests")
+        enrolled = await dbs.repo.enroll_device(token=token, tpm_pubkey=os.urandom(32),
+                                                machine_name="PC-R", os_version="",
+                                                app_version="3", protocol_version=2)
+        device = await dbs.repo.device_by_token(enrolled["device_token"])
+        await _make_collector(client, who, "reporter@gmail.example", hospitals=("HOSP555",))
+        await _watching_researcher(client, who, "boss@uni.example", hospitals=("HOSP555", "HOSP556"))
+        quiet = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=30))
+        brief = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=20))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE sessions SET hospital_id = 'HOSP555' "
+                               "WHERE session_id = ANY($1::text[])", [quiet, brief])
+            await conn.execute("UPDATE sessions SET closed_at = opened_at + interval '20 seconds', "
+                               "total_duration_seconds = 20, confirmation = 'unconfirmed' "
+                               "WHERE session_id = $1", brief)
+            await conn.execute("UPDATE devices SET pending_segments = 4 WHERE device_id = $1",
+                               device["device_id"])
+        await dbs.repo.raise_alert(alert_type="silent_session", session_id=quiet,
+                                   device_id=device["device_id"],
+                                   detail={"detail": "2 consecutive segments of digital silence"})
+
+        today = datetime.now(collectors.zone()).date()
+        async with dbs.rec.acquire() as conn:
+            text = await watchers.hospital_report(conn, "HOSP555", today)
+            other = await watchers.hospital_report(conn, "HOSP556", today)
+        assert text.startswith("\U0001F4CB Daily report: HOSP555")
+        assert "\U0001F534 Needs attention" in text and "with no sound" in text
+        for part in ("RECORDINGS", "MICROPHONE", "WHAT WILL BE KEPT", "DATA COLLECTORS",
+                     "PCs", "TO DO TOMORROW"):
+            assert part in text, part
+        assert "no sound at all: 1" in text
+        assert "not confirmed 1" in text
+        assert "4 clips still to upload" in text
+        assert "Telegram: 0 of 1 collectors connected" in text
+        assert len(text) <= 3900
+        assert "No place includes this hospital" in other
+
+        # The researcher sees it on the dashboard; a collector cannot.
+        client.cookies.clear()
+        who["value"] = "boss@uni.example"
+        await _sign_in(client)
+        shown = (await client.get("/api/v2/dashboard/watch/report",
+                                  params={"hospital_id": "HOSP555"})).json()
+        assert shown["text"].startswith("\U0001F4CB Daily report: HOSP555")
+        client.cookies.clear()
+        who["value"] = "reporter@gmail.example"
+        await _sign_in(client)
+        assert (await client.get("/api/v2/dashboard/watch/report",
+                                 params={"hospital_id": "HOSP555"})).status_code == 403
+
+        # Sent once each evening, after the report time, one per hospital.
+        from datetime import time as dtime
+        tz = collectors.zone()
+        before = datetime.combine(today, dtime(20, 0), tzinfo=tz)
+        after = datetime.combine(today, dtime(20, 45), tzinfo=tz)
+        async with dbs.rec.acquire() as conn:
+            await watchers.daily_reports(conn, now=before)
+            assert not [s for s in sent if s[0] == "boss@uni.example"]
+            await watchers.daily_reports(conn, now=after)
+            await watchers.daily_reports(conn, now=after)
+        reports = [s for s in sent if s[0] == "boss@uni.example"
+                   and s[1].startswith("Daily report")]
+        assert sorted(s[1].split(",")[0] for s in reports) == \
+            ["Daily report: HOSP555", "Daily report: HOSP556"]
+    _unserve()

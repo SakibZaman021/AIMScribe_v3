@@ -176,6 +176,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _table("collector_telegram")),
     ("037_v3_collector_telegram.sql", "recordings", "column collector_notifications.next_try_at",
      _column("collector_notifications", "next_try_at")),
+    # Without it researchers cannot be given hospitals, nor hear about them.
+    ("038_v3_researcher_hospitals.sql", "recordings", "table researcher_hospitals",
+     _table("researcher_hospitals")),
+    ("038_v3_researcher_hospitals.sql", "recordings", "column collector_notifications.audience",
+     _column("collector_notifications", "audience")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",

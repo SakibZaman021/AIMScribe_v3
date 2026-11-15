@@ -372,7 +372,10 @@ async def list_people(_: None = _admin()):
         rows = await conn.fetch("""
             SELECT p.email, p.role, p.display_name, p.added_by, p.added_at, p.last_signed_in,
                    p.db_user, p.db_password_set_at, p.place_id, pl.name AS place,
-                   (t.email IS NOT NULL) AS telegram
+                   (t.email IS NOT NULL) AS telegram, p.alert_mode,
+                   (SELECT array_agg(r.hospital_id ORDER BY r.hospital_id)
+                      FROM researcher_hospitals r
+                     WHERE r.email = p.email AND r.removed_at IS NULL) AS watching
               FROM portal_people p LEFT JOIN places pl ON pl.place_id = p.place_id
               LEFT JOIN collector_telegram t ON t.email = p.email
              WHERE p.removed_at IS NULL ORDER BY p.role, p.email

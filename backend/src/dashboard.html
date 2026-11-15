@@ -34,6 +34,7 @@
     <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
     <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
     <a href="#shift" data-view="shift" id="navShift" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My shift</span><b class="badge" id="badge-shift" hidden></b></a>
+    <a href="#watch" data-view="watch" id="navWatch" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My alerts</span></a>
     <a href="#downloads" data-view="downloads" id="navDownloads" hidden><span class="ico ico-dl" aria-hidden="true"></span><span class="label">Downloads</span></a>
     <a href="#cmed" data-view="cmed" id="navCmed" hidden><span class="ico ico-pc" aria-hidden="true"></span><span class="label">CMED</span></a>
     <a href="#people" data-view="people" id="navPeople" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">People</span></a>
@@ -68,6 +69,8 @@
     <label class="field"><span>From</span> <input type="date" id="from"></label>
     <label class="field"><span>To</span> <input type="date" id="to"></label>
     <label class="field"><span>Clinic</span> <select id="clinic"><option value="">All clinics</option></select></label>
+    <label class="field" id="mineField" hidden><input type="checkbox" id="mine">
+      <span>Only my hospitals</span></label>
   </div>
 
   <main id="main">
@@ -186,6 +189,49 @@
     </section>
 
     <!-- ============================== Downloads -->
+    <!-- ============================== My alerts (researchers, 038) -->
+    <section class="view" data-view="watch" aria-label="My alerts" hidden>
+      <section class="panel" aria-labelledby="h-watch">
+        <div class="head wrap"><h3 id="h-watch">The hospitals you look after</h3></div>
+        <div class="body shiftbody">
+          <p id="wHospitals" role="status">Loading</p>
+          <p class="hint" id="wState">You see and download every hospital as before. For these
+            you also get the data collectors' alerts, whether they dealt with them, and a report
+            every evening at <b id="wReportAt">20:30</b>.</p>
+          <label class="field"><span>Alerts</span>
+            <select id="wMode">
+              <option value="everything">Everything: every alert, handled or not, and the report</option>
+              <option value="problems">Only problems: not handled in 15 min, PC down, recording problems, and the report</option>
+            </select></label>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-wtg">
+        <div class="head wrap"><h3 id="h-wtg">Alerts on your phone</h3>
+          <span class="hint">Telegram, free. Do this once, on your phone.</span></div>
+        <div class="body shiftbody">
+          <p id="wTgState" role="status"></p>
+          <div class="row">
+            <button type="button" class="primary" id="wTgLink" hidden>Connect Telegram</button>
+            <button type="button" class="ghost" id="wTgTest" hidden>Send me a test alert</button>
+          </div>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-wrep">
+        <div class="head wrap"><h3 id="h-wrep">Evening report</h3>
+          <span class="hint">See it now, for any day, exactly as Telegram sends it.</span></div>
+        <div class="body row">
+          <label class="field"><span>Hospital</span> <select id="wRepHosp"></select></label>
+          <label class="field"><span>Day</span> <input type="date" id="wRepDay"></label>
+          <button type="button" class="ghost" id="wRepShow">Show report</button>
+        </div>
+        <div class="body"><pre id="wReport" class="report"></pre></div>
+      </section>
+      <section class="panel" aria-labelledby="h-walerts">
+        <div class="head wrap"><h3 id="h-walerts">My alerts</h3></div>
+        <div class="scroll"><div id="wAlerts"></div></div>
+      </section>
+    </section>
+
     <section class="view" data-view="downloads" aria-label="Downloads" hidden>
       <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
         <div class="head wrap"><h3 id="h-bulk">Download in batches</h3>
