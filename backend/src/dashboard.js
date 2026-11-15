@@ -1670,6 +1670,13 @@ async function collectorCall(method, path, body) {
   return data;
 }
 
+/* How an alert went out; 'held' = quiet hours, kept for the next summary (16 Nov). */
+function sentTag(n) {
+  if (n.delivered) return tag("good", n.channel === "telegram" ? "Telegram" : "email");
+  if (n.channel === "held") return tag("quiet", "held (night)");
+  return tag("warn", "not sent", n.error || "");
+}
+
 const EVENT_LABELS = {
   jabra_unplugged: "Jabra unplugged", jabra_back: "Jabra back", jabra_not_plugged: "Jabra not plugged in",
   recording_problem: "Recording problem", pc_silent: "PC not reporting",
@@ -1678,6 +1685,7 @@ const EVENT_LABELS = {
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
   recording_too_long: "Recording not stopped", handled: "Seen", daily_report: "Daily report",
   still_not_fixed: "Still not fixed", problem_fixed: "Fixed", repeated_stops: "Repeated stops",
+  shift_report: "Shift summary", summary_csv: "Summary CSV",
   stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
 };
 
@@ -1737,8 +1745,7 @@ async function loadShift() {
         + td("What", tag(n.urgent ? "bad" : "good", EVENT_LABELS[n.event] || human(n.event)))
         + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
         + td("Message", esc(n.subject), "wrap")
-        + td("Sent", n.delivered ? tag("good", n.channel === "telegram" ? "Telegram" : "email")
-          : tag("warn", "not sent", n.error || ""))
+        + td("Sent", sentTag(n))
         + td("", n.seen_at ? `<span class="hint">seen</span>`
           : `<button type="button" class="chip" data-seen="${esc(n.id)}">Mark seen</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1961,6 +1968,11 @@ async function loadWatch(first) {
   }
   $("wMode").value = me.mode || "everything";
   $("wReportAt").textContent = me.report_at || "20:30";
+  $("wMiddayAt").textContent = me.midday_at || "14:30";
+  if (first) {   // the summary most recently sent
+    const hm = new Date().toLocaleTimeString("en-GB", { timeZone: "Asia/Dhaka", hour12: false }).slice(0, 5);
+    $("wRepShift").value = hm >= (me.report_at || "20:30") ? "evening" : (hm >= (me.midday_at || "14:30") ? "morning" : "evening");
+  }
   $("wRepHosp").innerHTML = hs.map((h) =>
     `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("");
   $("wRepShow").disabled = !hs.length;
@@ -2008,8 +2020,7 @@ async function loadWatch(first) {
                          EVENT_LABELS[n.event] || human(n.event)))
         + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
         + td("Message", esc(n.subject), "wrap")
-        + td("Sent", n.delivered ? tag("good", n.channel === "telegram" ? "Telegram" : "email")
-          : tag("warn", "not sent", n.error || ""))
+        + td("Sent", sentTag(n))
         + `</tr>`).join("") + `</tbody></table>`;
 }
 
@@ -2020,12 +2031,22 @@ $("wMode").addEventListener("change", async () => {
   loadWatch();
 });
 $("wRepShow").addEventListener("click", async () => {
-  $("wReport").textContent = "Building the report...";
+  $("wReport").textContent = "Building the summary...";
   try {
     const r = await watchCall("GET", `/report?hospital_id=${encodeURIComponent($("wRepHosp").value)}`
+      + `&shift=${encodeURIComponent($("wRepShift").value)}`
       + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : ""));
     $("wReport").textContent = r.text;
   } catch (err) { $("wReport").textContent = `Could not build it: ${err.message}`; }
+});
+$("wRepCsv").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = `/api/v2/dashboard/watch/summary.csv?shift=${encodeURIComponent($("wRepShift").value)}`
+    + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : "");
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 });
 $("wTgLink").addEventListener("click", async () => {
   $("wTgLink").disabled = true;

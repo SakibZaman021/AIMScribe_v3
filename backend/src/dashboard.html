@@ -216,12 +216,13 @@
           <p class="hint" id="wState">You see and download every hospital as before. For these
             you also get every alert the data collectors get, with the collector on shift and
             their phone and Telegram; word when they press Seen; a reminder when a problem is
-            still not fixed after 30, 60 and 90 minutes; word when it is fixed; and a report
-            every evening at <b id="wReportAt">20:30</b>.</p>
+            still not fixed after 30, 60 and 90 minutes; word when it is fixed; and a summary of
+            each shift at <b id="wMiddayAt">14:30</b> and <b id="wReportAt">20:30</b>, with a CSV.
+            Nothing is sent at night: what happens then is in the next summary.</p>
           <label class="field"><span>Alerts</span>
             <select id="wMode">
               <option value="everything">Everything</option>
-              <option value="problems">Only problems (urgent alerts, follow-ups, report)</option>
+              <option value="problems">Only problems (urgent alerts, follow-ups, summaries)</option>
             </select></label>
         </div>
       </section>
@@ -243,12 +244,19 @@
         </div>
       </section>
       <section class="panel" aria-labelledby="h-wrep">
-        <div class="head wrap"><h3 id="h-wrep">Evening report</h3>
-          <span class="hint">See it now, for any day, exactly as Telegram sends it.</span></div>
+        <div class="head wrap"><h3 id="h-wrep">Shift summaries</h3>
+          <span class="hint">Any day, exactly as Telegram sends it. The CSV has every recording
+            and alert at all your hospitals, one row each, to open in Excel.</span></div>
         <div class="body row">
           <label class="field"><span>Hospital</span> <select id="wRepHosp"></select></label>
           <label class="field"><span>Day</span> <input type="date" id="wRepDay"></label>
-          <button type="button" class="ghost" id="wRepShow">Show report</button>
+          <label class="field"><span>Shift</span> <select id="wRepShift">
+            <option value="morning">Morning (to 14:30)</option>
+            <option value="evening">Evening (to 20:30)</option>
+            <option value="day">Whole day</option>
+          </select></label>
+          <button type="button" class="ghost" id="wRepShow">Show summary</button>
+          <button type="button" class="ghost" id="wRepCsv">Download CSV</button>
         </div>
         <div class="body"><pre id="wReport" class="report"></pre></div>
       </section>

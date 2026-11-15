@@ -38,6 +38,9 @@ from confirmation import Visit                 # noqa: E402
 from db_v2 import V2Repository                 # noqa: E402
 
 pytestmark = pytest.mark.asyncio
+# Quiet hours (no alerts at night) follow the clock; these tests check the
+# alerts themselves at any hour, and the quiet-hours test turns them on.
+os.environ.setdefault("AIMS_QUIET_HOURS", "off")
 
 # Every v2 and v3 migration, in order, as a deployment applies them.
 RECORDINGS_SCRIPTS = sorted((BACKEND / "scripts").glob("0[0-9][0-9]_*.sql"))
@@ -3234,26 +3237,39 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         shown = (await client.get("/api/v2/dashboard/watch/report",
                                   params={"hospital_id": "HOSP555"})).json()
         assert shown["text"].startswith("\U0001F4CB Daily report: HOSP555")
+        evening = (await client.get("/api/v2/dashboard/watch/report", params={
+            "hospital_id": "HOSP555", "shift": "evening"})).json()
+        assert evening["text"].startswith("\U0001F4CB Evening shift summary: HOSP555")
+        assert "(14:30 to 20:30)" in evening["text"].splitlines()[0]
+        assert (await client.get("/api/v2/dashboard/watch/report", params={
+            "hospital_id": "HOSP555", "shift": "night"})).status_code == 400
         client.cookies.clear()
         who["value"] = "reporter@gmail.example"
         await _sign_in(client)
         assert (await client.get("/api/v2/dashboard/watch/report",
                                  params={"hospital_id": "HOSP555"})).status_code == 403
 
-        # Sent once each evening, after the report time, one per hospital.
+        # Two summaries a day, each once, one per hospital, then one CSV.
         from datetime import time as dtime
         tz = collectors.zone()
-        before = datetime.combine(today, dtime(20, 0), tzinfo=tz)
-        after = datetime.combine(today, dtime(20, 45), tzinfo=tz)
+        at = {t: datetime.combine(today, dtime(*t), tzinfo=tz) for t in
+              ((14, 0), (14, 45), (20, 0), (20, 45))}
+        mine = lambda: [s[1] for s in sent if s[0] == "boss@uni.example"]   # noqa: E731
         async with dbs.rec.acquire() as conn:
-            await watchers.daily_reports(conn, now=before)
-            assert not [s for s in sent if s[0] == "boss@uni.example"]
-            await watchers.daily_reports(conn, now=after)
-            await watchers.daily_reports(conn, now=after)
-        reports = [s for s in sent if s[0] == "boss@uni.example"
-                   and s[1].startswith("Daily report")]
-        assert sorted(s[1].split(",")[0] for s in reports) == \
-            ["Daily report: HOSP555", "Daily report: HOSP556"]
+            await watchers.shift_summaries(conn, now=at[(14, 0)])
+            assert not mine()
+            await watchers.shift_summaries(conn, now=at[(14, 45)])
+            await watchers.shift_summaries(conn, now=at[(20, 0)])
+            morning = mine()
+            assert sorted(x.split(",")[0] for x in morning) == [
+                "Morning shift summary CSV", "Morning shift summary: HOSP555",
+                "Morning shift summary: HOSP556"]
+            await watchers.shift_summaries(conn, now=at[(20, 45)])
+            await watchers.shift_summaries(conn, now=at[(20, 45)])
+        evening = [x for x in mine() if x not in morning]
+        assert sorted(x.split(",")[0] for x in evening) == [
+            "Evening shift summary CSV", "Evening shift summary: HOSP555",
+            "Evening shift summary: HOSP556"]
     _unserve()
 
 
@@ -3435,7 +3451,8 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             assert done["subject"].startswith("Fixed after 31 min: Jabra unplugged")
             assert done["body"].startswith("The Jabra is back in use")
             assert await conn.fetchval("SELECT resolution FROM collector_notifications "
-                                       "WHERE event_key = $1 LIMIT 1", key) == \
+                                       "WHERE event_key = $1 AND audience = 'collector' "
+                                       "LIMIT 1", key) == \
                 "the Jabra is back in use"
             today = (datetime.now(collectors.zone()) - timedelta(minutes=31)).date()
             text = await watchers.hospital_report(conn, "HOSP003", today)
@@ -3557,4 +3574,148 @@ async def test_a_collector_saves_their_official_name_and_lab_id(dbs, monkeypatch
                  if p["email"] == "first@gmail.example"]
         assert found and found[0]["name"] == "Md. Sakib Zaman" and found[0]["code"] == "DC-907"
         assert found[0]["missing"] == []
+    _unserve()
+
+
+async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
+        dbs, monkeypatch):
+    """
+    16 Nov: from the evening summary until the morning shift nobody is messaged
+    - it is kept, marked held, and is in the next summary; a PC switched off after
+    the shift is no alert; at 14:30 and 20:30 researchers get each hospital's
+    summary and one CSV of every recording and alert.
+    """
+    import csv
+    import io
+    import collectors
+    import watchers
+    from datetime import time as dtime
+    sent, files = [], []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    async def fake_telegram(method, payload, timeout=15):
+        if method == "sendMessage":
+            sent.append((payload["chat_id"], payload["text"].split("\n")[0], payload["text"]))
+        return {"message_id": 1}, None
+
+    async def fake_upload(method, fields, filename, content, timeout=60):
+        files.append((fields["chat_id"], filename, content, fields["caption"]))
+        return {"message_id": 2}, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake_telegram)
+    monkeypatch.setattr(collectors, "_telegram_upload", fake_upload)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO hospitals (hospital_id, name, timezone) VALUES "
+                               "('HOSP661', 'Night Clinic', 'Asia/Dhaka') ON CONFLICT DO NOTHING")
+            await conn.execute("UPDATE devices SET hospital_id = 'HOSP661', machine_name = 'PC-N', "
+                               "microphone_is_clinic = FALSE, last_seen_at = now() "
+                               "WHERE device_id = $1", device["device_id"])
+        place = await _make_collector(client, who, "night@gmail.example", hospitals=("HOSP661",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "nightwatch@uni.example", hospitals=("HOSP661",))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO collector_telegram (email, chat_id, username) VALUES "
+                               "('night@gmail.example', 661001, 'night_dc'), "
+                               "('nightwatch@uni.example', 661002, 'night_res')")
+            sid = f"N{device['device_id'].hex[:25]}"[:26]
+            await conn.execute("""
+                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                      protocol_version, status, session_date, opened_at)
+                VALUES ($1, 'P9', 'DR0661', 'HOSP661', $2, 2, 'active', now()::date, now())
+            """, sid, device["device_id"])
+
+            # ------------------------------------------------ the night: held, not sent
+            monkeypatch.setenv("AIMS_QUIET_HOURS", "on")
+            monkeypatch.setenv("AIMS_REPORT_AT", "00:00")          # quiet from midnight: now
+            assert await watchers.quiet_for(conn, "HOSP661")
+            before = len(sent)
+            await collectors.notify(conn, hospital_id="HOSP661", event="jabra_unplugged",
+                                    subject="Jabra unplugged: HOSP661, PC-N",
+                                    body="b" + collectors._footer(), event_key="night-1",
+                                    urgent=True, everyone_if_nobody=True,
+                                    device_id=device["device_id"], session_id=sid)
+            assert len(sent) == before                          # nobody messaged
+            held = await conn.fetch("SELECT email, channel, delivered FROM "
+                                    "collector_notifications WHERE event_key = 'night-1'")
+            assert {r["email"] for r in held} == {"night@gmail.example",
+                                                  "nightwatch@uni.example"}
+            assert all(r["channel"] == "held" and not r["delivered"] for r in held)
+            # Held is not a failure, is not escalated and is not chased all night.
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '40 minutes' WHERE event_key = 'night-1'")
+            notifier = collectors.Notifier()
+            await notifier.escalate(conn)
+            await watchers.persisting(conn)
+            await notifier.failure_alarm(conn)
+            assert len(sent) == before
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications WHERE "
+                                           "event_key IN ('esc:night-1', 'still:night-1:1')")
+            # A PC switched off after the shift hours is no alert at all.
+            await conn.execute("UPDATE places SET morning_start = '00:00', "
+                               "evening_end = '00:00:01' WHERE place_id = $1", place)
+            await conn.execute("UPDATE devices SET last_seen_at = now() - interval '5 minutes' "
+                               "WHERE device_id = $1", device["device_id"])
+            assert not await watchers.in_shift_hours(conn, "HOSP661")
+            await notifier.silent_pcs(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'pc_silent' AND hospital_id = 'HOSP661'")
+
+            # ------------------------------------------------ the summaries
+            monkeypatch.setenv("AIMS_REPORT_AT", "20:30")
+            tz = collectors.zone()
+            day = datetime.now(tz).date()
+            # The rows of the last hours: both are in them, whatever the hour.
+            now = datetime.now(timezone.utc)
+            rows = await watchers.summary_rows(conn, ["HOSP661"], now - timedelta(hours=2),
+                                               now + timedelta(hours=1))
+            kinds = {r["type"] for r in rows}
+            assert kinds == {"recording", "alert"}
+            alert = next(r for r in rows if r["type"] == "alert")
+            assert alert["sent"] == "held (quiet hours)" and alert["pc"] == "PC-N"
+            rec = next(r for r in rows if r["type"] == "recording")
+            assert rec["how_it_ended"] == "still open" and rec["session_id"] == sid
+            assert rec["collector_on_shift"] not in ("", "nobody")    # who was on shift
+            text = watchers.csv_text(rows)
+            assert text.startswith(b"\xef\xbb\xbf")                   # Excel reads it right
+            header = next(csv.reader(io.StringIO(text.decode("utf-8-sig"))))
+            assert header == watchers.CSV_COLUMNS
+            assert b"P9" not in text                                 # no patient details
+
+            # Sent at the summary time: a message per hospital, then the CSV as a file.
+            evening = datetime.combine(day, dtime(20, 45), tzinfo=tz)
+            sent.clear()
+            await watchers.shift_summaries(conn, now=evening)
+            await watchers.shift_summaries(conn, now=evening)          # once only
+            subjects = [x[1] for x in sent if x[0] == 661002]
+            assert any(x.startswith("\U0001F4CB Evening shift summary: HOSP661") or
+                       "Evening shift summary: HOSP661" in x for x in subjects)
+            mine = [f for f in files if f[0] == 661002]
+            assert len(mine) == 2                                      # morning and evening
+            assert {f[1] for f in mine} == {f"aimscribe_{day.isoformat()}_morning.csv",
+                                            f"aimscribe_{day.isoformat()}_evening.csv"}
+            assert all(f[2].startswith(b"\xef\xbb\xbf") for f in mine)
+
+        # And on the dashboard, for any day and shift.
+        client.cookies.clear()
+        who["value"] = "nightwatch@uni.example"
+        await _sign_in(client)
+        got = await client.get("/api/v2/dashboard/watch/summary.csv",
+                               params={"day": day.isoformat(), "shift": "day"})
+        assert got.status_code == 200 and "text/csv" in got.headers["content-type"]
+        assert "attachment" in got.headers["content-disposition"]
+        assert got.content.decode("utf-8-sig").count("\n") >= 2      # header and the recording
+        assert (await client.get("/api/v2/dashboard/watch/summary.csv",
+                                 params={"shift": "night"})).status_code == 400
+        page = (await client.get("/api/v2/dashboard/watch/me")).json()
+        assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
     _unserve()

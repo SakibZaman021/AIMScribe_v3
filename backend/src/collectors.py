@@ -828,6 +828,48 @@ async def send_telegram(chat_id: int, text: str,
     return (True, None) if result is not None else (False, error)
 
 
+async def _telegram_upload(method: str, fields: Dict[str, Any], filename: str,
+                           content: bytes, timeout: float = 60) -> Tuple[Optional[Any],
+                                                                      Optional[str]]:
+    """One Bot API call carrying a file (sendDocument). Never raises; never shows the token."""
+    token = _token()
+    if not token:
+        return None, "Telegram is not set up on this server (AIMS_TELEGRAM_BOT_TOKEN)"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            reply = await client.post(
+                f"{TELEGRAM_API}/bot{token}/{method}",
+                data={k: str(v) for k, v in fields.items()},
+                files={"document": (filename, content, "text/csv")})
+        try:
+            body = reply.json()
+        except ValueError:
+            body = {}
+        if reply.status_code == 200 and body.get("ok"):
+            return body.get("result"), None
+        return None, _hide(f"Telegram answered {reply.status_code}: "
+                           f"{body.get('description') or reply.text[:200]}")[:500]
+    except Exception as exc:
+        return None, _hide(f"Telegram could not be reached: {type(exc).__name__} {exc}")[:500]
+
+
+async def send_telegram_file(chat_id: int, filename: str, content: bytes,
+                             caption: str) -> Tuple[bool, Optional[str]]:
+    await _pace_chat(chat_id)
+    await _pace("telegram")
+    result, error = await _telegram_upload("sendDocument", {"chat_id": chat_id,
+                                                            "caption": caption[:1000]},
+                                           filename, content)
+    return (True, None) if result is not None else (False, error)
+
+
+async def _summary_file(conn, note: Dict[str, Any]) -> Tuple[str, bytes]:
+    """The researcher's shift CSV, built when it is sent (and again if it is retried)."""
+    import watchers
+    _, day, shift = note["event_key"].split(":", 2)
+    return await watchers.summary_csv_for(conn, note["email"], date.fromisoformat(day), shift)
+
+
 # ------------------------------------------------------------ one alert, any channel
 
 def _transient(error: Optional[str]) -> bool:
@@ -847,6 +889,14 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
         if channel == "telegram":
             if chat is None or not telegram_ready():
                 continue
+            if note["event"] == "summary_csv":
+                filename, content = await _summary_file(conn, note)
+                ok, error = await send_telegram_file(
+                    chat, filename, content, f"{note['subject']}\n\n{note['body']}")
+                if ok:
+                    return True, None, channel
+                errors.append((channel, error or "not sent"))
+                continue
             ok, error = await send_telegram(
                 chat, _telegram_text(note["subject"], note["body"], note["urgent"]),
                 # Only the collector, who must act, gets the Seen button.
@@ -865,7 +915,8 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
 async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: str = "") -> bool:
     """Send one kept alert and keep how it went; an alert that failed for a passing reason
     gets its next try."""
-    note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body, audience "
+    note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body, audience, "
+                               "event_key "
                                "FROM collector_notifications WHERE id = $1", note_id)
     if note is None:
         return False
@@ -881,6 +932,12 @@ async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: st
                            "WHERE id = $1", note_id,
                            timedelta(minutes=RETRY_WAITS[attempts - 1]))
     return ok
+
+
+async def _hold(conn, note_id: int) -> None:
+    """Quiet hours: the alert is kept for the summary and the dashboard, and not sent."""
+    await conn.execute("UPDATE collector_notifications SET channel = 'held', delivered = FALSE, "
+                       "error = NULL, next_try_at = NULL WHERE id = $1", note_id)
 
 
 async def _record(conn, *, email: str, event: str, subject: str, body: str, event_key: str,
@@ -1001,6 +1058,10 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
     if context:
         main, mark, foot = body.partition(_FOOTER_MARK)
         body = main.rstrip() + "\n\n" + context + (mark + foot if mark else "")
+    import watchers
+    # 16 Nov: from the evening summary until the morning shift, nobody is
+    # messaged - it is kept, marked held, and is in the next summary.
+    quiet = await watchers.quiet_for(conn, hospital_id)
     sent = 0
     told: List[str] = []
     on_shift = False
@@ -1019,19 +1080,22 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
                                     session_id=session_id, happened_at=happened_at)
             if note_id is not None:
                 told.append(email)
+                if quiet:
+                    await _hold(conn, note_id)
+                    continue
                 await _deliver(conn, note_id, email, subject, body)
                 sent += 1
     # 038/039: the researchers who look after this hospital get it too, written
     # for supervision: what the collector was asked to do, and the collector on
     # shift - or, with nobody on shift, all the place's collectors - with phone
     # and Telegram, so they can call them.
-    import watchers
     contacts = await watchers.contact_text(conn, hospital_id)
     sent += await watchers.copy_to_watchers(
         conn, hospital_id=hospital_id, event=event,
         subject=(subject if on_shift else f"Nobody on shift: {subject}"),
         body=watchers.researcher_body(body, contacts), event_key=event_key,
-        urgent=urgent, device_id=device_id, session_id=session_id, happened_at=happened_at)
+        urgent=urgent, device_id=device_id, session_id=session_id, happened_at=happened_at,
+        hold=quiet)
     return sent
 
 
@@ -1147,7 +1211,7 @@ class Notifier:
                      self.recordings_too_long, self.refusals, self.silent_pcs,
                      self.no_shift_started,
                      self.escalate, watchers.handled_followups, watchers.persisting,
-                     watchers.repeated_stops, watchers.daily_reports,
+                     watchers.repeated_stops, watchers.shift_summaries,
                      self.retry_failed, self.failure_alarm):
             try:
                 await self.keep_lease(conn)
@@ -1297,7 +1361,11 @@ class Notifier:
                AND last_seen_at < now() - $1::interval
                AND last_seen_at > now() - interval '30 minutes'
         """, SILENT_AFTER)
+        import watchers
         for row in rows:
+            # 16 Nov: a PC switched off after the shift is the day ending, not news.
+            if not await watchers.in_shift_hours(conn, row["hospital_id"]):
+                continue
             where = f"{row['hospital_id']}, {row['machine_name'] or 'a PC'}"
             await notify(conn, hospital_id=row["hospital_id"], event="pc_silent",
                          subject=f"PC not reporting: {where}",
@@ -1446,6 +1514,7 @@ class Notifier:
               FROM collector_notifications n
              WHERE n.urgent AND n.escalated_at IS NULL
                AND n.event NOT IN ('escalation', 'still_not_fixed')
+               AND n.channel IS DISTINCT FROM 'held'
                AND n.audience = 'collector'
                AND n.created_at < now() - $1::interval
                AND n.created_at > now() - interval '12 hours'
@@ -1454,12 +1523,18 @@ class Notifier:
                                   AND m.seen_at IS NOT NULL)
              ORDER BY n.event_key, n.id
         """, ESCALATE_AFTER)
+        import watchers
         for n in rows:
+            if await watchers.quiet_for(conn, n["hospital_id"], n["place_id"]):
+                # Night: not escalated now, nor stale in the morning; it is in the summary.
+                await conn.execute("UPDATE collector_notifications SET escalated_at = now() "
+                                   "WHERE event_key = $1 AND escalated_at IS NULL",
+                                   n["event_key"])
+                continue
             already = {r["email"] for r in await conn.fetch(
                 "SELECT email FROM collector_notifications WHERE event_key = $1", n["event_key"])}
             others = [e for e in await collectors_of(conn, n["place_id"]) if e not in already] \
                 if n["place_id"] else []
-            import watchers
             now_body = await watchers.fresh_context(conn, dict(n))
             subject = f"Not yet seen: {n['subject']}"
             body = (f"This urgent alert was sent at {_hhmm(n['created_at'])} and nobody has "
@@ -1512,7 +1587,7 @@ class Notifier:
         failed = await conn.fetchval("""
             SELECT count(*) FROM collector_notifications
              WHERE delivered = FALSE AND created_at > now() - interval '30 minutes'
-               AND event <> 'send_failures'
+               AND event <> 'send_failures' AND channel IS DISTINCT FROM 'held'
         """)
         if failed < FAILURES_ALARM:
             return
@@ -1523,7 +1598,8 @@ class Notifier:
         self._alarm_key = key
         last = await conn.fetchval("""
             SELECT error FROM collector_notifications
-             WHERE delivered = FALSE AND event <> 'send_failures' ORDER BY id DESC LIMIT 1
+             WHERE delivered = FALSE AND event <> 'send_failures'
+               AND channel IS DISTINCT FROM 'held' ORDER BY id DESC LIMIT 1
         """)
         logger.warning("%s alerts to data collectors failed in 30 minutes: %s", failed, last)
         subject = f"{failed} alerts to data collectors could not be sent"
@@ -1604,8 +1680,10 @@ class Notifier:
                                 + ", each with the data collector on shift and their phone "
                                 "and Telegram, so you can call them. You also hear when they "
                                 "press Seen, when a problem is still not fixed after 30 "
-                                "minutes, when it is fixed, and get a report every evening at "
-                                f"{watchers.report_time():%H:%M}.")
+                                "minutes and when it is fixed, and get a summary of each shift "
+                                f"at {watchers.midday_time():%H:%M} and "
+                                f"{watchers.report_time():%H:%M}, with a CSV. Nothing comes "
+                                "at night: it waits for the next summary.")
             return
         await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "
                             f"shift{' at ' + place if place else ''}, AIMScribe alerts come here. "

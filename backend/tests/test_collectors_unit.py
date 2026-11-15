@@ -1,6 +1,6 @@
 """Data collectors (036): the rules that need no database."""
 import sys
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -183,3 +183,15 @@ def test_one_telegram_chat_gets_at_most_one_message_a_second():
     other, same = asyncio.run(go())
     assert other < 0.2
     assert same >= collectors.CHAT_GAP - 0.05
+
+
+def test_the_two_summaries_meet_and_cover_the_night():
+    from datetime import date as d
+    import watchers
+    day = d(2026, 11, 16)
+    m0, m1, mw = watchers.shift_window(day, "morning")
+    e0, e1, ew = watchers.shift_window(day, "evening")
+    assert m1 == e0                                   # nothing falls between them
+    assert e1 - m0 == timedelta(hours=24)             # the night is in the morning one
+    assert (m0.hour, m0.minute) == (14, 30)           # 20:30 Dhaka the day before, in UTC
+    assert mw == "20:30 the day before to 14:30" and ew == "14:30 to 20:30"
