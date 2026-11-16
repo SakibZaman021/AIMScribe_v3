@@ -734,6 +734,24 @@ _REGISTER_REFUSALS = {
 }
 
 
+async def _register_refused(repo, code: str, body, device_id, address: str, *,
+                            hospital_id: Optional[str] = None) -> None:
+    """A PC that proved its key but could not join: one dashboard alert per reason and
+    CMED code a day, its detail the latest attempt (CMED > Clinic codes shows them)."""
+    try:
+        await repo.alert_once(
+            alert_type="device_register_refused",
+            group=f"register_refused:{code}:{body.cmed_hospital_id}",
+            window=timedelta(days=1), severity="warning",
+            detail={"code": code, "cmed_hospital_id": body.cmed_hospital_id,
+                    "hospital_id": hospital_id, "device_id": str(device_id),
+                    "machine_name": body.machine_name, "app_version": body.app_version,
+                    "address": address,
+                    "last_at": datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:                       # never the reason a refusal is lost
+        logger.warning("Could not record the refused registration: %s", exc)
+
+
 @router.post("/device/register")
 async def register_device(body: RegisterRequest, request: Request):
     """
@@ -774,14 +792,21 @@ async def register_device(body: RegisterRequest, request: Request):
                       "key_proof does not verify: this PC did not show it holds the key")
 
     repo = _repo()
-    hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
-    if hospital_id is None:
-        return _coded(403, "UNKNOWN_CLINIC",
-                      "CMED's clinic code is not a clinic this server runs")
-
     import security
     address = security.client_ip(request)
     device_id = integrity.device_id_for_key(pubkey)
+    hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
+    if hospital_id is None:
+        # 16 Nov: say which code, and what to do - and keep it on the dashboard,
+        # so AIMS LAB sees it without asking CMED for the PC's log.
+        await _register_refused(repo, "UNKNOWN_CLINIC", body, device_id, address)
+        return _coded(403, "UNKNOWN_CLINIC",
+                      f"CMED's clinic code '{body.cmed_hospital_id}' is not set up on the "
+                      "AIMS LAB server. AIMS LAB links it to one of its clinics "
+                      "(dashboard > CMED > Clinic codes); then this PC joins by itself at "
+                      "the next patient. Check that hospital_id in the start command is "
+                      "exactly the code AIMS LAB was given (CMED-TEST while testing).",
+                      cmed_hospital_id=body.cmed_hospital_id)
     result = await repo.register_device(
         device_id=device_id, tpm_pubkey=pubkey, hospital_id=hospital_id,
         machine_name=body.machine_name, os_version=body.os_version,
@@ -792,7 +817,8 @@ async def register_device(body: RegisterRequest, request: Request):
     if "refused" in result:
         status, code, message = _REGISTER_REFUSALS[result["refused"]]
         logger.warning("Registration of %s at %s refused: %s", device_id, hospital_id, code)
-        return _coded(status, code, message)
+        await _register_refused(repo, code, body, device_id, address, hospital_id=hospital_id)
+        return _coded(status, code, message, cmed_hospital_id=body.cmed_hospital_id)
 
     await repo.audit(event_type="device.registered", actor_type="device",
                      device_id=device_id,
@@ -3889,10 +3915,61 @@ async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)
     cmed_id = (safe_identifier(body.cmed_hospital_id, field="cmed_hospital_id")
                if body.cmed_hospital_id else None)
     if cmed_id:
+        holder = await _repo().hospital_for_cmed_id(cmed_id)
+        if holder is not None and holder != hospital_id:
+            raise HTTPException(status_code=409,
+                                detail=f"CMED code '{cmed_id}' is already linked to clinic "
+                                       f"{holder}; one CMED code belongs to one clinic")
         await _repo().set_cmed_hospital_id(hospital_id, cmed_id)
+        _CLINIC_CACHE.clear()        # a newly linked code works at once here; elsewhere in a minute
         await _repo().audit(event_type="hospital.mapped", actor_type="admin",
                             actor_id=hospital_id, detail={"cmed_hospital_id": cmed_id})
     return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id}
+
+
+@router.get("/admin/clinic-codes")
+async def admin_clinic_codes(_: None = Depends(require_admin)):
+    """
+    Each clinic's CMED code, and the PCs refused in the last 30 days with the
+    code they sent (16 Nov) - the dashboard's CMED > Clinic codes.
+    """
+    repo = _repo()
+    async with repo._acquire() as conn:
+        clinics = await conn.fetch("""
+            SELECT h.hospital_id, h.name, h.timezone, h.active, h.cmed_hospital_id,
+                   h.cmed_last_message_at,
+                   (SELECT count(*) FROM devices d WHERE d.hospital_id = h.hospital_id
+                       AND d.revoked_at IS NULL) AS pcs
+              FROM hospitals h ORDER BY h.hospital_id
+        """)
+        refused = await conn.fetch("""
+            SELECT id, raised_at, detail FROM integrity_alerts
+             WHERE alert_type = 'device_register_refused'
+               AND raised_at > now() - interval '30 days'
+             ORDER BY id DESC LIMIT 100
+        """)
+
+    def iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    out = []
+    for r in refused:
+        detail = r["detail"]
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = {}
+        detail = detail or {}
+        out.append({"id": r["id"], "first_at": iso(r["raised_at"]),
+                    "last_at": detail.get("last_at") or iso(r["raised_at"]),
+                    "code": detail.get("code"), "cmed_hospital_id": detail.get("cmed_hospital_id"),
+                    "machine_name": detail.get("machine_name"),
+                    "app_version": detail.get("app_version"), "address": detail.get("address"),
+                    "linked_now": await repo.active_clinic_for_cmed(
+                        detail.get("cmed_hospital_id") or "") is not None})
+    return {"clinics": [{k: iso(v) for k, v in dict(c).items()} for c in clinics],
+            "refused": out}
 
 
 class DoctorRequest(BaseModel):

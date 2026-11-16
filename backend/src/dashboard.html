@@ -310,6 +310,17 @@
         </form>
         <div class="scroll"><div id="origins"></div></div>
       </section>
+      <section class="panel" aria-labelledby="h-codes" id="codesPanel" hidden>
+        <div class="head wrap"><h3 id="h-codes">Clinic codes</h3>
+          <span class="hint">The hospital code CMED sends (hospital_id) for each of our clinics.
+            A new PC joins only if the code in CMED's start command is linked here - letter
+            for letter - or is our own clinic ID.</span></div>
+        <div class="scroll"><div id="codes"></div></div>
+        <div class="head wrap"><h3>PCs that could not join</h3>
+          <span class="hint">The last 30 days: the code each PC was given by CMED, and why it
+            was refused. Link the code to a clinic and the PC joins at its next patient.</span></div>
+        <div class="scroll"><div id="refusedPcs"></div></div>
+      </section>
       <section class="panel" aria-labelledby="h-clients" id="clientsPanel" hidden>
         <div class="head wrap"><h3 id="h-clients">CMED connections</h3>
           <span class="hint">One per hospital: CMED's public key, which every API 2 and API 3 is

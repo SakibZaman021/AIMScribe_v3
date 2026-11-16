@@ -3747,3 +3747,54 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
         page = (await client.get("/api/v2/dashboard/watch/me")).json()
         assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
     _unserve()
+
+
+async def test_an_unknown_clinic_code_is_named_shown_and_fixed_on_the_dashboard(dbs):
+    """
+    16 Nov: CMED's developer saw only UNKNOWN_CLINIC. The refusal now names the
+    code and what to do; the dashboard lists the PC and its code; linking the code
+    to a clinic lets the same PC join at its next try; one code, one clinic.
+    """
+    await enrolled_device(dbs.repo)                       # HOSP003 <- CMED-DHOLPUR
+    _server(dbs)
+    try:
+        key = _p256()
+        refused = await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+        body = json.loads(refused.body)
+        assert (refused.status_code, body["code"]) == (403, "UNKNOWN_CLINIC")
+        assert "'CMED-ARMAN-01'" in body["message"] and "Clinic codes" in body["message"]
+        assert body["cmed_hospital_id"] == "CMED-ARMAN-01"
+        # Tried again: still one line on the dashboard, its detail the latest try.
+        await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+
+        codes = await api_v2.admin_clinic_codes()
+        mine = [r for r in codes["refused"] if r["cmed_hospital_id"] == "CMED-ARMAN-01"]
+        assert len(mine) == 1
+        assert mine[0]["code"] == "UNKNOWN_CLINIC" and mine[0]["machine_name"] == "ARMAN-PC"
+        assert mine[0]["address"] == "203.0.113.7" and not mine[0]["linked_now"]
+        clinic = next(c for c in codes["clinics"] if c["hospital_id"] == "HOSP003")
+        assert clinic["cmed_hospital_id"] == "CMED-DHOLPUR"
+
+        # Linked on the dashboard (to its own clinic): the same PC joins.
+        await dbs.repo.upsert_hospital("HOSP_ARMAN", "Arman test clinic", "Asia/Dhaka")
+        saved = await api_v2.admin_hospital(api_v2.HospitalRequest(
+            hospital_id="HOSP_ARMAN", name="Arman test clinic", timezone="Asia/Dhaka",
+            cmed_hospital_id="CMED-ARMAN-01"))
+        assert saved["cmed_hospital_id"] == "CMED-ARMAN-01"
+        joined = await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+        assert joined["hospital_id"] == "HOSP_ARMAN" and joined["approval"] == "pending"
+        again = await api_v2.admin_clinic_codes()
+        assert next(r for r in again["refused"]
+                    if r["cmed_hospital_id"] == "CMED-ARMAN-01")["linked_now"]
+
+        # One CMED code belongs to one clinic: a second link is refused, by name.
+        with pytest.raises(api_v2.HTTPException) as clash:
+            await api_v2.admin_hospital(api_v2.HospitalRequest(
+                hospital_id="HOSP003", name="Dholpur", timezone="Asia/Dhaka",
+                cmed_hospital_id="CMED-ARMAN-01"))
+        assert clash.value.status_code == 409 and "HOSP_ARMAN" in clash.value.detail
+    finally:
+        _unserve()

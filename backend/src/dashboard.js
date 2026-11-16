@@ -1102,6 +1102,7 @@ async function whoAmI() {
       $("navPeople").hidden = false;
       loadPeople();
       $("originsPanel").hidden = false;
+      $("codesPanel").hidden = false;
       $("clientsPanel").hidden = false;
       $("navCmed").hidden = false;
       loadCmed();
@@ -1137,7 +1138,78 @@ async function adminCall(method, path, body) {
    ============================================================ */
 const dhaka = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
 
+/* 16 Nov: each clinic's CMED code, and PCs that could not join with the code they sent. */
+let CLINIC_CODES = [];
+async function loadCodes() {
+  let data;
+  try { data = await adminCall("GET", "/api/v2/admin/clinic-codes"); }
+  catch (err) {
+    $("codes").innerHTML = empty("Clinic codes could not be loaded", err.message, true);
+    return;
+  }
+  CLINIC_CODES = data.clinics || [];
+  $("codes").innerHTML = !CLINIC_CODES.length
+    ? empty("No clinic yet", "Clinics appear here once they are set up.", true)
+    : `<table><thead><tr><th>Our clinic</th><th>CMED's code for it</th><th>PCs</th>`
+      + `<th>Last from CMED</th></tr></thead><tbody>`
+      + CLINIC_CODES.map((c) => `<tr>`
+        + td("Our clinic", `<b><code>${esc(c.hospital_id)}</code></b><br><span class="hint">${esc(c.name || "")}</span>`
+          + (c.active ? "" : ` ${tag("quiet", "inactive")}`))
+        + td("CMED's code", `<input class="small" data-codefor="${esc(c.hospital_id)}" value="${esc(c.cmed_hospital_id || "")}" `
+          + `placeholder="${esc(c.hospital_id)} (our ID)" aria-label="CMED code for ${esc(c.hospital_id)}"> `
+          + `<button type="button" class="chip" data-savecode="${esc(c.hospital_id)}">Save</button>`)
+        + td("PCs", esc(String(c.pcs || 0)))
+        + td("Last from CMED", esc(c.cmed_last_message_at ? dhaka(c.cmed_last_message_at) : "never"))
+        + `</tr>`).join("") + `</tbody></table>`;
+  const refused = data.refused || [];
+  const options = CLINIC_CODES.map((c) =>
+    `<option value="${esc(c.hospital_id)}">${esc(c.hospital_id)} ${esc(c.name || "")}</option>`).join("");
+  $("refusedPcs").innerHTML = !refused.length
+    ? empty("None", "No PC was refused in the last 30 days.", true)
+    : `<table><thead><tr><th>Last tried</th><th>Code CMED sent</th><th>Why</th><th>PC</th>`
+      + `<th>Fix</th></tr></thead><tbody>`
+      + refused.map((r) => `<tr>`
+        + td("Last tried", esc(dhaka(r.last_at)))
+        + td("Code CMED sent", `<code>${esc(r.cmed_hospital_id || "")}</code>`)
+        + td("Why", tag(r.code === "UNKNOWN_CLINIC" ? "bad" : "warn", r.code || ""))
+        + td("PC", `${esc(r.machine_name || "")}<br><span class="hint">${esc(r.address || "")}`
+          + `${r.app_version ? " · recorder " + esc(r.app_version) : ""}</span>`)
+        + td("Fix", r.linked_now ? tag("good", "linked now: joins at the next patient")
+          : r.code !== "UNKNOWN_CLINIC" ? `<span class="hint">see the reason</span>`
+          : `<select class="small" data-linkcode="${esc(r.cmed_hospital_id || "")}" aria-label="Clinic for ${esc(r.cmed_hospital_id || "")}">`
+            + `<option value="">Link to clinic...</option>${options}</select>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+async function saveCode(hospitalId, code) {
+  const clinic = CLINIC_CODES.find((c) => c.hospital_id === hospitalId);
+  if (!clinic) return;
+  if (!code) { window.alert("Type CMED's code first."); return; }
+  if (clinic.cmed_hospital_id && clinic.cmed_hospital_id !== code
+      && !window.confirm(`${hospitalId} answers to '${clinic.cmed_hospital_id}' now. Replace it with '${code}'? PCs sent the old code would no longer join.`)) return;
+  try {
+    await adminCall("POST", "/api/v2/admin/hospital", {
+      hospital_id: hospitalId, name: clinic.name || hospitalId,
+      timezone: clinic.timezone || "Asia/Dhaka", cmed_hospital_id: code });
+  } catch (err) { window.alert(`Not saved: ${err.message}`); }
+  loadCodes();
+}
+
+$("codes").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-savecode]");
+  if (!b) return;
+  const input = document.querySelector(`[data-codefor="${CSS.escape(b.dataset.savecode)}"]`);
+  saveCode(b.dataset.savecode, (input ? input.value : "").trim());
+});
+$("refusedPcs").addEventListener("change", (e) => {
+  const sel = e.target.closest("[data-linkcode]");
+  if (!sel || !sel.value) return;
+  if (!window.confirm(`Link CMED's code '${sel.dataset.linkcode}' to clinic ${sel.value}?`)) { sel.value = ""; return; }
+  saveCode(sel.value, sel.dataset.linkcode);
+});
+
 async function loadCmed() {
+  loadCodes();
   try {
     const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
     $("origins").innerHTML = !origins.length

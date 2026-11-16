@@ -65,13 +65,16 @@ DEVICE_TOKEN_FILE = "device.token"
 class EnrollmentError(RuntimeError):
     """Enrollment failed. The agent stays unenrolled and refuses to record."""
 
-    def __init__(self, message: str, *, rejected: bool = False, code: str = ""):
+    def __init__(self, message: str, *, rejected: bool = False, code: str = "",
+                 reason: str = ""):
         super().__init__(message)
         # The server said no - a mistyped, used or expired token. Trying the
         # same token again cannot succeed; an unreachable server can.
         self.rejected = rejected
         # The server's reason, when it gave one (UNKNOWN_CLINIC, ...).
         self.code = code
+        # And its words for it - which clinic code, and what to do (16 Nov).
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -300,12 +303,15 @@ async def register(cfg, device_key: DeviceKey, cmed_hospital_id: str, *,
                 body = await response.text()
                 if response.status >= 300:
                     try:
-                        code = str(json.loads(body).get("code") or "")
+                        answer = json.loads(body)
+                        code = str(answer.get("code") or "")
+                        reason = str(answer.get("message") or "")[:400]
                     except Exception:
-                        code = ""
+                        code, reason = "", ""
                     raise EnrollmentError(
                         f"server refused registration ({response.status} {code}): "
-                        f"{body[:200]}", rejected=400 <= response.status < 500, code=code)
+                        f"{body[:400]}", rejected=400 <= response.status < 500, code=code,
+                        reason=reason)
                 data = json.loads(body)
     except EnrollmentError:
         raise

@@ -65,6 +65,18 @@ SOCKET_STOP_REASONS = frozenset({"doctor_stopped", "consultation_finished",
                                  "technical_problem", "software_update"})
 
 
+
+def origin_refusal(origin: str) -> Dict[str, Any]:
+    """What a page at an address not on the list is told, by socket or by HTTP."""
+    return {
+        "event": "error", "command": "connect", "status": 403,
+        "code": "ORIGIN_NOT_ALLOWED", "origin": origin,
+        "message": (f"This page ({origin}) is not allowed to control the AIMScribe recorder. "
+                    "AIMS LAB adds the page's address on its dashboard (CMED > Trusted EHR "
+                    "addresses); every recorder takes it within a minute."),
+        "timestamp": crypto.iso_utc(datetime.now(timezone.utc)),
+    }
+
 class _Bucket:
     """Token bucket: `rate` messages a second on average, `burst` at once."""
 
@@ -128,6 +140,14 @@ class WebSocketManager:
 
         if not self.cfg.security.origin_allowed(origin):
             logger.warning("Rejected WebSocket: origin %r is not allowed", origin)
+            if origin and self.cfg.security.host_allowed(host) \
+                    and peer in ("127.0.0.1", "::1"):
+                # A browser cannot read why a socket was refused before it opened:
+                # the page saw only "connection failed". So a page at an address
+                # not on the list is told, in one message, and the socket closed -
+                # no command is ever read from it (16 Nov).
+                await websocket.accept()
+                await self._send(websocket, origin_refusal(origin))
             await websocket.close(code=CLOSE_POLICY, reason="origin not allowed")
             return False
 

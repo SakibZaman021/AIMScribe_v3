@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from core import crypto
@@ -331,8 +331,13 @@ class Runtime:
                 return OFFLINE + "the AIMS LAB server did not answer in time"
             except EnrollmentError as exc:
                 logger.error("Registration failed: %s", exc)
-                # A refusal names its code; anything else is the network.
-                return exc.code or OFFLINE + "the AIMS LAB server could not be reached"
+                # A refusal names its code and the server's reason - which clinic
+                # code, and what to do - so CMED's page can show it (16 Nov);
+                # anything else is the network.
+                if exc.code:
+                    reason = getattr(exc, "reason", "")
+                    return f"{exc.code}: {reason}" if reason else exc.code
+                return OFFLINE + "the AIMS LAB server could not be reached"
             self.adopt_identity(identity, load_device_token(self.cfg))
             if self.controller is not None:
                 self.controller.register = None
@@ -481,7 +486,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             knocked = getattr(runtime, "unknown_origin_knocked", None)
             if knocked is not None:
                 knocked()
-            return _error_response(403, "FORBIDDEN_ORIGIN", "Origin not allowed")
+            return _origin_refused(request, origin)
 
         from api.websocket_server import _same_windows_session
         if not _same_windows_session(request):
@@ -630,8 +635,11 @@ def create_app(runtime: Runtime) -> FastAPI:
         origin = request.headers.get("origin")
         if not origin or not cfg.security.origin_allowed(origin):
             logger.warning("Rejected HTTP start from origin %r", origin)
+            if origin:
+                return _origin_refused(request, origin)
             return _error_response(403, "ORIGIN_NOT_ALLOWED",
-                                   "This page is not allowed to control the recorder.")
+                                   "This request names no page (no Origin header), so it may "
+                                   "not control the recorder.")
         raw = (await request.body()).decode("utf-8", errors="replace")
         try:
             message = json.loads(raw)
@@ -658,6 +666,34 @@ def create_app(runtime: Runtime) -> FastAPI:
             await runtime.ws.disconnect(websocket)
 
     return app
+
+
+def _origin_refused(request: Request, origin: str) -> JSONResponse:
+    """
+    A page at an address not on the list, told why in a way its browser lets it
+    read (16 Nov). Without the CORS headers the browser hides the 403 and the page
+    sees only "Failed to fetch"; the browser's preflight (OPTIONS) must pass too,
+    or the request itself is never sent. Nothing else is let through: the
+    request stops here, and only this refusal - the page's own address and what
+    to do - is readable.
+    """
+    from api.websocket_server import origin_refusal
+    headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin",
+               "Cache-Control": "no-store"}
+    if request.method == "OPTIONS" and request.headers.get("access-control-request-method"):
+        headers.update({"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
+                        "Access-Control-Max-Age": "60"})
+        if request.headers.get("access-control-request-private-network"):
+            headers["Access-Control-Allow-Private-Network"] = "true"
+        return Response(status_code=204, headers=headers)
+    refusal = origin_refusal(origin)
+    return JSONResponse(status_code=403, headers=headers, content={
+        "success": False,
+        "error": {"code": "ORIGIN_NOT_ALLOWED", "message": refusal["message"],
+                  "origin": origin},
+        "timestamp": refusal["timestamp"],
+    })
 
 
 def _error_response(status: int, code: str, message: str) -> JSONResponse:

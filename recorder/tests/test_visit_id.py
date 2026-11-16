@@ -195,6 +195,20 @@ async def test_api1_over_http_is_the_websocket_start_with_the_same_origin_rule(
         r = await http.post(url, json=body("VIS-A", "P1", 0),
                             headers={"Origin": "https://evil.example"})
         assert r.status_code == 403 and ctl.state != "recording"
+        # 16 Nov: the page can read why - its address and what to do - because the
+        # refusal carries the CORS headers, and the browser's preflight passes.
+        assert r.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
+        assert "https://evil.example" in r.json()["error"]["message"]
+        assert r.headers["access-control-allow-origin"] == "https://evil.example"
+        pre = await http.options(url, headers={
+            "Origin": "https://evil.example", "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type"})
+        assert pre.status_code == 204
+        assert pre.headers["access-control-allow-origin"] == "https://evil.example"
+        other = await http.get("/api/v1/session/status",
+                               headers={"Origin": "https://evil.example"})
+        assert other.status_code == 403 and other.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
+        assert ctl.state != "recording"
 
         first = await http.post(url, json=body("VIS-A", "P1", 0), headers={"Origin": origin})
         assert first.status_code == 200, first.text
