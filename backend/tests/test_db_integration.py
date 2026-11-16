@@ -3798,3 +3798,78 @@ async def test_an_unknown_clinic_code_is_named_shown_and_fixed_on_the_dashboard(
         assert clash.value.status_code == 409 and "HOSP_ARMAN" in clash.value.detail
     finally:
         _unserve()
+
+
+async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
+    """
+    042: through the real middleware, as a PC sees it. A refused join is kept
+    with the exact message; a join that works too; the same refusal repeated is
+    one line with a count; a malformed request keeps the field names, never the
+    values; only an admin can read it.
+    """
+    import asyncio
+    import httpx
+    from fastapi import FastAPI
+    import device_log
+    from api_v2 import router as v2_router
+
+    await enrolled_device(dbs.repo)                       # HOSP003 <- CMED-DHOLPUR
+    _server(dbs)
+    monkeypatch.setenv("AIMS_ADMIN_KEY", "admin-key-for-tests")
+    app = FastAPI()
+    device_log.install(app)
+    app.include_router(v2_router)
+    app.include_router(device_log.router)
+
+    async def settle():
+        await asyncio.gather(*list(device_log._PENDING), return_exceptions=True)
+
+    def as_json(req):
+        return json.loads(req.model_dump_json())
+
+    try:
+        transport = httpx.ASGITransport(app=app, client=("198.51.100.9", 40000))
+        async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
+            key = _p256()
+            refused = await http.post("/api/v2/device/register", json=as_json(
+                _registration("CMED-NOT-LINKED", key=key, machine="AMIR-MACBOOK")))
+            assert refused.status_code == 403
+            joined = await http.post("/api/v2/device/register", json=as_json(
+                _registration(key=_p256(), machine="CLINIC-PC-9")))
+            assert joined.status_code == 200
+            for _ in range(3):                             # a lost PC, heartbeating
+                beat = await http.post("/api/v2/heartbeat", json={},
+                                       headers={"X-Device-Token": "not-a-real-token"})
+                assert beat.status_code == 401
+            bad = await http.post("/api/v2/session/open", json={"patient_ref": "SECRET-P123"},
+                                  headers={"X-Device-Token": "not-a-real-token"})
+            assert bad.status_code in (401, 422)
+            await settle()
+
+            # Only an admin reads it.
+            assert (await http.get("/api/v2/admin/device-log")).status_code in (401, 403, 503)
+            rows = (await http.get("/api/v2/admin/device-log", params={"days": 1},
+                                   headers={"X-Admin-Key": "admin-key-for-tests"})).json()["rows"]
+            csv_text = (await http.get("/api/v2/admin/device-log.csv",
+                                       headers={"X-Admin-Key": "admin-key-for-tests"})).text
+
+        amir = next(r for r in rows if r["machine_name"] == "AMIR-MACBOOK")
+        assert amir["step"] == "join by itself (no token)" and amir["status"] == 403
+        assert amir["code"] == "UNKNOWN_CLINIC" and amir["cmed_hospital_id"] == "CMED-NOT-LINKED"
+        assert "'CMED-NOT-LINKED' is not set up" in amir["message"]
+        assert amir["address"] == "198.51.100.9" and amir["device_id"]
+        ok = next(r for r in rows if r["machine_name"] == "CLINIC-PC-9")
+        assert ok["status"] == 200 and ok["code"] == "JOINED_PENDING"
+        assert "joined clinic HOSP003" in ok["message"]
+        beats = [r for r in rows if r["step"] == "heartbeat" and r["address"] == "198.51.100.9"]
+        assert len(beats) == 1 and beats[0]["repeats"] == 3
+        assert beats[0]["message"] == "unknown device token"
+        assert "SECRET-P123" not in json.dumps(rows)       # never a value the PC sent
+        assert "SECRET-P123" not in csv_text and "AMIR-MACBOOK" in csv_text
+
+        # Researchers' database logins are refused the table (scripts/roles).
+        roles = (Path(__file__).resolve().parent.parent / "scripts" / "roles"
+                 / "researcher_logins_recordings.sql").read_text(encoding="utf-8")
+        assert "REVOKE ALL ON device_events FROM aims_researchers" in roles
+    finally:
+        _unserve()

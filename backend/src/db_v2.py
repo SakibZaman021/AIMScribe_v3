@@ -290,7 +290,7 @@ class V2Repository:
         async with self._acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT device_id, hospital_id, tpm_pubkey, app_version, revoked_at,
-                       signs_requests, approval
+                       signs_requests, approval, machine_name
                 FROM devices WHERE token_sha256 = $1
             """, hash_token(token))
         return dict(row) if row else None

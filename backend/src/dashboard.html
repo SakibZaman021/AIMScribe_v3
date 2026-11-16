@@ -321,6 +321,24 @@
             was refused. Link the code to a clinic and the PC joins at its next patient.</span></div>
         <div class="scroll"><div id="refusedPcs"></div></div>
       </section>
+      <section class="panel" aria-labelledby="h-devlog" id="deviceLogPanel" hidden>
+        <div class="head wrap"><h3 id="h-devlog">Device log</h3>
+          <span class="hint">Admins only. Every time a PC tried to join, and every time the
+            server refused a PC something - with the exact reason the PC was sent. The same
+            refusal repeated within ten minutes is one line, with a count.</span></div>
+        <div class="body row">
+          <label class="field"><span>Period</span> <select id="dlDays">
+            <option value="1">Last day</option><option value="7" selected>Last 7 days</option>
+            <option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+            <option value="3650">Everything</option></select></label>
+          <label class="field"><span>Find</span>
+            <input id="dlSearch" type="search" autocomplete="off" placeholder="PC name, address, code, CMED code..."></label>
+          <label class="field"><input id="dlFailed" type="checkbox"> <span>Refusals only</span></label>
+          <button type="button" class="ghost" id="dlShow">Show</button>
+          <button type="button" class="ghost" id="dlCsv">Download CSV</button>
+        </div>
+        <div class="scroll"><div id="deviceLog"></div></div>
+      </section>
       <section class="panel" aria-labelledby="h-clients" id="clientsPanel" hidden>
         <div class="head wrap"><h3 id="h-clients">CMED connections</h3>
           <span class="hint">One per hospital: CMED's public key, which every API 2 and API 3 is

@@ -189,6 +189,8 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it a collector cannot save their official name and lab ID.
     ("040_v3_collector_identity.sql", "recordings", "column portal_people.collector_code",
      _column("portal_people", "collector_code")),
+    # Without it nobody can see what a PC was told when it could not join.
+    ("042_v3_device_log.sql", "recordings", "table device_events", _table("device_events")),
     # Without it places keep the first-guess evening shift (14:00-20:00), not the lab's.
     ("041_v3_shift_times.sql", "recordings", "evening shift ends 20:30 by default",
      "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'places' "

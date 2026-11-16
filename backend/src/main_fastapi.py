@@ -258,6 +258,11 @@ app.add_middleware(
 # security middleware and sees the request id that middleware sets.
 import cmed_log  # noqa: E402
 cmed_log.install(app)
+# The device log (042): every PC's join attempts and every refusal sent to a
+# PC, with the exact reason - admins see it under CMED > Device log.
+import device_log  # noqa: E402
+device_log.install(app)
+app.include_router(device_log.router)
 
 # Every request: a per-address rate limit, and errors that never carry
 # internals (stack traces, SQL, file paths) back to the caller.

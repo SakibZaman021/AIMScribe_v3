@@ -149,6 +149,9 @@ async def require_device(
     device = await _repo().device_by_token(x_device_token)
     if device is None:
         raise HTTPException(status_code=401, detail="unknown device token")
+    import device_log                         # 042: which PC this reply goes to
+    device_log.note(device_id=device.get("device_id"), machine_name=device.get("machine_name"),
+                    app_version=device.get("app_version"), hospital_id=device.get("hospital_id"))
     if device["revoked_at"] is not None:
         raise HTTPException(status_code=403, detail="device has been revoked")
     await _check_device_signature(request, device)
@@ -643,6 +646,8 @@ async def enroll_device(body: EnrollRequest):
     credential yet. The token is single-use, expiring, and carries both the
     hospital and the doctor, so a device can never assert its own identity.
     """
+    import device_log                         # 042: who tried to join
+    device_log.note(machine_name=body.machine_name, app_version=body.app_version)
     try:
         pubkey = bytes.fromhex(body.device_pubkey)
     except ValueError:
@@ -765,6 +770,9 @@ async def register_device(body: RegisterRequest, request: Request):
     An outsider can register, but cannot get past pending: approval needs
     CMED's server to name, to the second, visits that PC really recorded.
     """
+    import device_log                         # 042: who tried to join, and with what code
+    device_log.note(machine_name=body.machine_name, app_version=body.app_version,
+                    cmed_hospital_id=body.cmed_hospital_id)
     if not self_registration_enabled():
         return _coded(403, "SELF_REGISTRATION_OFF",
                       "this server enrols PCs with an enrolment token only")
@@ -795,6 +803,7 @@ async def register_device(body: RegisterRequest, request: Request):
     import security
     address = security.client_ip(request)
     device_id = integrity.device_id_for_key(pubkey)
+    device_log.note(device_id=device_id)
     hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
     if hospital_id is None:
         # 16 Nov: say which code, and what to do - and keep it on the dashboard,

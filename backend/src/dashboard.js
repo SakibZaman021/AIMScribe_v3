@@ -1103,6 +1103,7 @@ async function whoAmI() {
       loadPeople();
       $("originsPanel").hidden = false;
       $("codesPanel").hidden = false;
+      $("deviceLogPanel").hidden = false;
       $("clientsPanel").hidden = false;
       $("navCmed").hidden = false;
       loadCmed();
@@ -1208,8 +1209,56 @@ $("refusedPcs").addEventListener("change", (e) => {
   saveCode(sel.value, sel.dataset.linkcode);
 });
 
+/* 042: what every PC was told - admins only (the server refuses anyone else). */
+function deviceLogQuery() {
+  return `days=${encodeURIComponent($("dlDays").value)}`
+    + `&failed_only=${$("dlFailed").checked ? "true" : "false"}`
+    + `&q=${encodeURIComponent($("dlSearch").value.trim())}`;
+}
+async function loadDeviceLog() {
+  let rows;
+  try { rows = (await adminCall("GET", `/api/v2/admin/device-log?${deviceLogQuery()}`)).rows || []; }
+  catch (err) { $("deviceLog").innerHTML = empty("The device log could not be loaded", err.message, true); return; }
+  $("deviceLog").innerHTML = !rows.length
+    ? empty("Nothing in this period", "No PC tried to join, and no PC was refused anything.", true)
+    : `<table><thead><tr><th>When</th><th>PC</th><th>Trying to</th><th>Result</th>`
+      + `<th>What the server told it</th></tr></thead><tbody>`
+      + rows.map((r) => {
+        const ok = r.status < 400;
+        const when = r.repeats > 1
+          ? `${esc(dhaka(r.last_at))}<br><span class="hint">${r.repeats} times since ${esc(dhaka(r.first_at))}</span>`
+          : esc(dhaka(r.last_at));
+        return `<tr class="${ok ? "" : "row-bad"}">`
+          + td("When", when)
+          + td("PC", `<b>${esc(r.machine_name || "unknown PC")}</b>`
+            + `<br><span class="hint">${esc(r.address || "")}`
+            + `${r.app_version ? " · recorder " + esc(r.app_version) : ""}`
+            + `${r.device_id ? " · " + esc(String(r.device_id).slice(0, 8)) : ""}</span>`)
+          + td("Trying to", esc(r.step || "")
+            + (r.cmed_hospital_id ? `<br><span class="hint">CMED code <code>${esc(r.cmed_hospital_id)}</code></span>` : "")
+            + (r.hospital_id ? `<br><span class="hint">clinic ${esc(r.hospital_id)}</span>` : ""))
+          + td("Result", tag(ok ? "good" : (r.status >= 500 ? "bad" : "warn"),
+                             `${r.status} ${r.code || ""}`))
+          + td("What the server told it", esc(r.message || ""), "wrap")
+          + `</tr>`;
+      }).join("") + `</tbody></table>`;
+}
+$("dlShow").addEventListener("click", loadDeviceLog);
+$("dlFailed").addEventListener("change", loadDeviceLog);
+$("dlDays").addEventListener("change", loadDeviceLog);
+$("dlSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") loadDeviceLog(); });
+$("dlCsv").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = `/api/v2/admin/device-log.csv?${deviceLogQuery()}`;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+});
+
 async function loadCmed() {
   loadCodes();
+  loadDeviceLog();
   try {
     const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
     $("origins").innerHTML = !origins.length

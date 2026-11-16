@@ -49,6 +49,10 @@ BEGIN
     IF to_regclass('public.portal_sessions') IS NOT NULL THEN
         REVOKE ALL ON portal_sessions FROM aims_researchers;
     END IF;
+    -- 042: what each PC was told - admins only.
+    IF to_regclass('public.device_events') IS NOT NULL THEN
+        REVOKE ALL ON device_events FROM aims_researchers;
+    END IF;
 END $$;
 
 
