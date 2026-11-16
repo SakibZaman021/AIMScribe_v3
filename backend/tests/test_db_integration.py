@@ -3837,10 +3837,12 @@ async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
             joined = await http.post("/api/v2/device/register", json=as_json(
                 _registration(key=_p256(), machine="CLINIC-PC-9")))
             assert joined.status_code == 200
-            for _ in range(3):                             # a lost PC, heartbeating
-                beat = await http.post("/api/v2/heartbeat", json={},
-                                       headers={"X-Device-Token": "not-a-real-token"})
-                assert beat.status_code == 401
+            # A lost PC, heartbeating - three at the same moment: still one line
+            # (the line is found-or-made as one step, 16 Nov).
+            beats_sent = await asyncio.gather(*(
+                http.post("/api/v2/heartbeat", json={},
+                          headers={"X-Device-Token": "not-a-real-token"}) for _ in range(3)))
+            assert all(b.status_code == 401 for b in beats_sent)
             unjoined = await http.post("/api/v2/heartbeat", json={})     # no token at all
             assert unjoined.status_code == 401
             assert "has not joined the AIMS LAB server yet" in unjoined.text
@@ -3897,4 +3899,33 @@ async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
                  / "researcher_logins_recordings.sql").read_text(encoding="utf-8")
         assert "REVOKE ALL ON device_events FROM aims_researchers" in roles
     finally:
+        _unserve()
+
+
+async def test_the_same_refusal_arriving_at_once_is_one_line(dbs, pg):
+    """
+    16 Nov (GitHub caught it once): identical refusals written at the same moment
+    each found no line and each made one. Found-or-made is now one step. Eight
+    connections opened beforehand, so the eight writes really meet.
+    """
+    import asyncio
+    import device_log
+    _server(dbs)
+    wide = await asyncpg.create_pool(pg.recordings, min_size=8, max_size=8)
+    own = dbs.repo._pool
+    dbs.repo._pool = wide
+    try:
+        row = {"step": "heartbeat", "method": "POST", "path": "/api/v2/heartbeat",
+               "status": 401, "code": "HTTP_401", "message": "race check",
+               "device_id": None, "address": "192.0.2.77", "machine_name": None,
+               "app_version": None, "hospital_id": None, "cmed_hospital_id": None,
+               "request_id": None, "sent": None}
+        await asyncio.gather(*(device_log._write(dict(row)) for _ in range(8)))
+        async with dbs.rec.acquire() as conn:
+            lines = await conn.fetch("SELECT repeats FROM device_events "
+                                     "WHERE address = '192.0.2.77' AND message = 'race check'")
+        assert [r["repeats"] for r in lines] == [8]
+    finally:
+        dbs.repo._pool = own
+        await wide.close()
         _unserve()

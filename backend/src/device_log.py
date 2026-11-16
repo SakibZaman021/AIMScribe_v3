@@ -244,9 +244,16 @@ _PENDING: Set[asyncio.Task] = set()
 
 async def _write(row: Dict[str, Any]) -> None:
     """One line, or one more repeat of the same refusal to the same PC within ten minutes."""
+    # Found-or-made as one step: several of the same refusal arriving together
+    # (and across the API's worker processes) used to each find no line and each
+    # make one. A transaction-scoped advisory lock on the line's identity makes
+    # them queue; it is released at commit, so it also works through pgbouncer.
+    identity = "|".join(str(x) for x in (row["path"], row["status"], row["code"],
+                                         row["message"], row["device_id"] or row["address"]))
     try:
         pool = api_v2._repo()._pool
-        async with pool.acquire() as conn:
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", identity)
             same = await conn.fetchval("""
                 UPDATE device_events SET repeats = repeats + 1, last_at = now(),
                        sent = COALESCE($9::jsonb, sent)
