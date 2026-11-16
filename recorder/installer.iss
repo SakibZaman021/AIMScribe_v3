@@ -34,7 +34,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.8.3"
+#define AppVersion     "3.9.0"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -483,10 +483,18 @@ begin
       StopIfGoingOnBatteries      defaults True - Windows would kill the agent
                                   mid-consultation when someone unplugged it.
 
-    Started once at sign-in, and restarted by Windows if it fails - three
-    times, a minute apart. It used to be re-launched every minute all day and
-    could not be ended by Windows; that is how persistent malware behaves, and
-    antivirus products treat it accordingly. A normal app is started once. }
+    Started at sign-in, and looked at again every two minutes (16 Nov): a
+    recorder ended from Task Manager is back within two minutes on its own -
+    a doctor will not start a program by hand, and a clinic that loses its
+    recorder loses its consultations. While it runs, the look starts nothing
+    (MultipleInstancesPolicy IgnoreNew: the task is still running), and the
+    program is started with --from-task, so a copy started by hand is left
+    alone without an "Already running" box. Windows can still end it
+    (AllowHardTerminate); whoever ends it, it is back within two minutes. IT
+    keeps it off for maintenance by disabling the task. An earlier version
+    re-launched it every minute and could not be ended by Windows, which
+    antivirus treats as malware; this one is a plain repeating logon task, the
+    pattern updaters use, and the signed build is what keeps antivirus quiet. }
   Result := '';
   XmlPath := ExpandConstant('{tmp}\aimscribe_task.xml');
   SetArrayLength(Xml, 0);
@@ -496,9 +504,14 @@ begin
   Append(Xml, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
   Append(Xml, '  <RegistrationInfo>');
   Append(Xml, '    <Author>AIMS LAB</Author>');
-  Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in.</Description>');
+  Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in, and again within two minutes if it was ended.</Description>');
   Append(Xml, '  </RegistrationInfo>');
-  Append(Xml, '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>');
+  Append(Xml, '  <Triggers><LogonTrigger>');
+    { In the order Windows itself exports it: Repetition, then Enabled. No
+      Duration: repeated for as long as the user is signed in. }
+  Append(Xml, '    <Repetition><Interval>PT2M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
+  Append(Xml, '    <Enabled>true</Enabled>');
+  Append(Xml, '  </LogonTrigger></Triggers>');
   Append(Xml, '  <Principals><Principal id="Author">');
   Append(Xml, '    <GroupId>S-1-5-32-545</GroupId>');
     { Least privilege: nothing the agent does needs administrator rights. }
@@ -522,6 +535,7 @@ begin
   Append(Xml, '  </Settings>');
   Append(Xml, '  <Actions Context="Author"><Exec>');
   Append(Xml, '    <Command>"' + ExpandConstant('{app}\{#AppExe}') + '"</Command>');
+  Append(Xml, '    <Arguments>--from-task</Arguments>');
   Append(Xml, '  </Exec></Actions>');
   Append(Xml, '</Task>');
   SaveStringsToUTF8FileWithoutBOM(XmlPath, Xml, False);

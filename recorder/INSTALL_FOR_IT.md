@@ -116,7 +116,18 @@ delivered to the server are deliberately kept in `C:\ProgramData\AIMScribe`.
    (ordinary users may write here; the agent runs as the signed-in doctor
    because Windows only gives a signed-in user the microphone).
 4. Registers the task **AIMScribe Agent**: at sign-in, least privilege,
-   restarted up to 3 times if it fails.
+   restarted up to 3 times if it fails, and **looked at again every two
+   minutes** (from 3.9.0). If the agent was ended - from Task Manager, by
+   anyone - it is running again within two minutes, silently; a doctor never
+   has to start it. While it runs the look starts nothing.
+
+   It records nothing by itself: it waits in the background and records only
+   when CMED's page sends the start of a consultation.
+
+   **To keep it off on purpose** (IT, maintenance), as an administrator:
+   `schtasks /Change /TN "AIMScribe Agent" /DISABLE`, then end AIMScribe in
+   Task Manager. Bring it back with `/ENABLE` - it starts within two minutes.
+   Ending it any other way, it comes back within two minutes.
 
 Nothing else. No registry policy, no services, no firewall rules (the agent
 listens on 127.0.0.1:5050 only, which never leaves the PC), no drivers.

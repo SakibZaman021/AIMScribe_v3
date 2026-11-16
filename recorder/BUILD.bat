@@ -68,7 +68,7 @@ if "%AIMS_BUILD_BOOTLOADER%"=="1" (
     python -m pip install --disable-pip-version-check -q pyinstaller==6.21.0
 )
 if errorlevel 1 goto :fail
-python -m pip install --disable-pip-version-check -q pytest pytest-asyncio pip-audit
+python -m pip install --disable-pip-version-check -q pytest pytest-asyncio pip-audit httpx
 if errorlevel 1 goto :fail
 
 echo [2/9] Auditing dependencies for known vulnerabilities...
@@ -158,6 +158,16 @@ if errorlevel 1 (
     goto :fail
 )
 certutil -hashfile dist\AIMScribeSetup.exe SHA256 | findstr /v "hash CertUtil" > dist\AIMScribeSetup.exe.sha256
+
+REM The release record: version, commit, SHA-256, server, signature - so every
+REM installer handed out traces to one commit (scripts\release_record.py).
+set "SIGSTATE=signed"
+if "%DEV_UNSIGNED%"=="1" set "SIGSTATE=UNSIGNED development build"
+python scripts\release_record.py dist\AIMScribeSetup.exe "%AIMS_BACKEND%" "%SIGSTATE%"
+if errorlevel 1 (
+    echo ERROR: the release record was not written.
+    goto :fail
+)
 
 echo.
 echo ============================================================
