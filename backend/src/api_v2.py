@@ -144,7 +144,14 @@ async def require_device(
     stops working the day the PC is upgraded.
     """
     if not x_device_token:
-        raise HTTPException(status_code=401, detail="device token required")
+        # 16 Nov: the Device log showed only "device token required" for a PC
+        # that had never joined; say what that means and how it is put right.
+        raise HTTPException(
+            status_code=401,
+            detail="device token required: this PC has not joined the AIMS LAB server yet. "
+                   "It joins by itself at its first CMED patient once CMED's clinic code "
+                   "is linked (AIMS LAB dashboard > CMED > Clinic codes), or with an "
+                   "enrolment token from AIMS LAB. Until then it cannot record or upload.")
 
     device = await _repo().device_by_token(x_device_token)
     if device is None:

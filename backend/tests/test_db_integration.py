@@ -3841,6 +3841,10 @@ async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
                 beat = await http.post("/api/v2/heartbeat", json={},
                                        headers={"X-Device-Token": "not-a-real-token"})
                 assert beat.status_code == 401
+            unjoined = await http.post("/api/v2/heartbeat", json={})     # no token at all
+            assert unjoined.status_code == 401
+            assert "has not joined the AIMS LAB server yet" in unjoined.text
+            assert "Clinic codes" in unjoined.text
             bad = await http.post("/api/v2/session/open", json={"patient_ref": "SECRET-P123"},
                                   headers={"X-Device-Token": "not-a-real-token"})
             assert bad.status_code in (401, 422)
@@ -3861,9 +3865,12 @@ async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
         ok = next(r for r in rows if r["machine_name"] == "CLINIC-PC-9")
         assert ok["status"] == 200 and ok["code"] == "JOINED_PENDING"
         assert "joined clinic HOSP003" in ok["message"]
-        beats = [r for r in rows if r["step"] == "heartbeat" and r["address"] == "198.51.100.9"]
+        beats = [r for r in rows if r["step"] == "heartbeat" and r["address"] == "198.51.100.9"
+                 and r["message"] == "unknown device token"]
         assert len(beats) == 1 and beats[0]["repeats"] == 3
-        assert beats[0]["message"] == "unknown device token"
+        never = [r for r in rows if r["step"] == "heartbeat"
+                 and "has not joined" in (r["message"] or "")]
+        assert len(never) == 1 and never[0]["repeats"] == 1     # its own line, not folded in
         assert "SECRET-P123" not in json.dumps(rows)       # never a value the PC sent
         assert "SECRET-P123" not in csv_text and "AMIR-MACBOOK" in csv_text
 

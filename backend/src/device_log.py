@@ -249,10 +249,13 @@ async def _write(row: Dict[str, Any]) -> None:
         async with pool.acquire() as conn:
             same = await conn.fetchval("""
                 UPDATE device_events SET repeats = repeats + 1, last_at = now(),
-                       message = COALESCE($6, message), sent = COALESCE($9::jsonb, sent)
+                       sent = COALESCE($9::jsonb, sent)
                  WHERE id = (SELECT id FROM device_events
                               WHERE path = $1 AND status = $2
                                 AND code IS NOT DISTINCT FROM $3
+                                -- the same reason: "no token" and "unknown token"
+                                -- are two problems, two lines (16 Nov)
+                                AND message IS NOT DISTINCT FROM $6
                                 AND COALESCE(device_id, address) = COALESCE($4, $5)
                                 AND last_at > now() - $7::interval
                                 AND path <> ALL($8::text[])

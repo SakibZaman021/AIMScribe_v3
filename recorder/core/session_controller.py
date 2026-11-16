@@ -1630,6 +1630,17 @@ class SessionController:
                 if self._active is not None:
                     self._keeper.touch()           # still live, for a restart to see
                 self._check_disk()
+                # 16 Nov: a PC that has not joined has no token, and every
+                # heartbeat it sent was refused (401) - 2,880 a day in the
+                # server's device log, telling nobody anything. Until it joins
+                # (at its first CMED patient) it says so once, here, and waits.
+                if not getattr(self._uploader, "joined", True):
+                    if not getattr(self, "_told_not_joined", False):
+                        self._told_not_joined = True
+                        logger.warning("This PC has not joined the AIMS LAB server yet: no "
+                                       "heartbeat until it joins at its first CMED patient")
+                    continue
+                self._told_not_joined = False
                 payload = self.heartbeat_payload()
                 health = getattr(self._uploader, "health", None)
                 reply = await self._uploader.heartbeat(payload)

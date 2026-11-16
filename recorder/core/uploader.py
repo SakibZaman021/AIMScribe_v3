@@ -240,6 +240,11 @@ class UploadManager:
         """Set before start(); it becomes a default header on the HTTP session."""
         self._device_token = token
 
+    @property
+    def joined(self) -> bool:
+        """This PC has its device token: the server knows it (16 Nov)."""
+        return bool(self._device_token)
+
     async def start(self) -> None:
         if self._running:
             return
