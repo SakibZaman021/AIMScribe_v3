@@ -24,8 +24,16 @@ def test_the_logon_task_looks_every_two_minutes_and_starts_quietly():
     # Not stopped by a laptop on battery, or by Windows when idle.
     assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in iss
     assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in iss
-    # Repetition before Enabled, as Windows exports it.
-    assert iss.index("<Repetition>") < iss.index("<Enabled>true</Enabled>')")
+    # At sign-in it starts at once; a clock repeats every two minutes from the
+    # moment Setup registers the task - a repetition on the sign-in trigger only
+    # began at the NEXT sign-in, so right after an install an ended recorder
+    # stayed off (found on a real PC, 16 Nov).
+    assert "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>" in iss
+    clock = iss[iss.index("<TimeTrigger>"):iss.index("</TimeTrigger>")]
+    assert "<Repetition><Interval>PT2M</Interval>" in clock
+    assert "<StartBoundary>' + GetDateTimeString(" in clock
+    # Repetition before StartBoundary and Enabled, as Windows exports it.
+    assert clock.index("<Repetition>") < clock.index("<StartBoundary>") < clock.index("<Enabled>")
 
 
 def test_one_rule_whoever_ends_it_it_comes_back():

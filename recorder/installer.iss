@@ -34,7 +34,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.9.0"
+#define AppVersion     "3.9.1"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -506,12 +506,23 @@ begin
   Append(Xml, '    <Author>AIMS LAB</Author>');
   Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in, and again within two minutes if it was ended.</Description>');
   Append(Xml, '  </RegistrationInfo>');
-  Append(Xml, '  <Triggers><LogonTrigger>');
-    { In the order Windows itself exports it: Repetition, then Enabled. No
-      Duration: repeated for as long as the user is signed in. }
-  Append(Xml, '    <Repetition><Interval>PT2M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
-  Append(Xml, '    <Enabled>true</Enabled>');
-  Append(Xml, '  </LogonTrigger></Triggers>');
+    { Two triggers (16 Nov, found by ending it on a PC just installed):
+        at sign-in   - it starts at once when someone signs in;
+        a clock      - every two minutes from the moment Setup registers the
+                       task, for good. A repetition on the sign-in trigger alone
+                       only begins at the NEXT sign-in, so after an install or
+                       upgrade an ended recorder stayed off until then - days,
+                       on a PC that is only ever put to sleep.
+      In the order Windows itself exports them: Repetition, then the rest. No
+      Duration: repeated for ever. }
+  Append(Xml, '  <Triggers>');
+  Append(Xml, '    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>');
+  Append(Xml, '    <TimeTrigger>');
+  Append(Xml, '      <Repetition><Interval>PT2M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
+  Append(Xml, '      <StartBoundary>' + GetDateTimeString('yyyy-mm-dd"T"hh:nn:ss', '-', ':') + '</StartBoundary>');
+  Append(Xml, '      <Enabled>true</Enabled>');
+  Append(Xml, '    </TimeTrigger>');
+  Append(Xml, '  </Triggers>');
   Append(Xml, '  <Principals><Principal id="Author">');
   Append(Xml, '    <GroupId>S-1-5-32-545</GroupId>');
     { Least privilege: nothing the agent does needs administrator rights. }
