@@ -1222,7 +1222,7 @@ async function loadDeviceLog() {
   $("deviceLog").innerHTML = !rows.length
     ? empty("Nothing in this period", "No PC tried to join, and no PC was refused anything.", true)
     : `<table><thead><tr><th>When</th><th>PC</th><th>Trying to</th><th>Result</th>`
-      + `<th>What the server told it</th></tr></thead><tbody>`
+      + `<th>What the server told it</th><th>What the PC sent</th></tr></thead><tbody>`
       + rows.map((r) => {
         const ok = r.status < 400;
         const when = r.repeats > 1
@@ -1240,8 +1240,29 @@ async function loadDeviceLog() {
           + td("Result", tag(ok ? "good" : (r.status >= 500 ? "bad" : "warn"),
                              `${r.status} ${r.code || ""}`))
           + td("What the server told it", esc(r.message || ""), "wrap")
+          + td("What the PC sent", sentDetails(r.sent, r.repeats), "wrap")
           + `</tr>`;
       }).join("") + `</tbody></table>`;
+}
+/* 043: the headers and fields the PC sent (latest attempt); secrets and patient
+   values were never kept, only that they came, their length and a fingerprint. */
+function sentDetails(sent, repeats) {
+  if (!sent || typeof sent !== "object") return `<span class="hint">not recorded</span>`;
+  const lines = [];
+  for (const [key, value] of Object.entries(sent)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const [k, v] of Object.entries(value)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          for (const [k2, v2] of Object.entries(v)) lines.push([`${key}.${k}.${k2}`, v2]);
+        } else lines.push([`${key}.${k}`, v]);
+      }
+    } else lines.push([key, value]);
+  }
+  const show = (v) => esc(Array.isArray(v) ? v.join(", ") : String(v));
+  return `<details class="sent"><summary>${lines.length} item${lines.length === 1 ? "" : "s"}`
+    + `${repeats > 1 ? " (latest try)" : ""}</summary><dl>`
+    + lines.map(([k, v]) => `<dt>${esc(k.replace(/^fields\./, ""))}</dt><dd>${show(v)}</dd>`).join("")
+    + `</dl></details>`;
 }
 $("dlShow").addEventListener("click", loadDeviceLog);
 $("dlFailed").addEventListener("change", loadDeviceLog);

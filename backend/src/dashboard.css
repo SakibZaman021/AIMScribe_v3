@@ -495,3 +495,10 @@ pre.report:empty { display: none; }
 
 /* 040: a collector's details not all saved yet */
 .panel.needs { border-color: var(--warn); background: var(--warn-bg); }
+
+/* 043: what a PC sent, in the device log */
+details.sent summary { cursor: pointer; color: var(--accent, inherit); }
+details.sent dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px;
+                  margin: 6px 0 0; font-size: 12px; }
+details.sent dt { color: var(--muted, inherit); font-family: ui-monospace, monospace; }
+details.sent dd { margin: 0; word-break: break-word; }

@@ -13,8 +13,14 @@ ten minutes adds to one line (repeats, last_at), so a refused heartbeat every
     GET /api/v2/admin/device-log        admins only: newest first, filtered
     GET /api/v2/admin/device-log.csv    the same, as a spreadsheet
 
-Never a request body, a token or a patient value: for a malformed request,
-only the names of the fields that were wrong. Each line also goes to the
+043: each line also keeps what the PC sent (its latest attempt): the headers
+that matter (recorder version, whether a device token came and which one by
+fingerprint, whether the request was signed, how far the PC's clock is from
+ours) and the fields of the request. Never a secret or a patient value: a
+token, a key proof or a signature as "sent", its length and a short
+fingerprint; a patient identifier as "sent" and its length; an unknown field
+as its kind and size. For a malformed request, the reply keeps only the names
+of the fields that were wrong. Each line also goes to the
 API's log as "DEVICE ...", so ./server-logs.sh api today DEVICE finds it.
 Writing it never fails or slows a reply. Nothing is deleted.
 """
@@ -60,6 +66,28 @@ STEPS = {
     "/api/v2/trusted-origins": "trusted EHR addresses", "/api/v2/doctors": "doctor list",
 }
 REPEAT_WINDOW = timedelta(minutes=10)
+BODY_LIMIT = 64 * 1024
+
+# What a PC's request may say, kept as sent: who and what it is, never a secret
+# or a patient's identity.
+PLAIN_FIELDS = {
+    "machine_name", "os_version", "app_version", "protocol_version", "key_storage",
+    "cmed_hospital_id", "hospital_id", "doctor_id", "start_time", "date", "session_id",
+    "seq_no", "bytes", "sha256", "consent_method", "reason", "close_reason",
+    "duration_seconds", "total_duration_seconds", "segment_count", "continues_session_id",
+    "grant_jti", "opened_at", "closed_at", "timestamp", "microphone", "microphones",
+    "status", "state", "event", "kind", "pending_segments", "held_count", "disk_free_mb",
+    "disk_encrypted", "clock_offset_seconds", "sample_rate", "channels", "sample_width",
+    "format", "codec", "entry_no", "entry_type", "command", "request_id", "visit_date",
+    "marker", "label", "new_doctor_id", "new_patient", "cpu", "memory_mb", "uptime_seconds",
+}
+# Kept only as sent / length / fingerprint.
+SECRET_FIELDS = {"enrollment_token", "device_token", "token", "key_proof", "proof",
+                 "signature", "refusal_signature", "password", "secret"}
+PATIENT_FIELDS = {"patient_id", "patient_ref", "patient_name", "patient", "visit_id",
+                  "phone", "name"}
+# Nested objects worth opening one level.
+OPEN_ONE_LEVEL = {"audio", "trigger", "health", "facts"}
 
 
 @dataclass
@@ -132,6 +160,85 @@ def outcome(status: int, body: bytes) -> Dict[str, Optional[str]]:
             "message": str(message)[:1000] if message else None}
 
 
+def _fingerprint(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+
+
+def _value(key: str, value: Any, depth: int = 0) -> Any:
+    name = key.lower()
+    if name in SECRET_FIELDS:
+        if not value:
+            return "empty"
+        text = value if isinstance(value, str) else json.dumps(value)
+        return f"sent ({len(text)} chars, fingerprint {_fingerprint(text)})"
+    if name in PATIENT_FIELDS:
+        return "empty" if not value else f"sent ({len(str(value))} chars)"
+    if name == "device_pubkey" and isinstance(value, str):
+        kind = ("TPM P-256 key" if len(value) == 130 else
+                "software Ed25519 key" if len(value) == 64 else f"{len(value)} hex chars")
+        return f"{kind}, fingerprint {_fingerprint(value)}"
+    if isinstance(value, dict) and depth == 0 and name in OPEN_ONE_LEVEL:
+        return {k: _value(k, v, 1) for k, v in list(value.items())[:30]}
+    if name in PLAIN_FIELDS:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value if not isinstance(value, str) else value[:200]
+        if isinstance(value, list) and all(isinstance(v, (str, int, float)) for v in value):
+            return [str(v)[:100] for v in value[:10]]
+    # Anything else: what kind of thing, and how big - never its content.
+    if isinstance(value, dict):
+        return f"object ({len(value)} fields: {', '.join(list(value)[:8])})"
+    if isinstance(value, list):
+        return f"list of {len(value)}"
+    if isinstance(value, str):
+        return f"text ({len(value)} chars)"
+    return type(value).__name__ if value is not None else None
+
+
+def what_was_sent(request: Request, body: bytes, server_now: float,
+                  known_pc: bool) -> Dict[str, Any]:
+    """The headers and fields of a PC's request, safe to keep (see the module notes)."""
+    h = request.headers
+    sent: Dict[str, Any] = {}
+    if h.get("user-agent"):
+        sent["user_agent"] = h["user-agent"][:120]
+    token = h.get("x-device-token")
+    if token:
+        sent["device_token"] = (f"sent ({len(token)} chars, fingerprint {_fingerprint(token)}) - "
+                                + ("a PC we know" if known_pc else "no PC here has this token"))
+    elif request.url.path not in JOIN_PATHS:
+        sent["device_token"] = "not sent"
+    if h.get("x-device-signature"):
+        sent["signed"] = "yes"
+        stamp = h.get("x-device-timestamp", "")
+        try:
+            offset = round(float(stamp) - server_now)
+            sent["pc_clock"] = ("same as the server" if abs(offset) < 5 else
+                                f"{abs(offset)} s {'ahead of' if offset > 0 else 'behind'} the server")
+        except ValueError:
+            sent["pc_clock"] = f"timestamp not a number ({stamp[:20]})"
+    elif token:
+        sent["signed"] = "no"
+    for name in ("origin", "content-type"):
+        if h.get(name):
+            sent[name.replace("-", "_")] = h[name][:120]
+    if h.get("content-length"):
+        sent["size"] = f"{h['content-length']} bytes"
+    if body and len(body) <= BODY_LIMIT and "json" in (h.get("content-type") or ""):
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            sent["body"] = "not valid JSON"
+        else:
+            if isinstance(data, dict):
+                sent["fields"] = {k: _value(k, v) for k, v in list(data.items())[:40]}
+            else:
+                sent["body"] = _value("body", data)
+    elif body and len(body) > BODY_LIMIT:
+        sent["body"] = f"{len(body)} bytes, not opened"
+    return sent
+
+
 _PENDING: Set[asyncio.Task] = set()
 
 
@@ -142,7 +249,7 @@ async def _write(row: Dict[str, Any]) -> None:
         async with pool.acquire() as conn:
             same = await conn.fetchval("""
                 UPDATE device_events SET repeats = repeats + 1, last_at = now(),
-                       message = COALESCE($6, message)
+                       message = COALESCE($6, message), sent = COALESCE($9::jsonb, sent)
                  WHERE id = (SELECT id FROM device_events
                               WHERE path = $1 AND status = $2
                                 AND code IS NOT DISTINCT FROM $3
@@ -152,24 +259,26 @@ async def _write(row: Dict[str, Any]) -> None:
                               ORDER BY id DESC LIMIT 1)
              RETURNING id
             """, row["path"], row["status"], row["code"], row["device_id"], row["address"],
-                row["message"], REPEAT_WINDOW, list(JOIN_PATHS))
+                row["message"], REPEAT_WINDOW, list(JOIN_PATHS), row["sent"])
             if same is None:
                 await conn.execute("""
                     INSERT INTO device_events (step, method, path, status, code, message,
                                                device_id, machine_name, app_version, address,
-                                               hospital_id, cmed_hospital_id, request_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                               hospital_id, cmed_hospital_id, request_id, sent)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
                 """, row["step"], row["method"], row["path"], row["status"], row["code"],
                     row["message"], row["device_id"], row["machine_name"], row["app_version"],
                     row["address"], row["hospital_id"], row["cmed_hospital_id"],
-                    row["request_id"])
+                    row["request_id"], row["sent"])
     except Exception as exc:                        # the log never fails a reply
         logger.debug("Device log not written: %s", exc)
 
 
-def _record(request: Request, holder: _Note, status: int, body: bytes) -> None:
+def _record(request: Request, holder: _Note, status: int, body: bytes,
+            sent: Optional[Dict[str, Any]] = None) -> None:
     path = request.url.path
-    row = {"step": step_of(path), "method": request.method[:8], "path": path[:200],
+    row = {"sent": json.dumps(sent, ensure_ascii=False, default=str) if sent else None,
+           "step": step_of(path), "method": request.method[:8], "path": path[:200],
            "status": status, "address": security.client_ip(request)[:64],
            "request_id": (security.request_id() or "")[:64] or None,
            "device_id": holder.device_id, "machine_name": holder.machine_name,
@@ -193,16 +302,26 @@ def install(app: FastAPI) -> None:
             return await call_next(request)
         holder = _Note()
         token = _NOTE.set(holder)
+        import time as _time
+        arrived = _time.time()
+        # Read once here and handed on unchanged (Starlette replays it to the
+        # route), so a signed request's body is exactly what the PC signed.
+        try:
+            request_body = await request.body()
+        except Exception:
+            request_body = b""
         try:
             try:
                 response = await call_next(request)
             except Exception:
-                _record(request, holder, 500, b"")
+                _record(request, holder, 500, b"",
+                        what_was_sent(request, request_body, arrived, holder.device_id is not None))
                 raise
             if response.status_code < 400 and path not in JOIN_PATHS:
                 return response                      # an ordinary success: not kept
             body = b"".join([chunk async for chunk in response.body_iterator])
-            _record(request, holder, response.status_code, body)
+            _record(request, holder, response.status_code, body,
+                    what_was_sent(request, request_body, arrived, holder.device_id is not None))
             return Response(content=body, status_code=response.status_code,
                             headers=dict(response.headers), media_type=response.media_type)
         finally:
@@ -229,7 +348,16 @@ async def _rows(days: int, failed_only: bool, q: str, limit: int) -> List[Dict[s
                         message, cmed_hospital_id, hospital_id, step, app_version) ILIKE $3)
              ORDER BY last_at DESC LIMIT $4
         """, days, failed_only, term, limit)
-    return [{k: _iso(v) for k, v in dict(r).items()} for r in rows]
+    out = []
+    for r in rows:
+        item = {k: _iso(v) for k, v in dict(r).items()}
+        if isinstance(item.get("sent"), str):
+            try:
+                item["sent"] = json.loads(item["sent"])
+            except ValueError:
+                pass
+        out.append(item)
+    return out
 
 
 @router.get("/device-log")
@@ -241,7 +369,25 @@ async def device_log(days: int = 7, failed_only: bool = False, q: str = "", limi
 
 CSV_COLUMNS = ["first_at", "last_at", "repeats", "step", "status", "code", "message",
                "machine_name", "device_id", "address", "app_version", "hospital_id",
-               "cmed_hospital_id", "method", "path", "request_id"]
+               "cmed_hospital_id", "sent", "method", "path", "request_id"]
+
+
+def flat_sent(sent: Any) -> str:
+    """'key: value; key: value' for a spreadsheet cell."""
+    if isinstance(sent, str):
+        try:
+            sent = json.loads(sent)
+        except ValueError:
+            return sent
+    if not isinstance(sent, dict):
+        return ""
+    parts = []
+    for key, value in sent.items():
+        if isinstance(value, dict):
+            parts += [f"{key}.{k}: {v}" for k, v in value.items()]
+        else:
+            parts.append(f"{key}: {value}")
+    return "; ".join(str(p) for p in parts)
 
 
 @router.get("/device-log.csv")
@@ -252,7 +398,8 @@ async def device_log_csv(days: int = 30, failed_only: bool = False, q: str = "",
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        writer.writerow({k: r.get(k, "") for k in CSV_COLUMNS})
+        writer.writerow({**{k: r.get(k, "") for k in CSV_COLUMNS},
+                         "sent": flat_sent(r.get("sent"))})
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return Response(content=buf.getvalue().encode("utf-8-sig"),
                     media_type="text/csv; charset=utf-8",
@@ -260,4 +407,4 @@ async def device_log_csv(days: int = 30, failed_only: bool = False, q: str = "",
                              f'attachment; filename="aimscribe_device_log_{stamp}.csv"'})
 
 
-__all__ = ["router", "install", "note", "outcome", "step_of"]
+__all__ = ["router", "install", "note", "outcome", "step_of", "what_was_sent", "flat_sent"]

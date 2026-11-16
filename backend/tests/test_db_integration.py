@@ -3867,6 +3867,24 @@ async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
         assert "SECRET-P123" not in json.dumps(rows)       # never a value the PC sent
         assert "SECRET-P123" not in csv_text and "AMIR-MACBOOK" in csv_text
 
+        # 043: what the PC sent - its fields as sent, secrets only by fingerprint.
+        sent = amir["sent"]["fields"]
+        assert sent["machine_name"] == "AMIR-MACBOOK"
+        assert sent["cmed_hospital_id"] == "CMED-NOT-LINKED"
+        assert sent["device_pubkey"].startswith("TPM P-256 key, fingerprint ")
+        assert sent["key_proof"].startswith("sent (") and "fingerprint" in sent["key_proof"]
+        raw_proof = json.loads(_registration("CMED-NOT-LINKED", key=key,
+                                             machine="AMIR-MACBOOK").model_dump_json())["key_proof"]
+        assert raw_proof not in json.dumps(rows) and raw_proof not in csv_text
+        assert amir["sent"]["content_type"].startswith("application/json")
+        beat_sent = beats[0]["sent"]
+        assert beat_sent["device_token"].startswith("sent (16 chars, fingerprint ")
+        assert beat_sent["device_token"].endswith("no PC here has this token")
+        assert "not-a-real-token" not in json.dumps(rows) and "not-a-real-token" not in csv_text
+        opened = next(r for r in rows if r["path"] == "/api/v2/session/open")
+        assert opened["sent"]["fields"]["patient_ref"] == "sent (11 chars)"
+        assert "device_token:" in csv_text or "device_token: sent" in csv_text
+
         # Researchers' database logins are refused the table (scripts/roles).
         roles = (Path(__file__).resolve().parent.parent / "scripts" / "roles"
                  / "researcher_logins_recordings.sql").read_text(encoding="utf-8")
