@@ -55,6 +55,8 @@ PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_start
                  "recording_too_long", "stopped_technical", "daily_report", "shift_report",
                  "summary_csv", "still_not_fixed", "problem_fixed", "repeated_stops"}
 MODES = ("everything", "problems")
+# The summaries themselves go out at their time, quiet hours or not.
+SUMMARY_EVENTS = ("shift_report", "summary_csv", "daily_report")
 UNHANDLED_AFTER = timedelta(minutes=15)
 SHORT_SECONDS = 60
 LATE_MINUTES = 15
@@ -135,12 +137,14 @@ async def quiet_for(conn, hospital_id: Optional[str] = None, place_id: Optional[
 
 async def in_shift_hours(conn, hospital_id: Optional[str],
                          now: Optional[datetime] = None) -> bool:
-    """Between a place's morning start and evening end: when a PC going quiet is news."""
+    """Inside a place's morning or evening shift: when a PC going quiet is news, not
+    the lunch break or the day ending."""
     t = (now or datetime.now(timezone.utc)).astimezone(collectors.zone()).time()
     places = await _place_rows(conn, hospital_id)
     if not places:
-        return dtime(8, 0) <= t < dtime(20, 0)
-    return any(p["morning_start"] <= t < p["evening_end"] for p in places)
+        return dtime(8, 0) <= t < dtime(14, 0) or dtime(14, 30) <= t < dtime(20, 30)
+    return any(p["morning_start"] <= t < p["morning_end"]
+               or p["evening_start"] <= t < p["evening_end"] for p in places)
 
 
 def _pool():

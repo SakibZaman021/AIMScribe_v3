@@ -458,8 +458,8 @@ class PlaceRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     morning_start: str = Field("08:00", pattern=r"^\d{2}:\d{2}$")
     morning_end: str = Field("14:00", pattern=r"^\d{2}:\d{2}$")
-    evening_start: str = Field("14:00", pattern=r"^\d{2}:\d{2}$")
-    evening_end: str = Field("20:00", pattern=r"^\d{2}:\d{2}$")
+    evening_start: str = Field("14:30", pattern=r"^\d{2}:\d{2}$")
+    evening_end: str = Field("20:30", pattern=r"^\d{2}:\d{2}$")
 
 
 class PlaceHospitalRequest(BaseModel):
@@ -1162,7 +1162,12 @@ async def send_shift_summary(conn, shift: Dict[str, Any]) -> None:
                             body=body, event_key=f"summary:{shift['id']}",
                             place_id=shift["place_id"])
     if note_id is not None:
-        await _deliver(conn, note_id, shift["email"], subject, body)
+        import watchers
+        if shift.get("ended_by") == "auto" and await watchers.quiet_for(
+                conn, place_id=shift["place_id"]):
+            await _hold(conn, note_id)            # night: on My shift, not in the inbox
+        else:
+            await _deliver(conn, note_id, shift["email"], subject, body)
     await conn.execute("UPDATE collector_shifts SET summary_sent_at = now() WHERE id = $1",
                        shift["id"])
 
@@ -1569,12 +1574,18 @@ class Notifier:
     # -- a message that could not be sent: try again, with growing waits
     async def retry_failed(self, conn) -> None:
         rows = await conn.fetch("""
-            SELECT id FROM collector_notifications
+            SELECT id, event, hospital_id, place_id FROM collector_notifications
              WHERE delivered = FALSE AND next_try_at IS NOT NULL AND next_try_at <= now()
                AND created_at > now() - $1::interval
              ORDER BY id LIMIT 50
         """, RETRY_FOR)
+        import watchers
         for r in rows:
+            # Quiet hours: nothing reaches anyone after the evening summary but the
+            # summary itself; a retry waits for the morning shift.
+            if r["event"] not in watchers.SUMMARY_EVENTS and \
+                    await watchers.quiet_for(conn, r["hospital_id"], r["place_id"]):
+                continue
             await _deliver(conn, r["id"])
         await conn.execute("""
             UPDATE collector_notifications SET next_try_at = NULL

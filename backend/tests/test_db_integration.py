@@ -3660,15 +3660,43 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
             assert len(sent) == before
             assert not await conn.fetchval("SELECT 1 FROM collector_notifications WHERE "
                                            "event_key IN ('esc:night-1', 'still:night-1:1')")
+            # A new place starts on the lab's shifts: 08:00-14:00 and 14:30-20:30.
+            times = await conn.fetchrow("SELECT * FROM places WHERE place_id = $1", place)
+            assert (f"{times['morning_start']:%H:%M}", f"{times['morning_end']:%H:%M}",
+                    f"{times['evening_start']:%H:%M}", f"{times['evening_end']:%H:%M}") == \
+                ("08:00", "14:00", "14:30", "20:30")
+            tz = collectors.zone()
+            on_day = datetime.now(tz).date()
+            assert not await watchers.in_shift_hours(           # the break between shifts
+                conn, "HOSP661", now=datetime.combine(on_day, dtime(14, 15), tzinfo=tz))
+            assert await watchers.in_shift_hours(
+                conn, "HOSP661", now=datetime.combine(on_day, dtime(15, 0), tzinfo=tz))
             # A PC switched off after the shift hours is no alert at all.
-            await conn.execute("UPDATE places SET morning_start = '00:00', "
-                               "evening_end = '00:00:01' WHERE place_id = $1", place)
+            await conn.execute("UPDATE places SET morning_start = '00:00', morning_end = '00:00', "
+                               "evening_start = '00:00', evening_end = '00:00' "
+                               "WHERE place_id = $1", place)
             await conn.execute("UPDATE devices SET last_seen_at = now() - interval '5 minutes' "
                                "WHERE device_id = $1", device["device_id"])
             assert not await watchers.in_shift_hours(conn, "HOSP661")
             await notifier.silent_pcs(conn)
             assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
                                            "WHERE event = 'pc_silent' AND hospital_id = 'HOSP661'")
+            # A message that failed before the summary is not retried into the night.
+            retry = await collectors._record(conn, email="night@gmail.example", event="pc_silent",
+                                             subject="s", body="b", event_key="night-retry",
+                                             urgent=True, hospital_id="HOSP661")
+            await conn.execute("UPDATE collector_notifications SET delivered = FALSE, "
+                               "next_try_at = now() - interval '1 minute' WHERE id = $1", retry)
+            await notifier.retry_failed(conn)
+            assert len(sent) == before
+            # A shift the server closes at night: its summary is kept, not mailed then.
+            shift = await conn.fetchrow("UPDATE collector_shifts SET ended_at = now(), "
+                                        "ended_by = 'auto' WHERE email = 'night@gmail.example' "
+                                        "AND ended_at IS NULL RETURNING *")
+            await collectors.send_shift_summary(conn, dict(shift))
+            assert len(sent) == before
+            assert await conn.fetchval("SELECT channel FROM collector_notifications "
+                                       "WHERE event_key = $1", f"summary:{shift['id']}") == "held"
 
             # ------------------------------------------------ the summaries
             monkeypatch.setenv("AIMS_REPORT_AT", "20:30")

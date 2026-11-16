@@ -189,6 +189,10 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it a collector cannot save their official name and lab ID.
     ("040_v3_collector_identity.sql", "recordings", "column portal_people.collector_code",
      _column("portal_people", "collector_code")),
+    # Without it places keep the first-guess evening shift (14:00-20:00), not the lab's.
+    ("041_v3_shift_times.sql", "recordings", "evening shift ends 20:30 by default",
+     "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'places' "
+     "AND column_name = 'evening_end' AND column_default LIKE '%20:30%')"),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
