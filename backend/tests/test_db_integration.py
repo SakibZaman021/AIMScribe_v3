@@ -3929,3 +3929,31 @@ async def test_the_same_refusal_arriving_at_once_is_one_line(dbs, pg):
         dbs.repo._pool = own
         await wide.close()
         _unserve()
+
+
+async def test_a_new_clinic_with_its_cmed_code_lets_the_pc_join(dbs):
+    """
+    16 Nov (Nabila's PC): a CMED connection for 'Susastho-Clinic-Test-1' was
+    registered, but no clinic answered to the code, so the PC was refused. A new
+    clinic made with the code (the dashboard's Add a clinic, or the connection
+    form's new clinic) lets the same PC join at its next try.
+    """
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        key = _p256()
+        refused = await api_v2.register_device(
+            _registration("Susastho-Clinic-Test-1", key=key, machine="Nabila"), _caller())
+        assert json.loads(refused.body)["code"] == "UNKNOWN_CLINIC"
+        made = await api_v2.admin_hospital(api_v2.HospitalRequest(
+            hospital_id="HOSP_SUSASTHO_TEST", name="Susastho Clinic (test 1)",
+            timezone="Asia/Dhaka", cmed_hospital_id="Susastho-Clinic-Test-1"))
+        assert made["cmed_hospital_id"] == "Susastho-Clinic-Test-1"
+        joined = await api_v2.register_device(
+            _registration("Susastho-Clinic-Test-1", key=key, machine="Nabila"), _caller())
+        assert joined["hospital_id"] == "HOSP_SUSASTHO_TEST" and joined["approval"] == "pending"
+        codes = await api_v2.admin_clinic_codes()
+        clinic = next(c for c in codes["clinics"] if c["hospital_id"] == "HOSP_SUSASTHO_TEST")
+        assert clinic["active"] and clinic["pcs"] == 1
+    finally:
+        _unserve()

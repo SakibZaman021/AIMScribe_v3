@@ -315,6 +315,13 @@
           <span class="hint">The hospital code CMED sends (hospital_id) for each of our clinics.
             A new PC joins only if the code in CMED's start command is linked here - letter
             for letter - or is our own clinic ID.</span></div>
+        <form id="clinicForm" class="peopleform">
+          <label>New clinic ID <input id="ncId" required autocomplete="off" placeholder="HOSP_SUSASTHO_TEST"></label>
+          <label>Name <input id="ncName" required autocomplete="off" placeholder="Susastho Clinic (test 1)"></label>
+          <label>CMED's code for it <input id="ncCode" autocomplete="off" placeholder="Susastho-Clinic-Test-1"></label>
+          <button type="submit" class="primary">Add a clinic</button>
+          <span id="clinicMsg" class="hint" role="status"></span>
+        </form>
         <div class="scroll"><div id="codes"></div></div>
         <div class="head wrap"><h3>PCs that could not join</h3>
           <span class="hint">The last 30 days: the code each PC was given by CMED, and why it
@@ -347,6 +354,10 @@
         <form id="clientForm" class="peopleform clientform">
           <label>CMED hospital code <input id="cHospital" required autocomplete="off" placeholder="CMED-TEST"></label>
           <label>Client id <input id="cClient" required autocomplete="off" placeholder="cmed-test"></label>
+          <label>Our clinic for this code <select id="cClinic" required>
+            <option value="">Choose...</option></select></label>
+          <label id="cNewWrap" hidden>New clinic ID <input id="cNewId" autocomplete="off" placeholder="HOSP_SUSASTHO_TEST"></label>
+          <label id="cNewNameWrap" hidden>New clinic name <input id="cNewName" autocomplete="off" placeholder="Susastho Clinic"></label>
           <label class="wide">CMED's public key (JWK, the .public.json they sent)
             <textarea id="cJwk" rows="4" required spellcheck="false" placeholder='{"kty": "EC", "crv": "P-384", "x": "...", "y": "..."}'></textarea></label>
           <button type="submit" class="primary">Register</button>

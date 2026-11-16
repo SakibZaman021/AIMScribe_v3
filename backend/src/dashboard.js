@@ -1149,6 +1149,13 @@ async function loadCodes() {
     return;
   }
   CLINIC_CODES = data.clinics || [];
+  // The connection form chooses among them, or a new one (16 Nov).
+  const keep = $("cClinic").value;
+  $("cClinic").innerHTML = `<option value="">Choose...</option>`
+    + CLINIC_CODES.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.hospital_id)} ${esc(c.name || "")}`
+      + `${c.cmed_hospital_id ? " (now " + esc(c.cmed_hospital_id) + ")" : ""}</option>`).join("")
+    + `<option value="__new">A new clinic...</option>`;
+  $("cClinic").value = keep;
   $("codes").innerHTML = !CLINIC_CODES.length
     ? empty("No clinic yet", "Clinics appear here once they are set up.", true)
     : `<table><thead><tr><th>Our clinic</th><th>CMED's code for it</th><th>PCs</th>`
@@ -1278,7 +1285,7 @@ $("dlCsv").addEventListener("click", () => {
 });
 
 async function loadCmed() {
-  loadCodes();
+  await loadCodes();
   loadDeviceLog();
   try {
     const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
@@ -1306,7 +1313,12 @@ async function loadCmed() {
           const live = !c.revoked_at;
           return `<tr class="${live ? "" : ""}">`
             + td("Client id", `<b><code>${esc(c.client_id)}</code></b><br><span class="hint">${esc(c.label || "")}</span>`)
-            + td("Hospital", esc((c.cmed_hospital_ids || []).join(", ")))
+            + td("Hospital", (c.cmed_hospital_ids || []).map((code) => {
+              const clinic = CLINIC_CODES.find((k) => k.cmed_hospital_id === code || k.hospital_id === code);
+              return `<code>${esc(code)}</code> `
+                + (clinic ? tag("good", "clinic " + clinic.hospital_id)
+                          : tag("bad", "no clinic: PCs cannot join"));
+            }).join("<br>"))
             + td("Key", (c.kids || []).map((k) => `<code title="Confirm with CMED by phone">${esc(k)}</code>`).join("<br>") || `<span class="hint">none</span>`)
             + td("Last used", esc(dhaka(c.last_used_at)))
             + td("Valid until", esc(dhaka(c.expires_at)))
@@ -1353,6 +1365,47 @@ $("cHospital").addEventListener("input", () => {
   $("cClient").value = $("cHospital").value.trim().toLowerCase();
 });
 
+/* 16 Nov: a CMED connection lets CMED's server send API 2 and 3 for a code;
+   only a clinic linked to the code lets a PC join. Both are done here, the
+   clinic first - Nabila's PC was refused because only the first was done. */
+$("cClinic").addEventListener("change", () => {
+  const isNew = $("cClinic").value === "__new";
+  $("cNewWrap").hidden = !isNew;
+  $("cNewNameWrap").hidden = !isNew;
+});
+
+async function linkCodeToClinic(code, clinicId, newName) {
+  const clinic = CLINIC_CODES.find((c) => c.hospital_id === clinicId);
+  if (clinic && clinic.cmed_hospital_id && clinic.cmed_hospital_id !== code
+      && !window.confirm(`${clinicId} answers to '${clinic.cmed_hospital_id}' now. Replace it with '${code}'? `
+        + "PCs sent the old code would no longer join.")) {
+    throw new Error("not linked: the clinic keeps its code");
+  }
+  await adminCall("POST", "/api/v2/admin/hospital", {
+    hospital_id: clinicId, name: clinic ? (clinic.name || clinicId) : newName,
+    timezone: clinic ? (clinic.timezone || "Asia/Dhaka") : "Asia/Dhaka", cmed_hospital_id: code });
+}
+
+$("clinicForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = $("ncId").value.trim();
+  const name = $("ncName").value.trim();
+  const code = $("ncCode").value.trim();
+  if (CLINIC_CODES.some((c) => c.hospital_id === id)) {
+    $("clinicMsg").textContent = `${id} already exists: give it a code in the table below.`;
+    return;
+  }
+  try {
+    await adminCall("POST", "/api/v2/admin/hospital", {
+      hospital_id: id, name, timezone: "Asia/Dhaka", cmed_hospital_id: code });
+    $("clinicMsg").textContent = code
+      ? `Added ${id}, answering to '${code}': a PC CMED starts with that code joins at its next patient.`
+      : `Added ${id}. Give it CMED's code in the table below before its PCs can join.`;
+    $("ncId").value = ""; $("ncName").value = ""; $("ncCode").value = "";
+    loadCmed();
+  } catch (err) { $("clinicMsg").textContent = `Not added: ${err.message}`; }
+});
+
 $("clientForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   let jwk;
@@ -1363,11 +1416,27 @@ $("clientForm").addEventListener("submit", async (e) => {
   if (by.length < 2) return;
   const hospital = $("cHospital").value.trim();
   const alg = jwk.crv === "P-256" ? "ES256" : jwk.kty === "RSA" ? "RS384" : "ES384";
+  let clinicId = $("cClinic").value;
+  const isNew = clinicId === "__new";
+  if (isNew) clinicId = $("cNewId").value.trim();
+  if (!clinicId || (isNew && !$("cNewName").value.trim())) {
+    $("clientMsg").textContent = "Choose our clinic for this code (or give the new clinic's ID and name): "
+      + "without it, PCs CMED starts with this code cannot join.";
+    return;
+  }
+  if (isNew && CLINIC_CODES.some((c) => c.hospital_id === clinicId)) {
+    $("clientMsg").textContent = `${clinicId} already exists: choose it in the list instead.`;
+    return;
+  }
+  try {
+    await linkCodeToClinic(hospital, clinicId, $("cNewName").value.trim());
+  } catch (err) { $("clientMsg").textContent = `Not registered: ${err.message}`; return; }
   try {
     const r = await adminCall("POST", "/api/v2/admin/cmed-client", {
       client_id: $("cClient").value.trim(), label: `CMED - ${hospital}`,
       cmed_hospital_ids: [hospital], created_by: by, jwk, alg });
-    $("clientMsg").innerHTML = `Registered. Send CMED: client_id <code>${esc(r.client_id)}</code>, `
+    $("clientMsg").innerHTML = `Registered, and '${esc(hospital)}' linked to clinic ${esc(clinicId)}. `
+      + `Send CMED: client_id <code>${esc(r.client_id)}</code>, `
       + `kid <code>${esc(r.kid)}</code>. Before they use it, read the kid to them by phone: `
       + `their key tool printed the same value.`;
     $("cJwk").value = "";
