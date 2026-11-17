@@ -2944,13 +2944,19 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         # way off it. It is taken instead, filed under the PC's own clinic and
         # marked unconfirmed: it cannot be matched to CMED's API 2 until the
         # hospital is sorted out, so it never enters the dataset by itself.
+        mapped_to = await repo.hospital_for_cmed_id(visit.cmed_hospital_id)
         await repo.raise_alert(
             alert_type="clinic_mismatch", severity="critical",
             device_id=device["device_id"],
             detail={"device_hospital": device["hospital_id"],
                     "cmed_hospital_id": visit.cmed_hospital_id,
-                    "mapped_to": await repo.hospital_for_cmed_id(visit.cmed_hospital_id),
-                    "kept": "uploaded and marked unconfirmed"})
+                    "mapped_to": mapped_to,
+                    "kept": "uploaded and marked unconfirmed",
+                    # What a person does; its waiting recordings then confirm.
+                    "fix": (f"move this PC to clinic {mapped_to}" if mapped_to else
+                            f"link CMED code {visit.cmed_hospital_id} to the clinic this PC "
+                            f"serves ({device['hospital_id']}), or to its real clinic and "
+                            f"move this PC there")})
         clinic = device["hospital_id"]
 
     # Decision D4: the doctor register is a directory, not a gate. CMED
@@ -3689,6 +3695,10 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
         logger.info("Sweep confirmed %s recording(s) whose notice had arrived",
                     len(reconciled))
 
+    # Then anything a clinic set-up mistake left waiting, once the PC has been
+    # moved or CMED's code linked: every few minutes, not every pass.
+    rematched = await rematch_after_clinic_fix()
+
     marked = 0
     for row in await repo.sessions_in_confirmation(
             ["pending"], opened_before=now - conf.CONFIRM_DEADLINE):
@@ -3715,7 +3725,31 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             "erase_held_clinics": held, "erase_stopped_clinics": stopped,
             "devices_rejected": rejected,
             "devices_approved": approved, "clinical_loaded": loaded,
-            "copies_overdue": len(overdue), "reconciled": len(reconciled)}
+            "copies_overdue": len(overdue), "reconciled": len(reconciled),
+            "rematched": len(rematched)}
+
+
+REMATCH_EVERY = timedelta(minutes=5)
+_LAST_REMATCH: Optional[datetime] = None
+
+
+async def rematch_after_clinic_fix(*, now: bool = False) -> List[str]:
+    """
+    clinical.rematch_waiting, at most every REMATCH_EVERY - or at once
+    (`now`) right after a PC is moved or a CMED code linked. Never fails
+    the caller.
+    """
+    global _LAST_REMATCH
+    at = datetime.now(timezone.utc)
+    if not now and _LAST_REMATCH is not None and at - _LAST_REMATCH < REMATCH_EVERY:
+        return []
+    _LAST_REMATCH = at
+    try:
+        import clinical
+        return await clinical.rematch_waiting()
+    except Exception as exc:
+        logger.warning("Rematching waiting recordings failed: %s", exc)
+        return []
 
 
 ERASE_BATCH = 100                       # per sweep; the worker sweeps every 30 s
@@ -3944,6 +3978,9 @@ async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)
         _CLINIC_CACHE.clear()        # a newly linked code works at once here; elsewhere in a minute
         await _repo().audit(event_type="hospital.mapped", actor_type="admin",
                             actor_id=hospital_id, detail={"cmed_hospital_id": cmed_id})
+        rematched = await rematch_after_clinic_fix(now=True)
+        return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id,
+                "confirmed_now": len(rematched)}
     return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id}
 
 
@@ -4154,8 +4191,11 @@ async def admin_move_device(device_id: str, body: DeviceMove,
                         detail={"from": was, "to": hospital_id, "reason": body.reason,
                                 "register_again": body.register_again})
     forget_directory()
+    # Its recordings left waiting by the wrong clinic are confirmed now, when
+    # CMED's messages for them are here.
+    rematched = await rematch_after_clinic_fix(now=True)
     return {"status": "moved", "device_id": str(did), "from": was, "to": hospital_id,
-            "register_again": body.register_again}
+            "register_again": body.register_again, "confirmed_now": len(rematched)}
 
 
 @router.post("/admin/device/{device_id}/unblock")

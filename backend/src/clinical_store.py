@@ -535,6 +535,37 @@ class ClinicalStore:
                     found.add(visit.patient_id)
         return found
 
+    async def intake_for_visit(self, visit) -> Optional[Dict[str, Any]]:
+        """
+        The newest API 2 (else API 3) CMED's server sent for these five fields,
+        whatever clinic it was filed under - a message that arrived before its
+        CMED code was linked to a clinic is filed under none.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, kind FROM intake_records
+                 WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
+                   AND start_time = $4 AND visit_date = $5
+                 ORDER BY (kind = 'patient_information') DESC, id DESC
+                 LIMIT 1
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                visit.start_time, visit.day)
+        return dict(row) if row else None
+
+    async def link_visit_recording(self, *, cmed_hospital_id: str, visit_id: Optional[str],
+                                   patient_id: str, session_id: str) -> bool:
+        """Interface 4's visit row names its recording (patient_visit.aims_id)."""
+        if not visit_id:
+            return False
+        async with self._pool.acquire() as conn:
+            done = await conn.fetchval("""
+                UPDATE patient_visit SET aims_id = $4, updated_at = now()
+                 WHERE hospital_id = $1 AND visit_id = $2 AND hospital_patient_id = $3
+                   AND aims_id IS DISTINCT FROM $4
+                RETURNING id
+            """, cmed_hospital_id, visit_id, patient_id, session_id)
+        return done is not None
+
     async def link_session(self, visit, *, session_id: str, file_stem: Optional[str],
                            hospital_id: Optional[str]) -> bool:
         """Tie the visit to its recording by the shared file name (SRS-DBA-21)."""
