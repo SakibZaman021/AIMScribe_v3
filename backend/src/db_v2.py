@@ -1749,6 +1749,58 @@ class V2Repository:
             """, limit)
         return [r["session_id"] for r in rows]
 
+    async def waiting_at_cmed_clinic(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Recordings still waiting for CMED whose PC now sits at the clinic CMED's
+        code names - the code linked to that clinic, or CMED using our own code
+        for a clinic with none linked. Newest grant first.
+
+        These are the recordings a clinic set-up mistake left waiting: the PC
+        enrolled at one clinic while CMED's code named another, or CMED's
+        messages arriving before its code was linked to any clinic. Once a
+        person has moved the PC or linked the code, their grant and CMED's
+        message can meet (clinical.rematch_waiting).
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.session_id, s.device_id, s.archived_at, s.closed_at,
+                       g.jti, g.hospital_id AS grant_hospital, d.hospital_id AS clinic,
+                       g.patient_id, g.doctor_id, g.cmed_hospital_id, g.start_time,
+                       g.visit_date, g.visit_id, g.issued_at
+                  FROM sessions s
+                  JOIN grant_authorisations g ON g.jti = s.grant_jti
+                  JOIN devices d ON d.device_id = s.device_id AND d.revoked_at IS NULL
+                  JOIN hospitals h ON h.hospital_id = d.hospital_id
+                 WHERE s.confirmation IN ('pending', 'unconfirmed')
+                   AND g.notice_id IS NULL AND g.patient_id <> 'REDACTED'
+                   AND (h.cmed_hospital_id = g.cmed_hospital_id
+                        OR (h.cmed_hospital_id IS NULL
+                            AND h.hospital_id = g.cmed_hospital_id))
+                 ORDER BY g.issued_at DESC
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def refile_session(self, session_id: str, jti: str, hospital_id: str) -> bool:
+        """
+        File a recording, and the grant it opened under, at another clinic: the
+        one its PC was moved to. Only before it is archived (a waiting
+        recording never is); its pieces keep their object keys.
+        """
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                moved = await conn.fetchval("""
+                    UPDATE sessions SET hospital_id = $2, updated_at = now()
+                     WHERE session_id = $1 AND archived_at IS NULL
+                    RETURNING session_id
+                """, session_id, hospital_id)
+                if moved is None:
+                    return False
+                await conn.execute(
+                    "UPDATE grant_authorisations SET hospital_id = $2 WHERE jti = $1",
+                    jti, hospital_id)
+        return True
+
     async def set_erase_deadlines(self, days: int) -> int:
         """Every recording CMED has not confirmed gets its date (opened + days)."""
         async with self._acquire() as conn:

@@ -456,6 +456,76 @@ async def confirm_waiting(visit: Visit, hospital_id: str, notice_id: int) -> Opt
     return None
 
 
+async def rematch_waiting(limit: int = 500) -> List[str]:
+    """
+    Confirm recordings a clinic set-up mistake left waiting, once a person has
+    put the set-up right. Returns the sessions confirmed.
+
+    Found on the live server on 17 Nov 2026: CMED's PC was enrolled at our
+    clinic TEST (code CMED-TEST, used with Postman), while CMED's own system
+    named its clinic Susastho-Clinic-Test-1. Every grant was filed under TEST
+    (a clinic mismatch, decision D1) and every API 2 under the clinic that
+    code is linked to - or, before it was linked, under none, leaving no
+    notice at all. The five fields matched to the second; the clinics never
+    did, so nothing was confirmed, and putting the set-up right afterwards
+    changed nothing for the recordings already waiting.
+
+    So: for each waiting recording whose PC now sits at the clinic its CMED
+    code names (db_v2.waiting_at_cmed_clinic), find CMED's message for the
+    same five fields - a notice at that clinic, or the stored API 2/3 itself
+    when it arrived before the code was linked - file the recording at that
+    clinic, and confirm it. Another clinic's API 2 still confirms nothing
+    while the PC is elsewhere (AT-63); one notice still confirms one grant,
+    the newest; a visit two PCs claim still waits for an administrator.
+    """
+    repo = api_v2._repo()
+    store = api_v2._clinical()
+    since = datetime.now(timezone.utc) - conf.UNCONFIRMED_LIFETIME
+    confirmed: List[str] = []
+    for row in await repo.waiting_at_cmed_clinic(limit):
+        try:
+            clinic = row["clinic"]
+            visit = api_v2._visit_from_grant(row)
+            if await api_v2._visit_contested(visit, clinic):
+                continue
+            notice_id = await repo.find_unclaimed_notice(visit, hospital_id=clinic, since=since)
+            if notice_id is None and store is not None:
+                intake = await store.intake_for_visit(visit)
+                if intake is None:
+                    continue
+                notice_id = await repo.record_notice(
+                    visit, hospital_id=clinic, clinical_record_id=int(intake["id"]),
+                    latest=intake["kind"] == "patient_information")
+                # Claimed already (by the grant of another recording of this
+                # visit): the record_notice above found that notice, not a new one.
+            if notice_id is None:
+                continue
+            if not await repo.claim_notice(notice_id, row["jti"]):
+                continue
+            was = row["grant_hospital"]
+            if was != clinic:
+                await repo.refile_session(row["session_id"], row["jti"], clinic)
+            await repo.set_session_confirmation(row["session_id"], "confirmed")
+            await repo.audit(event_type="session.confirmed", actor_type="service",
+                             actor_id="channel-b", session_id=row["session_id"],
+                             detail={"rematched": True, "clinic": clinic,
+                                     "filed_at_before": was})
+            await api_v2.confirm_continuations(row["session_id"])
+            if was != clinic and row.get("closed_at") is not None:
+                await api_v2._record_file_name(row["session_id"])   # the name carries the clinic
+            await attach_to_recording(visit, clinic)
+            if store is not None:
+                await store.link_visit_recording(
+                    cmed_hospital_id=visit.cmed_hospital_id, visit_id=row.get("visit_id"),
+                    patient_id=visit.patient_id, session_id=row["session_id"])
+            confirmed.append(row["session_id"])
+            logger.info("Session %s confirmed once its clinic was set right (%s -> %s)",
+                        row["session_id"], was, clinic)
+        except Exception as exc:                    # one row never stops the others
+            logger.warning("Could not rematch %s: %s", row.get("session_id"), exc)
+    return confirmed
+
+
 async def mark_json_for_rewrite(visit: Visit, hospital_id: Optional[str] = None
                                 ) -> Optional[str]:
     """
@@ -480,6 +550,6 @@ def _now_iso() -> str:
 
 
 __all__ = ["router", "receive", "process", "list_visits", "check_hospital",
-           "confirm_waiting", "mark_json_for_rewrite",
+           "confirm_waiting", "rematch_waiting", "mark_json_for_rewrite",
            "attach_to_recording", "patient_visits",
            "problems_with", "key_digest", "MAX_BODY_BYTES"]

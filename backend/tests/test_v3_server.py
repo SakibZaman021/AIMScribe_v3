@@ -184,6 +184,39 @@ class FakeRepo:
                 confirmed.append(session_id)
         return confirmed
 
+    # a clinic set right after the fact (17 Nov 2026): device id -> clinic now
+    def clinic_of_device(self, device_id):
+        return getattr(self, "device_clinics", {}).get(str(device_id), "HOSP003")
+
+    async def waiting_at_cmed_clinic(self, limit=500):
+        rows = []
+        for s in self.sessions.values():
+            g = self.auths.get(s.get("grant_jti") or "")
+            if (not g or s["confirmation"] not in ("pending", "unconfirmed")
+                    or g["notice_id"] is not None or g["patient_id"] == "REDACTED"):
+                continue
+            clinic = self.clinic_of_device(s["device_id"])
+            code = self.hospitals.get(clinic)
+            if code != g["cmed_hospital_id"] and not (
+                    code is None and clinic == g["cmed_hospital_id"]):
+                continue
+            rows.append(dict(session_id=s["session_id"], device_id=s["device_id"],
+                             archived_at=s.get("archived_at"), closed_at=s.get("closed_at"),
+                             jti=g["jti"], grant_hospital=g["hospital_id"], clinic=clinic,
+                             patient_id=g["patient_id"], doctor_id=g["doctor_id"],
+                             cmed_hospital_id=g["cmed_hospital_id"],
+                             start_time=g["start_time"], visit_date=g["visit_date"],
+                             visit_id=g.get("visit_id"), issued_at=g["issued_at"]))
+        return sorted(rows, key=lambda r: r["issued_at"], reverse=True)[:limit]
+
+    async def refile_session(self, session_id, jti, hospital_id):
+        s = self.sessions[session_id]
+        if s.get("archived_at"):
+            return False
+        s["hospital_id"] = hospital_id
+        self.auths[jti]["hospital_id"] = hospital_id
+        return True
+
     async def sessions_in_confirmation(self, states, *, opened_before):
         return [dict(s) for s in self.sessions.values()
                 if s["confirmation"] in states and s["opened_at"] < opened_before]
@@ -575,6 +608,20 @@ class FakeClinical:
     async def link_session(self, visit, **kw):
         self.linked.append(kw)
         return True
+
+    async def intake_for_visit(self, visit):
+        found = [r for r in self.records
+                 if (r["patient_id"], r["doctor_id"], r["cmed_hospital_id"], r["start_time"],
+                     r["visit_date"]) == (visit.patient_id, visit.doctor_id,
+                                          visit.cmed_hospital_id, visit.start_time, visit.day)]
+        if not found:
+            return None
+        best = max(found, key=lambda r: (r["kind"] == "patient_information", r["id"]))
+        return {"id": best["id"], "kind": best["kind"]}
+
+    async def link_visit_recording(self, **kw):
+        self.__dict__.setdefault("visit_links", []).append(kw)
+        return bool(kw.get("visit_id"))
 
     async def prescribed(self, visits):
         return {v.patient_id for v in visits
