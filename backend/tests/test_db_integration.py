@@ -1988,8 +1988,8 @@ async def test_a_researcher_downloads_the_archived_wav_and_it_is_logged(dbs, mon
         _unserve()
 
 
-async def test_an_admin_downloads_the_clinical_record_and_a_researcher_cannot(dbs, monkeypatch):
-    """17 Nov: the JSON CMED sent, decrypted like the audio; admins only, logged."""
+async def test_an_admin_and_a_researcher_download_the_clinical_record(dbs, monkeypatch):
+    """17 Nov: the JSON CMED sent, decrypted like the audio, for the same people; logged."""
     import httpx
     record = json.dumps({"patient": "PDOWNJ", "rx": ["paracetamol"]}).encode()
     sid, stem = await _copied_recording(dbs, "PDOWNJ")
@@ -2016,12 +2016,15 @@ async def test_an_admin_downloads_the_clinical_record_and_a_researcher_cannot(db
         assert disposition.endswith('.json"') and "PDOWNJ" not in disposition
 
         await _researcher(client, who, email="reader@uni.example")
-        denied = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+        theirs = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
                                   headers={"Sec-Fetch-Site": "same-origin"})
-        assert denied.status_code == 403
-        # The researcher's audio download is unchanged.
+        assert theirs.status_code == 200 and theirs.content == record
+        # Started from another site: nothing, as for the audio.
+        assert (await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                                 headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
     try:
-        assert len(asked) == 1
+        assert len(asked) == 2
+        assert asked[1] == asked[0]
         assert asked[0]["expect"] == {"session_id": sid, "kind": "json",
                                       "stem_sha256": hashlib.sha256(stem.encode()).hexdigest()}
         assert asked[0]["url"].endswith(".json.enc?expires=300")
@@ -2031,6 +2034,12 @@ async def test_an_admin_downloads_the_clinical_record_and_a_researcher_cannot(db
                 "SELECT count(*) FROM audit_log WHERE event_type = 'recording.downloaded' "
                 "AND actor_id = 'owner@uiu.example' AND session_id = $1", sid)
         assert logged == 1
+        async with dbs.rec.acquire() as conn:
+            theirs_logged = await conn.fetchval(
+                "SELECT count(*) FROM portal_downloads WHERE session_id = $1 "
+                "AND email = 'reader@uni.example' AND outcome = 'completed' "
+                "AND object_key LIKE '%.json.enc'", sid)
+        assert theirs_logged == 1
     finally:
         _unserve()
 
@@ -2673,6 +2682,9 @@ async def test_a_collector_views_but_never_downloads_or_opens_the_database(dbs, 
         audio = await client.get(f"/api/v2/dashboard/recordings/{mine}/audio",
                                  headers={"Accept": "application/json"})
         assert audio.status_code == 403
+        record = await client.get(f"/api/v2/dashboard/recordings/{mine}/record",
+                                  headers={"Accept": "application/json"})
+        assert record.status_code == 403
         assert (await client.get("/api/v2/dashboard/bulk/preview")).status_code == 403
         batch = await client.post("/api/v2/dashboard/bulk/batches", json={},
                                   headers={"X-AIMS-Portal": "1"})

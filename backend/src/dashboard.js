@@ -849,17 +849,17 @@ function audioLinks(r) {
   const files = r.files || [];
   const link = (href, label, title) =>
     `<a class="copy dl" href="${esc(href)}" title="${esc(title)}">${esc(label)}</a>`;
-  // 17 Nov: the clinical record CMED sent, decrypted the same way. Admins only.
-  const record = PORTAL.role !== "admin" ? ""
-    : files.length > 1
+  // 17 Nov: the clinical record CMED sent (JSON), decrypted the same way, for
+  // the same people: researchers and admins (a data collector stopped above).
+  const record = files.length > 1
       ? "<br>" + files.map((f) => link(`${recordUrl(r)}?part=${f.part_no}`, `Record ${f.part_no}`,
           `Download the clinical record of patient file ${f.part_no} (JSON)`)).join(" ")
-      : "<br>" + link(recordUrl(r), "Record", "Download the clinical record CMED sent (JSON)");
+      : "<br>" + link(recordUrl(r), "Record (JSON)", "Download the clinical record CMED sent (JSON)");
   if (files.length > 1) {
     return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
       `Download patient file ${f.part_no} (WAV)`)).join(" ") + record;
   }
-  return link(base, "Download", "Download the WAV") + record;
+  return link(base, "Audio (WAV)", "Download the WAV") + record;
 }
 
 function recordUrl(r) {
@@ -883,7 +883,7 @@ function recordingsTable(list) {
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
     + `<th>Patient files and rule</th><th class="num">Length</th><th>Microphone</th>`
     + `<th>CMED</th><th>Status</th>`
-    + `<th>Stored</th><th>Audio</th><th>Folder on server</th></tr></thead><tbody>`
+    + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
@@ -907,7 +907,7 @@ function recordingsTable(list) {
           + td("CMED", confirmTag(r.confirmation))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
-          + td("Audio", audioLinks(r))
+          + td("Download", audioLinks(r))
           + td("Folder", folder
             ? `<span title="${esc(folder)}">${esc(folder)}</span>`
               + ` <button type="button" class="copy" data-copy="${esc(folder)}">Copy</button>`

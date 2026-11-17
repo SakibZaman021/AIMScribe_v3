@@ -22,8 +22,9 @@ who, which recording, when, and whether it all arrived. The file is named by
 clinic, doctor, date and session, without the patient's identifier.
 
 The clinical record (17 Nov) - the JSON CMED sent, kept as its own sealed
-copy - comes the same way, for admins only: it is the patient's record, not
-research audio. Before this, reading one meant the copy key and restore.py.
+copy - comes the same way, to the same people (researchers and admins; a data
+collector neither), under the same daily limit, logged the same way. Before
+this, reading one meant the copy key and restore.py.
 """
 from __future__ import annotations
 
@@ -185,7 +186,7 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
 
 @router.get("/recordings/{session_id}/record")
 async def download_record(session_id: str, request: Request, part: Optional[int] = None):
-    """The clinical record CMED sent, decrypted from its sealed copy. Admins only."""
+    """The clinical record CMED sent, decrypted from its sealed copy, as the audio is."""
     return await _download(session_id, request, part, "json")
 
 
@@ -193,8 +194,6 @@ async def _download(session_id: str, request: Request, part: Optional[int], kind
     person = await portal.person_for(request)
     if person is None:
         return _refusal(request, 401, "Sign in with Google to download recordings.")
-    if kind == "json" and person.role != "admin":
-        return _refusal(request, 403, "Only an admin may download a clinical record.")
     if person.role == "collector":
         # 036: data collectors view only - no file, no batch, no playback.
         return _refusal(request, 403, "A data collector can view recordings but not "
