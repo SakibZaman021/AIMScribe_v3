@@ -131,11 +131,17 @@ class FakeStore:
 
     def __init__(self, bucket="aimscribe-archive", *, corrupt=False):
         self.bucket, self.objects, self.corrupt = bucket, {}, corrupt
-        self.client = SimpleNamespace(copy_object=self._copy, stat_object=self._stat)
+        self.client = SimpleNamespace(copy_object=self._copy, stat_object=self._stat,
+                                      remove_object=self._remove)
+        self.removed = []
 
     def _copy(self, bucket, target, source):
         size, etag = self.objects[source.object_name]
         self.objects[target] = (size - 1 if self.corrupt else size, etag)
+
+    def _remove(self, bucket, key):
+        self.objects.pop(key, None)
+        self.removed.append(key)
 
     def _stat(self, bucket, key):
         if key not in self.objects:
@@ -302,3 +308,51 @@ async def test_a_visit_without_a_visit_id_is_keyed_by_its_start(dbs):
     rows = await dbs.clinical.visit_folder(patient)
     assert [(r["visit_key"], r["sex"], r["age_years"], r["source"]) for r in rows] == [
         (api_v2.visit_key(patient, "DR0042", None, v.start_time), "female", 41, "interface 2")]
+
+
+@postgres
+async def test_old_copies_go_only_once_their_twin_is_in_the_store(dbs):
+    """045: the user's decision of 17 Nov - remove the by-day copies, safely."""
+    store = FakeStore()
+    api_v2.ctx.repo, api_v2.ctx.clinical = dbs.repo, dbs.clinical
+    api_v2.ctx.copy, api_v2.ctx.copy_json = store, None
+    try:
+        sid, patient, stem, old = await _archived_on_postgres(dbs)
+        store.objects[old] = (1000, "ab" * 16)
+        await visit_layout.move_copies(apply=True)
+        new = next(k for k in store.objects if k.startswith(f"visits/{patient}/"))
+
+        dry = await visit_layout.retire_old_copies(apply=False)
+        assert dry["would_remove"] >= 1 and old in store.objects
+
+        done = await visit_layout.retire_old_copies(apply=True)
+        assert old not in store.objects and new in store.objects
+        assert not any(k["object_key"] == old for k in done["kept"])
+        async with dbs.rec.acquire() as conn:
+            row = await conn.fetchrow("SELECT removed_at FROM cloud_copies WHERE object_key = $1",
+                                      old)
+        assert row["removed_at"] is not None                   # the row stays, marked
+        # Downloads see only the copy that is there.
+        assert [c["object_key"] for c in await dbs.repo.copies_for(sid)] == [new]
+        again = await visit_layout.retire_old_copies(apply=True)
+        assert not any(k["object_key"] == old for k in again["kept"])
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.copy = None
+
+
+@postgres
+async def test_an_old_copy_whose_twin_is_missing_is_kept(dbs):
+    store = FakeStore()
+    api_v2.ctx.repo, api_v2.ctx.clinical = dbs.repo, dbs.clinical
+    api_v2.ctx.copy, api_v2.ctx.copy_json = store, None
+    try:
+        sid, patient, stem, old = await _archived_on_postgres(dbs)
+        store.objects[old] = (1000, "ab" * 16)
+        await visit_layout.move_copies(apply=True)
+        new = next(k for k in store.objects if k.startswith(f"visits/{patient}/"))
+        del store.objects[new]                                  # the twin vanished
+        report = await visit_layout.retire_old_copies(apply=True)
+        assert any(k["object_key"] == old for k in report["kept"])
+        assert old in store.objects and old not in store.removed
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.copy = None

@@ -1259,6 +1259,25 @@ class V2Repository:
             """, limit)
         return [dict(r) for r in rows]
 
+    async def old_copies_with_twin(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """By-day copies still in the store whose visit-folder twin is recorded (045)."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT o.id, o.session_id, o.kind, o.object_key, o.bytes, o.sha256,
+                       n.object_key AS twin_key, n.bytes AS twin_bytes, n.sha256 AS twin_sha256
+                  FROM cloud_copies o
+                  JOIN cloud_copies n ON n.copied_from = o.object_key AND n.layout = 'by_visit'
+                                     AND n.removed_at IS NULL
+                 WHERE o.layout = 'by_day' AND o.removed_at IS NULL
+                 ORDER BY o.id LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def mark_copy_removed(self, copy_id: int) -> None:
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE cloud_copies SET removed_at = now() "
+                               "WHERE id = $1 AND removed_at IS NULL", copy_id)
+
     async def record_moved_copy(self, old: Dict[str, Any], new_key: str) -> int:
         """
         A copy placed in its visit's folder by the backfill: a new row, the old
@@ -1324,6 +1343,7 @@ class V2Repository:
                 SELECT kind, object_key, version, bytes, sha256, plain_sha256,
                        uploaded_at, verified_at
                   FROM cloud_copies WHERE session_id = $1
+                   AND removed_at IS NULL           -- 045: a removed copy is not there
                  ORDER BY kind, version
             """, session_id)
         return [dict(row) for row in rows]
