@@ -38,6 +38,8 @@ const clinicName = (id) => {
   const c = CLINICS.find((x) => x.hospital_id === id);
   return (c && c.name) || id || "";
 };
+// 18 Nov: this collector's Telegram, for the warning at Start shift.
+let myTelegram = {};
 const tag = (tone, text, tip) =>
   `<span class="tag ${tone}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(text)}</span>`;
 const empty = (title, line, ok) =>
@@ -1916,8 +1918,26 @@ async function collectorCall(method, path, body) {
 }
 
 /* How an alert went out; 'held' = quiet hours, kept for the next summary (16 Nov). */
+// 18 Nov: alerts about something that just happened (watchers.REAL_TIME_EVENTS):
+// how long from the event to the message reaching them.
+const REAL_TIME = ["jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
+                   "recording_without_jabra", "stopped_unusually", "stopped_technical"];
+
+function tookWords(n) {
+  if (!n.delivered_at) return "";
+  const from = REAL_TIME.includes(n.event) && n.happened_at ? n.happened_at : n.created_at;
+  const s = Math.max(0, Math.round((Date.parse(n.delivered_at) - Date.parse(from)) / 1000));
+  return s < 90 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
+}
+
 function sentTag(n) {
-  if (n.delivered) return tag("good", n.channel === "telegram" ? "Telegram" : "email");
+  if (n.delivered) {
+    const took = tookWords(n);
+    return tag(took && /min/.test(took) && REAL_TIME.includes(n.event) ? "warn" : "good",
+               (n.channel === "telegram" ? "Telegram" : "email") + (took ? ` · ${took}` : ""),
+               took ? (REAL_TIME.includes(n.event) ? "From the event to the message reaching them"
+                                                   : "From the alert to the message reaching them") : "");
+  }
   if (n.channel === "held") return tag("quiet", "held (night)");
   // 17 Nov: no Telegram yet - sent, marked late, the moment they connect it.
   if (n.channel === "waiting") return tag("warn", "waiting for Telegram", n.error || "");
@@ -1958,6 +1978,7 @@ async function loadShift() {
   $("shiftStart").hidden = !!on;
   $("shiftEnd").hidden = !on;
   const tg = me.telegram || {};
+  myTelegram = tg;
   $("shiftHint").textContent = tg.linked
     ? "While you are on shift, Telegram alerts you at once when the Jabra is unplugged, a patient "
       + "is recorded without the Jabra, a recording has a problem or a PC stops reporting. "
@@ -1999,6 +2020,10 @@ async function loadShift() {
 }
 
 $("shiftStart").addEventListener("click", async () => {
+  if (myTelegram.ready && !myTelegram.linked && !window.confirm(
+      "Your Telegram is not connected, so alerts will not reach your phone during this "
+      + "shift. Press Cancel, then Connect Telegram (it takes a minute). Or press OK to "
+      + "start anyway: alerts then wait and arrive, marked late, once you connect.")) return;
   $("shiftStart").disabled = true;
   try { await collectorCall("POST", "/shift/start"); }
   catch (err) { window.alert(`Not started: ${err.message}`); }

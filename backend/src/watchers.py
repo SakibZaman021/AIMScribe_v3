@@ -281,6 +281,44 @@ async def watchers_of(conn, hospital_id: Optional[str]) -> List[Tuple[str, str]]
     return [(r["email"], r["alert_mode"] or "everything") for r in rows]
 
 
+# 18 Nov: alerts about something that just happened. Their speed is from the
+# moment it happened to the moment Telegram took the message. (A "running 60
+# min" or "PC not reporting" alert is late by design, so it is not counted.)
+REAL_TIME_EVENTS = ("jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
+                    "recording_without_jabra", "stopped_unusually", "stopped_technical")
+
+
+def _span(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds} s" if seconds < 90 else f"{seconds // 60} min {seconds % 60:02d} s"
+
+
+async def alert_speed(conn, hospital_id: str, start: datetime, end: datetime) -> Optional[str]:
+    """How fast this hospital's alerts reached the collectors, in words; None before any."""
+    row = await conn.fetchrow("""
+        SELECT count(*) AS n,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM
+                   delivered_at - COALESCE(happened_at, created_at))) AS typical,
+               max(extract(epoch FROM delivered_at - COALESCE(happened_at, created_at)))
+                   AS slowest,
+               count(*) FILTER (WHERE delivered_at - COALESCE(happened_at, created_at)
+                                      > interval '2 minutes') AS late
+          FROM collector_notifications
+         WHERE hospital_id = $1 AND audience = 'collector' AND delivered_at IS NOT NULL
+           AND event = ANY($4::text[]) AND created_at >= $2 AND created_at < $3
+    """, hospital_id, start, end, list(REAL_TIME_EVENTS))
+    if not row or not row["n"]:
+        return None
+    waiting = await conn.fetchval("""
+        SELECT count(*) FROM collector_notifications
+         WHERE hospital_id = $1 AND channel = 'waiting' AND created_at >= $2 AND created_at < $3
+    """, hospital_id, start, end)
+    return (f"Alert speed, from the event to the collector's Telegram: typically "
+            f"{_span(row['typical'])}, slowest {_span(row['slowest'])} ({row['n']} alerts"
+            + (f", {row['late']} over 2 min" if row["late"] else "") + ")"
+            + (f"; {waiting} waiting for someone to connect Telegram" if waiting else ""))
+
+
 async def assigned_since(conn, hospital_id: Optional[str]) -> Dict[str, datetime]:
     """When each researcher began looking after this hospital."""
     if not hospital_id:
@@ -412,6 +450,7 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
     On 'problems', only urgent alerts and PROBLEMS_ONLY. In quiet hours (`hold`) it
     is kept, marked held, and not sent."""
     sent = 0
+    to_send: List[int] = []
     since = await assigned_since(conn, hospital_id) \
         if happened_at is not None and event not in SUMMARY_EVENTS else {}
     for email, mode in await watchers_of(conn, hospital_id):
@@ -427,8 +466,9 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
             if hold:
                 await collectors._hold(conn, note_id)
             else:
-                await collectors._deliver(conn, note_id)
+                to_send.append(note_id)
                 sent += 1
+    await collectors.deliver_all(conn, to_send)
     return sent
 
 
@@ -438,6 +478,7 @@ async def _to_watchers(conn, hospitals: List[str], *, since: Optional[datetime] 
     with `since`, the start of the problem, not to one assigned after it who
     never had its first alert (`first_key`)."""
     told: List[str] = []
+    waiting: List[int] = []
     had_first = set()
     if since is not None and first_key:
         had_first = {r["email"] for r in await conn.fetch(
@@ -453,8 +494,9 @@ async def _to_watchers(conn, hospitals: List[str], *, since: Optional[datetime] 
             note_id = await collectors._record(conn, email=email, hospital_id=hid,
                                                audience="watcher", **note)
             if note_id is not None:
-                await collectors._deliver(conn, note_id)
+                waiting.append(note_id)
                 told.append(email)
+    await collectors.deliver_all(conn, waiting)
     return told
 
 
@@ -502,10 +544,13 @@ async def _still_wrong(conn, family: str, first: Dict[str, Any],
                 return "fixed", f"a good recording was made at {hhmm(r['opened_at'])}"
         return "still", "no good recording on this PC since the alert"
     if family == "long":
-        s = await conn.fetchrow("SELECT opened_at, closed_at FROM sessions "
+        s = await conn.fetchrow("SELECT opened_at, closed_at, confirmation FROM sessions "
                                 "WHERE session_id = $1", first["session_id"])
         if s is None:
             return "ended", "the recording is gone"
+        if s["confirmation"] == "refused":
+            # 18 Nov: not "still running" - the patient said no and it was deleted.
+            return "ended", "the patient did not consent; the recording was deleted"
         if s["closed_at"] is not None:
             return "fixed", f"the recording was stopped at {hhmm(s['closed_at'])}"
         minutes = int((now - s["opened_at"]).total_seconds() // 60)
@@ -608,6 +653,7 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
         if not duty:
             duty = {n["email"]: n["place_id"] for n in notes}
         now_body = await fresh_context(conn, first)
+        reminders: List[int] = []
         for email, pid in sorted(duty.items()):
             text = (f"{_first_up(how)}. The first alert was at "
                     f"{collectors._hhmm(first['created_at'])}, {minutes} min ago.\n\n"
@@ -617,7 +663,8 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                 event_key=key, urgent=True, place_id=pid, hospital_id=first["hospital_id"],
                 device_id=first["device_id"], session_id=first["session_id"])
             if note_id is not None:
-                await collectors._deliver(conn, note_id)
+                reminders.append(note_id)
+        await collectors.deliver_all(conn, reminders)
         # Every place holding the hospital, not just the one this note went to.
         contacts = await contact_text(conn, first["hospital_id"],
                                       None if first["hospital_id"] else first["place_id"])
@@ -1250,6 +1297,9 @@ async def hospital_report(conn, hospital_id: str, day: date, shift: str = "day")
         red.append(f"{len(unhandled)} urgent alert(s) not handled")
         todo.insert(0, f"{len(unhandled)} urgent alert(s) were never marked seen: talk to the "
                        "collector on shift.")
+    speed = await alert_speed(conn, hospital_id, start, end)
+    if speed:
+        body.append(speed)
     # 039: problems still there 30 minutes after the alert, and how each ended.
     lasted = await conn.fetch("""
         SELECT o.event_key, o.event, o.subject, o.created_at, o.resolved_at, o.resolution
@@ -1374,7 +1424,7 @@ async def watch_me(request: Request):
                                    "WHERE email = $1", person.email)
         notes = await conn.fetch("""
             SELECT id, created_at, happened_at, event, urgent, subject, hospital_id,
-                   delivered, error, channel
+                   delivered, error, channel, delivered_at
               FROM collector_notifications WHERE email = $1 AND audience = 'watcher'
              ORDER BY id DESC LIMIT 50
         """, person.email)

@@ -2209,6 +2209,14 @@ class V2Repository:
                            status = $2::text, confirmation = $2::text,
                            refused_at = CASE WHEN $2::text = 'refused' THEN now()
                                              ELSE refused_at END,
+                           -- 18 Nov: an erased recording has ended. Without this a
+                           -- refused one stayed "running" for ever, and the alert
+                           -- rules sent 283 "still running / not fixed" messages
+                           -- about 11 refused recordings on 16-17 Nov.
+                           closed_at = COALESCE(closed_at, now()),
+                           close_reason = COALESCE(close_reason,
+                               CASE WHEN $2::text = 'refused'
+                                    THEN 'doctor_stopped:patient_did_not_consent' END),
                            updated_at = now()
                      WHERE session_id = $1
                 """, session_id, state)

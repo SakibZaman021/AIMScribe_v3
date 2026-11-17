@@ -314,7 +314,7 @@ async def me(request: Request):
                                     "AND ended_at IS NULL", person.email)
         notes = await conn.fetch("""
             SELECT id, created_at, happened_at, event, urgent, subject, hospital_id,
-                   delivered, error, seen_at, channel
+                   delivered, error, seen_at, channel, delivered_at
               FROM collector_notifications WHERE email = $1 ORDER BY id DESC LIMIT 50
         """, person.email)
         chat = await conn.fetchrow("SELECT username, linked_at FROM collector_telegram "
@@ -751,16 +751,36 @@ def _hide(text: str) -> str:
     return text.replace(token, "<token>") if token else text
 
 
+# 18 Nov: one connection to Telegram, kept open. A new one per message took
+# 0.49 s from the server (measured); a kept one 0.16 s. And 8 s, not 15, before
+# a message counts as not sent - it is retried - so one slow call cannot hold
+# every hospital's alerts up for long.
+TELEGRAM_TIMEOUT = 8.0
+_KEPT: Dict[str, Any] = {"loop": None, "client": None}
+
+
+def _kept_client() -> httpx.AsyncClient:
+    """The kept connection for this event loop (a test's loop gets its own)."""
+    loop = asyncio.get_running_loop()
+    client = _KEPT["client"]
+    if client is None or client.is_closed or _KEPT["loop"] is not loop:
+        client = httpx.AsyncClient(timeout=TELEGRAM_TIMEOUT,
+                                   limits=httpx.Limits(max_connections=10,
+                                                       max_keepalive_connections=10))
+        _KEPT.update(loop=loop, client=client)
+    return client
+
+
 async def _telegram(method: str, payload: Dict[str, Any],
-                    timeout: float = 15) -> Tuple[Optional[Any], Optional[str]]:
+                    timeout: float = TELEGRAM_TIMEOUT) -> Tuple[Optional[Any], Optional[str]]:
     """One Bot API call: (result, None) or (None, why). Never raises; never shows the token."""
     token = _token()
     if not token:
         return None, ("Telegram is not set up on this server (AIMS_TELEGRAM_BOT_TOKEN): "
                       "run ./set-telegram.sh in deploy/uiu")
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            reply = await client.post(f"{TELEGRAM_API}/bot{token}/{method}", json=payload)
+        reply = await _kept_client().post(f"{TELEGRAM_API}/bot{token}/{method}",
+                                          json=payload, timeout=timeout)
         try:
             body = reply.json()
         except ValueError:
@@ -938,6 +958,10 @@ async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: st
         sending["subject"] = (f"Sent late (from {_hhmm(note['created_at'])}, before Telegram "
                               f"was connected): {note['subject']}")
     ok, error, channel = await _send_to(conn, sending)
+    if ok:
+        # 18 Nov: when it reached them, so the speed can be shown and checked.
+        await conn.execute("UPDATE collector_notifications SET delivered_at = now() "
+                           "WHERE id = $1", note_id)
     if not ok and _unreachable(error):
         # 17 Nov: these were lost - tried once by email, which is not set up, and
         # never again. Now kept as waiting, and sent the moment they connect.
@@ -992,6 +1016,53 @@ async def send_waiting(conn, email: str) -> int:
     if rows:
         logger.info("Sent %s of %s waiting alert(s) to a newly connected Telegram",
                     sent, len(rows))
+    return sent
+
+
+SEND_AT_ONCE = 6
+SPARE_CONNECTION_WAIT = 5.0
+
+
+async def deliver_all(conn, note_ids: List[int]) -> int:
+    """
+    18 Nov: an alert for several people goes to them at the same time, not one
+    after another - each on its own database connection, at most six at once.
+    One person's messages still keep their order (each chat is paced on its
+    own). Inside a transaction, or without a pool, one at a time as before:
+    the other connections could not see rows not yet committed.
+    """
+    ids = [i for i in note_ids if i is not None]
+    if len(ids) <= 1 or conn.is_in_transaction():
+        return sum([1 for i in ids if await _deliver(conn, i)])
+    try:
+        pool = _pool()
+    except Exception:
+        pool = None
+    if pool is None:
+        return sum([1 for i in ids if await _deliver(conn, i)])
+    gate = asyncio.Semaphore(SEND_AT_ONCE)
+    later: List[int] = []
+
+    async def one(note_id: int) -> bool:
+        async with gate:
+            try:
+                own = await pool.acquire(timeout=SPARE_CONNECTION_WAIT)
+            except Exception:
+                # No spare connection soon: never wait on one - it goes out
+                # below, on this round's own connection, one at a time.
+                later.append(note_id)
+                return False
+            try:
+                return await _deliver(own, note_id)
+            except Exception as exc:
+                logger.warning("Alert %s could not be sent: %s", note_id, _hide(str(exc)))
+                return False
+            finally:
+                await pool.release(own)
+    sent = sum(1 for ok in await asyncio.gather(*(one(i) for i in ids)) if ok)
+    for note_id in later:
+        if await _deliver(conn, note_id):
+            sent += 1
     return sent
 
 
@@ -1125,6 +1196,7 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
     quiet = await watchers.quiet_for(conn, hospital_id)
     sent = 0
     told: List[str] = []
+    to_send: List[int] = []
     on_shift = False
     for place_id in await places_of(conn, hospital_id):
         duty = await on_duty(conn, place_id)
@@ -1144,8 +1216,9 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
                 if quiet:
                     await _hold(conn, note_id)
                     continue
-                await _deliver(conn, note_id, email, subject, body)
-                sent += 1
+                to_send.append(note_id)
+    await deliver_all(conn, to_send)
+    sent += len(to_send)
     # 038/039: the researchers who look after this hospital get it too, written
     # for supervision: what the collector was asked to do, and the collector on
     # shift - or, with nobody on shift, all the place's collectors - with phone
@@ -1460,6 +1533,7 @@ class Notifier:
                    d.machine_name, d.microphone
               FROM sessions s JOIN devices d ON d.device_id = s.device_id
              WHERE s.closed_at IS NULL AND s.opened_at > now() - interval '3 hours'
+               AND s.confirmation IS DISTINCT FROM 'refused'
                AND d.revoked_at IS NULL AND d.microphone_is_clinic = FALSE
                AND d.last_seen_at > s.opened_at + interval '5 seconds'
                AND NOT EXISTS (SELECT 1 FROM integrity_alerts a
@@ -1508,6 +1582,7 @@ class Notifier:
             SELECT s.session_id, s.opened_at, s.hospital_id, s.device_id, d.machine_name
               FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id
              WHERE s.closed_at IS NULL
+               AND s.confirmation IS DISTINCT FROM 'refused'
                AND s.opened_at < now() - $1::interval
                AND s.opened_at > now() - interval '12 hours'
                AND NOT EXISTS (SELECT 1 FROM collector_notifications n

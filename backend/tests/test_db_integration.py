@@ -553,6 +553,50 @@ async def test_refusal_endpoint_on_postgres(dbs):
         _unserve()
 
 
+async def test_a_refused_recording_has_ended_and_no_alert_calls_it_running(dbs, monkeypatch):
+    """18 Nov: refused at 17:10, yet "still running (150 min)" in Telegram for hours."""
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append(subject)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    device = await enrolled_device(dbs.repo)
+    sid = await _linked_session(dbs, device, visit(patient_id="PREFUSE18"))
+    _server(dbs)
+    try:
+        await api_v2.refuse_session(api_v2.RefuseRequest(session_id=sid), device=device)
+        async with dbs.rec.acquire() as conn:
+            session = await conn.fetchrow("SELECT opened_at, closed_at, close_reason "
+                                          "FROM sessions WHERE session_id = $1", sid)
+            assert session["closed_at"] is not None
+            assert session["close_reason"] == "doctor_stopped:patient_did_not_consent"
+            # Even opened two hours ago, it is not "running 60 min".
+            await conn.execute("UPDATE sessions SET opened_at = now() - interval '2 hours' "
+                               "WHERE session_id = $1", sid)
+            await collectors.Notifier().recordings_too_long(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"long:{sid}")
+            # A "running too long" chain begun before the refusal ends, and says why.
+            state, how = await watchers._still_wrong(
+                conn, "long", {"session_id": sid, "device_id": device["device_id"],
+                               "created_at": session["opened_at"]},
+                datetime.now(timezone.utc))
+            assert state == "ended" and "did not consent" in how
+            # A refused one still open from before 18 Nov (migration 046 ends it).
+            await conn.execute("UPDATE sessions SET closed_at = NULL, close_reason = NULL "
+                               "WHERE session_id = $1", sid)
+            await collectors.Notifier().recordings_too_long(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"long:{sid}")
+    finally:
+        _unserve()
+    assert not any("PREFUSE18" in x for x in sent)
+
+
 async def test_closing_names_the_recording_and_links_the_visit(dbs):
     """SRS-SES-05, SRS-DBA-21, SRS-DBA-25."""
     device = await enrolled_device(dbs.repo)
@@ -3216,6 +3260,10 @@ async def test_an_alert_for_someone_without_telegram_waits_and_arrives_when_they
                                     "collector_notifications WHERE email = 'late@gmail.example' "
                                     "AND event_key LIKE 'waittest:%' ORDER BY id")
             assert [(r["delivered"], r["channel"]) for r in rows] == [(True, "telegram")] * 2
+            assert await conn.fetchval("SELECT count(*) FROM collector_notifications "
+                                       "WHERE email = 'late@gmail.example' "
+                                       "AND event_key LIKE 'waittest:%' "
+                                       "AND delivered_at IS NOT NULL") == 2
             # The stored alert is kept as it was; only the message says "late".
             assert sorted(r["subject"] for r in rows) == ["Older alert",
                                                           "PC not reporting: HOSP9W1"]
@@ -3255,6 +3303,74 @@ async def test_every_consultation_without_the_jabra_is_alerted_at_once(dbs, monk
     assert any("Patient 2 recorded without the Jabra" in x for x in sent)
     assert any("Jabra unplugged 1" in x for x in sent)
     assert not any("Jabra unplugged 2" in x for x in sent)
+
+
+async def test_an_alert_reaches_everyone_at_once_and_its_speed_is_kept(dbs, monkeypatch):
+    """18 Nov: delivered_at for every alert, sent to several people in parallel."""
+    import asyncio
+    import collectors
+    import watchers
+    from datetime import datetime, timedelta, timezone
+    starts = []
+
+    async def slow_mail(to, subject, text):
+        starts.append(asyncio.get_running_loop().time())
+        await asyncio.sleep(0.4)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", slow_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await dbs.repo.upsert_hospital("HOSP9S1", "Speed clinic", "Asia/Dhaka")
+        for email in ("fast1@gmail.example", "fast2@gmail.example", "fast3@gmail.example"):
+            await _make_collector(client, who, email, hospitals=("HOSP9S1",))
+            assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                    ).status_code == 200
+        _server(dbs)
+        try:
+            happened = datetime.now(timezone.utc) - timedelta(seconds=5)
+            async with dbs.rec.acquire() as conn:
+                await collectors.notify(conn, hospital_id="HOSP9S1", event="jabra_unplugged",
+                                        subject="Jabra unplugged: HOSP9S1", body="b",
+                                        event_key="speed:1", urgent=True,
+                                        happened_at=happened)
+                rows = await conn.fetch("SELECT delivered, delivered_at FROM "
+                                        "collector_notifications WHERE event_key = 'speed:1' "
+                                        "AND audience = 'collector'")
+                assert len(rows) == 3 and all(r["delivered"] and r["delivered_at"] for r in rows)
+                # In parallel: all three began within the first send's 0.4 s.
+                assert max(starts) - min(starts) < 0.35
+                today = datetime.now(collectors.zone()).date()
+                start, end, _ = watchers.shift_window(today, "day")
+                line = await watchers.alert_speed(conn, "HOSP9S1", start, end)
+                assert line.startswith("Alert speed, from the event to the collector's "
+                                       "Telegram: typically ") and "(3 alerts" in line
+        finally:
+            _unserve()
+
+
+async def test_telegram_calls_share_one_kept_connection(monkeypatch):
+    """18 Nov: 0.49 s per message on a new connection, 0.16 s on a kept one."""
+    import asyncio
+    import httpx
+    import collectors
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    seen = []
+
+    def answer(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "result": {"username": "B"}})
+
+    kept = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    monkeypatch.setitem(collectors._KEPT, "loop", asyncio.get_running_loop())
+    monkeypatch.setitem(collectors._KEPT, "client", kept)
+    for _ in range(3):
+        result, error = await collectors._telegram("getMe", {})
+        assert result == {"username": "B"} and error is None
+    assert collectors._KEPT["client"] is kept and len(seen) == 3
+    assert collectors.TELEGRAM_TIMEOUT == 8.0
+    await kept.aclose()
 
 
 async def test_a_newly_assigned_researcher_gets_only_what_happens_afterwards(dbs, monkeypatch):
