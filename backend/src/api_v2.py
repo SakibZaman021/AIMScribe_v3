@@ -1348,7 +1348,7 @@ def _remove_object(object_key: str) -> None:
     # The copies are never deleted here (SRS-ARC-12). The credential should not
     # even reach them, but a bucket misconfigured into holding both would make
     # this the code that destroyed the only remaining copy.
-    if ctx.copy is not None and (object_key.startswith(("copies/", "visits/"))
+    if ctx.copy is not None and (is_copy_key(object_key)
                                  or ctx.minio.bucket == ctx.copy.bucket):
         raise RuntimeError(f"refusing to delete {object_key}: it is in the copy bucket")
     ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
@@ -2450,14 +2450,16 @@ def visit_key(patient_id: str, doctor_id: Optional[str], visit_id: Optional[str]
 def copy_object_key(session: Dict[str, Any], kind: str, version: int,
                     visit: Optional[str] = None) -> str:
     """
-    Where a copy lives in the copy bucket. With the visit's key (from 17 Nov
-    2026) in its visit's folder, so one patient's visits are one listing:
+    Where a copy lives in the copy bucket - the user's layout (18 Nov 2026):
+    the hospital at the top, then the doctor, the day, and the visit's own
+    folder, which holds every file of that visit (the audio and CMED's JSON
+    now; the transcript and NER later):
 
-        visits/<patient_id>/<visit_key>/<file name>.vN.wav.enc
+        <hospital_id>/<doctor_id>/<YYYY-MM-DD>/<patient>_<doctor>_<visit_id>/<file>.vN.wav.enc
 
-    Without one, as before, by clinic, doctor and day. The file name is the
-    same either way: the encryption binds it (cloudcopy.binding), so a copy
-    can move folder and still restore.
+    Without a visit key (none can be found for it) the file sits in the
+    day's folder. The file name is the same either way: the encryption binds
+    it (cloudcopy.binding), so a copy can move folder and still restore.
     """
     stem = session.get("file_stem") or safe_session_id(str(session["session_id"]))
     if not _STEM_SAFE.match(str(stem)):
@@ -2466,44 +2468,95 @@ def copy_object_key(session: Dict[str, Any], kind: str, version: int,
     # transcoding stands between the archive and its copy. Older copies made
     # as FLAC keep their .flac.enc names and still restore.
     suffix = "wav.enc" if kind == "audio" else "json.enc"
-    if visit and _VISIT_KEY_SAFE.match(visit):
-        return (f"visits/{safe_identifier(session['patient_id'], field='patient_id')}"
-                f"/{visit}/{stem}.v{version}.{suffix}")
     day = session.get("session_date")
     day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
-    return (f"copies/{safe_identifier(session['hospital_id'], field='hospital_id')}"
-            f"/{safe_identifier(session['doctor_id'], field='doctor_id')}"
-            f"/{day}/{stem}.v{version}.{suffix}")
+    folder = (f"{safe_identifier(session['hospital_id'], field='hospital_id')}"
+              f"/{safe_identifier(session['doctor_id'], field='doctor_id')}/{day}")
+    if visit and _VISIT_KEY_SAFE.match(visit):
+        folder += f"/{visit}"
+    return f"{folder}/{stem}.v{version}.{suffix}"
+
+
+_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Folders that are never a hospital's: the earlier layouts, and the pieces.
+_NOT_A_HOSPITAL = ("copies", "visits", "audio")
+
+
+def visit_folder_of(object_key: str) -> Optional[str]:
+    """
+    The visit key a copy's path names, or None for a copy loose in a day's
+    folder. Two shapes hold one: the current <hospital>/<doctor>/<day>/
+    <visit>/<file>, and visits/<patient>/<visit>/<file> (17 Nov only).
+    """
+    parts = object_key.split("/")
+    if (len(parts) == 5 and parts[0] not in _NOT_A_HOSPITAL and _DAY.match(parts[2])
+            and _VISIT_KEY_SAFE.match(parts[3])):
+        return parts[3]
+    if len(parts) == 4 and parts[0] == "visits":
+        return parts[2]
+    return None
+
+
+def is_copy_key(object_key: str) -> bool:
+    """A key in the copy bucket's own layouts - never the pieces'."""
+    parts = object_key.split("/")
+    return (object_key.startswith(("copies/", "visits/"))
+            or (len(parts) >= 4 and parts[0] not in _NOT_A_HOSPITAL
+                and bool(_DAY.match(parts[2]))))
 
 
 def layout_of(object_key: str) -> str:
-    return "by_visit" if object_key.startswith("visits/") else "by_day"
+    return "by_visit" if visit_folder_of(object_key) else "by_day"
 
 
 async def visit_key_of(session: Dict[str, Any],
                        part: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
-    The visit key of a recording, or of one patient's part of it. The visit_id
-    and start_time are CMED's, from the grant the recording (or part) opened
-    under - used only while that grant is still this recording's patient (a
-    reassigned recording keeps its first grant).
+    The visit key of a recording, or of one patient's part of it:
+    <patient>_<doctor>_<visit_id>. CMED gives every visit a visit_id. It is
+    taken from the grant the recording (or part) opened under - while that
+    grant is still this recording's patient (a reassigned recording keeps its
+    first grant) - and, when the start command carried none (recorders before
+    3.8), from CMED's own API 2 for the same patient and start time. Only
+    when neither has one does CMED's start time stand in.
     """
     repo = _repo()
     if part is not None:
         grant = (await repo.get_authorisation(part["grant_jti"])
                  if part.get("grant_jti") else None)
-        visit = (grant or {}).get("visit_id") \
-            if (grant or {}).get("patient_id") == part["patient_id"] else None
+        same = (grant or {}).get("patient_id") == part["patient_id"]
+        visit = (grant or {}).get("visit_id") if same else None
+        if not visit:
+            visit = await _cmed_visit_id(part.get("cmed_hospital_id"), part["patient_id"],
+                                         part.get("start_time"))
         return visit_key(part["patient_id"], part["doctor_id"], visit, part["start_time"],
                          fallback=f"{session['session_id']}-p{part['part_no']}")
     grant = (await repo.get_authorisation(session["grant_jti"])
              if session.get("grant_jti") else None)
     same = grant is not None and grant.get("patient_id") == session.get("patient_id")
     visit = session.get("visit_id") or ((grant or {}).get("visit_id") if same else None)
-    return visit_key(session.get("patient_id"), session.get("doctor_id"),
-                     visit if (same or grant is None) else None,
+    if grant is not None and not same:
+        visit = None
+    if not visit and same:
+        visit = await _cmed_visit_id(grant.get("cmed_hospital_id"), grant["patient_id"],
+                                     grant.get("start_time"))
+    return visit_key(session.get("patient_id"), session.get("doctor_id"), visit,
                      grant["start_time"] if same else None,
                      fallback=str(session["session_id"]))
+
+
+async def _cmed_visit_id(cmed_hospital_id: Optional[str], patient_id: Optional[str],
+                         start_time: Optional[str]) -> Optional[str]:
+    """CMED's visit_id for this visit, from its API 2 or API 3 (interface 4)."""
+    if ctx.clinical is None or not (cmed_hospital_id and patient_id and start_time) \
+            or not hasattr(ctx.clinical, "visit_id_for"):
+        return None
+    try:
+        found = await ctx.clinical.visit_id_for(cmed_hospital_id, patient_id, start_time)
+    except Exception as exc:
+        logger.warning("Could not look up CMED's visit_id: %s", exc)
+        return None
+    return found if found and VISIT_ID.match(found) else None
 
 
 @router.get("/archive/copy/pending")
@@ -2830,18 +2883,18 @@ async def register_visit_object(session: Dict[str, Any], object_key: str, *, kin
                                 part_no: Optional[int] = None) -> bool:
     """
     Tell the clinical database where a visit's file now is (clinical/006
-    visit_objects), so v_visit_folder shows it beside the visit. Only a copy in
-    a visit's folder: its path names the patient and the visit. Best effort -
-    scripts/backfill_visit_layout.py writes any row missed here.
+    visit_objects; by_visit.files), so the visit's tables name it. Only a
+    copy in a visit's folder. Best effort - visit_layout.py writes any row
+    missed here.
     """
-    parts = object_key.split("/")
-    if ctx.clinical is None or len(parts) != 4 or parts[0] != "visits":
+    key = visit_folder_of(object_key)
+    if ctx.clinical is None or key is None:
         return False
-    patient_id, key = parts[1], parts[2]
-    doctor_id = session.get("doctor_id")
+    patient_id, doctor_id = session.get("patient_id"), session.get("doctor_id")
     if part_no is not None:
         part = next((p for p in await _repo().parts_for(session["session_id"])
                      if p["part_no"] == part_no), None)
+        patient_id = (part or {}).get("patient_id") or patient_id
         doctor_id = (part or {}).get("doctor_id") or doctor_id
     try:
         return await ctx.clinical.record_visit_object(

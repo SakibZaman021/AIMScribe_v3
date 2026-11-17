@@ -51,8 +51,10 @@ def test_a_copy_moves_folder_but_keeps_its_name():
                "doctor_id": "DR0042", "hospital_id": "HOSP003", "session_date": "2026-09-13"}
     old = api_v2.copy_object_key(session, "audio", 2)
     new = api_v2.copy_object_key(session, "audio", 2, KEY)
-    assert old == f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v2.wav.enc"
-    assert new == f"visits/P0012345/{KEY}/{STEM}.v2.wav.enc"
+    assert old == f"HOSP003/DR0042/2026-09-13/{STEM}.v2.wav.enc"
+    assert new == f"HOSP003/DR0042/2026-09-13/{KEY}/{STEM}.v2.wav.enc"
+    assert api_v2.visit_folder_of(new) == KEY and api_v2.visit_folder_of(old) is None
+    assert api_v2.visit_folder_of(f"visits/P0012345/{KEY}/{STEM}.v2.wav.enc") == KEY
     assert old.rsplit("/", 1)[1] == new.rsplit("/", 1)[1]
     import cloudcopy
     import restore
@@ -66,7 +68,7 @@ async def test_a_new_copy_goes_to_its_visits_folder_and_is_registered(server):
     sid = await archived(server)
     place = await api_v2.archive_copy_authorize(
         api_v2.CopyAuthorizeRequest(session_id=sid, kind="audio"))
-    assert place["object_key"] == f"visits/P0012345/{KEY}/{STEM}.v1.wav.enc"
+    assert place["object_key"] == f"HOSP003/DR0042/2026-09-13/{KEY}/{STEM}.v1.wav.enc"
     assert server.repo.sessions[sid]["visit_key"] == KEY
 
     await api_v2.archive_copy_complete(api_v2.CopyCompleteRequest(
@@ -102,6 +104,36 @@ async def test_a_refusal_removes_the_visits_file_register(server):
     assert server.clinical.visit_objects
     await api_v2._erase_session(sid, state="refused")
     assert server.clinical.visit_objects == []
+
+
+async def test_the_visit_id_comes_from_cmeds_api2_when_the_start_had_none(server, monkeypatch):
+    """CMED gives every visit a visit_id; a recorder before 3.8 did not pass it on."""
+    sid = await archived(server)
+
+    async def from_api2(cmed_hospital_id, patient_id, start_time):
+        assert (patient_id, start_time) == ("P0012345", "2026-09-13T10:14:32+06:00")
+        return "VIS-T-31496"
+    monkeypatch.setattr(server.clinical, "visit_id_for", from_api2, raising=False)
+    place = await api_v2.archive_copy_authorize(
+        api_v2.CopyAuthorizeRequest(session_id=sid, kind="audio"))
+    assert place["object_key"] == (f"HOSP003/DR0042/2026-09-13/P0012345_DR0042_VIS-T-31496/"
+                                   f"{STEM}.v1.wav.enc")
+
+
+def test_the_hospital_is_the_top_folder():
+    key = f"HOSP003/DR0042/2026-09-13/{KEY}/{STEM}.v1.wav.enc"
+    assert api_v2.visit_folder_of(key) == KEY and api_v2.layout_of(key) == "by_visit"
+    assert api_v2.is_copy_key(key) and api_v2.is_copy_key(f"HOSP003/DR0042/2026-09-13/{STEM}.v1.wav.enc")
+    # The pieces' own keys are never taken for a copy.
+    assert not api_v2.is_copy_key("audio/P1_DR1_HOSP003_093012_20260728_X97HT/seg_00001.wav")
+    assert api_v2.visit_folder_of("audio/HOSP003/2026-09-13/x/y.wav") is None
+
+
+def test_the_segment_bucket_code_never_deletes_a_hospital_folder_copy(monkeypatch):
+    monkeypatch.setattr(api_v2.ctx, "copy", SimpleNamespace(bucket="copies"))
+    monkeypatch.setattr(api_v2.ctx, "minio", SimpleNamespace(bucket="pieces"))
+    with pytest.raises(RuntimeError):
+        api_v2._remove_object(f"HOSP003/DR0042/2026-09-13/{KEY}/x.v1.wav.enc")
 
 
 def test_the_segment_bucket_code_never_deletes_a_visits_copy(monkeypatch):
@@ -150,7 +182,7 @@ class FakeStore:
         return Stat(size=size, etag=etag)
 
 
-async def _archived_on_postgres(dbs, *, visit_id="VIS-T-31496"):
+async def _archived_on_postgres(dbs, *, visit_id="VIS-T-31496", in_visits=False):
     """A confirmed recording with one by-day copy, as the live server holds them."""
     from test_db_integration import visit as a_visit
     repo = dbs.repo
@@ -168,9 +200,11 @@ async def _archived_on_postgres(dbs, *, visit_id="VIS-T-31496"):
             UPDATE sessions SET patient_id = $2, grant_jti = $3, visit_id = $4,
                    confirmation = 'confirmed', file_stem = $5, archived_at = now()
              WHERE session_id = $1""", sid, patient, jti, visit_id, stem)
-    old = f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.wav.enc"
+    old = (f"visits/{patient}/{patient}_DR0042_{visit_id}/{stem}.v1.wav.enc" if in_visits
+           else f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.wav.enc")
     await repo.record_cloud_copy(session_id=sid, kind="audio", object_key=old, version=1,
-                                 byte_length=1000, sha256=b"\1" * 32, plain_sha256=None)
+                                 byte_length=1000, sha256=b"\1" * 32, plain_sha256=None,
+                                 layout=api_v2.layout_of(old))
     return sid, patient, stem, old
 
 
@@ -183,7 +217,8 @@ async def test_the_backfill_moves_registers_and_runs_again_safely(dbs):
         sid, patient, stem, old = await _archived_on_postgres(dbs)
         store.objects[old] = (1000, "ab" * 16)
         key = f"{patient}_DR0042_VIS-T-31496"
-        new = f"visits/{patient}/{key}/{stem}.v1.wav.enc"
+        day = (await dbs.repo.get_session(sid))["session_date"].isoformat()
+        new = f"HOSP003/DR0042/{day}/{key}/{stem}.v1.wav.enc"
 
         dry = await visit_layout.backfill(apply=False)
         assert dry["copies"]["would_move"] >= 1 and new not in store.objects
@@ -270,7 +305,8 @@ async def test_one_row_per_visit_with_everything_on_it(dbs):
         await dbs.clinical.record_visit_object(
             visit_key=key, patient_id=patient, doctor_id="DR4290371", visit_id=visit_id,
             hospital_id="HOSP_SUSASTHO_TEST", session_id="01SESSION", part_no=None,
-            kind="audio", object_key=f"visits/{patient}/{key}/x.v1.wav.enc", version=1,
+            kind="audio", object_key=f"HOSP_SUS/DR4290371/2026-11-17/{key}/x.v1.wav.enc",
+            version=1,
             byte_length=10)
 
         rows = await dbs.clinical.visit_folder(patient)
@@ -282,9 +318,9 @@ async def test_one_row_per_visit_with_everything_on_it(dbs):
         assert row["diagnoses"] == "Upper respiratory infection"
         assert row["drugs"] == "Tablet Napa 500 mg 1+1+1 5 days"
         assert (row["tests"], row["advice"]) == ("CBC", "Rest")
-        assert row["audio_objects"] == [f"visits/{patient}/{key}/x.v1.wav.enc"]
+        assert row["audio_objects"] == [f"HOSP_SUS/DR4290371/2026-11-17/{key}/x.v1.wav.enc"]
         assert row["session_ids"] == ["01SESSION"]
-        assert row["archive_folder"] == f"visits/{patient}/{key}/"
+        assert row["archive_folder"] == f"HOSP_SUS/DR4290371/2026-11-17/{key}/"
     finally:
         api_v2.ctx.clinical = None
 
@@ -320,7 +356,7 @@ async def test_old_copies_go_only_once_their_twin_is_in_the_store(dbs):
         sid, patient, stem, old = await _archived_on_postgres(dbs)
         store.objects[old] = (1000, "ab" * 16)
         await visit_layout.move_copies(apply=True)
-        new = next(k for k in store.objects if k.startswith(f"visits/{patient}/"))
+        new = next(k for k in store.objects if f"/{patient}_DR0042_VIS-T-31496/" in k)
 
         dry = await visit_layout.retire_old_copies(apply=False)
         assert dry["would_remove"] >= 1 and old in store.objects
@@ -349,10 +385,122 @@ async def test_an_old_copy_whose_twin_is_missing_is_kept(dbs):
         sid, patient, stem, old = await _archived_on_postgres(dbs)
         store.objects[old] = (1000, "ab" * 16)
         await visit_layout.move_copies(apply=True)
-        new = next(k for k in store.objects if k.startswith(f"visits/{patient}/"))
+        new = next(k for k in store.objects if f"/{patient}_DR0042_VIS-T-31496/" in k)
         del store.objects[new]                                  # the twin vanished
         report = await visit_layout.retire_old_copies(apply=True)
         assert any(k["object_key"] == old for k in report["kept"])
         assert old in store.objects and old not in store.removed
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.copy = None
+
+
+@postgres
+async def test_a_17_nov_copy_moves_into_its_days_visit_folder(dbs):
+    """visits/<patient>/<visit>/ (17 Nov) -> <hospital>/<doctor>/<day>/<PID_DID_VID>/ (18 Nov)."""
+    store = FakeStore()
+    api_v2.ctx.repo, api_v2.ctx.clinical = dbs.repo, dbs.clinical
+    api_v2.ctx.copy, api_v2.ctx.copy_json = store, None
+    try:
+        sid, patient, stem, old = await _archived_on_postgres(dbs, in_visits=True)
+        store.objects[old] = (1000, "ab" * 16)
+        key = f"{patient}_DR0042_VIS-T-31496"
+        await dbs.clinical.record_visit_object(
+            visit_key=key, patient_id=patient, doctor_id="DR0042", visit_id="VIS-T-31496",
+            hospital_id="HOSP003", session_id=sid, part_no=None, kind="audio",
+            object_key=old, version=1, byte_length=1000)
+        day = (await dbs.repo.get_session(sid))["session_date"].isoformat()
+        new = f"HOSP003/DR0042/{day}/{key}/{stem}.v1.wav.enc"
+
+        await visit_layout.backfill(apply=True)
+        assert new in store.objects
+        await visit_layout.retire_old_copies(apply=True)
+        assert old not in store.objects and new in store.objects
+        assert [c["object_key"] for c in await dbs.repo.copies_for(sid)] == [new]
+        async with dbs.cli.acquire() as conn:
+            registered = [r["object_key"] for r in await conn.fetch(
+                "SELECT object_key FROM visit_objects WHERE session_id = $1", sid)]
+        assert registered == [new]                       # the register follows the file
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.copy = None
+
+
+@postgres
+async def test_the_by_visit_tables_lead_with_who_and_export_clean(dbs):
+    """clinical/007: what a person opens first, and a CSV export of it."""
+    import clinical_v4
+    api_v2.ctx.clinical = dbs.clinical
+    try:
+        patient, visit_id = f"P{uuid.uuid4().hex[:7]}", "VIS-T-888"
+        five = {"visit_id": visit_id, "patient_id": patient, "doctor_id": "DR4290371",
+                "hospital_id": "Susastho-Clinic-Test-1",
+                "start_time": "2026-11-17T11:50:39+06:00", "date": "2026-11-17"}
+        info = {**five, "demographics": {"sex": "female", "date_of_birth": "2020-09-17",
+                                         "age": "6Y 2M", "blood_group": "B+"},
+                "observations": [{"category": "vitals", "items": [
+                    {"name": "Blood Pressure", "value": "110/70", "unit": "mmHg"},
+                    {"name": "Pulse", "value": "96", "unit": "bpm"},
+                    {"name": "Weight", "value": "19", "unit": "kg"}]}]}
+        rx = {**five, "chief_complaints": [{"complaint": "Fever", "duration": "3 days"}],
+              "diagnosis": [{"code": "R50.9", "display": "Fever, unspecified"}],
+              "drug_orders": [{"form": "Syrup", "medication_name": "Napa",
+                               "strength": "120 mg/5 ml", "dose": "1 spoon",
+                               "frequency": "3 times", "duration": "5 days"},
+                              {"form": "Tablet", "medication_name": "Fexo", "dose": "1+0+1"}],
+              "lab_orders": [{"test_name": "CBC"}], "advice": [{"instruction": "Plenty of water"}],
+              "issued_at": "2026-11-17T12:03:35+06:00", "follow_up": "2026-11-24"}
+        for kind, body in (("patient_information", info), ("prescription", rx)):
+            await clinical_v4.file_message(kind, body, five["hospital_id"], visit_id, patient,
+                                           clinical_v4.read(kind, body), "tests")
+        key = f"{patient}_DR4290371_{visit_id}"
+        await dbs.clinical.record_visit_object(
+            visit_key=key, patient_id=patient, doctor_id="DR4290371", visit_id=visit_id,
+            hospital_id="HOSP_SUS", session_id="01SESSION", part_no=None, kind="audio",
+            object_key=f"HOSP_SUS/DR4290371/2026-11-17/{key}/r.v1.wav.enc",
+            version=1, byte_length=2 * 1048576)
+
+        lead = ["clinic", "cmed_clinic_code", "patient_id", "doctor_id", "visit_id",
+                "visit_date", "start_time"]
+        async with dbs.cli.acquire() as conn:
+            for view in ("overview", "demographics", "prescription", "medicines", "files"):
+                cols = [r["column_name"] for r in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = "
+                    "'by_visit' AND table_name = $1 ORDER BY ordinal_position", view)]
+                assert cols[:7] == lead, view
+            over = await conn.fetchrow("SELECT * FROM by_visit.overview WHERE patient_id = $1",
+                                       patient)
+            demo = await conn.fetchrow(
+                "SELECT * FROM by_visit.demographics WHERE patient_id = $1", patient)
+            presc = await conn.fetchrow(
+                "SELECT * FROM by_visit.prescription WHERE patient_id = $1", patient)
+            meds = await conn.fetch("SELECT * FROM by_visit.medicines WHERE patient_id = $1",
+                                    patient)
+            files = await conn.fetch("SELECT * FROM by_visit.files WHERE patient_id = $1",
+                                     patient)
+            chunks = []
+
+            async def keep(chunk):
+                chunks.append(chunk)
+            await conn.copy_from_query(
+                "SELECT * FROM by_visit.prescription WHERE patient_id = $1", patient,
+                output=keep, format="csv", header=True)
+        assert over["visit_id"] == visit_id
+        assert (over["start_time"], over["api2_received"], over["api3_received"]) == (
+            "11:50:39", True, True)
+        assert over["archive_folder"] == f"HOSP_SUS/DR4290371/2026-11-17/{key}/"
+        assert (demo["sex"], demo["age"], demo["blood_group"]) == ("female", "6Y 2M", "B+")
+        assert (demo["blood_pressure"], demo["pulse"], demo["weight"]) == (
+            "110/70 mmHg", "96 bpm", "19 kg")
+        assert presc["chief_complaints"] == "Fever, 3 days"
+        assert presc["diagnoses"] == "Fever, unspecified (R50.9)"
+        assert presc["medicines"] == \
+            "Syrup Napa 120 mg/5 ml 1 spoon 3 times 5 days; Tablet Fexo 1+0+1"
+        assert (presc["investigations"], presc["advice"], presc["follow_up"]) == (
+            "CBC", "Plenty of water", "2026-11-24")
+        assert [m["medicine"] for m in meds] == ["Napa", "Fexo"]
+        assert [(f["file"], float(f["size_mb"])) for f in files] == [("audio", 2.0)]
+        text = b"".join(chunks).decode("utf-8")
+        assert text.splitlines()[0].startswith(
+            "clinic,cmed_clinic_code,patient_id,doctor_id,visit_id")
+        assert patient in text and "{" not in text                 # plain text, no JSON
+    finally:
+        api_v2.ctx.clinical = None

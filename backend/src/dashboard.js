@@ -881,7 +881,7 @@ function recordingsTable(list) {
   }
   const showClinic = !$("clinic").value;
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
-    + `<th>Patient files and rule</th><th class="num">Length</th><th>Microphone</th>`
+    + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
     + `<th>CMED</th><th>Status</th>`
     + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
@@ -902,6 +902,7 @@ function recordingsTable(list) {
           + (showClinic ? td("Clinic", esc(clinicName(r.hospital_id))) : "")
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
+          + td("Visit", r.visit_id ? esc(r.visit_id) : `<span class="hint">–</span>`)
           + td("Length", `${num(r.minutes || 0)} min`, "num")
           + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))

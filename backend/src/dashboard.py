@@ -585,7 +585,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     async with _pool().acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT s.session_id, s.session_date, s.hospital_id, s.doctor_id,
-                   s.patient_id, s.file_stem, s.local_start, s.local_end,
+                   s.patient_id, s.visit_id, s.file_stem, s.local_start, s.local_end,
                    s.confirmation, s.status, s.total_duration_seconds,
                    s.segment_count, s.opened_at, s.closed_at, s.archived_at,
                    s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
@@ -631,6 +631,8 @@ def _recording_row(row) -> Dict[str, Any]:
         # CMED's own patient number. The dashboard shows no name and nothing
         # clinical (SRS-DSH-06); this is how a clinic finds the consultation.
         "patient_id": row["patient_id"],
+        # CMED's visit_id (interface 4), when API 1 carried one.
+        "visit_id": row["visit_id"] if "visit_id" in row.keys() else None,
         "file_stem": row["file_stem"],
         "local_start": moment(row["local_start"]),
         "local_end": moment(row["local_end"]),

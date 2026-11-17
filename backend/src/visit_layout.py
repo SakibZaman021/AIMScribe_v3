@@ -5,9 +5,10 @@ clinical/006). Run once after deploying, by scripts/backfill_visit_layout.py.
 Three steps, each safe to run again:
 
   1. Every recording (and each patient's part of one) gets its visit key.
-  2. Every cloud copy still only in copies/<clinic>/<doctor>/<day>/ is copied,
-     inside the store, to visits/<patient_id>/<visit_key>/ under the same file
-     name - the encryption binds the name, so the copy restores exactly as the
+  2. Every cloud copy not yet in its visit's folder - loose in a day's folder,
+     or in the 17 Nov visits/<patient>/ layout - is copied, inside the store,
+     to <hospital>/<doctor>/<day>/<patient>_<doctor>_<visit_id>/ (the
+     user's layout, 18 Nov) under the same file name - the encryption binds the name, so the copy restores exactly as the
      original does. Nothing is downloaded, decrypted or encrypted again. The
      new object is read back (size, and the store's fingerprint when it has
      one) and only then recorded, as a new cloud_copies row pointing at the
@@ -103,7 +104,14 @@ async def move_copies(*, apply: bool, limit: int = 500) -> Dict[str, Any]:
             out["skipped"].append({"object_key": copy["object_key"], "why": "no visit key"})
             continue
         name = copy["object_key"].rsplit("/", 1)[-1]
-        target = f"visits/{patient}/{key}/{name}"
+        named = {**session, "patient_id": patient,
+                 "doctor_id": (part or session).get("doctor_id")}
+        # The day's folder, then the visit's; the file keeps its name (the
+        # encryption binds it).
+        folder = api_v2.copy_object_key(named, copy["kind"], copy["version"], key)
+        target = f"{folder.rsplit('/', 1)[0]}/{name}"
+        if target == copy["object_key"]:
+            continue
         if not apply:
             out["would_move"] += 1
             logger.info("would copy %s -> %s", copy["object_key"], target)
@@ -141,14 +149,14 @@ async def register_copies(*, apply: bool) -> Dict[str, int]:
     if clinical is None:
         return out
     for row in await repo.by_visit_copies():
-        parts = row["object_key"].split("/")
-        if len(parts) != 4:
+        key = api_v2.visit_folder_of(row["object_key"])
+        if key is None:
             continue
         if not apply:
             out["registered"] += 1
             continue
         added = await clinical.record_visit_object(
-            visit_key=parts[2], patient_id=parts[1], doctor_id=row["doctor_id"] or "unknown",
+            visit_key=key, patient_id=row["patient_id"], doctor_id=row["doctor_id"] or "unknown",
             visit_id=row["visit_id"], hospital_id=row["hospital_id"],
             session_id=row["session_id"], part_no=row.get("part_no"), kind=row["kind"],
             object_key=row["object_key"], version=row["version"], byte_length=row["bytes"])
@@ -158,7 +166,8 @@ async def register_copies(*, apply: bool) -> Dict[str, int]:
 
 async def retire_old_copies(*, apply: bool, limit: int = 1000) -> Dict[str, Any]:
     """
-    Remove the old by-day copies, decided by the user on 17 Nov 2026 (045).
+    Remove copies that were moved on: the by-day copies (the user's decision,
+    17 Nov 2026) and the visits/<patient>/ ones (18 Nov), 045.
 
     Only a copy whose twin in the visit's folder is recorded with the same
     bytes and fingerprint, AND that the store confirms holds the twin now with
@@ -209,6 +218,9 @@ async def retire_old_copies(*, apply: bool, limit: int = 1000) -> Dict[str, Any]
                                     "why": "the store still holds it (a lock?)"})
                 continue
         await repo.mark_copy_removed(row["id"])
+        if api_v2.ctx.clinical is not None:
+            # The visit's file register names only what is there.
+            await api_v2.ctx.clinical.forget_object(row["object_key"])
         out["removed"] += 1
     if apply and out["removed"]:
         await repo.audit(event_type="copies.retired", actor_type="admin",
