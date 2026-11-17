@@ -602,13 +602,17 @@ class ClinicalStore:
     async def visit_id_for(self, cmed_hospital_id: str, patient_id: str,
                            start_time: str) -> Optional[str]:
         """CMED's visit_id for a visit, from its interface-4 messages."""
+        try:
+            moment = datetime.datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+        except ValueError:
+            return None
         async with self._pool.acquire() as conn:
             return await conn.fetchval("""
                 SELECT visit_id FROM patient_visit
                  WHERE hospital_id = $1 AND hospital_patient_id = $2
                    AND start_time = $3::timestamptz
                  ORDER BY id DESC LIMIT 1
-            """, cmed_hospital_id, patient_id, start_time)
+            """, cmed_hospital_id, patient_id, moment)
 
     async def forget_object(self, object_key: str) -> int:
         """A file removed from the archive (moved on): its register row goes."""
