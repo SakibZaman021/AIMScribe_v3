@@ -638,6 +638,9 @@ function drawRooms(d) {
       const disk = q.disk_encrypted === true ? tag("good", "Encrypted")
         : q.disk_encrypted === false ? tag("bad", "Not encrypted")
         : `<span class="hint">not reported</span>`;
+      const key = q.key === "tpm" ? tag("good", "TPM chip", "Its key is inside the PC's security chip: it cannot be copied off this PC")
+        : q.key === "software" ? tag("warn", "Software key", "No usable TPM chip (or joined before 3.6): its key is locked to this PC by Windows, but a person with full control of the PC could copy it. Revoke the PC here if it is ever lost or misused.")
+        : `<span class="hint">–</span>`;
       const mic = !q.microphone ? `<span class="hint">not reported</span>`
         : q.microphone_is_clinic ? tag("good", "Jabra", q.microphone)
         : tag("warn", "PC microphone", `${q.microphone} - the Jabra is not plugged in`);
@@ -666,13 +669,14 @@ function drawRooms(d) {
         + td("Held", held, "num")
         + td("Microphone", mic)
         + td("Disk", disk)
+        + td("Key", key)
         + td("Clock", clock, "num")
         + td("Offline (7 days)", offlineText(q.offline_periods))
         + `</tr>`;
     }).join("");
   });
   $("rooms").innerHTML = `<table><thead><tr><th>PC</th><th>State</th><th>Last seen</th>`
-    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th>`
+    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th><th>Key</th>`
     + `<th class="num">Clock</th><th>Offline (7 days)</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
@@ -845,11 +849,21 @@ function audioLinks(r) {
   const files = r.files || [];
   const link = (href, label, title) =>
     `<a class="copy dl" href="${esc(href)}" title="${esc(title)}">${esc(label)}</a>`;
+  // 17 Nov: the clinical record CMED sent, decrypted the same way. Admins only.
+  const record = PORTAL.role !== "admin" ? ""
+    : files.length > 1
+      ? "<br>" + files.map((f) => link(`${recordUrl(r)}?part=${f.part_no}`, `Record ${f.part_no}`,
+          `Download the clinical record of patient file ${f.part_no} (JSON)`)).join(" ")
+      : "<br>" + link(recordUrl(r), "Record", "Download the clinical record CMED sent (JSON)");
   if (files.length > 1) {
     return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
-      `Download patient file ${f.part_no} (WAV)`)).join(" ");
+      `Download patient file ${f.part_no} (WAV)`)).join(" ") + record;
   }
-  return link(base, "Download", "Download the WAV");
+  return link(base, "Download", "Download the WAV") + record;
+}
+
+function recordUrl(r) {
+  return `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/record`;
 }
 
 /* 036: which microphone a recording used - the Jabra, the PC's own, or both. */

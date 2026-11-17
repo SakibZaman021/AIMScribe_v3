@@ -1058,6 +1058,7 @@ async def test_the_dashboard_shows_every_room(dbs):
     mine = next(r for r in rooms["rooms"] if r["device_id"] == str(device["device_id"]))
     assert (mine["pending_segments"], mine["spool_mb"]) == (4, 42.0)
     assert mine["silent"] is False
+    assert mine["key"] in ("tpm", "software")             # 3.9.2: shown per PC
 
 
 async def test_a_recorder_not_heard_from_is_called_silent(dbs):
@@ -1386,6 +1387,35 @@ async def test_a_pc_registers_itself_and_cmed_confirming_two_visits_approves_it(
                 "SELECT count(*) FROM audit_log WHERE device_id = $1 "
                 "AND event_type = 'device.approved'", pc["device_id"])
         assert audited == 1
+    finally:
+        _unserve()
+
+
+def _ed25519():
+    """A software key, as a PC without a usable TPM holds one (3.9.2)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = Ed25519PrivateKey.generate()
+    return (key.public_key().public_bytes(serialization.Encoding.Raw,
+                                          serialization.PublicFormat.Raw), key.sign)
+
+
+async def test_a_pc_without_a_tpm_chip_registers_with_its_software_key(dbs):
+    """17 Nov: no BIOS at a clinic. Pending like any PC; a forged proof still fails."""
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        key = _ed25519()
+        joined = await api_v2.register_device(_registration(key=key), _caller())
+        assert joined["approval"] == "pending" and "device_token" in joined
+        async with dbs.rec.acquire() as conn:
+            stored = await conn.fetchval("SELECT tpm_pubkey FROM devices WHERE device_id = $1",
+                                         joined["device_id"])
+        assert len(bytes(stored)) == 32
+
+        forged = _registration(key=_ed25519())
+        forged.device_pubkey = _ed25519()[0].hex()          # proof made with another key
+        assert _refusal(await api_v2.register_device(forged, _caller()))             == (401, "KEY_PROOF_INVALID")
     finally:
         _unserve()
 
@@ -1953,6 +1983,53 @@ async def test_a_researcher_downloads_the_archived_wav_and_it_is_logged(dbs, mon
                 "AND actor_id = 'researcher@uni.example' AND session_id = $1", sid)
         assert (row["email"], row["outcome"], row["bytes"]) == (
             "researcher@uni.example", "completed", len(_DL_WAV))
+        assert logged == 1
+    finally:
+        _unserve()
+
+
+async def test_an_admin_downloads_the_clinical_record_and_a_researcher_cannot(dbs, monkeypatch):
+    """17 Nov: the JSON CMED sent, decrypted like the audio; admins only, logged."""
+    import httpx
+    record = json.dumps({"patient": "PDOWNJ", "rx": ["paracetamol"]}).encode()
+    sid, stem = await _copied_recording(dbs, "PDOWNJ")
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="json",
+        object_key=f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.json.enc",
+        version=1, byte_length=len(record) + 200, sha256=b"3" * 32,
+        plain_sha256=hashlib.sha256(record).digest())
+    asked = []
+
+    def worker(request):
+        asked.append(json.loads(request.content))
+        return httpx.Response(200, content=record,
+                              headers={"Content-Length": str(len(record))})
+
+    who = {"value": "owner@uiu.example"}
+    async with _download_app(dbs, monkeypatch, who, worker) as client:
+        await _sign_in(client)
+        got = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                               headers={"Sec-Fetch-Site": "same-origin"})
+        assert got.status_code == 200 and got.content == record
+        assert got.headers["content-type"].startswith("application/json")
+        disposition = got.headers["content-disposition"]
+        assert disposition.endswith('.json"') and "PDOWNJ" not in disposition
+
+        await _researcher(client, who, email="reader@uni.example")
+        denied = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                                  headers={"Sec-Fetch-Site": "same-origin"})
+        assert denied.status_code == 403
+        # The researcher's audio download is unchanged.
+    try:
+        assert len(asked) == 1
+        assert asked[0]["expect"] == {"session_id": sid, "kind": "json",
+                                      "stem_sha256": hashlib.sha256(stem.encode()).hexdigest()}
+        assert asked[0]["url"].endswith(".json.enc?expires=300")
+        assert asked[0]["plain_sha256"] == hashlib.sha256(record).hexdigest()
+        async with dbs.rec.acquire() as conn:
+            logged = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE event_type = 'recording.downloaded' "
+                "AND actor_id = 'owner@uiu.example' AND session_id = $1", sid)
         assert logged == 1
     finally:
         _unserve()

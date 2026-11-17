@@ -34,7 +34,7 @@
 ; ============================================================
 
 #define AppName        "AIMScribe Agent"
-#define AppVersion     "3.9.1"
+#define AppVersion     "3.9.2"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -184,8 +184,6 @@ var
   ConfigPage: TInputQueryWizardPage;
   KeptApiKey: String;
   InstallProblem: String;
-  { 9 when this PC has no TPM 2.0 chip to keep its identity key in. }
-  InstallExitCode: Integer;
 
 function OpenEvent(dwDesiredAccess: Longword; bInheritHandle: Boolean;
   lpName: String): Longword;
@@ -664,8 +662,8 @@ end;
 { This PC's identity key is created inside its TPM chip, as administrator -
   which only Setup is - so nothing on the PC can ever copy it. The agent, run
   as whoever signs in, may use the key to sign but never export it. A PC
-  enrolled before 3.6 keeps the software key it enrolled with, so a missing
-  TPM does not stop its update; a new PC without one cannot be set up. }
+  enrolled before 3.6 keeps the software key it enrolled with. A PC with no
+  usable TPM is still set up (below). }
 function ProvisionDeviceKey(): String;
 var
   ResultCode: Integer;
@@ -675,17 +673,12 @@ begin
               SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     ResultCode := 10;
   Log('Device key in the TPM: exit ' + IntToStr(ResultCode));
-  if (ResultCode = 0) or AlreadyEnrolled() then Exit;
-  if ResultCode = 9 then
-  begin
-    InstallExitCode := 9;
-    Result := 'This PC has no usable TPM 2.0 security chip, so AIMScribe cannot ' +
-              'keep its identity key safe here. Switch the TPM on in the PC''s ' +
-              'firmware (BIOS/UEFI) settings, or use another PC.';
-  end
-  else
-    Result := 'This PC''s identity key could not be created in its TPM chip ' +
-              '(code ' + IntToStr(ResultCode) + '). See the AIMScribe log.';
+  { No usable TPM (17 Nov): never a reason to stop. The agent signs with this
+    PC's software key instead, locked to the PC by Windows, as every PC did
+    before 3.6, and the dashboard shows which PCs have no chip. Nobody at a
+    clinic is sent into the BIOS. }
+  if ResultCode <> 0 then
+    Log('No TPM key (code ' + IntToStr(ResultCode) + '): the software key will be used');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -720,8 +713,6 @@ function GetCustomSetupExitCode(): Integer;
 begin
   if InstallProblem = '' then
     Result := 0
-  else if InstallExitCode <> 0 then
-    Result := InstallExitCode
   else
     Result := 8;
 end;

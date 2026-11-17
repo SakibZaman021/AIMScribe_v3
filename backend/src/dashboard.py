@@ -269,7 +269,7 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
                approval, registered_via, microphone, microphone_is_clinic,
-               blocked_at, revoked_reason
+               blocked_at, revoked_reason, octet_length(tpm_pubkey) AS key_bytes
           FROM devices
          WHERE ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
          ORDER BY hospital_id, machine_name
@@ -323,6 +323,9 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             # 033: blocked by the sweep on evidence; an admin may unblock it.
             "blocked": row["blocked_at"] is not None,
             "blocked_reason": row["revoked_reason"] if row["blocked_at"] else None,
+            # 3.9.2: where its identity key lives - 65 bytes P-256 in its TPM
+            # chip, 32 bytes Ed25519 in software (no usable chip, or before 3.6).
+            "key": {65: "tpm", 32: "software"}.get(row["key_bytes"]),
         })
         if is_silent:
             silent += 1

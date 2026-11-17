@@ -298,9 +298,10 @@ class EnrollRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    # Only a P-256 key inside the PC's TPM (65 bytes, 130 hex) may register
-    # itself: it cannot be copied off the PC. A software key needs a token.
-    device_pubkey: str = Field(..., min_length=130, max_length=130)
+    # A P-256 key inside the PC's TPM (65 bytes, 130 hex), or (3.9.2) the
+    # Ed25519 software key of a PC with no usable chip (32 bytes, 64 hex).
+    # integrity.device_key_problem refuses any other length or shape.
+    device_pubkey: str = Field(..., min_length=64, max_length=130)
     key_proof: str = Field(..., min_length=40, max_length=200)
     # CMED's code for the clinic, from CMED's own trigger on this PC.
     cmed_hospital_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
@@ -769,7 +770,8 @@ async def register_device(body: RegisterRequest, request: Request):
     """
     A clinic PC joins without an enrolment token.
 
-    It shows it holds a key that lives in its TPM, and names the clinic CMED's
+    It shows it holds its key - in its TPM, or (3.9.2) a software key on a PC
+    without a usable chip - and names the clinic CMED's
     own trigger named on it. It joins as *pending*: it records and uploads as
     any PC does, up to AIMS_PENDING_UPLOAD_MB, and nothing it records is kept
     unless CMED's server confirms that visit. Once CMED has confirmed two of
@@ -790,9 +792,11 @@ async def register_device(body: RegisterRequest, request: Request):
     problem = integrity.device_key_problem(pubkey)
     if problem is not None:
         return _coded(400, "BAD_KEY", problem)
-    if integrity.device_key_kind(pubkey) != "p256":
-        return _coded(400, "TPM_KEY_REQUIRED",
-                      "only a key held in the PC's TPM may register without a token")
+    # 17 Nov (recorder 3.9.2): a PC with no usable TPM chip joins with its
+    # software key too. The gate was never the key: the PC proves it holds it
+    # (below), joins as pending, and nothing it records is kept until CMED's
+    # server confirms its visits. The kind is recorded and shown per PC.
+    key_kind = "TPM chip" if integrity.device_key_kind(pubkey) == "p256" else "software key"
     if abs(time.time() - body.timestamp) > DEVICE_SIGNATURE_WINDOW:
         return _coded(401, "CLOCK", "the registration's time is more than five minutes "
                                     "from the server's; check the PC's clock")
@@ -840,7 +844,7 @@ async def register_device(body: RegisterRequest, request: Request):
                      device_id=device_id,
                      detail={"machine_name": body.machine_name, "hospital_id": hospital_id,
                              "app_version": body.app_version, "address": address,
-                             "approval": result["approval"]})
+                             "approval": result["approval"], "key": key_kind})
     await repo.alert_once(
         alert_type="device_registered", group=f"device_registered:{device_id}",
         window=timedelta(days=7), severity="info",

@@ -21,13 +21,16 @@ def test_the_registration_proof_and_the_pc_id_are_the_servers():
     assert hashlib.sha256(message).hexdigest() ==         "2c3ce0a13d1e69e1e6c95b2b65513e00f4307939e9b525c07df95fcd4ae12073"
 
 
-def test_only_a_tpm_key_registers_itself_and_only_when_allowed():
+def test_any_pc_registers_itself_when_allowed_chip_or_not():
+    # 3.9.2: a PC with no usable TPM joins with its software key; the gate is
+    # CMED confirming two of its visits, not the kind of key.
     on = SimpleNamespace(security=SimpleNamespace(self_register=True))
     off = SimpleNamespace(security=SimpleNamespace(self_register=False))
     tpm, software = SimpleNamespace(kind="p256-tpm"), SimpleNamespace(kind="ed25519")
     assert enrollment.can_self_register(on, tpm)
-    assert not enrollment.can_self_register(on, software)
+    assert enrollment.can_self_register(on, software)
     assert not enrollment.can_self_register(off, tpm)
+    assert not enrollment.can_self_register(off, software)
 
 
 def test_a_revoked_pc_stops_asking_and_says_so_once():

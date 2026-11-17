@@ -270,9 +270,13 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
 
 
 def can_self_register(cfg, device_key: DeviceKey) -> bool:
-    """Only a key the PC cannot give away - one in its TPM - may join without a token."""
-    return bool(getattr(cfg.security, "self_register", False)) and \
-        getattr(device_key, "kind", "") == "p256-tpm"
+    """
+    Any PC may join without a token, at the clinic CMED's trigger names: with
+    its TPM key, or (3.9.2) with its software key when it has no usable chip.
+    The gate is not the key: a PC stays pending, and nothing it records is
+    kept, until CMED's server confirms two of its visits.
+    """
+    return bool(getattr(cfg.security, "self_register", False))
 
 
 async def register(cfg, device_key: DeviceKey, cmed_hospital_id: str, *,

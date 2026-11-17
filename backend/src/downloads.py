@@ -16,10 +16,14 @@ Nothing decrypted is written to any disk. The worker holds the last chunk
 back until the whole file's SHA-256 is the archived file's, so a download
 that completes is that file, byte for byte.
 
-Anyone on the portal list may download - researchers and admins - and each
-download is a row in portal_downloads and an entry in the audit log: who,
-which recording, when, and whether it all arrived. The file is named by
+Anyone on the portal list may download the audio - researchers and admins -
+and each download is a row in portal_downloads and an entry in the audit log:
+who, which recording, when, and whether it all arrived. The file is named by
 clinic, doctor, date and session, without the patient's identifier.
+
+The clinical record (17 Nov) - the JSON CMED sent, kept as its own sealed
+copy - comes the same way, for admins only: it is the patient's record, not
+research audio. Before this, reading one meant the copy key and restore.py.
 """
 from __future__ import annotations
 
@@ -43,7 +47,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v2/dashboard", tags=["downloads"])
 
-_KEY_NAME = re.compile(r"^(?P<stem>.+)\.v(?P<version>\d+)\.wav\.enc$")
+_KEY_NAME = re.compile(r"^(?P<stem>.+)\.v(?P<version>\d+)\.(?:wav|json)\.enc$")
+# What each kind of copy is downloaded as.
+_KINDS = {"audio": ("wav", "audio/wav", "the WAV"),
+          "json": ("json", "application/json", "the clinical record")}
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -80,13 +87,15 @@ def _refusal(request: Request, status: int, message: str):
 
 
 def _stem_of(object_key: str) -> Optional[str]:
-    """`copies/.../<stem>.v2.wav.enc` -> `<stem>`, as restore.py reads it."""
+    """`copies/.../<stem>.v2.wav.enc` (or `.json.enc`) -> `<stem>`, as restore.py reads it."""
     found = _KEY_NAME.match(object_key.rsplit("/", 1)[-1])
     return found.group("stem") if found else None
 
 
-async def _the_copy(session_id: str, part: Optional[int]) -> Dict[str, Any]:
-    """The newest audio copy of this recording, or of one of its patient files."""
+async def _the_copy(session_id: str, part: Optional[int],
+                    kind: str = "audio") -> Dict[str, Any]:
+    """The newest copy of one kind - audio or the clinical JSON - of this
+    recording, or of one of its patient files."""
     repo = api_v2._repo()
     session = await repo.get_session(session_id)
     if session is None:
@@ -107,15 +116,18 @@ async def _the_copy(session_id: str, part: Optional[int]) -> Dict[str, Any]:
         chosen = parts[0]
     stem = (chosen or {}).get("file_stem") or session.get("file_stem")
     copies = [c for c in await repo.copies_for(session_id)
-              if c["kind"] == "audio" and _stem_of(c["object_key"]) == stem]
+              if c["kind"] == kind and _stem_of(c["object_key"]) == stem]
     if not stem or not copies:
+        if kind == "json":
+            raise _Refused(409, "This recording has no copy of its clinical record yet. "
+                                "It is made once CMED has sent the record; try again later.")
         raise _Refused(409, "This recording has no cloud copy yet. It is made within "
                             "minutes of archiving; try again later.")
     copy = max(copies, key=lambda c: c["version"])
     if not copy.get("plain_sha256"):
         raise _Refused(409, "This copy has no recorded fingerprint, so a download "
                             "could not be checked.")
-    expect: Dict[str, Any] = {"session_id": session_id, "kind": "audio",
+    expect: Dict[str, Any] = {"session_id": session_id, "kind": kind,
                               "stem_sha256": hashlib.sha256(stem.encode("utf-8")).hexdigest()}
     if chosen is not None:
         expect["part_no"] = chosen["part_no"]
@@ -127,7 +139,7 @@ async def _the_copy(session_id: str, part: Optional[int]) -> Dict[str, Any]:
         name += f"_part{chosen['part_no']}"
     return {"object_key": copy["object_key"], "plain_sha256": bytes(copy["plain_sha256"]).hex(),
             "expect": expect, "part_no": (chosen or {}).get("part_no"),
-            "filename": _SAFE_NAME.sub("-", name)[:150] + ".wav"}
+            "filename": _SAFE_NAME.sub("-", name)[:150] + "." + _KINDS[kind][0]}
 
 
 async def _within_limits(conn, email: str, role: str = "researcher") -> None:
@@ -168,9 +180,21 @@ async def _finish(row_id: int, email: str, session_id: str, part_no: Optional[in
 
 @router.get("/recordings/{session_id}/audio")
 async def download_audio(session_id: str, request: Request, part: Optional[int] = None):
+    return await _download(session_id, request, part, "audio")
+
+
+@router.get("/recordings/{session_id}/record")
+async def download_record(session_id: str, request: Request, part: Optional[int] = None):
+    """The clinical record CMED sent, decrypted from its sealed copy. Admins only."""
+    return await _download(session_id, request, part, "json")
+
+
+async def _download(session_id: str, request: Request, part: Optional[int], kind: str):
     person = await portal.person_for(request)
     if person is None:
         return _refusal(request, 401, "Sign in with Google to download recordings.")
+    if kind == "json" and person.role != "admin":
+        return _refusal(request, 403, "Only an admin may download a clinical record.")
     if person.role == "collector":
         # 036: data collectors view only - no file, no batch, no playback.
         return _refusal(request, 403, "A data collector can view recordings but not "
@@ -183,7 +207,7 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
                                       "(AIMS_DECRYPT_URL).")
     sid = api_v2._sid(session_id)
     try:
-        copy = await _the_copy(sid, part)
+        copy = await _the_copy(sid, part, kind)
         async with portal._pool().acquire() as conn:
             await _within_limits(conn, person.email, person.role)
             row_id = await conn.fetchval("""
@@ -194,7 +218,7 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
     except _Refused as refused:
         return _refusal(request, refused.status, refused.message)
 
-    store = api_v2._copy_bucket("audio")
+    store = api_v2._copy_bucket(kind)
     link = await asyncio.get_event_loop().run_in_executor(
         None, store.get_presigned_download_url, copy["object_key"], 300)
     client = _client()
@@ -253,7 +277,7 @@ async def download_audio(session_id: str, request: Request, part: Optional[int] 
             finally:
                 await _finish(row_id, person.email, sid, copy["part_no"], ok, sent, reason)
 
-    return StreamingResponse(body(), media_type="audio/wav", headers={
+    return StreamingResponse(body(), media_type=_KINDS[kind][1], headers={
         "Content-Length": str(size),
         "Content-Disposition": f'attachment; filename="{copy["filename"]}"',
         "Cache-Control": "no-store",
