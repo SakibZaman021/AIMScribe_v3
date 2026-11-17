@@ -219,6 +219,7 @@ SELECT f.session_id, f.part_no, f.hospital_id, f.doctor_id, f.session_date,
   JOIN LATERAL (
     SELECT c.object_key, c.plain_sha256, c.bytes FROM cloud_copies c
      WHERE c.session_id = f.session_id AND c.kind = 'audio' AND c.plain_sha256 IS NOT NULL
+       AND c.removed_at IS NULL
        AND regexp_replace(c.object_key, '^.*/', '') = f.stem || '.v' || c.version || '.wav.enc'
      ORDER BY c.version DESC LIMIT 1
   ) c ON true

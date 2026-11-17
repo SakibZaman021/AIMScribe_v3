@@ -156,6 +156,67 @@ async def register_copies(*, apply: bool) -> Dict[str, int]:
     return out
 
 
+async def retire_old_copies(*, apply: bool, limit: int = 1000) -> Dict[str, Any]:
+    """
+    Remove the old by-day copies, decided by the user on 17 Nov 2026 (045).
+
+    Only a copy whose twin in the visit's folder is recorded with the same
+    bytes and fingerprint, AND that the store confirms holds the twin now with
+    the old object's size (and the same ETag where the store gives one). The
+    row stays, marked removed_at, and nothing reads it for a download. A copy
+    the store still holds after the delete (a bucket lock) is not marked; it
+    is asked for again on the next run.
+    """
+    repo = api_v2._repo()
+    loop = asyncio.get_running_loop()
+    out: Dict[str, Any] = {"removed": 0, "would_remove": 0, "kept": []}
+    for row in await repo.old_copies_with_twin(limit):
+        if bytes(row["sha256"]) != bytes(row["twin_sha256"])                 or int(row["bytes"]) != int(row["twin_bytes"]):
+            out["kept"].append({"object_key": row["object_key"],
+                                "why": "the recorded twin is not the same bytes"})
+            continue
+        store = _store_for(row["kind"])
+        if store is None:
+            out["kept"].append({"object_key": row["object_key"], "why": "no copy bucket"})
+            continue
+        try:
+            twin = await loop.run_in_executor(None, store.client.stat_object, store.bucket,
+                                              row["twin_key"])
+        except Exception as exc:
+            out["kept"].append({"object_key": row["object_key"],
+                                "why": f"twin not in the store: {str(exc)[:200]}"})
+            continue
+        try:
+            old = await loop.run_in_executor(None, store.client.stat_object, store.bucket,
+                                             row["object_key"])
+        except Exception:
+            old = None                      # already gone: only the row is left to mark
+        problem = _same_object(old, twin) if old is not None else (
+            None if int(getattr(twin, "size", -1)) == int(row["bytes"])
+            else "the twin's size is not the size recorded")
+        if problem:
+            out["kept"].append({"object_key": row["object_key"], "why": problem})
+            continue
+        if not apply:
+            out["would_remove"] += 1
+            logger.info("would remove %s (twin %s)", row["object_key"], row["twin_key"])
+            continue
+        if old is not None:
+            left = await api_v2._delete_cloud_objects([{"kind": row["kind"],
+                                                        "object_key": row["object_key"]}])
+            if left:
+                out["kept"].append({"object_key": row["object_key"],
+                                    "why": "the store still holds it (a lock?)"})
+                continue
+        await repo.mark_copy_removed(row["id"])
+        out["removed"] += 1
+    if apply and out["removed"]:
+        await repo.audit(event_type="copies.retired", actor_type="admin",
+                         actor_id="visit_layout", detail={"removed": out["removed"],
+                                                          "kept": len(out["kept"])})
+    return out
+
+
 async def backfill(*, apply: bool = False, limit: int = 500) -> Dict[str, Any]:
     """All three steps. Without `apply`, what they would do."""
     keys = await set_visit_keys(apply=apply)
@@ -165,12 +226,13 @@ async def backfill(*, apply: bool = False, limit: int = 500) -> Dict[str, Any]:
     return {"applied": apply, "visit_keys": keys, "copies": moved, "clinical": registered}
 
 
-__all__ = ["backfill", "set_visit_keys", "move_copies", "register_copies"]
+__all__ = ["backfill", "set_visit_keys", "move_copies", "register_copies",
+           "retire_old_copies"]
 
 
 # ---------------------------------------------------------------- run on the server
 
-async def _main(apply: bool, limit: int) -> int:
+async def _main(apply: bool, limit: int, *, retire: bool = False) -> int:
     """With the API's own settings: run inside the API container."""
     import json
     import os
@@ -197,13 +259,14 @@ async def _main(apply: bool, limit: int) -> int:
     api_v2.ctx.copy_json = AsyncAppContext._copy_bucket(prefix="AIMS_JSON") \
         if os.getenv("AIMS_JSON_BUCKET", "").strip() else None
     try:
-        report = await backfill(apply=apply, limit=limit)
+        report = await (retire_old_copies(apply=apply) if retire
+                        else backfill(apply=apply, limit=limit))
     finally:
         await rec.close()
         if cli is not None:
             await cli.close()
     print(json.dumps(report, indent=2, default=str))
-    failed = report["copies"].get("failed") or []
+    failed = report.get("kept") if retire else (report["copies"].get("failed") or [])
     return 1 if failed else 0
 
 
@@ -214,6 +277,9 @@ if __name__ == "__main__":                         # pragma: no cover - the serv
     parser.add_argument("--apply", action="store_true",
                         help="do it (without this, only say what would be done)")
     parser.add_argument("--limit", type=int, default=500, help="copies per run")
+    parser.add_argument("--retire-old", action="store_true",
+                        help="instead: remove the old by-day copies whose visit-folder twin "
+                             "is in the store (045); with --apply only")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    sys.exit(asyncio.run(_main(args.apply, args.limit)))
+    sys.exit(asyncio.run(_main(args.apply, args.limit, retire=args.retire_old)))

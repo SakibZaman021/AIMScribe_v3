@@ -202,6 +202,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("cloud_copies", "layout")),
     ("044_v3_visit_key.sql", "recordings", "column sessions.visit_key",
      _column("sessions", "visit_key")),
+    # Without it downloads and the bulk list cannot read the copies (removed_at).
+    ("045_v3_copy_removed.sql", "recordings", "column cloud_copies.removed_at",
+     _column("cloud_copies", "removed_at")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",
