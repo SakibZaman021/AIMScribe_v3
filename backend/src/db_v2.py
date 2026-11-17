@@ -809,6 +809,16 @@ class V2Repository:
             """, session_id)
         return (int(row["entry_no"]), bytes(row["entry_hash"])) if row else None
 
+    async def device_moved_between(self, device_id, from_clinic: str, to_clinic: str) -> bool:
+        """An administrator moved this PC from one clinic to the other (audit log)."""
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM audit_log
+                 WHERE device_id = $1 AND event_type = 'device.moved'
+                   AND detail::jsonb ->> 'from' = $2 AND detail::jsonb ->> 'to' = $3
+                 LIMIT 1
+            """, device_id, from_clinic, to_clinic))
+
     async def genesis_in_use(self, entry_hash: bytes, session_id: str) -> bool:
         """Another recording already opened with this exact genesis entry."""
         async with self._acquire() as conn:
