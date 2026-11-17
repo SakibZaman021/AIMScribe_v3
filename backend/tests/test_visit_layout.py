@@ -504,3 +504,28 @@ async def test_the_by_visit_tables_lead_with_who_and_export_clean(dbs):
         assert patient in text and "{" not in text                 # plain text, no JSON
     finally:
         api_v2.ctx.clinical = None
+
+
+@postgres
+async def test_cmeds_visit_id_is_found_from_api2_on_postgres(dbs):
+    """The lookup a recorder before 3.8 needs: patient and start time -> CMED's visit_id."""
+    import clinical_v4
+    api_v2.ctx.clinical = dbs.clinical
+    try:
+        patient = f"P{uuid.uuid4().hex[:7]}"
+        body = {"visit_id": "VIS-T-424242", "patient_id": patient, "doctor_id": "DR1",
+                "hospital_id": "Susastho-Clinic-Test-1",
+                "start_time": "2026-11-17T11:50:39+06:00", "date": "2026-11-17"}
+        await clinical_v4.file_message("patient_information", body, body["hospital_id"],
+                                       body["visit_id"], patient,
+                                       clinical_v4.read("patient_information", body), "tests")
+        found = await dbs.clinical.visit_id_for("Susastho-Clinic-Test-1", patient,
+                                                "2026-11-17T11:50:39+06:00")
+        assert found == "VIS-T-424242"
+        # The same moment written in UTC is the same visit.
+        assert await dbs.clinical.visit_id_for("Susastho-Clinic-Test-1", patient,
+                                               "2026-11-17T05:50:39Z") == "VIS-T-424242"
+        assert await dbs.clinical.visit_id_for("Susastho-Clinic-Test-1", patient,
+                                               "not a time") is None
+    finally:
+        api_v2.ctx.clinical = None
