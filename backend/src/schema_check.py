@@ -214,6 +214,8 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it the visit tables a person opens first are missing.
     ("clinical/007_by_visit_tables.sql", "clinical", "view by_visit.overview",
      "SELECT to_regclass('by_visit.overview') IS NOT NULL"),
+    ("clinical/008_patient_list.sql", "clinical", "view by_visit.patient_list",
+     "SELECT to_regclass('by_visit.patient_list') IS NOT NULL"),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
      _table("consultation_findings")),
