@@ -98,7 +98,9 @@ async def test_no_check_on_entry_type_at_all_accepts_every_type(dbs):
 async def test_the_clinical_database_is_checked_too(dbs):
     async with broken(dbs.cli, "DROP TABLE prescriptions CASCADE") as pool:
         problems = await schema_check.missing(dbs.rec, pool)
-    assert [p["migration"] for p in problems] == ["clinical/001_aims_clinical.sql"]
+    # v_visit_folder (006) reads the prescriptions, so the cascade takes it too.
+    assert [p["migration"] for p in problems] == ["clinical/001_aims_clinical.sql",
+                                                  "clinical/006_visit_folder.sql"]
 
 
 @postgres

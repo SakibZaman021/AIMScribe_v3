@@ -197,7 +197,17 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     ("041_v3_shift_times.sql", "recordings", "evening shift ends 20:30 by default",
      "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'places' "
      "AND column_name = 'evening_end' AND column_default LIKE '%20:30%')"),
+    # Without it no copy can be recorded: the server writes cloud_copies.layout.
+    ("044_v3_visit_key.sql", "recordings", "column cloud_copies.layout",
+     _column("cloud_copies", "layout")),
+    ("044_v3_visit_key.sql", "recordings", "column sessions.visit_key",
+     _column("sessions", "visit_key")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
+    # Without it a visit's files are not registered and v_visit_folder is missing.
+    ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",
+     _table("visit_objects")),
+    ("clinical/006_visit_folder.sql", "clinical", "view v_visit_folder",
+     _table("v_visit_folder")),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
      _table("consultation_findings")),

@@ -1348,7 +1348,7 @@ def _remove_object(object_key: str) -> None:
     # The copies are never deleted here (SRS-ARC-12). The credential should not
     # even reach them, but a bucket misconfigured into holding both would make
     # this the code that destroyed the only remaining copy.
-    if ctx.copy is not None and (object_key.startswith("copies/")
+    if ctx.copy is not None and (object_key.startswith(("copies/", "visits/"))
                                  or ctx.minio.bucket == ctx.copy.bucket):
         raise RuntimeError(f"refusing to delete {object_key}: it is in the copy bucket")
     ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
@@ -2416,23 +2416,94 @@ class CopyFailedRequest(BaseModel):
     message: str = Field("", max_length=1000)
 
 
-def copy_object_key(session: Dict[str, Any], kind: str, version: int) -> str:
+_VISIT_KEY_SAFE = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+
+
+def visit_key(patient_id: str, doctor_id: Optional[str], visit_id: Optional[str] = None,
+              start_time: Optional[str] = None, *, fallback: Optional[str] = None
+              ) -> Optional[str]:
     """
-    Where a copy lives in the copy bucket. The same shape as the archive tree,
-    so a restore can walk one clinic or one day without an index.
+    One visit's name, and its folder in the cloud archive:
+
+        <patient_id>_<doctor_id>_<visit_id>             P4347460_DR4290371_VIS-T-31496
+        <patient_id>_<doctor_id>_<YYYYMMDD>T<HHMMSS>    no visit_id: CMED's start_time
+                                                        as written (clinic time)
+        <patient_id>_<doctor_id>_<fallback>             neither (a legacy recording)
+
+    clinical/006 computes the same in SQL (patient_visit.visit_key,
+    encounters.visit_key); test_visit_layout.py keeps the two in step.
+    """
+    if not patient_id:
+        return None
+    if visit_id:
+        tail = visit_id
+    elif start_time:
+        tail = str(start_time)[:19].replace("-", "").replace(":", "")
+    else:
+        tail = fallback
+    if not tail:
+        return None
+    key = f"{patient_id}_{doctor_id or 'unknown'}_{tail}"
+    return key if _VISIT_KEY_SAFE.match(key) else None
+
+
+def copy_object_key(session: Dict[str, Any], kind: str, version: int,
+                    visit: Optional[str] = None) -> str:
+    """
+    Where a copy lives in the copy bucket. With the visit's key (from 17 Nov
+    2026) in its visit's folder, so one patient's visits are one listing:
+
+        visits/<patient_id>/<visit_key>/<file name>.vN.wav.enc
+
+    Without one, as before, by clinic, doctor and day. The file name is the
+    same either way: the encryption binds it (cloudcopy.binding), so a copy
+    can move folder and still restore.
     """
     stem = session.get("file_stem") or safe_session_id(str(session["session_id"]))
     if not _STEM_SAFE.match(str(stem)):
         raise HTTPException(status_code=409, detail="unsafe file name for this session")
-    day = session.get("session_date")
-    day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
     # The raw WAV, encrypted (decided with CMED and the study team): no
     # transcoding stands between the archive and its copy. Older copies made
     # as FLAC keep their .flac.enc names and still restore.
     suffix = "wav.enc" if kind == "audio" else "json.enc"
+    if visit and _VISIT_KEY_SAFE.match(visit):
+        return (f"visits/{safe_identifier(session['patient_id'], field='patient_id')}"
+                f"/{visit}/{stem}.v{version}.{suffix}")
+    day = session.get("session_date")
+    day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
     return (f"copies/{safe_identifier(session['hospital_id'], field='hospital_id')}"
             f"/{safe_identifier(session['doctor_id'], field='doctor_id')}"
             f"/{day}/{stem}.v{version}.{suffix}")
+
+
+def layout_of(object_key: str) -> str:
+    return "by_visit" if object_key.startswith("visits/") else "by_day"
+
+
+async def visit_key_of(session: Dict[str, Any],
+                       part: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    The visit key of a recording, or of one patient's part of it. The visit_id
+    and start_time are CMED's, from the grant the recording (or part) opened
+    under - used only while that grant is still this recording's patient (a
+    reassigned recording keeps its first grant).
+    """
+    repo = _repo()
+    if part is not None:
+        grant = (await repo.get_authorisation(part["grant_jti"])
+                 if part.get("grant_jti") else None)
+        visit = (grant or {}).get("visit_id") \
+            if (grant or {}).get("patient_id") == part["patient_id"] else None
+        return visit_key(part["patient_id"], part["doctor_id"], visit, part["start_time"],
+                         fallback=f"{session['session_id']}-p{part['part_no']}")
+    grant = (await repo.get_authorisation(session["grant_jti"])
+             if session.get("grant_jti") else None)
+    same = grant is not None and grant.get("patient_id") == session.get("patient_id")
+    visit = session.get("visit_id") or ((grant or {}).get("visit_id") if same else None)
+    return visit_key(session.get("patient_id"), session.get("doctor_id"),
+                     visit if (same or grant is None) else None,
+                     grant["start_time"] if same else None,
+                     fallback=str(session["session_id"]))
 
 
 @router.get("/archive/copy/pending")
@@ -2611,15 +2682,19 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
         raise HTTPException(status_code=409, detail="session is not archived yet")
 
     version = await repo.next_copy_version(session_id, body.kind)
-    named = session
+    named, part = session, None
     if body.part_no is not None:
         part = next((p for p in await repo.parts_for(session_id)
                      if p["part_no"] == body.part_no), None)
         if part is None or not part.get("file_stem"):
             raise HTTPException(status_code=404, detail="no such part")
         named = {**session, "file_stem": part["file_stem"],
-                 "doctor_id": part["doctor_id"]}
-    object_key = copy_object_key(named, body.kind, version)
+                 "doctor_id": part["doctor_id"], "patient_id": part["patient_id"]}
+    # Into the visit's folder (044): the key is kept with the recording.
+    visit = await visit_key_of(session, part)
+    if visit:
+        await repo.set_visit_key(session_id, visit, part_no=body.part_no)
+    object_key = copy_object_key(named, body.kind, version, visit)
     loop = asyncio.get_event_loop()
     upload = await loop.run_in_executor(
         None, copy.get_presigned_upload_url, object_key, 3600)
@@ -2706,7 +2781,10 @@ async def _record_copies(body: "CopyCompleteRequest", session_id: str, session):
         await repo.record_cloud_copy(
             session_id=session_id, kind=copy.kind, object_key=copy.object_key,
             version=copy.version, byte_length=copy.bytes, sha256=digest,
-            plain_sha256=plain)
+            plain_sha256=plain, layout=layout_of(copy.object_key))
+        await register_visit_object(session, copy.object_key, kind=copy.kind,
+                                    version=copy.version, byte_length=copy.bytes,
+                                    part_no=body.part_no)
 
     if body.part_no is not None:
         # One patient's part of a recording cut into several. The recording
@@ -2745,6 +2823,36 @@ async def _record_copies(body: "CopyCompleteRequest", session_id: str, session):
     logger.info("Cloud copy complete for %s; deleted %s piece(s) from the segment "
                 "bucket", session_id, removed)
     return {"status": "copied", "objects_deleted": removed}
+
+
+async def register_visit_object(session: Dict[str, Any], object_key: str, *, kind: str,
+                                version: int, byte_length: Optional[int],
+                                part_no: Optional[int] = None) -> bool:
+    """
+    Tell the clinical database where a visit's file now is (clinical/006
+    visit_objects), so v_visit_folder shows it beside the visit. Only a copy in
+    a visit's folder: its path names the patient and the visit. Best effort -
+    scripts/backfill_visit_layout.py writes any row missed here.
+    """
+    parts = object_key.split("/")
+    if ctx.clinical is None or len(parts) != 4 or parts[0] != "visits":
+        return False
+    patient_id, key = parts[1], parts[2]
+    doctor_id = session.get("doctor_id")
+    if part_no is not None:
+        part = next((p for p in await _repo().parts_for(session["session_id"])
+                     if p["part_no"] == part_no), None)
+        doctor_id = (part or {}).get("doctor_id") or doctor_id
+    try:
+        return await ctx.clinical.record_visit_object(
+            visit_key=key, patient_id=patient_id, doctor_id=doctor_id or "unknown",
+            visit_id=session.get("visit_id") if part_no is None else None,
+            hospital_id=session.get("hospital_id"), session_id=session["session_id"],
+            part_no=part_no, kind=kind, object_key=object_key, version=version,
+            byte_length=byte_length)
+    except Exception as exc:
+        logger.warning("Could not register %s in the clinical database: %s", object_key, exc)
+        return False
 
 
 @router.post("/archive/copy/failed")
@@ -3200,6 +3308,10 @@ async def _erase_session(session_id: str, *, state: str):
         await repo.delete_notices_for(visit)
         if ctx.clinical is not None:
             await ctx.clinical.erase_visit(visit)
+    if ctx.clinical is not None and hasattr(ctx.clinical, "forget_session_objects"):
+        # The visit's file register names the patient: it goes with the files,
+        # which the erase task removes from the cloud (cloud_copies, all layouts).
+        await ctx.clinical.forget_session_objects(session_id)
     await repo.erase_session(session_id, state=state)
     return removed, visit
 
@@ -3254,6 +3366,13 @@ async def _record_file_name(session_id: str) -> Optional[str]:
                                 session["hospital_id"], start, end, visit=visit_id),
         local_start=start.time().replace(tzinfo=None),
         local_end=end.time().replace(tzinfo=None))
+    # The visit's key (044): v_visit_recordings, and later its cloud folder.
+    try:
+        key = await visit_key_of({**session, "visit_id": visit_id or session.get("visit_id")})
+        if key and hasattr(repo, "set_visit_key"):
+            await repo.set_visit_key(session_id, key)
+    except Exception as exc:
+        logger.warning("Could not set the visit key of %s: %s", session_id, exc)
 
     # A resumed recording leaves the visit linked to the first one (S4); it is
     # found from there through continuation_links.

@@ -352,6 +352,15 @@ class FakeRepo:
     async def copies_for(self, session_id):
         return [dict(c) for c in self.copies if c["session_id"] == session_id]
 
+    # the visit's folder (044)
+    async def set_visit_key(self, session_id, visit_key, *, part_no=None):
+        if part_no is None:
+            self.sessions[session_id]["visit_key"] = visit_key
+        else:
+            for part in self.parts.get(session_id, []):
+                if part["part_no"] == part_no:
+                    part["visit_key"] = visit_key
+
     async def mark_copied(self, session_id):
         self.sessions[session_id].update(copied_at=NOW(), json_stale=False)
 
@@ -622,6 +631,18 @@ class FakeClinical:
     async def link_visit_recording(self, **kw):
         self.__dict__.setdefault("visit_links", []).append(kw)
         return bool(kw.get("visit_id"))
+
+    async def record_visit_object(self, **kw):
+        objects = self.__dict__.setdefault("visit_objects", [])
+        if any(o["object_key"] == kw["object_key"] for o in objects):
+            return False
+        objects.append(kw)
+        return True
+
+    async def forget_session_objects(self, session_id):
+        objects = self.__dict__.setdefault("visit_objects", [])
+        self.visit_objects = [o for o in objects if o["session_id"] != session_id]
+        return len(objects) - len(self.visit_objects)
 
     async def prescribed(self, visits):
         return {v.patient_id for v in visits
@@ -1282,8 +1303,9 @@ async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
     for kind, suffix in (("audio", "wav.enc"), ("json", "json.enc")):
         place = await api_v2.archive_copy_authorize(
             api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
-        assert place["object_key"] == \
-            f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v1.{suffix}"
+        # In the visit's folder (044): no visit_id came, so CMED's start_time names it.
+        assert place["object_key"] == (f"visits/P0012345/P0012345_DR0042_20260913T101432/"
+                                       f"{STEM}.v1.{suffix}")
         assert place["version"] == 1
         # The audio goes to cold storage; the JSON to the warm bucket beside it.
         assert place["bucket"] == ("aimscribe-copies" if kind == "audio"

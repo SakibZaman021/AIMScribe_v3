@@ -581,6 +581,37 @@ class ClinicalStore:
 
     # ------------------------------------------------------------ refusal
 
+    async def record_visit_object(self, *, visit_key: str, patient_id: str, doctor_id: str,
+                                  visit_id: Optional[str], hospital_id: Optional[str],
+                                  session_id: str, part_no: Optional[int], kind: str,
+                                  object_key: str, version: int,
+                                  byte_length: Optional[int]) -> bool:
+        """One file of a visit in the cloud archive (clinical/006). Once per object."""
+        async with self._pool.acquire() as conn:
+            added = await conn.fetchval("""
+                INSERT INTO visit_objects (visit_key, patient_id, doctor_id, visit_id,
+                                           hospital_id, session_id, part_no, kind,
+                                           object_key, version, bytes)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                ON CONFLICT (object_key) DO NOTHING
+                RETURNING id
+            """, visit_key, patient_id, doctor_id, visit_id, hospital_id, session_id,
+                part_no, kind, object_key, version, byte_length)
+        return added is not None
+
+    async def forget_session_objects(self, session_id: str) -> int:
+        """A refused or expired recording: its files are erased, so is their register."""
+        async with self._pool.acquire() as conn:
+            done = await conn.execute("DELETE FROM visit_objects WHERE session_id = $1",
+                                      session_id)
+        return int(done.split()[-1]) if done else 0
+
+    async def visit_folder(self, patient_id: str) -> List[Dict[str, Any]]:
+        """Every visit of one patient, newest first (clinical/006 patient_folder)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM patient_folder($1)", patient_id)
+        return [dict(r) for r in rows]
+
     async def erase_visit(self, visit) -> int:
         """
         The patient refused (SRS-CNS-04): remove everything CMED sent for this
