@@ -24,7 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
 import api_v2
@@ -628,6 +628,124 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
             "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], []),
                             **times.get(r["session_id"], {})}
                            for r in rows]}
+
+
+# ============================================================
+# One patient's history (18 Nov 2026)
+# ============================================================
+
+_PATIENT_VIEWS = ("overview", "demographics", "prescription", "medicines", "files")
+
+
+async def _clinical_reader(request: Request) -> str:
+    """
+    Who may read a patient's clinical record here: an admin or a researcher
+    signed in to the portal, or the admin key. Never a data collector, who
+    sees no clinical value anywhere (036). Returns the name logged for it.
+    """
+    import portal
+    person = await portal.person_for(request)
+    if person is not None:
+        if person.role not in ("admin", "researcher"):
+            raise HTTPException(status_code=403,
+                                detail="A patient's clinical record is for researchers and admins.")
+        return person.email
+    if request.headers.get("x-admin-key"):
+        return "admin key"
+    raise HTTPException(status_code=401, detail="Sign in to look up a patient.")
+
+
+def _plain(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is not None and type(value).__name__ == "Decimal":
+        return float(value)
+    return value
+
+
+@router.get("/patient/{patient_ref}")
+async def patient_history(patient_ref: str, request: Request,
+                          _: None = Depends(require_viewer),
+                          scope: Any = Depends(collectors.hospital_scope)):
+    """
+    Everything held about one patient, newest visit first: who they are, and
+    for each visit the demographics and vitals (API 2), the prescription
+    (API 3), the medicines, and the recordings with their files. Found by
+    CMED's patient ID, or by a visit ID of theirs. Read from the by_visit
+    views (clinical/007, 008); every look-up is logged by name in
+    clinical_access_log.
+    """
+    actor = await _clinical_reader(request)
+    try:
+        ref = safe_identifier(patient_ref.strip(), field="patient_id")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Give a patient ID or a visit ID.")
+    store = api_v2.ctx.clinical
+    if store is None:
+        raise HTTPException(status_code=503, detail="The clinical database is not connected.")
+    async with store._pool.acquire() as conn:
+        patient_id = await conn.fetchval(
+            "SELECT patient_id FROM by_visit.overview WHERE patient_id = $1 LIMIT 1", ref)
+        if patient_id is None:                   # perhaps a visit ID
+            patient_id = await conn.fetchval(
+                "SELECT patient_id FROM by_visit.overview WHERE visit_id = $1 LIMIT 1", ref)
+        if patient_id is None:
+            await store.log_access(actor=actor, action="dashboard.patient", patient_id=ref,
+                                   detail={"found": False})
+            return {"query": ref, "found": False, "patient": None, "visits": []}
+        people = [dict(r) for r in await conn.fetch(
+            "SELECT * FROM by_visit.patient_list WHERE patient_id = $1", patient_id)]
+        rows = {name: [dict(r) for r in await conn.fetch(
+                    f"SELECT * FROM by_visit.{name} WHERE patient_id = $1", patient_id)]
+                for name in _PATIENT_VIEWS}
+
+    visible = None if not isinstance(scope, list) else set(scope)
+    visits: List[Dict[str, Any]] = []
+    for v in rows["overview"]:
+        if visible is not None and v.get("clinic") not in visible:
+            continue
+        key = v["visit_key"]
+        demo = next((d for d in rows["demographics"] if d["visit_key"] == key), None)
+        presc = next((d for d in rows["prescription"] if d["visit_key"] == key), None)
+        visits.append({
+            **{k: _plain(val) for k, val in v.items()},
+            "demographics": {k: _plain(val) for k, val in demo.items()} if demo else None,
+            "prescription": {k: _plain(val) for k, val in presc.items()} if presc else None,
+            "medicines": [{k: _plain(val) for k, val in m.items()}
+                          for m in rows["medicines"] if m["visit_key"] == key],
+            "files": [{k: _plain(val) for k, val in f.items()}
+                      for f in rows["files"] if f["visit_key"] == key],
+        })
+
+    # The recordings, for their download links: only copied, confirmed ones download.
+    sessions = sorted({f["recording"] for v in visits for f in v["files"] if f.get("recording")}
+                      | {s.strip() for v in visits for s in (v.get("recordings") or "").split(",")
+                         if s.strip()})
+    recorded: Dict[str, Dict[str, Any]] = {}
+    if sessions:
+        async with _pool().acquire() as conn:
+            for r in await conn.fetch("""
+                SELECT session_id, confirmation, copied_at IS NOT NULL AS copied,
+                       total_duration_seconds, parts_count, local_start
+                  FROM sessions WHERE session_id = ANY($1::text[])
+            """, sessions):
+                recorded[r["session_id"]] = {
+                    "session_id": r["session_id"], "confirmation": r["confirmation"],
+                    "copied": r["copied"], "parts": r["parts_count"],
+                    "minutes": round(float(r["total_duration_seconds"] or 0) / 60, 1),
+                    "local_start": _plain(r["local_start"])}
+    for v in visits:
+        ids = {f["recording"] for f in v["files"] if f.get("recording")} \
+            | {s.strip() for s in (v.get("recordings") or "").split(",") if s.strip()}
+        v["recordings_detail"] = [recorded[i] for i in sorted(ids) if i in recorded]
+
+    await store.log_access(actor=actor, action="dashboard.patient", patient_id=patient_id,
+                           detail={"visits": len(visits), "query": ref})
+    return {"query": ref, "found": True,
+            "patient": {k: _plain(val) for k, val in people[0].items()} if people else None,
+            "visits": visits}
 
 
 async def _cmed_message_times(rows) -> Dict[str, Dict[str, Any]]:

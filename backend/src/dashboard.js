@@ -333,6 +333,7 @@ const VIEWS = {
   overview: ["Overview", "How the clinics, the recordings and the server are doing", true],
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
+  patient: ["Patients", "One patient's visits, newest first: demographics, prescriptions and recordings", false],
   shift: ["My shift", "Your shift, and the alerts mailed to you", false],
   watch: ["My alerts", "The hospitals you look after: alerts, and the evening report", false],
   downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
@@ -1871,6 +1872,85 @@ $("bBatches").addEventListener("click", (e) => {
 });
 $("bEveryone").addEventListener("change", loadBatches);
 
+/* ============================================================
+   One patient's history (18 Nov 2026): type the ID, see every visit.
+   ============================================================ */
+function pText(label, value) {
+  return value ? `<div class="prow"><span class="pl">${esc(label)}</span><span class="pv">${esc(value)}</span></div>` : "";
+}
+function pArrived(iso, ok) {
+  if (!ok) return tag("warn", "not received");
+  if (!iso) return tag("good", "received");
+  return tag("good", String(iso).replace("T", " ").slice(0, 16));
+}
+function visitCard(v) {
+  const d = v.demographics || {}, p = v.prescription || {};
+  const vitals = [["BP", d.blood_pressure], ["Pulse", d.pulse], ["Temp", d.temperature],
+    ["Weight", d.weight], ["Height", d.height], ["SpO2", d.spo2]]
+    .filter(([, x]) => x).map(([n, x]) => `${n} ${x}`).join(" · ");
+  const meds = (v.medicines || []).length
+    ? `<table class="pmeds"><thead><tr><th>Medicine</th><th>Strength</th><th>Dose</th><th>How often</th><th>When</th><th>For</th></tr></thead><tbody>`
+      + v.medicines.map((m) => `<tr><td>${esc([m.form, m.medicine].filter(Boolean).join(" "))}</td>`
+        + `<td>${esc(m.strength || "")}</td><td>${esc(m.dose || "")}</td><td>${esc(m.frequency || "")}</td>`
+        + `<td>${esc(m.timing || "")}</td><td>${esc(m.duration || "")}</td></tr>`).join("")
+      + `</tbody></table>` : "";
+  const recs = (v.recordings_detail || []).map((r) => {
+    const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}`;
+    const links = r.copied && r.confirmation === "confirmed" && PORTAL
+      ? ` <a class="copy dl" href="${esc(base)}/audio">Audio (WAV)</a> <a class="copy dl" href="${esc(base)}/record">Record (JSON)</a>`
+      : "";
+    return `<div class="prec">${confirmTag(r.confirmation)} <span class="mono">${esc(r.session_id)}</span>`
+      + ` <span class="hint">${esc(String(r.local_start || "").slice(0, 5))} · ${num(r.minutes || 0)} min</span>${links}</div>`;
+  }).join("");
+  return `<section class="panel pvisit">
+    <div class="head wrap"><h3>${esc(v.visit_date || "")} <span class="hint">${esc(v.start_time || "")}</span></h3>
+      <span class="tags">${tag("quiet", v.visit_id || "no visit ID")} ${tag("quiet", v.doctor_id || "")}
+        ${tag("quiet", v.clinic ? clinicName(v.clinic) : v.cmed_clinic_code || "")}</span></div>
+    <div class="body pbody">
+      <div class="prow"><span class="pl">API 2</span><span class="pv">${pArrived(v.api2_received_at, v.api2_received)}</span></div>
+      <div class="prow"><span class="pl">API 3</span><span class="pv">${pArrived(v.api3_received_at, v.api3_received)}</span></div>
+      ${pText("Age", d.age)}
+      ${pText("Vitals", vitals)}
+      ${pText("Complaints", p.chief_complaints)}
+      ${pText("Examination", p.examination)}
+      ${pText("Diagnoses", p.diagnoses)}
+      ${meds ? `<div class="prow"><span class="pl">Medicines</span><span class="pv">${meds}</span></div>` : ""}
+      ${pText("Tests", p.investigations)}
+      ${pText("Advice", p.advice)}
+      ${pText("Follow-up", p.follow_up)}
+      <div class="prow"><span class="pl">Recordings</span><span class="pv">${recs || `<span class="hint">none</span>`}</span></div>
+      ${pText("Archive folder", v.archive_folder)}
+    </div>
+  </section>`;
+}
+async function loadPatient(ref) {
+  $("patientMsg").textContent = "Looking up…";
+  $("patientOut").innerHTML = "";
+  try {
+    const d = await api(`/patient/${encodeURIComponent(ref)}`);
+    if (!d.found) {
+      $("patientMsg").textContent = `No patient or visit "${ref}" is held.`;
+      return;
+    }
+    const pt = d.patient || {};
+    $("patientMsg").textContent = `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
+    $("patientOut").innerHTML = `<section class="panel"><div class="head wrap"><h3>${esc(pt.patient_id || ref)}</h3>
+      <span class="tags">${tag("quiet", pt.cmed_clinic_code || "")}</span></div>
+      <div class="body pbody">
+        ${pText("Sex", pt.sex)}${pText("Date of birth", pt.date_of_birth)}${pText("Age", pt.age)}
+        ${pText("Blood group", pt.blood_group)}${pText("Visits", String(pt.visits || d.visits.length))}
+        ${pText("First visit", pt.first_visit)}${pText("Last visit", pt.last_visit)}
+      </div></section>` + d.visits.map(visitCard).join("");
+  } catch (err) {
+    $("patientMsg").textContent = `Not shown: ${err.message}`;
+  }
+}
+$("patientForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const ref = $("patientRef").value.trim();
+  if (ref) loadPatient(ref);
+});
+
 function startBulk() {
   $("bulkPanel").hidden = false;
   $("batchesPanel").hidden = false;
@@ -1897,6 +1977,8 @@ async function start() {
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
   if (PORTAL && PORTAL.role !== "collector") startBulk();
+  // 18 Nov: a patient's clinical record - researchers and admins only.
+  if (!PORTAL || PORTAL.role !== "collector") $("navPatient").hidden = false;
   showView(location.hash.slice(1));
   await refresh();
 }
