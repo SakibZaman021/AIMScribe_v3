@@ -3817,6 +3817,8 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
     # Then anything a clinic set-up mistake left waiting, once the PC has been
     # moved or CMED's code linked: every few minutes, not every pass.
     rematched = await rematch_after_clinic_fix()
+    # And the other recordings of a visit CMED has confirmed, from the same PC.
+    same_visit = await confirm_same_visit_safely()
 
     marked = 0
     for row in await repo.sessions_in_confirmation(
@@ -3845,7 +3847,7 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             "devices_rejected": rejected,
             "devices_approved": approved, "clinical_loaded": loaded,
             "copies_overdue": len(overdue), "reconciled": len(reconciled),
-            "rematched": len(rematched)}
+            "rematched": len(rematched), "same_visit": len(same_visit)}
 
 
 REMATCH_EVERY = timedelta(minutes=5)
@@ -3865,9 +3867,23 @@ async def rematch_after_clinic_fix(*, now: bool = False) -> List[str]:
     _LAST_REMATCH = at
     try:
         import clinical
-        return await clinical.rematch_waiting()
+        rematched = await clinical.rematch_waiting()
     except Exception as exc:
         logger.warning("Rematching waiting recordings failed: %s", exc)
+        rematched = []
+    if now:
+        # A move or a link: the visit's other recordings from that PC too, at once.
+        rematched += await confirm_same_visit_safely()
+    return rematched
+
+
+async def confirm_same_visit_safely() -> List[str]:
+    """clinical.confirm_same_visit, never failing the caller."""
+    try:
+        import clinical
+        return await clinical.confirm_same_visit()
+    except Exception as exc:
+        logger.warning("Confirming a visit's other recordings failed: %s", exc)
         return []
 
 

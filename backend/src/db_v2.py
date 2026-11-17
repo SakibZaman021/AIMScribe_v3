@@ -1864,6 +1864,45 @@ class V2Repository:
             """, limit)
         return [dict(r) for r in rows]
 
+    async def waiting_same_visit(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Recordings still waiting whose visit CMED has confirmed through another
+        recording from the same PC: the doctor stopped and started again for
+        the same patient, and each start was a grant of its own. One API 2
+        confirms one grant (SRS-CNF-04), so the others waited to be erased.
+
+        Same PC and the same five fields as a confirmed recording, and no other
+        PC ever asked for that visit (a contested visit waits for a person).
+        `clinic` is where the confirmed one is filed.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT DISTINCT ON (s.session_id)
+                       s.session_id, s.hospital_id, s.closed_at, g.jti,
+                       g.patient_id, g.doctor_id, g.cmed_hospital_id, g.start_time,
+                       g.visit_date, c.session_id AS confirmed_by, c.hospital_id AS clinic
+                  FROM sessions s
+                  JOIN grant_authorisations g ON g.jti = s.grant_jti
+                  JOIN grant_authorisations g2
+                    ON g2.jti <> g.jti AND g2.notice_id IS NOT NULL
+                   AND g2.device_id = g.device_id
+                   AND g2.patient_id = g.patient_id AND g2.doctor_id = g.doctor_id
+                   AND g2.cmed_hospital_id = g.cmed_hospital_id
+                   AND g2.start_time = g.start_time AND g2.visit_date = g.visit_date
+                  JOIN sessions c ON c.grant_jti = g2.jti AND c.confirmation = 'confirmed'
+                 WHERE s.confirmation IN ('pending', 'unconfirmed')
+                   AND g.notice_id IS NULL AND g.patient_id <> 'REDACTED'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM grant_authorisations o
+                        WHERE o.device_id <> g.device_id
+                          AND o.patient_id = g.patient_id AND o.doctor_id = g.doctor_id
+                          AND o.cmed_hospital_id = g.cmed_hospital_id
+                          AND o.start_time = g.start_time AND o.visit_date = g.visit_date)
+                 ORDER BY s.session_id, c.opened_at DESC
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
     async def refile_session(self, session_id: str, jti: str, hospital_id: str) -> bool:
         """
         File a recording, and the grant it opened under, at another clinic: the

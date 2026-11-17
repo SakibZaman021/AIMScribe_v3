@@ -209,6 +209,31 @@ class FakeRepo:
                              visit_id=g.get("visit_id"), issued_at=g["issued_at"]))
         return sorted(rows, key=lambda r: r["issued_at"], reverse=True)[:limit]
 
+    async def waiting_same_visit(self, limit=500):
+        five = ("patient_id", "doctor_id", "cmed_hospital_id", "start_time", "visit_date")
+        rows = []
+        for s in self.sessions.values():
+            g = self.auths.get(s.get("grant_jti") or "")
+            if (not g or s["confirmation"] not in ("pending", "unconfirmed")
+                    or g["notice_id"] is not None or g["patient_id"] == "REDACTED"):
+                continue
+            same = [a for a in self.auths.values()
+                    if all(a[k] == g[k] for k in five)]
+            if any(str(a["device_id"]) != str(g["device_id"]) for a in same):
+                continue
+            done = [c for c in self.sessions.values()
+                    if c.get("confirmation") == "confirmed" and any(
+                        a["jti"] == c.get("grant_jti") and a["jti"] != g["jti"]
+                        and a["notice_id"] is not None for a in same)]
+            if not done:
+                continue
+            c = max(done, key=lambda c: c["opened_at"])
+            rows.append(dict(session_id=s["session_id"], hospital_id=s["hospital_id"],
+                             closed_at=s.get("closed_at"), jti=g["jti"],
+                             **{k: g[k] for k in five},
+                             confirmed_by=c["session_id"], clinic=c["hospital_id"]))
+        return rows[:limit]
+
     async def refile_session(self, session_id, jti, hospital_id):
         s = self.sessions[session_id]
         if s.get("archived_at"):

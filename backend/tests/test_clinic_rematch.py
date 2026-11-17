@@ -157,8 +157,12 @@ async def test_one_message_confirms_the_newest_recording_of_the_visit(server):
         server.repo.auths[server.repo.sessions[sid]["grant_jti"]]["issued_at"] += (
             timedelta(seconds=1) if sid == second else timedelta(0))
     move_pc(server)
-    assert await rematch() == [second]
-    assert server.repo.sessions[first]["confirmation"] == "pending"
+    # CMED's message is claimed by the newest; the earlier one is the same
+    # visit from the same PC, and is confirmed with it (17 Nov decision).
+    assert await rematch() == [second, first]
+    jti_of = {sid: server.repo.sessions[sid]["grant_jti"] for sid in (first, second)}
+    assert server.repo.notices[0]["claimed_by_jti"] == jti_of[second]
+    assert server.repo.sessions[first]["confirmation"] == "confirmed"
 
 
 async def test_a_refused_or_erased_recording_is_left_alone(server):
@@ -262,3 +266,106 @@ async def test_the_live_case_on_postgres(dbs, linked_first):
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = api_v2.ctx.grants = None
         api_v2.forget_directory()
+
+
+# ---------------------------------------------------------------- the visit's other recordings
+
+async def confirm_same_visit():
+    return await api_v2.confirm_same_visit_safely()
+
+
+async def test_every_recording_of_a_confirmed_visit_from_the_same_pc_is_kept(server):
+    """VIS-T-31492 on 16 Nov: five starts for one patient; the 16-piece one waited to be erased."""
+    live_layout(server)
+    await send("patient_information", api2(**VISIT))
+    first, _ = await record(server, segments=16)
+    second, _ = await record(server, segments=2)
+    move_pc(server)
+    await rematch()
+    states = {sid: server.repo.sessions[sid]["confirmation"] for sid in (first, second)}
+    assert sorted(states.values()) == ["confirmed", "confirmed"]
+    for sid in (first, second):
+        assert server.repo.sessions[sid]["hospital_id"] == "HOSP_SUSASTHO_TEST"
+    entry = [a for a in server.repo.audits if a["event_type"] == "session.confirmed"
+             and "same_visit_as" in a["detail"]]
+    assert len(entry) == 1
+
+
+async def test_a_restart_in_normal_running_is_confirmed_by_the_sweep(server):
+    """API 2 first, then two starts at the right clinic: the second used to wait for ever."""
+    await send("patient_information", api2())
+    _, one = await mint()
+    sid1 = open_session(server)
+    await api_v2._link_grant(sid1, one["jti"], "P0012345", DEVICE)
+    _, two = await mint()
+    sid2 = open_session(server)
+    assert await api_v2._link_grant(sid2, two["jti"], "P0012345", DEVICE) == "pending"
+    assert await confirm_same_visit() == [sid2]
+    assert server.repo.sessions[sid2]["confirmation"] == "confirmed"
+    assert await confirm_same_visit() == []
+
+
+async def test_another_pcs_recording_of_the_visit_is_never_taken_in(server):
+    other = dict(DEVICE, device_id="dev-2")
+    await send("patient_information", api2())
+    _, one = await mint()
+    sid1 = open_session(server)
+    await api_v2._link_grant(sid1, one["jti"], "P0012345", DEVICE)
+    _, two = await mint(device=other)
+    sid2 = open_session(server, device=other)
+    await api_v2._link_grant(sid2, two["jti"], "P0012345", other)
+    assert await confirm_same_visit() == []
+    assert server.repo.sessions[sid2]["confirmation"] == "pending"
+
+
+async def test_a_refused_visit_keeps_its_other_recordings_out(server, monkeypatch):
+    """VIS-T-31493: the patient refused; their other recordings must not be confirmed."""
+    await send("patient_information", api2())
+    _, one = await mint()
+    sid1 = open_session(server)
+    await api_v2._link_grant(sid1, one["jti"], "P0012345", DEVICE)
+    _, two = await mint()
+    sid2 = open_session(server)
+    await api_v2._link_grant(sid2, two["jti"], "P0012345", DEVICE)
+
+    async def refused(digest):
+        return True
+    monkeypatch.setattr(server.repo, "refused_visit", refused)
+    assert await confirm_same_visit() == []
+
+
+@postgres
+async def test_a_visits_other_recordings_on_postgres(dbs):
+    """The SQL of waiting_same_visit: same PC, same five fields, filed with the confirmed one."""
+    import uuid
+    import clinical
+    from datetime import datetime, timezone
+    from test_db_integration import visit as a_visit
+
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    api_v2.ctx.repo, api_v2.ctx.clinical = repo, dbs.clinical
+    try:
+        v = a_visit(patient_id=f"P{uuid.uuid4().hex[:7]}")
+        notice = await repo.record_notice(v, hospital_id="HOSP003", clinical_record_id=1)
+        sids = []
+        for n in range(3):
+            jti = uuid.uuid4().hex
+            await repo.create_authorisation(jti=jti, device_id=device["device_id"],
+                                            hospital_id="HOSP003", visit=v,
+                                            expires_at=datetime.now(timezone.utc))
+            sid = await a_session(repo, device)
+            await repo.link_authorisation(jti, sid)
+            if n == 0:
+                assert await repo.claim_notice(notice, jti)
+                await repo.set_session_confirmation(sid, "confirmed", grant_jti=jti)
+            else:
+                await repo.set_session_confirmation(sid, "unconfirmed", grant_jti=jti)
+            sids.append(sid)
+
+        assert sorted(await clinical.confirm_same_visit()) == sorted(sids[1:])
+        for sid in sids:
+            assert (await repo.get_session(sid))["confirmation"] == "confirmed"
+        assert await clinical.confirm_same_visit() == []
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = None
