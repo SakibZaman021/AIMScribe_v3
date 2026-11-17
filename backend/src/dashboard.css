@@ -502,3 +502,17 @@ details.sent dl { display: grid; grid-template-columns: max-content 1fr; gap: 2p
                   margin: 6px 0 0; font-size: 12px; }
 details.sent dt { color: var(--muted, inherit); font-family: ui-monospace, monospace; }
 details.sent dd { margin: 0; word-break: break-word; }
+
+/* 18 Nov 2026: one patient's history */
+.pfind { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.pfind input { min-width: 14rem; }
+.pbody { display: grid; gap: 6px; }
+.prow { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 12px; align-items: baseline; }
+.prow .pl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.prow .pv { min-width: 0; overflow-wrap: anywhere; }
+.pmeds { border-collapse: collapse; width: 100%; font-size: 13px; }
+.pmeds th, .pmeds td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.pmeds th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+.prec { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 2px 0; }
+.pvisit .head h3 .hint { font-weight: 400; margin-left: 6px; }
+@media (max-width: 640px) { .prow { grid-template-columns: 1fr; gap: 2px; } }
