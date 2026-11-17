@@ -895,8 +895,16 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     claimed_hospital = hospital_id
     hospital_id = device["hospital_id"]
     if claimed_hospital != hospital_id:
+        # 17 Nov: an administrator moved the PC while it held recordings made
+        # under its old clinic. From 3.9.3 the recorder learns the move and
+        # sends them; that is expected, not an intrusion, so it is noted
+        # quietly. Any other disagreement is still critical.
+        moved = hasattr(_repo(), "device_moved_between") and \
+            await _repo().device_moved_between(device["device_id"], claimed_hospital,
+                                               hospital_id)
         await _repo().raise_alert(
-            alert_type="clinic_mismatch", severity="critical",
+            alert_type="recorded_before_move" if moved else "clinic_mismatch",
+            severity="info" if moved else "critical",
             session_id=session_id, device_id=device["device_id"],
             detail={"device_hospital": hospital_id, "claimed": claimed_hospital},
         )
@@ -1859,7 +1867,10 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
             detail={"spool_bytes": body.spool_bytes,
                     "pending_segments": body.pending_segments})
     await _check_clock(device, body)
-    reply: Dict[str, Any] = {"status": "ok"}
+    # The clinic this PC belongs to now. A PC moved on the dashboard learns it
+    # here within 30 seconds; before 3.9.3 it kept the clinic it joined at and
+    # refused every grant for the new one (17 Nov, CMED's PC at TEST/Karail).
+    reply: Dict[str, Any] = {"status": "ok", "hospital_id": device["hospital_id"]}
     # Interface 4: CMED's API 3 for the recording this PC has open has arrived.
     # The recorder ends it about two minutes after that, unless the next
     # patient is opened first; it is told on every heartbeat until it closes.

@@ -42,7 +42,7 @@ import logging
 import os
 import platform
 import socket
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -363,6 +363,21 @@ def _keep(cfg, device_key: DeviceKey, data: Dict[str, Any]) -> DeviceIdentity:
     tmp.write_text(identity.to_json(), encoding="utf-8")
     os.replace(tmp, path)
     return identity
+
+
+def save_clinic(cfg, identity: DeviceIdentity, hospital_id: str) -> DeviceIdentity:
+    """
+    The server moved this PC to another clinic (3.9.3). The identity file is
+    rewritten with the new clinic and nothing else, so the PC keeps its id,
+    key and token, and a restart starts at the new clinic.
+    """
+    moved = replace(identity, hospital_id=str(hospital_id))
+    path = identity_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(moved.to_json(), encoding="utf-8")
+    os.replace(tmp, path)
+    return moved
 
 
 async def ensure_enrolled(cfg, device_key: DeviceKey, *, ssl_context=None) -> Optional[DeviceIdentity]:

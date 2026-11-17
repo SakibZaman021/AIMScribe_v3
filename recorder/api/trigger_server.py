@@ -23,6 +23,7 @@ import json
 import logging
 import secrets
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -181,6 +182,7 @@ class Runtime:
         self.uploader.set_device_token(load_device_token(self.cfg))
         if self.identity is not None:
             self.uploader.device_id = self.identity.device_id
+            self.uploader.hospital_id = self.identity.hospital_id
         self.uploader.set_grant_key(grant_key)
         from core.health_log import FILE_NAME as HEALTH_LOG, HealthLog
         self.uploader.health = HealthLog(self.cfg.paths.state_dir / HEALTH_LOG)
@@ -201,6 +203,7 @@ class Runtime:
 
         if self_register:
             self.controller.register = self.register_from_trigger
+        self.controller.on_clinic = self.adopt_clinic
         await self.controller.start()
         self.ws.set_controller(self.controller)
         self.ws.set_register_source(self.uploader, self.controller.hospital_id)
@@ -343,12 +346,38 @@ class Runtime:
                 self.controller.register = None
             return None
 
+    def adopt_clinic(self, hospital_id: str) -> None:
+        """
+        The server says this PC now belongs to another clinic: an administrator
+        moved it on the dashboard (3.9.3). The new clinic is saved, so it holds
+        after a restart; the next patient records there; and recordings held
+        because their grant named the new clinic are asked for again at once.
+        A recording in progress finishes under the clinic it started at.
+        """
+        if self.identity is None or not hospital_id or hospital_id == self.identity.hospital_id:
+            return
+        from core.enrollment import save_clinic
+        was = self.identity.hospital_id
+        try:
+            self.identity = save_clinic(self.cfg, self.identity, hospital_id)
+        except OSError as exc:
+            # Still adopted for this run; saved again at the next heartbeat.
+            logger.error("Could not save the new clinic %s: %s", hospital_id, exc)
+            self.identity = replace(self.identity, hospital_id=hospital_id)
+        if self.controller is not None:
+            self.controller.hospital_id = hospital_id
+        self.ws.set_register_source(self.uploader, hospital_id)
+        released = self.uploader.clinic_changed(hospital_id) if self.uploader else 0
+        logger.warning("This PC was moved from %s to %s by AIMS LAB; %d held recording(s) "
+                       "asked for again", was, hospital_id, released)
+
     def adopt_identity(self, identity, device_token: Optional[str]) -> None:
         """Enrolled while running: from now on this PC records and uploads."""
         self.identity = identity
         if self.uploader is not None:
             self.uploader.set_device_token(device_token)
             self.uploader.device_id = identity.device_id
+            self.uploader.hospital_id = identity.hospital_id
         if self.controller is not None:
             self.controller.device_id = identity.device_id
             self.controller.hospital_id = identity.hospital_id

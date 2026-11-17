@@ -832,6 +832,16 @@ class SessionController:
 
     async def _on_heartbeat_reply(self, reply: Dict[str, Any]) -> None:
         """What the server's heartbeat reply asks of this PC."""
+        clinic = reply.get("hospital_id") if isinstance(reply, dict) else None
+        if isinstance(clinic, str) and clinic and self.device_id and clinic != self.hospital_id:
+            # An administrator moved this PC on the dashboard (3.9.3). Before,
+            # the PC kept the clinic it joined at and refused every grant for
+            # the new one until it was made to join again by hand.
+            adopt = getattr(self, "on_clinic", None)
+            if adopt is not None:
+                adopt(clinic)
+            else:
+                self.hospital_id = clinic
         if isinstance(reply, dict) and reply.get("trusted_origins"):
             from core import trusted_origins
             trusted_origins.apply(reply["trusted_origins"])

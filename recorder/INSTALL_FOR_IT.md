@@ -30,6 +30,12 @@ with a software key that Windows locks to that PC, as every PC did before 3.6,
 and the dashboard's PC list shows it as "software key (no TPM chip)". Nobody
 needs to change BIOS settings. A PC keeps the key it joined with.
 
+**Moving a PC to another clinic is one click on the dashboard** (from 3.9.3).
+The PC learns its new clinic at its next check-in, within 30 seconds, and
+records the next patient there; recordings it held from before the move
+upload as well. Nothing is done on the PC. Before 3.9.3 a moved PC refused
+every recording until it was made to join again by hand.
+
 ---
 
 ## 2. Before you install: check the file
