@@ -526,6 +526,44 @@ async def rematch_waiting(limit: int = 500) -> List[str]:
     return confirmed
 
 
+async def confirm_same_visit(limit: int = 500) -> List[str]:
+    """
+    Confirm every recording of a visit CMED has confirmed, from the same PC.
+
+    A doctor who stops and starts again for the same patient makes a new
+    recording each time, under a grant of its own, and one API 2 confirms one
+    grant - so on 16 Nov the longest recordings of VIS-T-31492 (16 and 10
+    pieces) waited to be erased while a 2-piece one was kept. CMED's message
+    proves the consultation took place; the same PC recording the same five
+    fields is that consultation. Not when the patient refused it, and not
+    when another PC also asked for it (an administrator decides those).
+    Filed where the confirmed recording is.
+    """
+    repo = api_v2._repo()
+    confirmed: List[str] = []
+    for row in await repo.waiting_same_visit(limit):
+        try:
+            visit = api_v2._visit_from_grant(row)
+            if await repo.refused_visit(visit.digest()):
+                continue
+            if row["clinic"] and row["clinic"] != row["hospital_id"]:
+                await repo.refile_session(row["session_id"], row["jti"], row["clinic"])
+            await repo.set_session_confirmation(row["session_id"], "confirmed")
+            await repo.audit(event_type="session.confirmed", actor_type="service",
+                             actor_id="channel-b", session_id=row["session_id"],
+                             detail={"same_visit_as": row["confirmed_by"],
+                                     "clinic": row["clinic"]})
+            await api_v2.confirm_continuations(row["session_id"])
+            if row["clinic"] != row["hospital_id"] and row.get("closed_at") is not None:
+                await api_v2._record_file_name(row["session_id"])   # the name carries the clinic
+            confirmed.append(row["session_id"])
+            logger.info("Session %s confirmed: the same visit as %s", row["session_id"],
+                        row["confirmed_by"])
+        except Exception as exc:                    # one row never stops the others
+            logger.warning("Could not confirm %s with its visit: %s", row.get("session_id"), exc)
+    return confirmed
+
+
 async def mark_json_for_rewrite(visit: Visit, hospital_id: Optional[str] = None
                                 ) -> Optional[str]:
     """
@@ -550,6 +588,6 @@ def _now_iso() -> str:
 
 
 __all__ = ["router", "receive", "process", "list_visits", "check_hospital",
-           "confirm_waiting", "rematch_waiting", "mark_json_for_rewrite",
+           "confirm_waiting", "rematch_waiting", "confirm_same_visit", "mark_json_for_rewrite",
            "attach_to_recording", "patient_visits",
            "problems_with", "key_digest", "MAX_BODY_BYTES"]
