@@ -594,8 +594,14 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                       AND a.alert_type = 'microphone_switched') AS mic_switches,
                    -- 18 Nov: an open recording on a PC gone quiet is not "active".
                    (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
-                       AS pc_last_seen
+                       AS pc_last_seen,
+                   -- 18 Nov: the visit CMED's API 2 and API 3 are matched on.
+                   g.cmed_hospital_id AS cmed_code,
+                   COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+                   g.start_time AS cmed_start_time
               FROM sessions s
+              LEFT JOIN grant_authorisations g
+                     ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
              WHERE {' AND '.join(where)}
              ORDER BY s.opened_at DESC NULLS LAST
              LIMIT ${len(args)}
@@ -617,9 +623,42 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                     "needs_review": p["needs_review"],
                     "start_seconds": p["start_seconds"], "end_seconds": p["end_seconds"]})
 
+    times = await _cmed_message_times(rows)
     return {"count": len(rows),
-            "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], [])}
+            "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], []),
+                            **times.get(r["session_id"], {})}
                            for r in rows]}
+
+
+async def _cmed_message_times(rows) -> Dict[str, Dict[str, Any]]:
+    """
+    18 Nov 2026: when CMED's API 2 and API 3 for each listed recording reached
+    us, so the newest recording's row answers "did API 2 come?" at a glance.
+    `cmed_matched` is False for a recording with nothing to match on (no
+    grant: a legacy recording). Never fails the list: unknown is None.
+    """
+    visits, out = [], {}
+    for r in rows:
+        keys = r.keys()
+        code = r["cmed_code"] if "cmed_code" in keys else None
+        matched = bool(code)
+        out[r["session_id"]] = {"api2_at": None, "api3_at": None, "cmed_matched": matched}
+        if matched:
+            visits.append({"key": r["session_id"], "cmed_hospital_id": code,
+                           "visit_id": r["cmed_visit_id"], "patient_id": r["patient_id"],
+                           "start_time": r["cmed_start_time"]})
+    store = api_v2.ctx.clinical
+    if not visits or store is None or not hasattr(store, "message_times"):
+        return out
+    try:
+        found = await store.message_times(visits)
+    except Exception as exc:
+        logger.warning("Could not read when API 2 / API 3 arrived: %s", exc)
+        return out
+    for key, when in found.items():
+        out[key].update({name: value.isoformat() if hasattr(value, "isoformat") else value
+                         for name, value in when.items()})
+    return out
 
 
 PC_QUIET = timedelta(minutes=10)

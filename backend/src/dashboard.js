@@ -873,6 +873,17 @@ function micTag(m) {
   return tag(m.kind === "jabra" ? "good" : "warn", m.label, names);
 }
 
+/* 18 Nov: when CMED's API 2 / API 3 for this recording's visit reached us. */
+function cmedArrival(r, iso, what) {
+  if (!r.cmed_matched) return `<span class="hint">–</span>`;
+  if (!iso) return tag("warn", "not received", `CMED's ${what} for this visit has not reached the server`);
+  const at = new Date(iso);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" });
+  const day = at.toLocaleDateString("en-CA", { timeZone: "Asia/Dhaka" });
+  const other = r.date && day !== String(r.date).slice(0, 10);
+  return tag("good", other ? `${day} ${time}` : time, `CMED's ${what} arrived ${at.toLocaleString([], { timeZone: "Asia/Dhaka" })}`);
+}
+
 function recordingsTable(list) {
   if (!list.length) {
     return STATE
@@ -882,7 +893,7 @@ function recordingsTable(list) {
   const showClinic = !$("clinic").value;
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
     + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
-    + `<th>CMED</th><th>Status</th>`
+    + `<th>CMED</th><th>API 2</th><th>API 3</th><th>Status</th>`
     + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
@@ -912,6 +923,8 @@ function recordingsTable(list) {
           + td("Length", `${num(r.minutes || 0)} min`, "num")
           + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
+          + td("API 2", cmedArrival(r, r.api2_at, "patient information"))
+          + td("API 3", cmedArrival(r, r.api3_at, "prescription"))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
           + td("Download", audioLinks(r))
