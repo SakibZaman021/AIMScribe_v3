@@ -130,6 +130,8 @@ apply aims_clinical aims_clinical_owner /aims/scripts/clinical/003_consultation_
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/004_patient_visit.sql
 # Every section of a visit as rows, and the research views (v_visit, ...).
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/005_visit_sections.sql
+# One row per visit, findable by patient: visit keys, the visit's files, v_visit_folder.
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/006_visit_folder.sql
 
 # The clinical database's read-only login, for the database viewer: its
 # password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.

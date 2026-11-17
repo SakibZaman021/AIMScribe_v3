@@ -709,7 +709,8 @@ class V2Repository:
                        quarantine_reason, sample_rate, channels, sample_width,
                        object_prefix, confirmation, grant_jti, file_stem,
                        local_start, local_end, copied_at, segments_deleted_at,
-                       json_stale, parts_count, parts_stale, continues_session_id
+                       json_stale, parts_count, parts_stale, continues_session_id,
+                       visit_id
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -1209,9 +1210,91 @@ class V2Repository:
                  WHERE session_id = $1 AND kind = $2
             """, session_id, kind))
 
+    async def set_visit_key(self, session_id: str, visit_key: str, *,
+                            part_no: Optional[int] = None) -> None:
+        """The recording's (or one part's) visit key: its folder in the cloud archive (044)."""
+        async with self._acquire() as conn:
+            if part_no is None:
+                await conn.execute("UPDATE sessions SET visit_key = $2 WHERE session_id = $1 "
+                                   "AND visit_key IS DISTINCT FROM $2", session_id, visit_key)
+            else:
+                await conn.execute("UPDATE consultation_parts SET visit_key = $3 "
+                                   "WHERE session_id = $1 AND part_no = $2 "
+                                   "AND visit_key IS DISTINCT FROM $3",
+                                   session_id, part_no, visit_key)
+
+    async def without_visit_key(self, limit: int = 5000) -> Tuple[List[Dict[str, Any]],
+                                                                  List[Dict[str, Any]]]:
+        """Recordings, and patients' parts of them, not yet given a visit key."""
+        async with self._acquire() as conn:
+            sessions = await conn.fetch("""
+                SELECT * FROM sessions
+                 WHERE visit_key IS NULL AND patient_id <> 'REDACTED'
+                   AND COALESCE(confirmation, '') NOT IN ('refused', 'expired')
+                 ORDER BY opened_at LIMIT $1
+            """, limit)
+            parts = await conn.fetch("""
+                SELECT p.* FROM consultation_parts p JOIN sessions s USING (session_id)
+                 WHERE p.visit_key IS NULL AND s.patient_id <> 'REDACTED'
+                   AND COALESCE(s.confirmation, '') NOT IN ('refused', 'expired')
+                 ORDER BY p.session_id, p.part_no LIMIT $1
+            """, limit)
+        return [dict(r) for r in sessions], [dict(r) for r in parts]
+
+    async def copies_to_move(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Copies still only in the old by-day folders, with what their visit's
+        folder needs: for scripts/backfill_visit_layout.py.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT c.id, c.session_id, c.kind, c.object_key, c.version, c.bytes,
+                       c.sha256, c.plain_sha256
+                  FROM cloud_copies c
+                 WHERE c.layout = 'by_day'
+                   AND NOT EXISTS (SELECT 1 FROM cloud_copies n
+                                    WHERE n.copied_from = c.object_key)
+                 ORDER BY c.id
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def record_moved_copy(self, old: Dict[str, Any], new_key: str) -> int:
+        """
+        A copy placed in its visit's folder by the backfill: a new row, the old
+        one untouched. The same bytes, so the same fingerprints and version.
+        """
+        async with self._acquire() as conn:
+            return int(await conn.fetchval("""
+                INSERT INTO cloud_copies
+                    (session_id, kind, object_key, version, bytes, sha256, plain_sha256,
+                     verified_at, layout, copied_from)
+                VALUES ($1,$2,$3,$4,$5,$6,$7, now(), 'by_visit', $8)
+                ON CONFLICT (object_key) DO UPDATE SET verified_at = now()
+                RETURNING id
+            """, old["session_id"], old["kind"], new_key, old["version"], old["bytes"],
+                 old["sha256"], old["plain_sha256"], old["object_key"]))
+
+    async def by_visit_copies(self, limit: int = 100000) -> List[Dict[str, Any]]:
+        """Every copy in a visit's folder, for registering in the clinical database."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT c.session_id, c.kind, c.object_key, c.version, c.bytes,
+                       COALESCE(p.doctor_id, s.doctor_id) AS doctor_id,
+                       CASE WHEN p.part_no IS NULL THEN s.visit_id END AS visit_id,
+                       s.hospital_id, p.part_no
+                  FROM cloud_copies c JOIN sessions s ON s.session_id = c.session_id
+                  LEFT JOIN consultation_parts p
+                         ON p.session_id = c.session_id AND p.file_stem IS NOT NULL
+                        AND c.object_key LIKE '%/' || p.file_stem || '.v%'
+                 WHERE c.layout = 'by_visit' ORDER BY c.id LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
     async def record_cloud_copy(
         self, *, session_id: str, kind: str, object_key: str, version: int,
         byte_length: int, sha256: bytes, plain_sha256: Optional[bytes],
+        layout: str = "by_day",
     ) -> int:
         """
         One verified object in the copy bucket, recorded only after the worker
@@ -1225,15 +1308,15 @@ class V2Repository:
             return int(await conn.fetchval("""
                 INSERT INTO cloud_copies
                     (session_id, kind, object_key, version, bytes, sha256,
-                     plain_sha256, verified_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+                     plain_sha256, verified_at, layout)
+                VALUES ($1,$2,$3,$4,$5,$6,$7, now(), $8)
                 ON CONFLICT (object_key) DO UPDATE
                     SET bytes = EXCLUDED.bytes, sha256 = EXCLUDED.sha256,
                         plain_sha256 = EXCLUDED.plain_sha256,
                         uploaded_at = now(), verified_at = now()
                 RETURNING id
             """, session_id, kind, object_key, version, byte_length, sha256,
-                 plain_sha256))
+                 plain_sha256, layout))
 
     async def copies_for(self, session_id: str) -> List[Dict[str, Any]]:
         async with self._acquire() as conn:
