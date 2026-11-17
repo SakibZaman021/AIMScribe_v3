@@ -1328,9 +1328,10 @@ async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
     for kind, suffix in (("audio", "wav.enc"), ("json", "json.enc")):
         place = await api_v2.archive_copy_authorize(
             api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
-        # In the visit's folder (044): no visit_id came, so CMED's start_time names it.
-        assert place["object_key"] == (f"visits/P0012345/P0012345_DR0042_20260913T101432/"
-                                       f"{STEM}.v1.{suffix}")
+        # Hospital, doctor, day, then the visit's folder (18 Nov): no visit_id came, so
+        # CMED's start_time names the visit.
+        assert place["object_key"] == (f"HOSP003/DR0042/2026-09-13/"
+                                       f"P0012345_DR0042_20260913T101432/{STEM}.v1.{suffix}")
         assert place["version"] == 1
         # The audio goes to cold storage; the JSON to the warm bucket beside it.
         assert place["bucket"] == ("aimscribe-copies" if kind == "audio"

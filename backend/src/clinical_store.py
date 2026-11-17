@@ -599,6 +599,24 @@ class ClinicalStore:
                 part_no, kind, object_key, version, byte_length)
         return added is not None
 
+    async def visit_id_for(self, cmed_hospital_id: str, patient_id: str,
+                           start_time: str) -> Optional[str]:
+        """CMED's visit_id for a visit, from its interface-4 messages."""
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("""
+                SELECT visit_id FROM patient_visit
+                 WHERE hospital_id = $1 AND hospital_patient_id = $2
+                   AND start_time = $3::timestamptz
+                 ORDER BY id DESC LIMIT 1
+            """, cmed_hospital_id, patient_id, start_time)
+
+    async def forget_object(self, object_key: str) -> int:
+        """A file removed from the archive (moved on): its register row goes."""
+        async with self._pool.acquire() as conn:
+            done = await conn.execute("DELETE FROM visit_objects WHERE object_key = $1",
+                                      object_key)
+        return int(done.split()[-1]) if done else 0
+
     async def forget_session_objects(self, session_id: str) -> int:
         """A refused or expired recording: its files are erased, so is their register."""
         async with self._pool.acquire() as conn:

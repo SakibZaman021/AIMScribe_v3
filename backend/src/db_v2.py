@@ -1243,15 +1243,17 @@ class V2Repository:
 
     async def copies_to_move(self, limit: int = 500) -> List[Dict[str, Any]]:
         """
-        Copies still only in the old by-day folders, with what their visit's
-        folder needs: for scripts/backfill_visit_layout.py.
+        Copies not yet in their visit's folder inside the day's folder: loose in
+        a day's folder, or in the 17 Nov visits/<patient>/ layout. Not yet
+        copied on, and still in the store. For visit_layout.move_copies.
         """
         async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT c.id, c.session_id, c.kind, c.object_key, c.version, c.bytes,
                        c.sha256, c.plain_sha256
                   FROM cloud_copies c
-                 WHERE c.layout = 'by_day'
+                 WHERE (c.layout = 'by_day' OR c.object_key LIKE 'visits/%')
+                   AND c.removed_at IS NULL
                    AND NOT EXISTS (SELECT 1 FROM cloud_copies n
                                     WHERE n.copied_from = c.object_key)
                  ORDER BY c.id
@@ -1260,7 +1262,7 @@ class V2Repository:
         return [dict(r) for r in rows]
 
     async def old_copies_with_twin(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """By-day copies still in the store whose visit-folder twin is recorded (045)."""
+        """Copies still in the store whose moved-on twin is recorded (045)."""
         async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT o.id, o.session_id, o.kind, o.object_key, o.bytes, o.sha256,
@@ -1268,7 +1270,7 @@ class V2Repository:
                   FROM cloud_copies o
                   JOIN cloud_copies n ON n.copied_from = o.object_key AND n.layout = 'by_visit'
                                      AND n.removed_at IS NULL
-                 WHERE o.layout = 'by_day' AND o.removed_at IS NULL
+                 WHERE o.removed_at IS NULL
                  ORDER BY o.id LIMIT $1
             """, limit)
         return [dict(r) for r in rows]
@@ -1300,13 +1302,15 @@ class V2Repository:
             rows = await conn.fetch("""
                 SELECT c.session_id, c.kind, c.object_key, c.version, c.bytes,
                        COALESCE(p.doctor_id, s.doctor_id) AS doctor_id,
+                       COALESCE(p.patient_id, s.patient_id) AS patient_id,
                        CASE WHEN p.part_no IS NULL THEN s.visit_id END AS visit_id,
                        s.hospital_id, p.part_no
                   FROM cloud_copies c JOIN sessions s ON s.session_id = c.session_id
                   LEFT JOIN consultation_parts p
                          ON p.session_id = c.session_id AND p.file_stem IS NOT NULL
                         AND c.object_key LIKE '%/' || p.file_stem || '.v%'
-                 WHERE c.layout = 'by_visit' ORDER BY c.id LIMIT $1
+                 WHERE c.layout = 'by_visit' AND c.removed_at IS NULL
+                 ORDER BY c.id LIMIT $1
             """, limit)
         return [dict(r) for r in rows]
 
