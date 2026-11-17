@@ -894,6 +894,12 @@ function recordingsTable(list) {
           const [tone, text] = ENDED[r.close_reason] || ["warn", "Stopped: " + human(r.close_reason)];
           status.push(tag(tone, text));
         }
+        // 18 Nov: open, but its PC has gone quiet - the audio waits on that PC.
+        if (r.on_pc_offline_since) {
+          status.push(tag("warn", "Waiting on the PC (offline since "
+            + esc(r.on_pc_offline_since.replace("T", " ").slice(0, 16)) + " UTC)",
+            "The PC went offline with this recording open. Its audio is on the PC and is sent, and the recording closed, when the PC is back online."));
+        }
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";

@@ -591,7 +591,10 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
                    s.microphones,
                    (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
-                      AND a.alert_type = 'microphone_switched') AS mic_switches
+                      AND a.alert_type = 'microphone_switched') AS mic_switches,
+                   -- 18 Nov: an open recording on a PC gone quiet is not "active".
+                   (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
+                       AS pc_last_seen
               FROM sessions s
              WHERE {' AND '.join(where)}
              ORDER BY s.opened_at DESC NULLS LAST
@@ -617,6 +620,19 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     return {"count": len(rows),
             "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], [])}
                            for r in rows]}
+
+
+PC_QUIET = timedelta(minutes=10)
+
+
+def _offline_since(row) -> Optional[str]:
+    keys = row.keys()
+    if "pc_last_seen" not in keys or row["closed_at"] is not None:
+        return None
+    seen = row["pc_last_seen"]
+    if seen is None or datetime.now(timezone.utc) - seen < PC_QUIET:
+        return None
+    return seen.isoformat()
 
 
 def _recording_row(row) -> Dict[str, Any]:
@@ -645,6 +661,10 @@ def _recording_row(row) -> Dict[str, Any]:
         "archive_relpath": row["archive_relpath"],
         "quarantine_reason": row["quarantine_reason"],
         "close_reason": row["close_reason"],
+        # Still open, and its PC not heard from for PC_QUIET: the audio is on
+        # that PC, waiting, and arrives (and the recording closes) when the PC
+        # is back online. Never closed from here - the PC still holds the audio.
+        "on_pc_offline_since": _offline_since(row),
         # 036: which microphone(s) the recording used, and how often it switched.
         "microphone": collectors.microphone_label(
             row["microphones"] if "microphones" in row.keys() else None,
