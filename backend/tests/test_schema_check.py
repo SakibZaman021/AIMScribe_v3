@@ -102,7 +102,8 @@ async def test_the_clinical_database_is_checked_too(dbs):
     # so the cascade takes them too.
     assert [p["migration"] for p in problems] == ["clinical/001_aims_clinical.sql",
                                                   "clinical/006_visit_folder.sql",
-                                                  "clinical/007_by_visit_tables.sql"]
+                                                  "clinical/007_by_visit_tables.sql",
+                                                  "clinical/008_patient_list.sql"]
 
 
 @postgres
