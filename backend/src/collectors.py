@@ -912,15 +912,42 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
     return False, "; ".join(f"{c}: {e}" for c, e in errors)[:500], errors[0][0]
 
 
-async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: str = "") -> bool:
+WAITING = "waiting"
+WAITING_NOTE = ("Telegram not connected yet: sent when they connect it "
+                "(email is not set up on this server)")
+
+
+def _unreachable(error: Optional[str]) -> bool:
+    """Failed only because there is no way to reach them yet - no Telegram, and no mail."""
+    text = (error or "").lower()
+    return text == "no way to reach this person" or text.startswith(
+        "email: mail is not set up")
+
+
+async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: str = "",
+                   late: bool = False) -> bool:
     """Send one kept alert and keep how it went; an alert that failed for a passing reason
-    gets its next try."""
+    gets its next try. One for a person not yet reachable waits for their Telegram."""
     note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body, audience, "
-                               "event_key "
+                               "event_key, created_at "
                                "FROM collector_notifications WHERE id = $1", note_id)
     if note is None:
         return False
-    ok, error, channel = await _send_to(conn, dict(note))
+    sending = dict(note)
+    if late:
+        sending["subject"] = (f"Sent late (from {_hhmm(note['created_at'])}, before Telegram "
+                              f"was connected): {note['subject']}")
+    ok, error, channel = await _send_to(conn, sending)
+    if not ok and _unreachable(error):
+        # 17 Nov: these were lost - tried once by email, which is not set up, and
+        # never again. Now kept as waiting, and sent the moment they connect.
+        await conn.execute("""
+            UPDATE collector_notifications
+               SET delivered = FALSE, error = $2, channel = $3, attempts = attempts + 1,
+                   next_try_at = NULL
+             WHERE id = $1
+        """, note_id, WAITING_NOTE, WAITING)
+        return False
     attempts = await conn.fetchval("""
         UPDATE collector_notifications
            SET delivered = $2, error = $3, channel = COALESCE($4, channel),
@@ -932,6 +959,40 @@ async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: st
                            "WHERE id = $1", note_id,
                            timedelta(minutes=RETRY_WAITS[attempts - 1]))
     return ok
+
+
+WAITING_FOR = timedelta(hours=12)
+WAITING_MOST = 30
+
+
+async def send_waiting(conn, email: str) -> int:
+    """
+    Someone has just connected Telegram: send what waited for it - the last 12
+    hours, newest 30 at most, each marked late. Lost-by-email alerts from before
+    17 Nov count too. In quiet hours only summaries go; the rest are in the next
+    summary, as every alert at night is.
+    """
+    import watchers
+    rows = await conn.fetch("""
+        SELECT id, event, hospital_id, place_id FROM (
+            SELECT id, event, hospital_id, place_id FROM collector_notifications
+             WHERE email = $1 AND delivered = FALSE AND event <> 'send_failures'
+               AND created_at > now() - $2::interval
+               AND (channel = 'waiting' OR error LIKE 'email: mail is not set up%')
+             ORDER BY id DESC LIMIT $3) newest
+         ORDER BY id
+    """, email, WAITING_FOR, WAITING_MOST)
+    sent = 0
+    for r in rows:
+        if r["event"] not in watchers.SUMMARY_EVENTS and \
+                await watchers.quiet_for(conn, r["hospital_id"], r["place_id"]):
+            continue
+        if await _deliver(conn, r["id"], late=True):
+            sent += 1
+    if rows:
+        logger.info("Sent %s of %s waiting alert(s) to a newly connected Telegram",
+                    sent, len(rows))
+    return sent
 
 
 async def _hold(conn, note_id: int) -> None:
@@ -1099,8 +1160,11 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
     return sent
 
 
-THROTTLED = {"jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
-             "recording_without_jabra"}
+# 17 Nov: "recording_without_jabra" is no longer here. It is once per
+# consultation already (its event_key), and the 10-minute wait held the next
+# patient's alert up to 10 minutes - and dropped it when that consultation ended
+# inside the wait. The rest are a cable or a PC flapping, which the wait is for.
+THROTTLED = {"jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem"}
 
 
 _FOOTER_MARK = "\n\nOpen "
@@ -1599,6 +1663,7 @@ class Notifier:
             SELECT count(*) FROM collector_notifications
              WHERE delivered = FALSE AND created_at > now() - interval '30 minutes'
                AND event <> 'send_failures' AND channel IS DISTINCT FROM 'held'
+               AND channel IS DISTINCT FROM 'waiting'
         """)
         if failed < FAILURES_ALARM:
             return
@@ -1610,7 +1675,8 @@ class Notifier:
         last = await conn.fetchval("""
             SELECT error FROM collector_notifications
              WHERE delivered = FALSE AND event <> 'send_failures'
-               AND channel IS DISTINCT FROM 'held' ORDER BY id DESC LIMIT 1
+               AND channel IS DISTINCT FROM 'held' AND channel IS DISTINCT FROM 'waiting'
+             ORDER BY id DESC LIMIT 1
         """)
         logger.warning("%s alerts to data collectors failed in 30 minutes: %s", failed, last)
         subject = f"{failed} alerts to data collectors could not be sent"
@@ -1681,6 +1747,13 @@ class Notifier:
         """, row["email"])
         place = person["place"] if person else None
         await portal._audit("collector.telegram_linked", row["email"], {"username": username})
+        try:
+            await self._greet(conn, chat, row, person, place)
+        finally:
+            # 17 Nov: what waited for this Telegram, after the greeting.
+            await send_waiting(conn, row["email"])
+
+    async def _greet(self, conn, chat, row, person, place) -> None:
         if person is not None and person["role"] != "collector":
             import watchers
             mine = await watchers.watched_hospitals(row["email"], conn)

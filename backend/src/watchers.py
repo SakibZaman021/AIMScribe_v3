@@ -281,6 +281,26 @@ async def watchers_of(conn, hospital_id: Optional[str]) -> List[Tuple[str, str]]
     return [(r["email"], r["alert_mode"] or "everything") for r in rows]
 
 
+async def assigned_since(conn, hospital_id: Optional[str]) -> Dict[str, datetime]:
+    """When each researcher began looking after this hospital."""
+    if not hospital_id:
+        return {}
+    rows = await conn.fetch("SELECT email, added_at FROM researcher_hospitals "
+                            "WHERE hospital_id = $1 AND removed_at IS NULL", hospital_id)
+    return {r["email"]: r["added_at"] for r in rows}
+
+
+def _before_their_time(since: Dict[str, datetime], email: str,
+                       moment: Optional[datetime]) -> bool:
+    """
+    17 Nov: a researcher assigned at 16:29 was sent, at once, a refusal from
+    10:09 and every other alert of the day the rules still looked at - all
+    at the same second. They get what happens after they were assigned.
+    """
+    added = since.get(email)
+    return moment is not None and added is not None and moment < added
+
+
 async def _hospitals_for(conn, hospital_id: Optional[str], place_id: Optional[int]) -> List[str]:
     if hospital_id:
         return [hospital_id]
@@ -392,8 +412,12 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
     On 'problems', only urgent alerts and PROBLEMS_ONLY. In quiet hours (`hold`) it
     is kept, marked held, and not sent."""
     sent = 0
+    since = await assigned_since(conn, hospital_id) \
+        if happened_at is not None and event not in SUMMARY_EVENTS else {}
     for email, mode in await watchers_of(conn, hospital_id):
         if mode == "problems" and not urgent and event not in PROBLEMS_ONLY:
+            continue
+        if _before_their_time(since, email, happened_at):
             continue
         note_id = await collectors._record(
             conn, email=email, event=event, subject=subject, body=body, event_key=event_key,
@@ -408,12 +432,23 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
     return sent
 
 
-async def _to_watchers(conn, hospitals: List[str], **note) -> List[str]:
-    """One researcher message to everyone looking after any of these hospitals."""
+async def _to_watchers(conn, hospitals: List[str], *, since: Optional[datetime] = None,
+                       first_key: Optional[str] = None, **note) -> List[str]:
+    """One researcher message to everyone looking after any of these hospitals -
+    with `since`, the start of the problem, not to one assigned after it who
+    never had its first alert (`first_key`)."""
     told: List[str] = []
+    had_first = set()
+    if since is not None and first_key:
+        had_first = {r["email"] for r in await conn.fetch(
+            "SELECT email FROM collector_notifications WHERE event_key = $1 "
+            "AND audience = 'watcher'", first_key)}
     for hid in hospitals:
+        assigned = await assigned_since(conn, hid) if since is not None else {}
         for email, _mode in await watchers_of(conn, hid):
             if email in told:
+                continue
+            if email not in had_first and _before_their_time(assigned, email, since):
                 continue
             note_id = await collectors._record(conn, email=email, hospital_id=hid,
                                                audience="watcher", **note)
@@ -596,7 +631,8 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                                                       first["place_id"]),
                            event="still_not_fixed", subject=subject, body=body,
                            event_key=key, urgent=True, device_id=first["device_id"],
-                           session_id=first["session_id"])
+                           session_id=first["session_id"], since=first["created_at"],
+                           first_key=first["event_key"])
 
 
 async def repeated_stops(conn, now: Optional[datetime] = None) -> None:

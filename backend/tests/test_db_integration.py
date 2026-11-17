@@ -3153,6 +3153,151 @@ async def _watching_researcher(client, who, email, hospitals=("HOSP003",)):
         assert given.status_code == 200, given.text
 
 
+async def test_an_alert_for_someone_without_telegram_waits_and_arrives_when_they_connect(
+        dbs, monkeypatch):
+    """17 Nov: 27 alerts were lost - tried once by email, not set up, never again."""
+    import collectors
+    from datetime import datetime, timezone
+
+    async def no_mail(to, subject, text):
+        return False, "mail is not set up on this server (AIMS_RESEND_API_KEY)"
+
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "send_mail", no_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await dbs.repo.upsert_hospital("HOSP9W1", "Waiting clinic", "Asia/Dhaka")
+        await _make_collector(client, who, "late@gmail.example", hospitals=("HOSP9W1",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            await collectors.notify(conn, hospital_id="HOSP9W1", event="pc_silent",
+                                    subject="PC not reporting: HOSP9W1", body="Please check.",
+                                    event_key="waittest:1", urgent=True,
+                                    happened_at=datetime.now(timezone.utc))
+            note = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'late@gmail.example' "
+                                       "AND event_key = 'waittest:1'")
+            assert (note["delivered"], note["channel"]) == (False, "waiting")
+            assert "Telegram not connected" in note["error"] and note["next_try_at"] is None
+            # One lost before this change, the old way, is picked up too.
+            old = await collectors._record(conn, email="late@gmail.example", event="pc_silent",
+                                           subject="Older alert", body="b",
+                                           event_key="waittest:0", hospital_id="HOSP9W1")
+            await conn.execute("UPDATE collector_notifications SET channel = 'email', "
+                               "error = 'email: mail is not set up on this server "
+                               "(AIMS_RESEND_API_KEY)' WHERE id = $1", old)
+            # Waiting is not a failure to alarm AIMS LAB about.
+            assert await conn.fetchval("""
+                SELECT count(*) FROM collector_notifications
+                 WHERE email = 'late@gmail.example' AND delivered = FALSE
+                   AND channel IS DISTINCT FROM 'held' AND channel IS DISTINCT FROM 'waiting'
+            """) == 1
+
+        link = (await client.post("/api/v2/dashboard/collector/telegram/link", headers=h)).json()
+        code = link["url"].split("start=")[1]
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE collector_notifier_state SET last_id = 0 "
+                               "WHERE name = 'telegram'")
+            fake.updates = [{"update_id": 910001, "message": {
+                "chat": {"id": 4242, "type": "private"}, "text": f"/start {code}"}}]
+            await notifier.telegram_updates(conn)
+            texts = [m["text"] for m in fake.sent_to(4242)]
+            assert texts[0].startswith("Connected: late@gmail.example")
+            assert len(texts) == 3
+            assert all("Sent late (from " in t for t in texts[1:])
+            assert any("Older alert" in t for t in texts[1:])
+            assert any("PC not reporting: HOSP9W1" in t for t in texts[1:])
+            rows = await conn.fetch("SELECT delivered, channel, subject FROM "
+                                    "collector_notifications WHERE email = 'late@gmail.example' "
+                                    "AND event_key LIKE 'waittest:%' ORDER BY id")
+            assert [(r["delivered"], r["channel"]) for r in rows] == [(True, "telegram")] * 2
+            # The stored alert is kept as it was; only the message says "late".
+            assert sorted(r["subject"] for r in rows) == ["Older alert",
+                                                          "PC not reporting: HOSP9W1"]
+
+
+async def test_every_consultation_without_the_jabra_is_alerted_at_once(dbs, monkeypatch):
+    """17 Nov: the 10-minute wait per PC held the next patient's alert, or dropped it."""
+    import collectors
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append(subject)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await dbs.repo.upsert_hospital("HOSP9J1", "Jabra clinic", "Asia/Dhaka")
+        await _make_collector(client, who, "jabra@gmail.example", hospitals=("HOSP9J1",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            for n in (1, 2):
+                await collectors.notify(
+                    conn, hospital_id="HOSP9J1", event="recording_without_jabra",
+                    subject=f"Patient {n} recorded without the Jabra", body="b",
+                    event_key=f"nojabra:test{n}", urgent=True, device_id=device["device_id"])
+            # A flapping cable is still held to one alert per 10 minutes.
+            for n in (1, 2):
+                await collectors.notify(
+                    conn, hospital_id="HOSP9J1", event="jabra_unplugged",
+                    subject=f"Jabra unplugged {n}", body="b",
+                    event_key=f"unplug:test{n}", urgent=True, device_id=device["device_id"])
+    assert any("Patient 1 recorded without the Jabra" in x for x in sent)
+    assert any("Patient 2 recorded without the Jabra" in x for x in sent)
+    assert any("Jabra unplugged 1" in x for x in sent)
+    assert not any("Jabra unplugged 2" in x for x in sent)
+
+
+async def test_a_newly_assigned_researcher_gets_only_what_happens_afterwards(dbs, monkeypatch):
+    """17 Nov: assigned at 16:29, a researcher was sent a 10:09 refusal at once."""
+    import collectors
+    import watchers
+    from datetime import datetime, timedelta, timezone
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        # Its own hospital: the test database is shared, and HOSP003's researchers
+        # are counted by the tests after this one.
+        await dbs.repo.upsert_hospital("HOSP9N1", "Newcomer clinic", "Asia/Dhaka")
+        await _watching_researcher(client, who, "newcomer@uni.example",
+                                   hospitals=("HOSP9N1",))
+        now = datetime.now(timezone.utc)
+        async with dbs.rec.acquire() as conn:
+            await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP9N1", event="stopped_unusually", subject="Morning stop",
+                body="b", event_key="newcomer:old", urgent=True,
+                happened_at=now - timedelta(hours=6))
+            await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP9N1", event="stopped_unusually", subject="Fresh stop",
+                body="b", event_key="newcomer:new", urgent=True,
+                happened_at=now + timedelta(seconds=1))
+            # A follow-up about a problem that began before they were assigned: no.
+            await watchers._to_watchers(conn, ["HOSP9N1"], since=now - timedelta(hours=2),
+                                        event="still_not_fixed", subject="Old problem still",
+                                        body="b", event_key="newcomer:still", urgent=True)
+            await watchers._to_watchers(conn, ["HOSP9N1"], since=now + timedelta(seconds=1),
+                                        event="still_not_fixed", subject="New problem still",
+                                        body="b", event_key="newcomer:still2", urgent=True)
+    mine = [subject for to, subject in sent if to == "newcomer@uni.example"]
+    assert any("Fresh stop" in x for x in mine) and any("New problem still" in x for x in mine)
+    assert not any("Morning stop" in x or "Old problem still" in x for x in mine)
+
+
 async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_handled(
         dbs, monkeypatch):
     import collectors

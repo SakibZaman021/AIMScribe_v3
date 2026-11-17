@@ -1919,6 +1919,8 @@ async function collectorCall(method, path, body) {
 function sentTag(n) {
   if (n.delivered) return tag("good", n.channel === "telegram" ? "Telegram" : "email");
   if (n.channel === "held") return tag("quiet", "held (night)");
+  // 17 Nov: no Telegram yet - sent, marked late, the moment they connect it.
+  if (n.channel === "waiting") return tag("warn", "waiting for Telegram", n.error || "");
   return tag("warn", "not sent", n.error || "");
 }
 
