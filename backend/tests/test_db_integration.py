@@ -3702,9 +3702,15 @@ async def test_an_unusual_stop_is_told_with_the_doctor_the_pc_and_the_consultati
         assert "ROOM-2" in copy["subject"] and "the patient left the room" in copy["subject"]
         assert (declined, "stopwatch@uni.example") in notes
 
-        today = datetime.now(collectors.zone()).date()
+        # The report of the clinic day the recording started on - not "today":
+        # run between 00:00 and 00:12 Dhaka time, a recording opened 12
+        # minutes ago belongs to yesterday's report (CI failed so at 00:09 on
+        # 19 Nov 2026).
         async with dbs.rec.acquire() as conn:
-            text = await watchers.hospital_report(conn, "HOSP003", today)
+            opened = await conn.fetchval("SELECT opened_at FROM sessions WHERE session_id = $1",
+                                         left)
+            day = opened.astimezone(collectors.zone()).date()
+            text = await watchers.hospital_report(conn, "HOSP003", day)
         assert "stopped unusually" in text and "Stopped because:" in text
         assert "the patient left the room" in text
     _unserve()
