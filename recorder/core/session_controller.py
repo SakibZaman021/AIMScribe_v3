@@ -154,6 +154,9 @@ class ActiveSession:
     confirmation: str = ""                # confirming | confirmed | unconfirmed
     # Stop was pressed and the reason form is open (SRS-UIX-08).
     stop_hold: bool = False
+    # 3.9.4: Stop was pressed and the form is open; the recording carries on
+    # until a reason is saved, and no limit ends it meanwhile.
+    stop_pending: bool = False
     # Paused because Windows asked to shut down; resumed if it is cancelled.
     shutdown_hold: bool = False
     audio_seconds: float = 0.0
@@ -899,52 +902,70 @@ class SessionController:
 
     # ---- the limits ----
 
+    @staticmethod
+    def _limits_wait(active: ActiveSession) -> bool:
+        """
+        No limit ends a recording while the doctor's Stop form is open (the
+        reason may be a refusal), nor during the recorder's own holds. 3.9.4:
+        the doctor's own pause no longer stops the counselling limit - on 18
+        Nov a recording paused before CMED's prescription ran on until the next
+        patient. A paused recording captures nothing, so ending it loses nothing.
+        """
+        return active.stop_pending or (active.pause is not None
+                                       and active.pause.reason in _INTERNAL_PAUSES)
+
     async def _watch_limits(self, active: ActiveSession) -> None:
         """
-        Time limits, for bench tests only: both are off (0) by default, because
-        a clock must never end a real consultation (security.*_limit_seconds).
-        When set, neither runs while paused: a paused recording is already
-        silent, and the Stop form may be open with a reason that matters.
+        The counselling limit: two minutes after CMED's prescription the
+        recording ends by itself, at a quiet moment, unless the next patient
+        ended it first. The no-activity limit is for bench tests only (off by
+        default) and waits while paused.
         """
         poll = self._knob("limit_poll_seconds", 1.0)
         while self._active is active:
             await asyncio.sleep(poll)
-            if self._active is not active or active.pause is not None:
+            if self._active is not active or self._limits_wait(active):
                 continue
             now = time.monotonic()
             if active.armed_at is not None:
                 limit = self._knob("counselling_limit_seconds", 120.0)
                 if limit > 0 and now - active.armed_at >= limit:
-                    await self._end_at_a_pause(active, "counselling_limit")
-                    return
-            else:
+                    if await self._end_at_a_pause(active, "counselling_limit"):
+                        return
+            elif active.pause is None:
                 limit = self._knob("no_activity_limit_seconds", 0.0)
                 if limit > 0 and now - active.last_cmed_at >= limit:
-                    await self._close_by_limit(active, "no_activity_limit")
-                    return
+                    if await self._close_by_limit(active, "no_activity_limit"):
+                        return
 
-    async def _end_at_a_pause(self, active: ActiveSession, reason: str) -> None:
+    async def _end_at_a_pause(self, active: ActiveSession, reason: str) -> bool:
         """
         The limit is reached: close at the first quiet moment within the grace,
         so the recording does not end in the middle of the doctor's sentence.
+        Paused, it is silent already. False if it did not close (Stop pressed).
         """
         grace = self._knob("end_grace_seconds", 10.0)
         quiet = float(getattr(getattr(self.cfg, "segment", None), "silence_rms", 320))
         deadline = time.monotonic() + max(0.0, grace)
         step = min(0.2, max(0.01, grace / 50)) if grace > 0 else 0.0
         while time.monotonic() < deadline and self._active is active:
-            if getattr(active.segmenter, "live_level", 0.0) < quiet:
+            if active.pause is not None or \
+                    getattr(active.segmenter, "live_level", 0.0) < quiet:
                 break
             await asyncio.sleep(step)
-        await self._close_by_limit(active, reason)
+        return await self._close_by_limit(active, reason)
 
-    async def _close_by_limit(self, active: ActiveSession, reason: str) -> None:
+    async def _close_by_limit(self, active: ActiveSession, reason: str) -> bool:
         async with self._lock:
-            if self._active is not active or active.pause is not None:
-                return
-            logger.info("Session %s ended by itself: %s", active.session_id, reason)
+            if self._active is not active:
+                return True
+            if self._limits_wait(active):
+                return False
+            logger.info("Session %s ended by itself: %s%s", active.session_id, reason,
+                        " (it was paused)" if active.pause is not None else "")
             self._forget()
             await self._close_active(reason=reason)
+            return True
 
     def _background_task(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -1035,6 +1056,27 @@ class SessionController:
                 "paused_at": crypto.iso_utc(now),
             }
 
+    async def stop_requested(self) -> Dict[str, Any]:
+        """
+        3.9.4: Stop was pressed on the on-screen control and the reason form is
+        open. The recording CARRIES ON until a reason is saved (the lab's rule,
+        18 Nov 2026) - nothing is cut, so no gap is left if the doctor cancels;
+        a refusal still erases all of it. Meanwhile no limit ends it.
+        """
+        active = self._active
+        if active is None:
+            return {"status": "not_recording", "session_id": None}
+        active.stop_pending = True
+        return {"status": self.state, "session_id": active.session_id, "held": False}
+
+    async def stop_cancelled(self) -> Dict[str, Any]:
+        """The doctor cancelled the Stop form: nothing happened."""
+        active = self._active
+        if active is None:
+            return {"status": "unchanged", "session_id": None}
+        active.stop_pending = False
+        return {"status": self.state, "session_id": active.session_id}
+
     async def hold_for_stop(self) -> Dict[str, Any]:
         """
         Stop was pressed on the on-screen control: cut the microphone now.
@@ -1111,9 +1153,12 @@ class SessionController:
 
             paused_for = time.monotonic() - active.pause.started_monotonic
             active.paused_seconds += paused_for
-            # A pause counts towards neither limit.
+            # A pause does not count towards the no-activity limit. 3.9.4: the
+            # doctor's pause does count towards the counselling limit - it runs
+            # through the pause (before, the whole pause was added on, even the
+            # part before the prescription came). The recorder's own holds do not.
             active.last_cmed_at += paused_for
-            if active.armed_at is not None:
+            if active.armed_at is not None and active.pause.reason in _INTERNAL_PAUSES:
                 active.armed_at += paused_for
 
             entry = active.spool.append_chain_entry("resume", crypto.resume_payload(

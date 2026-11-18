@@ -248,6 +248,57 @@ async def test_no_limit_ends_a_paused_recording(monkeypatch, spool, device_key):
     await ctl.close()
 
 
+async def test_the_counselling_limit_ends_a_paused_recording(monkeypatch, spool, device_key):
+    """
+    3.9.4, 18 Nov: paused before CMED's prescription, a recording ran on until
+    the next patient. The doctor's pause no longer stops the two-minute limit.
+    """
+    ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.2,
+                   end_grace_seconds=5.0)
+    ctl.cfg.pause.reasons = ("other", "sensitive_personal_matter")
+    first = await ctl.open_session(trigger("P1", at(0)))
+    ctl._active.segmenter.live_level = 4000.0           # loud before the pause
+    await ctl.pause_session(reason="sensitive_personal_matter")
+    await ctl.arm(patient_id="P1", session_id=first["session_id"])
+    assert await wait_for(lambda: ctl.state == "idle", 1.5)   # no grace wait: it is silent
+    assert closed_reason(ctl) == "counselling_limit"
+    await ctl.close()
+
+
+async def test_a_pause_after_the_prescription_does_not_push_the_limit_back(monkeypatch, spool,
+                                                                          device_key):
+    """3.9.4: resuming used to add the whole pause onto the two minutes."""
+    ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.6,
+                   end_grace_seconds=0.0)
+    ctl.cfg.pause.reasons = ("other", "sensitive_personal_matter")
+    first = await ctl.open_session(trigger("P1", at(0)))
+    await ctl.arm(patient_id="P1", session_id=first["session_id"])
+    armed = ctl._active.armed_at
+    await ctl.pause_session(reason="sensitive_personal_matter")
+    await asyncio.sleep(0.2)
+    await ctl.resume_session()
+    assert ctl._active.armed_at == armed
+    assert await wait_for(lambda: ctl.state == "idle", 1.5)
+    await ctl.close()
+
+
+async def test_no_limit_ends_it_while_the_stop_form_is_open(monkeypatch, spool, device_key):
+    """3.9.4: Stop pressed - recording carries on, and no clock closes it under the
+    doctor (the reason may be a refusal); Cancel lets the limit end it."""
+    ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.1,
+                   end_grace_seconds=0.0)
+    first = await ctl.open_session(trigger("P1", at(0)))
+    await ctl.stop_requested()
+    assert ctl.state == "recording" and ctl._active.recorder.is_running
+    await ctl.arm(patient_id="P1", session_id=first["session_id"])
+    await asyncio.sleep(0.4)
+    assert ctl.state == "recording"                      # the form is open
+    await ctl.stop_cancelled()
+    assert await wait_for(lambda: ctl.state == "idle", 1.5)
+    assert closed_reason(ctl) == "counselling_limit"
+    await ctl.close()
+
+
 async def test_a_limit_of_zero_is_off(monkeypatch, spool, device_key):
     ctl = ctl_with(monkeypatch, spool, device_key, no_activity_limit_seconds=0,
                    counselling_limit_seconds=0)
