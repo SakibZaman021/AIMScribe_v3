@@ -137,6 +137,8 @@ apply aims_clinical aims_clinical_owner /aims/scripts/clinical/006_visit_folder.
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/007_by_visit_tables.sql
 # One row per patient: by_visit.patient_list.
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/008_patient_list.sql
+# The two functions the visit tables use, with every table named in full (19 Nov).
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/009_qualified_functions.sql
 
 # The clinical database's read-only login, for the database viewer: its
 # password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.
