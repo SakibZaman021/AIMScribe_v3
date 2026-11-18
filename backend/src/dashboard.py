@@ -595,6 +595,10 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    -- 18 Nov: an open recording on a PC gone quiet is not "active".
                    (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
                        AS pc_last_seen,
+                   -- 18 Nov: the PC it was recorded on, by its Windows name.
+                   (SELECT d.machine_name FROM devices d WHERE d.device_id = s.device_id)
+                       AS pc_name,
+                   s.device_id::text AS pc_id,
                    -- 18 Nov: the visit CMED's API 2 and API 3 are matched on.
                    g.cmed_hospital_id AS cmed_code,
                    COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
@@ -667,6 +671,7 @@ def _plain(value: Any) -> Any:
 
 @router.get("/patient/{patient_ref}")
 async def patient_history(patient_ref: str, request: Request,
+                          visit_id: Optional[str] = None,
                           _: None = Depends(require_viewer),
                           scope: Any = Depends(collectors.hospital_scope)):
     """
@@ -682,6 +687,13 @@ async def patient_history(patient_ref: str, request: Request,
         ref = safe_identifier(patient_ref.strip(), field="patient_id")
     except ValueError:
         raise HTTPException(status_code=400, detail="Give a patient ID or a visit ID.")
+    # 18 Nov: with a visit ID as well, that one consultation only.
+    only_visit = None
+    if isinstance(visit_id, str) and visit_id.strip():
+        only_visit = visit_id.strip()
+        if not api_v2.VISIT_ID.match(only_visit):
+            raise HTTPException(status_code=400,
+                                detail="A visit ID has letters, digits and '-' only.")
     store = api_v2.ctx.clinical
     if store is None:
         raise HTTPException(status_code=503, detail="The clinical database is not connected.")
@@ -705,6 +717,8 @@ async def patient_history(patient_ref: str, request: Request,
     visits: List[Dict[str, Any]] = []
     for v in rows["overview"]:
         if visible is not None and v.get("clinic") not in visible:
+            continue
+        if only_visit is not None and v.get("visit_id") != only_visit:
             continue
         key = v["visit_key"]
         demo = next((d for d in rows["demographics"] if d["visit_key"] == key), None)
@@ -742,8 +756,10 @@ async def patient_history(patient_ref: str, request: Request,
         v["recordings_detail"] = [recorded[i] for i in sorted(ids) if i in recorded]
 
     await store.log_access(actor=actor, action="dashboard.patient", patient_id=patient_id,
-                           detail={"visits": len(visits), "query": ref})
-    return {"query": ref, "found": True,
+                           detail={"visits": len(visits), "query": ref,
+                                   **({"visit_id": only_visit} if only_visit else {})})
+    return {"query": ref, "found": True, "visit_id": only_visit,
+            "visit_found": None if only_visit is None else bool(visits),
             "patient": {k: _plain(val) for k, val in people[0].items()} if people else None,
             "visits": visits}
 
@@ -818,6 +834,9 @@ def _recording_row(row) -> Dict[str, Any]:
         "archive_relpath": row["archive_relpath"],
         "quarantine_reason": row["quarantine_reason"],
         "close_reason": row["close_reason"],
+        # 18 Nov: the PC it was recorded on (its Windows name), to track a PC's problems.
+        "pc": row["pc_name"] if "pc_name" in row.keys() else None,
+        "pc_id": row["pc_id"] if "pc_id" in row.keys() else None,
         # Still open, and its PC not heard from for PC_QUIET: the audio is on
         # that PC, waiting, and arrives (and the recording closes) when the PC
         # is back online. Never closed from here - the PC still holds the audio.

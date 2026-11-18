@@ -114,3 +114,23 @@ async def test_a_data_collector_never_sees_a_clinical_record(dbs, monkeypatch):
     finally:
         _unserve()
     assert refused.value.status_code == 403
+
+
+async def test_patient_and_visit_id_give_that_one_consultation(dbs, monkeypatch):
+    """18 Nov: patient ID alone is the history; with a visit ID, that consultation."""
+    import dashboard
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    _server(dbs)
+    try:
+        await _two_visits(patient)
+        who = as_person(monkeypatch, "researcher")
+        one = await dashboard.patient_history(patient, who, visit_id=f"VIS-{patient}-1")
+        other = await dashboard.patient_history(patient, who, visit_id="VIS-NOT-THEIRS")
+        with pytest.raises(HTTPException) as bad:
+            await dashboard.patient_history(patient, who, visit_id="../x")
+    finally:
+        _unserve()
+    assert [v["visit_id"] for v in one["visits"]] == [f"VIS-{patient}-1"]
+    assert one["visit_found"] is True and one["visits"][0]["demographics"]["temperature"] == "99 F"
+    assert other["found"] is True and other["visit_found"] is False and other["visits"] == []
+    assert bad.value.status_code == 400

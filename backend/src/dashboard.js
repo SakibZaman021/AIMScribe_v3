@@ -894,9 +894,9 @@ function recordingsTable(list) {
       : empty("No recordings in this range", "Pick a wider range or another clinic.");
   }
   const showClinic = !$("clinic").value;
-  return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
+  return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>PC</th><th>Doctor</th>`
     + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
-    + `<th>CMED</th><th>API 2</th><th>API 3</th><th>Status</th>`
+    + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th>`
     + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
@@ -920,14 +920,15 @@ function recordingsTable(list) {
         return `<tr class="${tone}">`
           + td("Date", `${esc(r.date || "")}${t ? `<span class="sub2">${esc(t)}</span>` : ""}`)
           + (showClinic ? td("Clinic", esc(clinicName(r.hospital_id))) : "")
+          + td("PC", r.pc ? `<span title="${esc(r.pc_id || "")}">${esc(r.pc)}</span>` : `<span class="hint">–</span>`)
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
           + td("Visit", r.visit_id ? esc(r.visit_id) : `<span class="hint">–</span>`)
           + td("Length", `${num(r.minutes || 0)} min`, "num")
           + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
-          + td("API 2", cmedArrival(r, r.api2_at, "patient information"))
-          + td("API 3", cmedArrival(r, r.api3_at, "prescription"))
+          + td("Demographics", cmedArrival(r, r.api2_at, "demographics (API 2)"))
+          + td("Prescription", cmedArrival(r, r.api3_at, "prescription (API 3)"))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
           + td("Download", audioLinks(r))
@@ -1907,8 +1908,8 @@ function visitCard(v) {
       <span class="tags">${tag("quiet", v.visit_id || "no visit ID")} ${tag("quiet", v.doctor_id || "")}
         ${tag("quiet", v.clinic ? clinicName(v.clinic) : v.cmed_clinic_code || "")}</span></div>
     <div class="body pbody">
-      <div class="prow"><span class="pl">API 2</span><span class="pv">${pArrived(v.api2_received_at, v.api2_received)}</span></div>
-      <div class="prow"><span class="pl">API 3</span><span class="pv">${pArrived(v.api3_received_at, v.api3_received)}</span></div>
+      <div class="prow"><span class="pl">Demographics</span><span class="pv">${pArrived(v.api2_received_at, v.api2_received)}</span></div>
+      <div class="prow"><span class="pl">Prescription</span><span class="pv">${pArrived(v.api3_received_at, v.api3_received)}</span></div>
       ${pText("Age", d.age)}
       ${pText("Vitals", vitals)}
       ${pText("Complaints", p.chief_complaints)}
@@ -1923,17 +1924,23 @@ function visitCard(v) {
     </div>
   </section>`;
 }
-async function loadPatient(ref) {
+async function loadPatient(ref, visit) {
   $("patientMsg").textContent = "Looking up…";
   $("patientOut").innerHTML = "";
   try {
-    const d = await api(`/patient/${encodeURIComponent(ref)}`);
+    const d = await api(`/patient/${encodeURIComponent(ref)}`, visit ? { visit_id: visit } : {});
     if (!d.found) {
       $("patientMsg").textContent = `No patient or visit "${ref}" is held.`;
       return;
     }
     const pt = d.patient || {};
-    $("patientMsg").textContent = `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
+    if (d.visit_found === false) {
+      $("patientMsg").textContent = `${pt.patient_id || ref} has no visit "${visit}". Clear the visit ID to see every visit.`;
+      return;
+    }
+    $("patientMsg").textContent = visit
+      ? `Visit ${visit} of ${pt.patient_id || ref}.`
+      : `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
     $("patientOut").innerHTML = `<section class="panel"><div class="head wrap"><h3>${esc(pt.patient_id || ref)}</h3>
       <span class="tags">${tag("quiet", pt.cmed_clinic_code || "")}</span></div>
       <div class="body pbody">
@@ -1948,7 +1955,7 @@ async function loadPatient(ref) {
 $("patientForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const ref = $("patientRef").value.trim();
-  if (ref) loadPatient(ref);
+  if (ref) loadPatient(ref, $("visitRef").value.trim());
 });
 
 function startBulk() {
