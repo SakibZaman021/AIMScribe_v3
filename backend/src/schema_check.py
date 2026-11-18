@@ -224,6 +224,10 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      "SELECT to_regclass('by_visit.overview') IS NOT NULL"),
     ("clinical/008_patient_list.sql", "clinical", "view by_visit.patient_list",
      "SELECT to_regclass('by_visit.patient_list') IS NOT NULL"),
+    # Without it the database viewer cannot open by_visit.demographics.
+    ("clinical/009_qualified_functions.sql", "clinical", "visit_vital_value names its table",
+     "SELECT coalesce((SELECT position('public.visit_vital' IN prosrc) > 0 FROM pg_proc "
+     "WHERE proname = 'visit_vital_value' LIMIT 1), false)"),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
      _table("consultation_findings")),

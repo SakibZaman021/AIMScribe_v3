@@ -99,3 +99,26 @@ async def test_the_reading_logins_start_in_the_readable_tables(pg, dbs):
         """)
     assert path_of(rows, "aims_clinical_reader") == ["search_path=by_visit, public"]
     assert path_of(rows, "aims_clinical_writer") == []          # the server keeps public
+
+
+async def test_the_tables_open_in_the_viewers_schema(dbs):
+    """
+    19 Nov: choosing the by_visit schema, the database viewer runs
+    SET search_path TO by_visit - and demographics failed with
+    'relation "visit_vital" does not exist'. Every table and function must
+    work with by_visit alone on the path.
+    """
+    api_v2.ctx.clinical = dbs.clinical
+    try:
+        patient = f"P{uuid.uuid4().hex[:7]}"
+        await _visit(patient, "VIS-SP-1", "2026-11-17", "2026-11-17T11:50:39+06:00", dx="Fever")
+        async with dbs.cli.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL search_path TO by_visit")
+                for view in ("patient_list", "overview", "demographics", "prescription",
+                             "medicines", "files"):
+                    await conn.fetch(f"SELECT * FROM {view} WHERE patient_id = $1", patient)
+                rows = await conn.fetch("SELECT * FROM public.patient_folder($1)", patient)
+        assert len(rows) == 1
+    finally:
+        api_v2.ctx.clinical = None
