@@ -112,3 +112,33 @@ async def test_a_recording_with_nothing_to_match_shows_no_columns(dbs):
         _unserve()
     row = next(r for r in listed["recordings"] if r["session_id"] == sid)
     assert row["cmed_matched"] is False and row["api2_at"] is None
+
+
+async def test_a_reused_visit_id_from_another_consultation_is_not_this_ones(dbs):
+    """
+    18 Nov, Aalo Karail: CMED's page started a recording at 16:18:33 with
+    visit-95edb904; CMED's server later sent API 2 and API 3 for the same
+    visit_id but another consultation (start 20:07:39, another doctor). The
+    columns said "received" while the recording rightly stayed unconfirmed.
+    A message counts for a recording only when it is the same consultation.
+    """
+    import clinical_v4
+    import dashboard
+    device = await enrolled_device(dbs.repo)
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    sid = await _recording(dbs, device, patient, visit_id="visit-reused")   # starts at START
+    api_v2.ctx.clinical = dbs.clinical
+    body = {"visit_id": "visit-reused", "patient_id": patient, "doctor_id": "260-0",
+            "hospital_id": "CMED-DHOLPUR", "start_time": "2026-11-17T20:07:39+06:00",
+            "date": "2026-11-17"}
+    for kind in ("patient_information", "prescription"):
+        await clinical_v4.file_message(kind, body, "CMED-DHOLPUR", "visit-reused", patient,
+                                       clinical_v4.read(kind, body), "t")
+    _server(dbs)
+    try:
+        listed = await dashboard.recordings(patient_id=patient)
+    finally:
+        _unserve()
+    row = next(r for r in listed["recordings"] if r["session_id"] == sid)
+    assert row["cmed_matched"] is True
+    assert row["api2_at"] is None and row["api3_at"] is None

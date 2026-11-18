@@ -76,6 +76,19 @@ def _row(row, *, drop: Tuple[str, ...] = ()) -> Dict[str, Any]:
     return out
 
 
+def _same_moment(stored, sent: Optional[str]) -> bool:
+    """A stored start time (timestamptz) and CMED's text one name the same second."""
+    if stored is None or not sent:
+        return False
+    try:
+        moment = datetime.datetime.fromisoformat(str(sent).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        return False
+    return abs((stored - moment).total_seconds()) < 1
+
+
 class ClinicalStore:
     def __init__(self, pool, *, separate: bool = True):
         self._pool = pool
@@ -623,8 +636,8 @@ class ClinicalStore:
         async with self._pool.acquire() as conn:
             if by_id:
                 rows = await conn.fetch("""
-                    SELECT pv.hospital_id, pv.visit_id, pv.patient_information_at,
-                           pv.prescription_at
+                    SELECT pv.hospital_id, pv.visit_id, pv.hospital_patient_id,
+                           pv.start_time, pv.patient_information_at, pv.prescription_at
                       FROM patient_visit pv
                       JOIN unnest($1::text[], $2::text[]) AS w(code, visit)
                         ON pv.hospital_id = w.code AND pv.visit_id = w.visit
@@ -632,7 +645,11 @@ class ClinicalStore:
                 found = {(r["hospital_id"], r["visit_id"]): r for r in rows}
                 for v in by_id:
                     r = found.get((v["cmed_hospital_id"], v["visit_id"]))
-                    if r is not None:
+                    # 18 Nov: a visit_id alone is not enough. CMED's Karail system
+                    # sends one visit_id for a patient's every consultation, so
+                    # the message counts only when it is this consultation's:
+                    # the same patient and the same start time, to the second.
+                    if r is not None and r["hospital_patient_id"] == v.get("patient_id")                             and _same_moment(r["start_time"], v.get("start_time")):
                         keep(v["key"], r["patient_information_at"], r["prescription_at"])
             if by_fields:
                 rows = await conn.fetch("""
