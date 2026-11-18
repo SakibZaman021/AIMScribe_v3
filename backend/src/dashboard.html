@@ -148,11 +148,13 @@
     <section class="view" data-view="patient" aria-label="Patients" hidden>
       <section class="panel" aria-labelledby="h-patient">
         <div class="head wrap"><h3 id="h-patient">Find a patient</h3>
-          <button type="button" class="q" aria-label="About patients" data-tip="Type CMED's patient ID (or one of their visit IDs). Every visit of that patient appears, newest first: demographics and vitals from API 2, the prescription from API 3, and the recordings. Each look-up is logged by your name.">?</button></div>
+          <button type="button" class="q" aria-label="About patients" data-tip="Patient ID alone: every visit of that patient, newest first. Patient ID and visit ID: that one consultation. Each shows the demographics and vitals, the prescription and the recordings. Each look-up is logged by your name.">?</button></div>
         <form class="body pfind" id="patientForm" autocomplete="off">
-          <label class="field col"><span>Patient ID or visit ID</span>
+          <label class="field col"><span>Patient ID</span>
             <input type="search" id="patientRef" placeholder="P4347353" required></label>
-          <button type="submit" class="primary" id="patientGo">Show history</button>
+          <label class="field col"><span>Visit ID (optional: one consultation)</span>
+            <input type="search" id="visitRef" placeholder="VIS-T-31492"></label>
+          <button type="submit" class="primary" id="patientGo">Show</button>
           <span id="patientMsg" class="hint" role="status"></span>
         </form>
       </section>

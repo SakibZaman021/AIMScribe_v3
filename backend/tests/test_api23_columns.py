@@ -74,6 +74,7 @@ async def test_the_list_says_when_api2_and_api3_arrived(dbs):
     row = next(r for r in listed["recordings"] if r["session_id"] == sid)
     assert row["cmed_matched"] is True
     assert row["api2_at"] is not None and row["api3_at"] is None
+    assert row["pc"] == "PC"                     # 18 Nov: the PC it was recorded on
 
 
 async def test_a_visit_without_a_visit_id_is_found_by_patient_and_start(dbs):
