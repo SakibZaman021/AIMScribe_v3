@@ -332,6 +332,7 @@ function go(id) {
 const VIEWS = {
   overview: ["Overview", "How the clinics, the recordings and the server are doing", true],
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
+  events: ["Event log", "Every start, end, pause, refusal, microphone change, CMED message and alert", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
   patient: ["Patients", "One patient's visits, newest first: demographics, prescriptions and recordings", false],
   shift: ["My shift", "Your shift, and the alerts mailed to you", false],
@@ -914,6 +915,12 @@ function recordingsTable(list) {
             + esc(r.on_pc_offline_since.replace("T", " ").slice(0, 16)) + " UTC)",
             "The PC went offline with this recording open. Its audio is on the PC and is sent, and the recording closed, when the PC is back online."));
         }
+        // 18 Nov: the doctor has it paused now - nothing is being recorded.
+        if (r.paused_since) {
+          const at = new Date(r.paused_since).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" });
+          status.push(tag("warn", `Paused since ${at}` + (r.pause_reason ? ` (${human(r.pause_reason)})` : ""),
+            "The doctor paused this recording; nothing is recorded until they press Resume."));
+        }
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";
@@ -924,7 +931,9 @@ function recordingsTable(list) {
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
           + td("Visit", r.visit_id ? esc(r.visit_id) : `<span class="hint">–</span>`)
-          + td("Length", `${num(r.minutes || 0)} min`, "num")
+          + td("Length", `${num(r.minutes || 0)} min`
+            + (r.pauses ? `<span class="sub2" title="Paused by the doctor ${r.pauses} time(s): nothing was recorded then">`
+              + `paused ${num(r.paused_minutes || 0)} min (${r.pauses})</span>` : ""), "num")
           + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
           + td("Demographics", cmedArrival(r, r.api2_at, "demographics (API 2)"))
@@ -1001,6 +1010,64 @@ async function loadRecordings() {
   }
 }
 
+/* 18 Nov: the event log - what happened to each recording, newest first. */
+let EVENT_KIND = "";
+let eventSeq = 0;
+const EVENT_TONES = { "Patient did not consent": "bad", "Recording stopped unusually": "warn",
+  "Paused by the doctor": "warn", "Resumed": "good", "Not received from CMED": "bad",
+  "Microphone changed": "warn", "Alert sent": "quiet", "Recording ended": "good" };
+
+function eventParams() {
+  return { from: $("from").value, to: $("to").value, hospital_id: $("clinic").value,
+           doctor_id: $("eventDoctor").value.trim(), kind: EVENT_KIND };
+}
+
+async function loadEvents() {
+  const seq = ++eventSeq;
+  if (!$("eventsTable").firstChild) $("eventsTable").innerHTML = empty("Loading");
+  try {
+    const d = await api("/events", eventParams());
+    if (seq !== eventSeq) return;
+    const list = d.events || [];
+    $("eventsHint").textContent = `${num(d.count)} events${d.count > list.length ? ` (newest ${num(list.length)} shown; the CSV has all)` : ""} · newest first`;
+    if (!list.length) { $("eventsTable").innerHTML = empty("Nothing in this range", "Pick a wider range or another clinic."); return; }
+    const showClinic = !$("clinic").value;
+    $("eventsTable").innerHTML = `<table><thead><tr><th>Time</th>${showClinic ? "<th>Clinic</th>" : ""}`
+      + `<th>PC</th><th>Doctor</th><th>Patient</th><th>Event</th><th>Detail</th></tr></thead><tbody>`
+      + list.map((e) => `<tr>`
+        + td("Time", esc(e.time))
+        + (showClinic ? td("Clinic", esc(clinicName(e.hospital))) : "")
+        + td("PC", esc(e.pc || "–"))
+        + td("Doctor", esc(e.doctor || "–"))
+        + td("Patient", esc(e.patient_id || "–") + (e.visit_id ? `<span class="sub2">visit ${esc(e.visit_id)}</span>` : ""))
+        + td("Event", tag(EVENT_TONES[e.event] || "quiet", e.event))
+        + td("Detail", esc(e.detail || ""), "wrap")
+        + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    if (seq !== eventSeq) return;
+    $("eventsTable").innerHTML = empty("Could not load the event log", err.message);
+  }
+}
+
+$("eventKinds").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-kind]");
+  if (!b) return;
+  EVENT_KIND = b.dataset.kind;
+  document.querySelectorAll("#eventKinds [data-kind]").forEach((x) =>
+    x.setAttribute("aria-pressed", String(x === b)));
+  loadEvents();
+});
+$("eventDoctor").addEventListener("change", loadEvents);
+
+function fileLink(path, params) {
+  const query = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
+  window.location.href = `/api/v2/dashboard${path}?${query}`;
+}
+$("eventsCsv").addEventListener("click", () => fileLink("/events", { ...eventParams(), format: "csv" }));
+$("cmedMissingCsv").addEventListener("click", () => fileLink("/cmed-missing.csv",
+  { from: $("from").value, to: $("to").value, hospital_id: $("clinic").value }));
+addEventListener("hashchange", () => { if (location.hash === "#events") loadEvents(); });
+
 /* ============================================================
    Refresh, auto-refresh and the "updated" pill.
    ============================================================ */
@@ -1049,6 +1116,7 @@ async function refresh() {
     LAST = d;
     drawAll(d);
     await loadRecordings();
+    if (!$("eventsTable").closest(".view").hidden) loadEvents();
     if (PORTAL && PORTAL.role === "collector") loadShift();
     FAILED = false;
     UPDATED_AT = Date.now();
@@ -1511,8 +1579,16 @@ async function loadPeople() {
       catch (err) { HOSPITAL_LIST = []; }
     }
     const watchCell = (p) => {
-      if (p.role === "collector") return `<span class="hint">from their place</span>`;
       const mine = p.watching || [];
+      if (p.role === "collector") {
+        // 18 Nov: assigned as a researcher, then made a collector - the
+        // researcher alerts skip them, so they hear nothing for these hospitals.
+        if (!mine.length) return `<span class="hint">from their place</span>`;
+        return tag("bad", "Gets no researcher alerts",
+            "A data collector is sent only their place's alerts. Make them a researcher, or take these hospitals off.")
+          + " " + mine.map((h) => `<button type="button" class="chip" title="Take ${esc(h)} off"`
+          + ` data-unwatch="${esc(p.email)}" data-hospital="${esc(h)}">${esc(h)} ×</button>`).join(" ");
+      }
       return mine.map((h) => `<button type="button" class="chip" title="Stop looking after ${esc(h)}" `
           + `data-unwatch="${esc(p.email)}" data-hospital="${esc(h)}">${esc(h)} \u00d7</button>`).join(" ")
         + ` <select class="small" data-watchsel="${esc(p.email)}" aria-label="Give ${esc(p.email)} a hospital">`
@@ -1986,6 +2062,8 @@ async function start() {
   if (PORTAL && PORTAL.role !== "collector") startBulk();
   // 18 Nov: a patient's clinical record - researchers and admins only.
   if (!PORTAL || PORTAL.role !== "collector") $("navPatient").hidden = false;
+  // A data collector views the event log but downloads nothing (036).
+  if (PORTAL && PORTAL.role === "collector") $("eventFiles").querySelectorAll("button").forEach((b) => { b.hidden = true; });
   showView(location.hash.slice(1));
   await refresh();
 }

@@ -33,6 +33,7 @@
     <a href="#overview" data-view="overview"><span class="ico ico-overview" aria-hidden="true"></span><span class="label">Overview</span><b class="badge" id="badge-overview" hidden></b></a>
     <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
     <a href="#patient" data-view="patient" id="navPatient" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">Patients</span></a>
+    <a href="#events" data-view="events"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Event log</span></a>
     <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
     <a href="#shift" data-view="shift" id="navShift" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My shift</span><b class="badge" id="badge-shift" hidden></b></a>
     <a href="#watch" data-view="watch" id="navWatch" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My alerts</span></a>
@@ -143,6 +144,29 @@
       </div>
     </section>
 
+    <!-- ============================== Event log (18 Nov 2026) -->
+    <section class="view" data-view="events" aria-label="Event log" hidden>
+      <section class="panel" aria-labelledby="h-events">
+        <div class="head wrap"><h3 id="h-events">Event log</h3>
+          <span class="hint" id="eventsHint"></span></div>
+        <div class="chips small bar" id="eventKinds" role="group" aria-label="Show one kind of event">
+          <button type="button" class="chip" data-kind="" aria-pressed="true">All</button>
+          <button type="button" class="chip" data-kind="recording" aria-pressed="false">Recordings</button>
+          <button type="button" class="chip" data-kind="pause" aria-pressed="false">Pauses</button>
+          <button type="button" class="chip" data-kind="consent" aria-pressed="false">Consent</button>
+          <button type="button" class="chip" data-kind="microphone" aria-pressed="false">Microphone</button>
+          <button type="button" class="chip" data-kind="cmed" aria-pressed="false">CMED API 2 / 3</button>
+          <button type="button" class="chip" data-kind="alert" aria-pressed="false">Alerts sent</button>
+        </div>
+        <div class="bar" id="eventFiles">
+          <label class="field"><span>Doctor ID</span> <input type="text" id="eventDoctor" size="12" autocomplete="off"></label>
+          <button type="button" class="ghost small" id="eventsCsv">Download CSV</button>
+          <button type="button" class="ghost small" id="cmedMissingCsv" title="Recordings CMED's API 2 or API 3 never reached us for, with the fields CMED matches a visit on">Missing from CMED (CSV)</button>
+        </div>
+        <div class="scroll tall"><div id="eventsTable"></div></div>
+      </section>
+    </section>
+
     <!-- ============================== PCs -->
     <!-- ============================== One patient's history (18 Nov 2026) -->
     <section class="view" data-view="patient" aria-label="Patients" hidden>
@@ -239,8 +263,8 @@
             Nothing is sent at night: what happens then is in the next summary.</p>
           <label class="field"><span>Alerts</span>
             <select id="wMode">
-              <option value="everything">Everything</option>
-              <option value="problems">Only problems (urgent alerts, follow-ups, summaries)</option>
+              <option value="everything">Everything (every problem, and each normal recording)</option>
+              <option value="problems">Problems (everything unusual: Jabra, pauses, refusals, stops; not the normal recordings)</option>
             </select></label>
         </div>
       </section>

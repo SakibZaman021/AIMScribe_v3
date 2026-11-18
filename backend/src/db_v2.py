@@ -742,6 +742,7 @@ class V2Repository:
                        chain_head_hash = $6, chain_verified_at = now(),
                        manifest = $7, close_reason = $8,
                        status = 'closed', updated_at = now(),
+                       paused_since = NULL, pause_reason = NULL,
                        recording_date = COALESCE($9::date, recording_date),
                        start_time     = COALESCE($10::time, start_time),
                        end_time       = COALESCE($11::time, end_time)
@@ -754,6 +755,30 @@ class V2Repository:
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
                  close_reason or None, local_date, local_start, local_end)
+
+    async def note_pause(self, session_id: str, at: Optional[str],
+                         reason: Optional[str]) -> None:
+        """
+        18 Nov 2026: the doctor paused this recording (`at` and `reason`), or
+        resumed it (both None). Only while it is open; the signed pause or
+        resume itself is in chain_entries.
+        """
+        moment = None
+        if at:
+            try:
+                moment = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+            except ValueError:
+                moment = None
+        async with self._acquire() as conn:
+            if reason is None:
+                await conn.execute("UPDATE sessions SET paused_since = NULL, pause_reason = NULL "
+                                   "WHERE session_id = $1", session_id)
+            else:
+                await conn.execute("""
+                    UPDATE sessions SET paused_since = COALESCE($2::timestamptz, now()),
+                                        pause_reason = $3
+                     WHERE session_id = $1 AND closed_at IS NULL
+                """, session_id, moment, reason[:100])
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
         async with self._acquire() as conn:
@@ -2214,6 +2239,7 @@ class V2Repository:
                            -- rules sent 283 "still running / not fixed" messages
                            -- about 11 refused recordings on 16-17 Nov.
                            closed_at = COALESCE(closed_at, now()),
+                           paused_since = NULL, pause_reason = NULL,
                            close_reason = COALESCE(close_reason,
                                CASE WHEN $2::text = 'refused'
                                     THEN 'doctor_stopped:patient_did_not_consent' END),

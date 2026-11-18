@@ -208,6 +208,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it no alert can be marked delivered: the notifier writes delivered_at.
     ("046_v3_alert_delivery.sql", "recordings", "column collector_notifications.delivered_at",
      _column("collector_notifications", "delivered_at")),
+    # Without it a pause cannot be recorded on its recording, nor a card edited.
+    ("047_v3_pause_and_cards.sql", "recordings", "column sessions.paused_since",
+     _column("sessions", "paused_since")),
+    ("047_v3_pause_and_cards.sql", "recordings", "table telegram_boards",
+     _table("telegram_boards")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

@@ -581,6 +581,8 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     elif state:
         add("s.confirmation = $N", state)
 
+    args.append(sorted(api_v2.INTERNAL_PAUSES))
+    holds = f"${len(args)}"
     args.append(limit)
     async with _pool().acquire() as conn:
         rows = await conn.fetch(f"""
@@ -592,6 +594,12 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    s.microphones,
                    (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
                       AND a.alert_type = 'microphone_switched') AS mic_switches,
+                   -- 18 Nov: paused now, and how much of it was paused.
+                   s.paused_since, s.pause_reason, s.paused_seconds,
+                   (SELECT count(*) FROM chain_entries c WHERE c.session_id = s.session_id
+                      AND c.entry_type = 'pause'
+                      AND COALESCE(c.payload->>'reason', '') <> ALL({holds}::text[]))
+                       AS pauses,
                    -- 18 Nov: an open recording on a PC gone quiet is not "active".
                    (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
                        AS pc_last_seen,
@@ -845,6 +853,13 @@ def _recording_row(row) -> Dict[str, Any]:
         "microphone": collectors.microphone_label(
             row["microphones"] if "microphones" in row.keys() else None,
             int(row["mic_switches"] or 0) if "mic_switches" in row.keys() else 0),
+        # 18 Nov: paused now (open only), and the pauses the doctor made.
+        "paused_since": moment(row["paused_since"])
+        if "paused_since" in row.keys() and row["closed_at"] is None else None,
+        "pause_reason": row["pause_reason"] if "pause_reason" in row.keys() else None,
+        "paused_minutes": round(float(row["paused_seconds"] or 0) / 60, 1)
+        if "paused_seconds" in row.keys() else 0,
+        "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
     }
 
 
@@ -934,6 +949,286 @@ async def static(name: str) -> Response:
         raise HTTPException(status_code=404, detail="not found")
     return Response(path.read_text(encoding="utf-8"), media_type=media_type,
                     headers={"Cache-Control": "no-cache"})
+
+
+# ============================================================ the event log (18 Nov 2026)
+
+EVENT_KINDS = ("recording", "pause", "consent", "microphone", "cmed", "alert")
+_EVENT_CSV = ["time", "hospital", "pc", "doctor", "patient_id", "visit_id", "kind", "event",
+              "detail", "session_id"]
+_PROBLEM_ALERTS = {
+    "capture_failed", "microphone_unavailable", "start_abandoned", "disk_full",
+    "local_chain_invalid", "local_segment_unreadable", "silent_session",
+    "microphone_switched", "unexpected_agent_exit"}
+
+
+async def _event_rows(conn, start: date, end: date, clinics: Optional[List[str]],
+                      doctor: Optional[str], kind: Optional[str],
+                      limit_sessions: int = 1000) -> List[Dict[str, Any]]:
+    """Everything that happened to each recording in these days, one row per event."""
+    import watchers
+    where = ["s.session_date BETWEEN $1 AND $2"]
+    args: List[Any] = [start, end]
+    if clinics is not None:
+        args.append(clinics)
+        where.append(f"s.hospital_id = ANY(${len(args)}::text[])")
+    if doctor:
+        args.append(doctor)
+        where.append(f"s.doctor_id = ${len(args)}")
+    args.append(limit_sessions)
+    sessions = await conn.fetch(f"""
+        SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id, s.opened_at,
+               s.closed_at, s.close_reason, s.confirmation, s.total_duration_seconds,
+               s.paused_seconds, s.microphones, s.device_id,
+               COALESCE(s.visit_id, g.visit_id) AS visit_id,
+               (SELECT r.refused_at FROM session_refusals r
+                 WHERE r.session_id = s.session_id LIMIT 1) AS refused_at,
+               d.machine_name,
+               g.cmed_hospital_id AS cmed_code,
+               COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+               g.start_time AS cmed_start_time
+          FROM sessions s
+          LEFT JOIN devices d ON d.device_id = s.device_id
+          LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
+         WHERE {' AND '.join(where)}
+         ORDER BY s.opened_at DESC NULLS LAST
+         LIMIT ${len(args)}
+    """, *args)
+    by_id = {r["session_id"]: r for r in sessions}
+    out: List[Dict[str, Any]] = []
+
+    def add(at, r, what_kind: str, event: str, detail: str = "") -> None:
+        if at is None or (kind and what_kind != kind):
+            return
+        out.append({"at": at, "hospital": r["hospital_id"], "pc": r["machine_name"] or "",
+                    "doctor": r["doctor_id"] or "", "patient_id": r["patient_id"] or "",
+                    "visit_id": r["visit_id"] or "", "kind": what_kind, "event": event,
+                    "detail": detail, "session_id": r["session_id"]})
+
+    ids = list(by_id)
+    for r in sessions:
+        mics = ", ".join(r["microphones"] or []) or "microphone not reported"
+        add(r["opened_at"], r, "recording", "Recording started", mics)
+        if r["refused_at"] is not None:
+            add(r["refused_at"], r, "consent", "Patient did not consent",
+                "the recording was deleted")
+        elif r["closed_at"] is not None:
+            ended = watchers._ended_words(r["close_reason"], False, True)
+            usual = collectors.stop_kind(r["close_reason"]) is None
+            minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
+            paused = round(float(r["paused_seconds"] or 0) / 60, 1)
+            add(r["closed_at"], r, "recording",
+                "Recording ended" if usual else "Recording stopped unusually",
+                f"{ended}; {minutes} min recorded" + (f", {paused} min paused" if paused else ""))
+    if ids:
+        for c in await conn.fetch("""
+            SELECT session_id, entry_type, payload, occurred_at FROM chain_entries
+             WHERE session_id = ANY($1::text[]) AND entry_type IN ('pause', 'resume')
+             ORDER BY session_id, entry_no
+        """, ids):
+            payload = c["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            payload = payload or {}
+            r = by_id[c["session_id"]]
+            if c["entry_type"] == "pause":
+                reason = payload.get("reason") or ""
+                if reason in api_v2.INTERNAL_PAUSES:
+                    continue
+                add(c["occurred_at"], r, "pause", "Paused by the doctor",
+                    payload.get("reason_detail") or reason.replace("_", " "))
+            else:
+                seconds = float(payload.get("paused_seconds") or 0)
+                if seconds and c["occurred_at"]:
+                    add(c["occurred_at"], r, "pause", "Resumed",
+                        f"after {int(seconds // 60)} min {int(seconds % 60):02d} s paused")
+        for a in await conn.fetch("""
+            SELECT session_id, alert_type, raised_at, detail FROM integrity_alerts
+             WHERE session_id = ANY($1::text[]) AND alert_type = ANY($2::text[])
+        """, ids, sorted(_PROBLEM_ALERTS)):
+            detail = a["detail"]
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    detail = {}
+            detail = detail or {}
+            text = str(detail.get("detail") or detail.get("microphone") or "")[:200]
+            label = ("Microphone changed" if a["alert_type"] == "microphone_switched"
+                     else collectors.PROBLEMS.get(a["alert_type"], human_code(a["alert_type"])))
+            add(a["raised_at"], by_id[a["session_id"]], "microphone",
+                label[:1].upper() + label[1:], text)
+        times = await _cmed_message_times(sessions)
+        for sid, t in times.items():
+            r = by_id[sid]
+            if not t.get("cmed_matched") or r["refused_at"] is not None:
+                continue
+            for name, label in (("api2_at", "CMED API 2 (demographics) arrived"),
+                                ("api3_at", "CMED API 3 (prescription) arrived")):
+                if t.get(name):
+                    add(datetime.fromisoformat(t[name]), r, "cmed", label)
+            missing = [w for n, w in (("api2_at", "API 2"), ("api3_at", "API 3"))
+                       if not t.get(n)]
+            if missing and r["closed_at"] is not None:
+                add(r["closed_at"], r, "cmed", "Not received from CMED",
+                    " and ".join(missing) + " for this recording")
+        for n in await conn.fetch("""
+            SELECT DISTINCT ON (event_key) event_key, event, subject, created_at, session_id,
+                   (SELECT count(DISTINCT m.email) FROM collector_notifications m
+                     WHERE m.event_key = n.event_key) AS people,
+                   (SELECT min(m.seen_at) FROM collector_notifications m
+                     WHERE m.event_key = n.event_key AND m.audience = 'collector') AS seen_at
+              FROM collector_notifications n
+             WHERE session_id = ANY($1::text[])
+             ORDER BY event_key, created_at
+        """, ids):
+            r = by_id.get(n["session_id"])
+            if r is None:
+                continue
+            seen = (f"; Seen {n['seen_at'].astimezone(_zone()).strftime('%H:%M')}"
+                    if n["seen_at"] else "")
+            add(n["created_at"], r, "alert", "Alert sent",
+                f"{n['subject']} - to {n['people']} people{seen}")
+    out.sort(key=lambda e: e["at"], reverse=True)
+    return out
+
+
+def human_code(code: str) -> str:
+    return str(code or "").replace("_", " ")
+
+
+def _zone() -> ZoneInfo:
+    return collectors.zone()
+
+
+def _event_out(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {**e, "at": e["at"].isoformat(),
+            "time": e["at"].astimezone(_zone()).strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _csv(rows: List[Dict[str, Any]], columns: List[str]) -> bytes:
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in columns})
+    return buf.getvalue().encode("utf-8-sig")
+
+
+async def _no_collector_files(request: Request) -> None:
+    """A CSV is a download: researchers and admins, as for audio (036)."""
+    import portal
+    person = await portal.person_for(request)
+    if person is not None and person.role == "collector":
+        raise HTTPException(status_code=403, detail="A data collector can view the event "
+                                                    "log but not download it.")
+
+
+@router.get("/events")
+async def events(request: Request,
+                 from_date: Optional[str] = Query(None, alias="from"),
+                 to_date: Optional[str] = Query(None, alias="to"),
+                 hospital_id: Optional[str] = None, doctor_id: Optional[str] = None,
+                 kind: Optional[str] = None, format: Optional[str] = None,
+                 _: None = Depends(require_viewer),
+                 scope: Any = Depends(collectors.hospital_scope)):
+    """
+    18 Nov 2026: the event log - every recording's start and end, each pause
+    and resume with its reason, refusals, microphone changes, CMED's API 2 and
+    API 3 (and which never came), and each alert sent, newest first. With
+    format=csv, the same as a file.
+    """
+    today = clinic_today()
+    start = _day(from_date, today)
+    end = _day(to_date, today)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
+    doctor = _clinic(doctor_id) if doctor_id else None
+    if kind and kind not in EVENT_KINDS:
+        raise HTTPException(status_code=422, detail=f"kind is one of {', '.join(EVENT_KINDS)}")
+    if format == "csv":
+        await _no_collector_files(request)
+    async with _pool().acquire() as conn:
+        rows = await _event_rows(conn, start, end, clinics, doctor, kind)
+    if format == "csv":
+        name = f"aimscribe_events_{start.isoformat()}_{end.isoformat()}.csv"
+        return Response(_csv([_event_out(e) for e in rows], _EVENT_CSV),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    shown = rows[:3000]
+    return {"count": len(rows), "events": [_event_out(e) for e in shown]}
+
+
+_MISSING_CSV = ["cmed_hospital_id", "hospital", "doctor_id", "patient_id", "visit_id", "date",
+                "cmed_start_time", "recording_start", "recording_end", "api2_demographics",
+                "api3_prescription"]
+
+
+@router.get("/cmed-missing.csv")
+async def cmed_missing(request: Request,
+                       from_date: Optional[str] = Query(None, alias="from"),
+                       to_date: Optional[str] = Query(None, alias="to"),
+                       hospital_id: Optional[str] = None,
+                       _: None = Depends(require_viewer),
+                       scope: Any = Depends(collectors.hospital_scope)):
+    """
+    18 Nov 2026: the recordings CMED's API 2 or API 3 never reached us for -
+    with the five fields CMED matches a visit on, no names - to send to CMED.
+    Only recordings that ended over 10 minutes ago and were not refused.
+    """
+    await _no_collector_files(request)
+    today = clinic_today()
+    start = _day(from_date, today)
+    end = _day(to_date, today)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
+    where = ["s.session_date BETWEEN $1 AND $2", "s.closed_at < now() - interval '10 minutes'",
+             "s.confirmation IS DISTINCT FROM 'refused'", "g.cmed_hospital_id IS NOT NULL"]
+    args: List[Any] = [start, end]
+    if clinics is not None:
+        args.append(clinics)
+        where.append(f"s.hospital_id = ANY(${len(args)}::text[])")
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id, s.session_date,
+                   s.opened_at, s.closed_at,
+                   g.cmed_hospital_id AS cmed_code,
+                   COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+                   g.start_time AS cmed_start_time
+              FROM sessions s
+              JOIN grant_authorisations g ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
+             WHERE {' AND '.join(where)}
+             ORDER BY s.opened_at
+             LIMIT 5000
+        """, *args)
+    times = await _cmed_message_times(rows)
+    tz = _zone()
+
+    def when(value) -> str:
+        if not value:
+            return "missing"
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+        return moment.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+
+    out = []
+    for r in rows:
+        t = times.get(r["session_id"], {})
+        if t.get("api2_at") and t.get("api3_at"):
+            continue
+        out.append({"cmed_hospital_id": r["cmed_code"], "hospital": r["hospital_id"],
+                    "doctor_id": r["doctor_id"], "patient_id": r["patient_id"],
+                    "visit_id": r["cmed_visit_id"] or "",
+                    "date": r["session_date"].isoformat() if r["session_date"] else "",
+                    "cmed_start_time": r["cmed_start_time"] or "",
+                    "recording_start": r["opened_at"].astimezone(tz).strftime("%H:%M:%S")
+                    if r["opened_at"] else "",
+                    "recording_end": r["closed_at"].astimezone(tz).strftime("%H:%M:%S")
+                    if r["closed_at"] else "",
+                    "api2_demographics": when(t.get("api2_at")),
+                    "api3_prescription": when(t.get("api3_at"))})
+    name = f"cmed_missing_{start.isoformat()}_{end.isoformat()}.csv"
+    return Response(_csv(out, _MISSING_CSV), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 __all__ = ["router"]

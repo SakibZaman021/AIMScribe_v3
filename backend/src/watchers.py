@@ -32,6 +32,7 @@ Telegram bot and mailer (collectors.py); nothing here deletes anything.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -47,13 +48,23 @@ import api_v2
 import collectors
 import portal
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v2/dashboard/watch", tags=["researchers"])
 admin_router = APIRouter(prefix="/api/v2/admin", tags=["researchers"])
 
-# What a researcher on 'problems' gets besides every urgent alert.
+# 18 Nov 2026, the lab's rule: only two ends are normal - the consultation
+# finished, or the next patient came in. Everything else is a problem: the
+# Jabra or PC microphone, any pause, a patient who left or did not consent,
+# an emergency, a technical stop. A researcher on 'problems' gets every one of
+# those; 'everything' adds only the normal news (EVERYTHING_ONLY).
+EVERYTHING_ONLY = {"recording_finished", "jabra_back", "handled"}
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
                  "recording_too_long", "stopped_technical", "daily_report", "shift_report",
-                 "summary_csv", "still_not_fixed", "problem_fixed", "repeated_stops"}
+                 "summary_csv", "still_not_fixed", "problem_fixed", "repeated_stops",
+                 "stopped_unusually", "jabra_unplugged", "jabra_not_plugged",
+                 "recording_without_jabra", "recording_paused", "recording_resumed",
+                 "still_paused"}
 MODES = ("everything", "problems")
 # The summaries themselves go out at their time, quiet hours or not.
 SUMMARY_EVENTS = ("shift_report", "summary_csv", "daily_report")
@@ -76,7 +87,9 @@ PATTERN_WINDOW = timedelta(hours=2)
 FAMILY = {"jabra_unplugged": "jabra", "jabra_not_plugged": "jabra",
           "recording_without_jabra": "jabra", "pc_silent": "pc",
           "recording_problem": "recording", "stopped_technical": "recording",
-          "recording_too_long": "long", "no_shift_started": "noshift"}
+          "recording_too_long": "long", "no_shift_started": "noshift",
+          # 18 Nov: a recording the doctor left paused.
+          "still_paused": "paused"}
 
 PHONE = re.compile(r"^\+?[0-9][0-9 -]{5,20}[0-9]$")
 
@@ -285,7 +298,8 @@ async def watchers_of(conn, hospital_id: Optional[str]) -> List[Tuple[str, str]]
 # moment it happened to the moment Telegram took the message. (A "running 60
 # min" or "PC not reporting" alert is late by design, so it is not counted.)
 REAL_TIME_EVENTS = ("jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
-                    "recording_without_jabra", "stopped_unusually", "stopped_technical")
+                    "recording_without_jabra", "stopped_unusually", "stopped_technical",
+                    "recording_paused", "recording_resumed")
 
 
 def _span(seconds: float) -> str:
@@ -454,7 +468,7 @@ async def copy_to_watchers(conn, *, hospital_id: Optional[str], event: str, subj
     since = await assigned_since(conn, hospital_id) \
         if happened_at is not None and event not in SUMMARY_EVENTS else {}
     for email, mode in await watchers_of(conn, hospital_id):
-        if mode == "problems" and not urgent and event not in PROBLEMS_ONLY:
+        if mode == "problems" and event in EVERYTHING_ONLY:
             continue
         if _before_their_time(since, email, happened_at):
             continue
@@ -555,6 +569,18 @@ async def _still_wrong(conn, family: str, first: Dict[str, Any],
             return "fixed", f"the recording was stopped at {hhmm(s['closed_at'])}"
         minutes = int((now - s["opened_at"]).total_seconds() // 60)
         return "still", f"the recording is still running ({minutes} min)"
+    if family == "paused":
+        s = await conn.fetchrow("SELECT closed_at, paused_since, pause_reason FROM sessions "
+                                "WHERE session_id = $1", first["session_id"])
+        if s is None:
+            return "ended", "the recording is gone"
+        if s["closed_at"] is not None:
+            return "ended", f"the recording ended at {hhmm(s['closed_at'])}, still paused"
+        began = first.get("happened_at")
+        if s["paused_since"] is None or (began is not None and s["paused_since"] != began):
+            return "fixed", "the doctor pressed Resume"
+        words = (s["pause_reason"] or "no reason given").replace("_", " ")
+        return "still", f"paused since {hhmm(s['paused_since'])} ({words})"
     if family == "noshift":
         r = await conn.fetchrow("""
             SELECT s.started_at, """ + collectors.label_sql("p", "s.email") + """ AS who
@@ -570,7 +596,7 @@ async def _still_wrong(conn, family: str, first: Dict[str, Any],
 
 def _group(note: Dict[str, Any]) -> Tuple[str, str]:
     family = FAMILY[note["event"]]
-    if family == "long":
+    if family in ("long", "paused"):
         return family, str(note["session_id"])
     if family == "noshift":
         return family, note["event_key"]
@@ -588,7 +614,7 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
     now = now or datetime.now(timezone.utc)
     rows = await conn.fetch("""
         SELECT id, email, event, event_key, subject, body, created_at, place_id,
-               hospital_id, device_id, session_id
+               hospital_id, device_id, session_id, happened_at
           FROM collector_notifications
          WHERE audience = 'collector' AND resolved_at IS NULL
            AND channel IS DISTINCT FROM 'held'
@@ -612,8 +638,12 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
             await conn.execute("UPDATE collector_notifications SET resolved_at = $2, "
                                "resolution = $3 WHERE id = ANY($1::bigint[])",
                                [n["id"] for n in notes], now, how[:200])
-            if quiet:
-                continue                      # in the next summary, not at night
+            # 18 Nov: every card of it now says how it ended.
+            await collectors._refresh_card(conn, chain, (state, how, minutes))
+            if quiet or family == "paused":
+                # At night: in the next summary. A resumed pause: its card says
+                # so, and the researchers had the "resumed" line already.
+                continue
             heard = await conn.fetch("""
                 SELECT DISTINCT ON (email) email, hospital_id FROM collector_notifications
                  WHERE audience = 'watcher' AND event_key = ANY($1::text[])
@@ -625,7 +655,7 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                     subject=(f"Fixed after {minutes} min: " if state == "fixed" else
                              f"Ended after {minutes} min, not fixed: ") + what,
                     body=(f"{_first_up(how)} - by {collectors._hhmm(now)}, {minutes} min "
-                          f"after the alert at {collectors._hhmm(first['created_at'])}.\n"
+                          f"after the alert at {collectors._hhmm(first['created_at'])}. "
                           + await _seen_text(conn, keys, first["created_at"], chain)),
                     event_key=f"fixed:{chain}", hospital_id=h["hospital_id"],
                     device_id=first["device_id"], session_id=first["session_id"],
@@ -654,10 +684,13 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
             duty = {n["email"]: n["place_id"] for n in notes}
         now_body = await fresh_context(conn, first)
         reminders: List[int] = []
+        import cards
+        card_family = family in cards.CARD_FAMILIES
         for email, pid in sorted(duty.items()):
+            # 18 Nov: under the card, which has the details as they are now.
             text = (f"{_first_up(how)}. The first alert was at "
-                    f"{collectors._hhmm(first['created_at'])}, {minutes} min ago.\n\n"
-                    + now_body)
+                    f"{collectors._hhmm(first['created_at'])}, {minutes} min ago."
+                    + (f"\n\n{cards.DO[family]}" if card_family else "\n\n" + now_body))
             note_id = await collectors._record(
                 conn, email=email, event="still_not_fixed", subject=subject, body=text,
                 event_key=key, urgent=True, place_id=pid, hospital_id=first["hospital_id"],
@@ -665,6 +698,11 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
             if note_id is not None:
                 reminders.append(note_id)
         await collectors.deliver_all(conn, reminders)
+        await collectors._refresh_card(conn, chain)
+        # 18 Nov: a researcher's card already shows 30 and 90 minutes; only the
+        # 60-minute reminder is a message, with who to call.
+        if card_family and times != 2:
+            continue
         # Every place holding the hospital, not just the one this note went to.
         contacts = await contact_text(conn, first["hospital_id"],
                                       None if first["hospital_id"] else first["place_id"])
@@ -672,7 +710,7 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                 f"{collectors._hhmm(first['created_at'])}, {minutes} min ago; the collector "
                 "on shift has been reminded.\n"
                 + await _seen_text(conn, keys, first["created_at"], chain) + "\n\n"
-                + researcher_body(now_body, contacts)
+                + (contacts if card_family else researcher_body(now_body, contacts))
                 + "\n\nPlease call or message them." + last)
         await _to_watchers(conn, await _hospitals_for(conn, first["hospital_id"],
                                                       first["place_id"]),
@@ -713,7 +751,8 @@ async def repeated_stops(conn, now: Optional[datetime] = None) -> None:
     for (hid, doctor_id), per in stops.items():
         if len(per) < PATTERN_STOPS:
             continue
-        key = f"pattern:{hid}:{doctor_id}:{day}"
+        # 18 Nov: again at 6, 9 ... - once a day hid the refusals after the third.
+        key = f"pattern:{hid}:{doctor_id}:{day}:{len(per) // PATTERN_STOPS * PATTERN_STOPS}"
         if await quiet_for(conn, hid, now=now) or await conn.fetchval(
                 "SELECT 1 FROM collector_notifications WHERE event_key = $1 LIMIT 1", key):
             continue
@@ -861,7 +900,8 @@ daily_reports = shift_summaries
 
 
 CSV_COLUMNS = ["type", "hospital", "date", "time", "until", "doctor", "pc", "minutes",
-               "how_it_ended", "microphone", "cmed", "collector_on_shift", "alert",
+               "how_it_ended", "microphone", "cmed", "api2_demographics",
+               "api3_prescription", "pauses", "paused_min", "collector_on_shift", "alert",
                "sent", "seen_by", "seen_at", "seen_after_min", "fixed_after_min",
                "how_it_was_fixed", "reminders", "session_id"]
 MIC_WORDS = {"jabra": "Jabra all through", "mixed": "switched off the Jabra",
@@ -869,7 +909,7 @@ MIC_WORDS = {"jabra": "Jabra all through", "mixed": "switched off the Jabra",
 ALERT_EVENTS = ("jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
                 "pc_silent", "recording_without_jabra", "recording_too_long",
                 "stopped_unusually", "stopped_technical", "no_shift_started",
-                "repeated_stops")
+                "repeated_stops", "recording_paused", "still_paused")
 
 
 def _ended_words(close_reason: Optional[str], refused: bool, closed: bool) -> str:
@@ -898,7 +938,13 @@ async def summary_rows(conn, hospitals: List[str], start: datetime,
     recs = await conn.fetch("""
         SELECT s.session_id, s.hospital_id, s.doctor_id, s.opened_at, s.closed_at,
                s.total_duration_seconds, s.microphones, s.close_reason, s.confirmation,
-               d.machine_name, doc.full_name,
+               d.machine_name, doc.full_name, s.patient_id, s.paused_seconds,
+               g.cmed_hospital_id AS cmed_code,
+               COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+               g.start_time AS cmed_start_time,
+               (SELECT count(*) FROM chain_entries c WHERE c.session_id = s.session_id
+                  AND c.entry_type = 'pause'
+                  AND COALESCE(c.payload->>'reason', '') <> ALL($4::text[])) AS pauses,
                EXISTS (SELECT 1 FROM session_refusals x
                         WHERE x.session_id = s.session_id) AS refused,
                (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
@@ -916,9 +962,27 @@ async def summary_rows(conn, hospitals: List[str], start: datetime,
           LEFT JOIN devices d ON d.device_id = s.device_id
           LEFT JOIN doctors doc ON doc.doctor_id = s.doctor_id
                AND doc.hospital_id = s.hospital_id
+          LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
          WHERE s.hospital_id = ANY($1::text[]) AND s.opened_at >= $2 AND s.opened_at < $3
          ORDER BY s.opened_at
-    """, hospitals, start, end)
+    """, hospitals, start, end, sorted(api_v2.INTERNAL_PAUSES))
+    times: Dict[str, Dict[str, Any]] = {}
+    try:
+        import dashboard
+        times = await dashboard._cmed_message_times(recs)
+    except Exception as exc:                      # the CSV goes without the two columns
+        logger.warning("Summary: could not read when CMED's messages arrived: %s", exc)
+
+    def arrived(r, name: str) -> str:
+        t = times.get(r["session_id"], {})
+        if r["refused"] or not t.get("cmed_matched", bool(r["cmed_code"])):
+            return ""
+        value = t.get(name)
+        if not value:
+            return "missing"
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+        return f"{local(moment):%H:%M}"
+
     for r in recs:
         at = local(r["opened_at"])
         kind = collectors.microphone_label(r["microphones"], r["switches"])["kind"]
@@ -935,6 +999,10 @@ async def summary_rows(conn, hospitals: List[str], start: datetime,
                                          r["closed_at"] is not None),
             "microphone": "no sound" if r["no_sound"] else MIC_WORDS.get(kind, kind),
             "cmed": r["confirmation"] or "", "collector_on_shift": r["on_shift"] or "nobody",
+            "api2_demographics": arrived(r, "api2_at"),
+            "api3_prescription": arrived(r, "api3_at"),
+            "pauses": int(r["pauses"] or 0) or "",
+            "paused_min": round(float(r["paused_seconds"] or 0) / 60, 1) if r["pauses"] else "",
             "session_id": r["session_id"]}))
 
     alerts = await conn.fetch("""
@@ -1392,6 +1460,8 @@ ALERT_NAMES = {
     "pc_silent": "PC not reporting", "recording_without_jabra": "recorded without the Jabra",
     "recording_too_long": "recording not stopped",
     "stopped_unusually": "stopped unusually", "stopped_technical": "stopped: technical problem",
+    "recording_paused": "paused by the doctor", "recording_resumed": "resumed",
+    "still_paused": "still paused after 2 min",
 }
 
 
@@ -1569,7 +1639,9 @@ async def assign(body: WatchRequest, request: Request, _: None = Depends(api_v2.
                                    "AND removed_at IS NULL", email)
         if role is None:
             raise HTTPException(status_code=404, detail="no such person")
-        if role not in ("researcher", "admin"):
+        # Taking a hospital off is always allowed: a researcher later made a
+        # collector keeps the assignment, and hears nothing for it (18 Nov).
+        if role not in ("researcher", "admin") and not body.remove:
             raise HTTPException(status_code=409,
                                 detail="only researchers and admins look after hospitals; "
                                        "a data collector's hospitals come from their place")

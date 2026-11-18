@@ -67,6 +67,7 @@ NO_SHIFT_AFTER = timedelta(minutes=30)    # nobody pressed Start shift
 SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
 AUTO_CLOSE_AFTER = timedelta(hours=1)     # a shift nobody ended
 TOO_LONG = timedelta(minutes=60)          # a recording nobody stopped (038)
+PAUSE_ALERT = timedelta(minutes=2)        # 18 Nov: a recording paused this long
 OTHER_SHIFT = timedelta(hours=6)          # a shift started outside both windows
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -374,11 +375,14 @@ async def end_shift(request: Request):
 async def mark_seen(note_id: int, request: Request):
     person = await _collector(request, write=True)
     async with _pool().acquire() as conn:
-        done = await conn.execute("""
+        key = await conn.fetchval("""
             UPDATE collector_notifications SET seen_at = now()
              WHERE id = $1 AND email = $2 AND seen_at IS NULL
+            RETURNING event_key
         """, note_id, person.email)
-    return {"status": "seen" if done.endswith("1") else "unchanged"}
+        if key is not None:
+            await _refresh_card(conn, key)
+    return {"status": "seen" if key is not None else "unchanged"}
 
 
 @router.post("/telegram/link")
@@ -831,21 +835,78 @@ async def telegram_status() -> Dict[str, Any]:
 
 
 def _telegram_text(subject: str, text: str, urgent: bool) -> str:
-    return (("\U0001F534 " if urgent else "") + subject + "\n\n" + text)[:4000]
+    text = (text or "").strip()
+    return (("\U0001F534 " if urgent else "") + subject
+            + ("\n\n" + text if text else ""))[:4000]
 
 
 async def send_telegram(chat_id: int, text: str,
                         note_id: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     """One message to one chat; an urgent one carries a Seen button. Never raises."""
+    message_id, error = await send_telegram_message(chat_id, text, note_id=note_id)
+    return (True, None) if error is None else (False, error)
+
+
+async def send_telegram_message(chat_id: int, text: str, *, note_id: Optional[int] = None,
+                                silent: bool = False, reply_to: Optional[int] = None
+                                ) -> Tuple[Optional[int], Optional[str]]:
+    """
+    One message: (its message_id - 0 if Telegram gave none - or None, why not).
+    18 Nov: `silent` arrives without sound; `reply_to` sits under the
+    problem's card, so a reminder is read with what it is about.
+    """
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:4000],
                                "disable_web_page_preview": True}
     if note_id is not None:
         payload["reply_markup"] = {"inline_keyboard": [[
             {"text": "\u2705 Seen - I am on it", "callback_data": f"seen:{note_id}"}]]}
+    if silent:
+        payload["disable_notification"] = True
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": int(reply_to),
+                                       "allow_sending_without_reply": True}
     await _pace_chat(chat_id)
     await _pace("telegram")
     result, error = await _telegram("sendMessage", payload)
-    return (True, None) if result is not None else (False, error)
+    if result is None:
+        return None, error or "not sent"
+    return (int(result.get("message_id") or 0) if isinstance(result, dict) else 0), None
+
+
+# 18 Nov: what a researcher gets without sound - each still arrives at once, as
+# one line, but only what needs a person rings: a problem starting, nobody
+# pressing Seen, still not fixed at 60 minutes, a doctor's pattern of stops.
+WATCHER_SILENT = {"stopped_unusually", "recording_paused", "recording_resumed",
+                  "problem_fixed", "recording_finished", "jabra_back", "handled"}
+COLLECTOR_SILENT = {"recording_resumed", "jabra_back"}
+
+
+def _silent(note: Dict[str, Any]) -> bool:
+    if note.get("audience") == "watcher":
+        return note.get("event") in WATCHER_SILENT
+    return note.get("event") in COLLECTOR_SILENT
+
+
+async def _card_message(conn, note: Dict[str, Any], chat_id: int) -> Optional[int]:
+    """The card a reminder, escalation or fix belongs under, in this person's chat."""
+    key = note.get("event_key") or ""
+    if not key.startswith(("esc:", "still:", "fixed:")):
+        return None
+    import cards
+    return await conn.fetchval("""
+        SELECT tg_message_id FROM collector_notifications
+         WHERE email = $1 AND event_key = $2 AND tg_chat_id = $3 AND tg_message_id IS NOT NULL
+         LIMIT 1
+    """, note["email"], cards.base_key(key), chat_id)
+
+
+async def _refresh_card(conn, event_key: str, final=None) -> None:
+    """Edit a problem's cards; never fails what called it."""
+    try:
+        import cards
+        await cards.refresh(conn, event_key, final)
+    except Exception as exc:
+        logger.warning("Card %s could not be refreshed: %s", event_key, _hide(str(exc)))
 
 
 async def _telegram_upload(method: str, fields: Dict[str, Any], filename: str,
@@ -917,11 +978,16 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
                     return True, None, channel
                 errors.append((channel, error or "not sent"))
                 continue
-            ok, error = await send_telegram(
-                chat, _telegram_text(note["subject"], note["body"], note["urgent"]),
+            text = await _telegram_body(conn, note)
+            message_id, error = await send_telegram_message(
+                chat, text,
                 # Only the collector, who must act, gets the Seen button.
                 note_id=note["id"] if note["urgent"] and note["audience"] == "collector"
-                else None)
+                else None,
+                silent=_silent(note), reply_to=await _card_message(conn, note, chat))
+            ok = message_id is not None
+            if ok and message_id:
+                note["_tg"] = (chat, message_id)
         else:
             ok, error = await send_mail(note["email"], note["subject"], note["body"])
         if ok:
@@ -930,6 +996,22 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
     if not errors:
         return False, "no way to reach this person", None
     return False, "; ".join(f"{c}: {e}" for c, e in errors)[:500], errors[0][0]
+
+
+async def _telegram_body(conn, note: Dict[str, Any]) -> str:
+    """The message's text: for the first alert of a lasting problem, its card."""
+    try:
+        import cards
+        if cards.is_card(note) and note.get("created_at") is not None:
+            text = await cards.text_for(conn, note)
+            if note.get("late"):
+                text = (f"Sent late (from {_hhmm(note['created_at'])}, before Telegram was "
+                        f"connected)\n{text}")
+            return text[:4000]
+    except Exception as exc:
+        logger.warning("Card text for alert %s failed; sending it plain: %s", note.get("id"),
+                       _hide(str(exc)))
+    return _telegram_text(note["subject"], note["body"], note["urgent"])
 
 
 WAITING = "waiting"
@@ -949,19 +1031,25 @@ async def _deliver(conn, note_id: int, to: str = "", subject: str = "", text: st
     """Send one kept alert and keep how it went; an alert that failed for a passing reason
     gets its next try. One for a person not yet reachable waits for their Telegram."""
     note = await conn.fetchrow("SELECT id, email, event, urgent, subject, body, audience, "
-                               "event_key, created_at "
+                               "event_key, created_at, happened_at, device_id, session_id, "
+                               "place_id, hospital_id, seen_at "
                                "FROM collector_notifications WHERE id = $1", note_id)
     if note is None:
         return False
     sending = dict(note)
     if late:
+        sending["late"] = True
         sending["subject"] = (f"Sent late (from {_hhmm(note['created_at'])}, before Telegram "
                               f"was connected): {note['subject']}")
     ok, error, channel = await _send_to(conn, sending)
     if ok:
-        # 18 Nov: when it reached them, so the speed can be shown and checked.
-        await conn.execute("UPDATE collector_notifications SET delivered_at = now() "
-                           "WHERE id = $1", note_id)
+        # 18 Nov: when it reached them, so the speed can be shown and checked -
+        # and which Telegram message it became, so a card can be edited.
+        tg = sending.get("_tg")
+        await conn.execute("UPDATE collector_notifications SET delivered_at = now(), "
+                           "tg_chat_id = COALESCE($2, tg_chat_id), "
+                           "tg_message_id = COALESCE($3, tg_message_id) WHERE id = $1",
+                           note_id, tg[0] if tg else None, tg[1] if tg else None)
     if not ok and _unreachable(error):
         # 17 Nov: these were lost - tried once by email, which is not set up, and
         # never again. Now kept as waiting, and sent the moment they connect.
@@ -1168,12 +1256,27 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
                  event_key: str, urgent: bool = False, everyone_if_nobody: bool = False,
                  device_id=None, session_id: Optional[str] = None,
                  happened_at: Optional[datetime] = None,
-                 not_before: Optional[datetime] = None) -> int:
+                 not_before: Optional[datetime] = None,
+                 line: Optional[str] = None) -> int:
     """
     Mail an event to the collector(s) on shift at every place holding this
     hospital - or, for what must not wait, to all the place's collectors when
     nobody is on shift. Returns how many mails were sent.
+
+    18 Nov: `line` is what the researchers get instead - one short line, sent
+    without sound. And a new consultation (or a repeat) of a problem already
+    open on the same PC is not a new alert: its card is updated instead.
     """
+    if device_id is not None and event in FOLDED_EVENTS:
+        if event_key in _FOLDED:
+            return 0
+        first = await open_problem(conn, event, device_id)
+        if first is not None and first["event_key"] != event_key:
+            if len(_FOLDED) > 5000:
+                _FOLDED.clear()
+            _FOLDED.add(event_key)
+            await _refresh_card(conn, first["event_key"])
+            return 0
     if device_id is not None and event in THROTTLED:
         recent = await conn.fetchval("""
             SELECT 1 FROM collector_notifications
@@ -1223,6 +1326,12 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
     # for supervision: what the collector was asked to do, and the collector on
     # shift - or, with nobody on shift, all the place's collectors - with phone
     # and Telegram, so they can call them.
+    if line is not None:
+        sent += await watchers.copy_to_watchers(
+            conn, hospital_id=hospital_id, event=event, subject=line, body="",
+            event_key=event_key, urgent=urgent, device_id=device_id, session_id=session_id,
+            happened_at=happened_at, hold=quiet)
+        return sent
     contacts = await watchers.contact_text(conn, hospital_id)
     sent += await watchers.copy_to_watchers(
         conn, hospital_id=hospital_id, event=event,
@@ -1231,6 +1340,31 @@ async def notify(conn, *, hospital_id: Optional[str], event: str, subject: str, 
         urgent=urgent, device_id=device_id, session_id=session_id, happened_at=happened_at,
         hold=quiet)
     return sent
+
+
+# 18 Nov: alerts that are one more sighting of a problem a PC already has -
+# the Jabra still off when the next patient starts, the microphone silent
+# again, the PC quiet again. While that problem is open they update its card.
+FOLDED_EVENTS = {"jabra_unplugged", "jabra_not_plugged", "recording_without_jabra",
+                 "recording_problem", "pc_silent"}
+_FOLDED: set = set()
+
+
+async def open_problem(conn, event: str, device_id) -> Optional[Dict[str, Any]]:
+    """The first alert of the problem of this kind still open on this PC, if any."""
+    import watchers
+    family = watchers.FAMILY.get(event)
+    if family is None:
+        return None
+    kin = [e for e, f in watchers.FAMILY.items() if f == family]
+    row = await conn.fetchrow("""
+        SELECT event_key, created_at FROM collector_notifications
+         WHERE device_id = $1 AND event = ANY($2::text[]) AND audience = 'collector'
+           AND resolved_at IS NULL AND channel IS DISTINCT FROM 'held'
+           AND created_at > now() - $3::interval
+         ORDER BY created_at, id LIMIT 1
+    """, device_id, kin, watchers.WATCH_FOR)
+    return dict(row) if row else None
 
 
 # 17 Nov: "recording_without_jabra" is no longer here. It is once per
@@ -1351,10 +1485,11 @@ class Notifier:
         for step in (self.telegram_updates, self.close_forgotten_shifts, self.alerts,
                      self.idle_microphones, self.recordings_without_jabra,
                      self.recordings_too_long, self.refusals, self.silent_pcs,
-                     self.no_shift_started,
+                     self.no_shift_started, self.pauses, self.still_paused,
+                     self.normal_ends,
                      self.escalate, watchers.handled_followups, watchers.persisting,
                      watchers.repeated_stops, watchers.shift_summaries,
-                     self.retry_failed, self.failure_alarm):
+                     self.retry_failed, self.failure_alarm, self.boards):
             try:
                 await self.keep_lease(conn)
                 await step(conn)
@@ -1457,10 +1592,18 @@ class Notifier:
                     "and call AIMS LAB if it does not recover.")
         else:
             return
+        line = None
+        if event == "stopped_unusually":
+            import cards
+            minutes = round(float(detail.get("duration_seconds") or 0) / 60)
+            line = await cards.line(conn, happened, f"stopped after {minutes} min: "
+                                    f"{stop_label(detail.get('reason'))}",
+                                    session_id=row["session_id"], device_id=row["device_id"],
+                                    hospital_id=row["hospital_id"])
         await notify(conn, hospital_id=row["hospital_id"], event=event, subject=subject,
                      body=body + _footer(), event_key=f"alert:{row['id']}", urgent=urgent,
                      everyone_if_nobody=urgent, device_id=row["device_id"],
-                     session_id=row["session_id"], happened_at=happened)
+                     session_id=row["session_id"], happened_at=happened, line=line)
 
     # -- the Jabra unplugged while the PC waits for the next patient
     async def idle_microphones(self, conn) -> None:
@@ -1567,6 +1710,7 @@ class Notifier:
         """)
         for r in rows:
             label = STOP_LABELS["patient_did_not_consent"]
+            import cards
             await notify(conn, hospital_id=r["hospital_id"], event="stopped_unusually",
                          subject=f"Recording stopped: {label}",
                          body=(f"At {_hhmm(r['refused_at'])} the doctor stopped the recording "
@@ -1574,7 +1718,160 @@ class Notifier:
                                "patient asked.\n\nNothing to do now.") + _footer(),
                          event_key=f"refused:{r['session_id']}", urgent=False,
                          device_id=r["device_id"], session_id=r["session_id"],
-                         happened_at=r["refused_at"])
+                         happened_at=r["refused_at"],
+                         line=await cards.line(conn, r["refused_at"],
+                                               "patient did not consent (recording deleted)",
+                                               session_id=r["session_id"],
+                                               device_id=r["device_id"],
+                                               hospital_id=r["hospital_id"]))
+
+    # -- 18 Nov: the doctor paused a recording, or resumed it
+    async def pauses(self, conn) -> None:
+        """
+        Every pause the doctor makes (with its reason) and its resume reach the
+        collector on shift and the researchers at once. Read from the audit log
+        the server writes as each arrives (session.pause / session.resume).
+        """
+        await conn.execute("INSERT INTO collector_notifier_state (name, last_id) "
+                           "SELECT 'pauses', COALESCE(max(id), 0) FROM audit_log "
+                           "ON CONFLICT (name) DO NOTHING")
+        last = await conn.fetchval("SELECT last_id FROM collector_notifier_state "
+                                   "WHERE name = 'pauses'")
+        top = await conn.fetchval("SELECT max(id) FROM audit_log")
+        if top is None or top <= last:
+            return
+        rows = await conn.fetch("""
+            SELECT a.id, a.event_type, a.occurred_at, a.session_id, a.detail,
+                   s.hospital_id, s.device_id
+              FROM audit_log a JOIN sessions s ON s.session_id = a.session_id
+             WHERE a.id > $1 AND a.id <= $2
+               AND a.event_type IN ('session.pause', 'session.resume')
+             ORDER BY a.id
+        """, last, top)
+        import api_v2
+        import cards
+        for r in rows:
+            detail = r["detail"]
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    detail = {}
+            detail = detail or {}
+            sid = r["session_id"]
+            where = await cards.where_words(conn, session_id=sid, device_id=r["device_id"],
+                                            hospital_id=r["hospital_id"])
+            if r["event_type"] == "session.pause":
+                reason = str(detail.get("reason") or "")
+                if reason in api_v2.INTERNAL_PAUSES:
+                    continue
+                words = (detail.get("reason_detail") or reason.replace("_", " ")
+                         or "no reason given")
+                await notify(conn, hospital_id=r["hospital_id"], event="recording_paused",
+                             subject=f"Recording paused: {words}",
+                             body=(f"At {_hhmm(r['occurred_at'])} the doctor paused the "
+                                   f"recording ({where}): {words}. Nothing is recorded until "
+                                   "they press Resume. If it is still paused in "
+                                   f"{int(PAUSE_ALERT.total_seconds() // 60)} minutes you "
+                                   "will be told.") + _footer(),
+                             event_key=f"pause:{sid}:{r['id']}", urgent=False,
+                             device_id=r["device_id"], session_id=sid,
+                             happened_at=r["occurred_at"],
+                             line=await cards.line(conn, r["occurred_at"], f"paused: {words}",
+                                                   session_id=sid, device_id=r["device_id"],
+                                                   hospital_id=r["hospital_id"]))
+            else:
+                # Only a resume after a pause the doctor chose (not the Stop form's).
+                paused = await conn.fetchval("""
+                    SELECT max(created_at) FROM collector_notifications
+                     WHERE session_id = $1 AND event = 'recording_paused'
+                """, sid)
+                if paused is None:
+                    continue
+                seconds = await conn.fetchval("""
+                    SELECT (payload->>'paused_seconds')::float FROM chain_entries
+                     WHERE session_id = $1 AND entry_type = 'resume'
+                     ORDER BY entry_no DESC LIMIT 1
+                """, sid)
+                took = (f"{int(seconds // 60)} min {int(seconds % 60):02d} s"
+                        if seconds is not None else "a pause")
+                await notify(conn, hospital_id=r["hospital_id"], event="recording_resumed",
+                             subject="Recording resumed",
+                             body=(f"At {_hhmm(r['occurred_at'])} the doctor resumed the "
+                                   f"recording ({where}) after {took} paused.") + _footer(),
+                             event_key=f"resume:{sid}:{r['id']}", urgent=False,
+                             device_id=r["device_id"], session_id=sid,
+                             happened_at=r["occurred_at"],
+                             line=await cards.line(conn, r["occurred_at"],
+                                                   f"resumed after {took} paused",
+                                                   session_id=sid, device_id=r["device_id"],
+                                                   hospital_id=r["hospital_id"]))
+        await conn.execute("UPDATE collector_notifier_state SET last_id = $1, "
+                           "updated_at = now() WHERE name = 'pauses'", top)
+
+    # -- 18 Nov: a recording still paused after two minutes
+    async def still_paused(self, conn) -> None:
+        rows = await conn.fetch("""
+            SELECT s.session_id, s.hospital_id, s.device_id, s.paused_since, s.pause_reason
+              FROM sessions s
+             WHERE s.closed_at IS NULL AND s.paused_since IS NOT NULL
+               AND s.paused_since < now() - $1::interval
+               AND s.paused_since > now() - interval '6 hours'
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.event_key = 'stillpaused:' || s.session_id || ':'
+                                      || extract(epoch FROM s.paused_since)::bigint)
+             ORDER BY s.paused_since LIMIT 100
+        """, PAUSE_ALERT)
+        for r in rows:
+            words = (r["pause_reason"] or "no reason given").replace("_", " ")
+            minutes = int((datetime.now(timezone.utc) - r["paused_since"]).total_seconds() // 60)
+            await notify(conn, hospital_id=r["hospital_id"], event="still_paused",
+                         subject=f"Recording still paused after {minutes} min",
+                         body=(f"The doctor paused the recording at "
+                               f"{_hhmm(r['paused_since'])} ({words}) and has not resumed it. "
+                               "Nothing of this consultation is recorded meanwhile.\n\n"
+                               "Please ask the doctor whether the pause is still needed; "
+                               "Resume records again.") + _footer(),
+                         event_key=f"stillpaused:{r['session_id']}:"
+                                   f"{int(r['paused_since'].timestamp())}",
+                         urgent=True, everyone_if_nobody=True, device_id=r["device_id"],
+                         session_id=r["session_id"], happened_at=r["paused_since"])
+
+    # -- 18 Nov: a recording that ended normally, for researchers on "everything"
+    async def normal_ends(self, conn) -> None:
+        rows = await conn.fetch("""
+            SELECT s.session_id, s.hospital_id, s.device_id, s.closed_at, s.close_reason,
+                   s.total_duration_seconds
+              FROM sessions s
+             WHERE s.closed_at > now() - interval '10 minutes'
+               AND s.confirmation IS DISTINCT FROM 'refused'
+               AND s.hospital_id IN (SELECT hospital_id FROM researcher_hospitals
+                                      WHERE removed_at IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.event_key = 'done:' || s.session_id)
+             ORDER BY s.closed_at LIMIT 200
+        """)
+        import cards
+        import watchers
+        for r in rows:
+            if stop_kind(r["close_reason"]) is not None:
+                continue                          # an unusual end has its own alert
+            how = ("next patient came in" if r["close_reason"] == "superseded_by_new_patient"
+                   else "consultation finished")
+            minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
+            text = await cards.line(conn, r["closed_at"], f"{how}, {minutes} min recorded",
+                                    session_id=r["session_id"], device_id=r["device_id"],
+                                    hospital_id=r["hospital_id"])
+            await watchers.copy_to_watchers(
+                conn, hospital_id=r["hospital_id"], event="recording_finished", subject=text,
+                body="", event_key=f"done:{r['session_id']}", device_id=r["device_id"],
+                session_id=r["session_id"], happened_at=r["closed_at"],
+                hold=await watchers.quiet_for(conn, r["hospital_id"]))
+
+    # -- 18 Nov: each researcher's pinned live board
+    async def boards(self, conn) -> None:
+        import cards
+        await cards.boards(conn)
 
     # -- a recording left running: the doctor forgot to press Stop (038)
     async def recordings_too_long(self, conn) -> None:
@@ -1702,8 +1999,8 @@ class Notifier:
                 subject=f"Not seen in 15 min: {n['subject']}",
                 body=(f"The alert went out at {_hhmm(n['created_at'])} and nobody has pressed "
                       "Seen in 15 minutes. The place's other collectors and AIMS LAB are now "
-                      "told.\n\n" + watchers.researcher_body(
-                          now_body, await watchers.contact_text(conn, n["hospital_id"]))),
+                      "told.\n\n"
+                      + await watchers.contact_text(conn, n["hospital_id"])),
                 event_key=f"esc:{n['event_key']}", urgent=True, device_id=n["device_id"],
                 session_id=n["session_id"])
             await conn.execute("UPDATE collector_notifications SET escalated_at = now() "
@@ -1836,10 +2133,13 @@ class Notifier:
                                 "hospitals you look after come here"
                                 + (f" ({', '.join(mine)})" if mine else
                                    " (none assigned yet: ask an admin)")
-                                + ", each with the data collector on shift and their phone "
-                                "and Telegram, so you can call them. You also hear when they "
-                                "press Seen, when a problem is still not fixed after 30 "
-                                "minutes and when it is fixed, and get a summary of each shift "
+                                + ". Each problem is one card that updates itself (new "
+                                "patients, Seen, fixed); your phone rings only when a problem "
+                                "starts, nobody presses Seen in 15 minutes, it is still not "
+                                "fixed after 60, or a doctor has repeated unusual stops - with "
+                                "who to call. Refusals, pauses and other stops come as silent "
+                                "one-line messages. A pinned board shows each hospital live. "
+                                "You also get a summary of each shift "
                                 f"at {watchers.midday_time():%H:%M} and "
                                 f"{watchers.report_time():%H:%M}, with a CSV. Nothing comes "
                                 "at night: it waits for the next summary.")
@@ -1858,7 +2158,7 @@ class Notifier:
                 UPDATE collector_notifications n SET seen_at = COALESCE(n.seen_at, now())
                   FROM collector_telegram t
                  WHERE n.id = $1 AND t.email = n.email AND t.chat_id = $2
-                RETURNING n.id
+                RETURNING n.event_key
             """, int(data[5:]), int(chat_id))
             if done:
                 answer = "Marked seen"
@@ -1867,6 +2167,8 @@ class Notifier:
                     "chat_id": chat_id, "message_id": message.get("message_id"),
                     "reply_markup": {"inline_keyboard": [[
                         {"text": "\u2705 Seen", "callback_data": "done"}]]}})
+                # 18 Nov: every copy of the card - the researchers' too - says who.
+                await _refresh_card(conn, done)
         await _telegram("answerCallbackQuery", {"callback_query_id": query.get("id"),
                                                 "text": answer})
 

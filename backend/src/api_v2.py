@@ -1394,6 +1394,11 @@ async def _queue_transcription(session_id: str, body: CommitRequest,
                      session_id, body.seq_no, exc)
 
 
+# The recorder pauses by itself while the Stop form is open (older recorders)
+# and while Windows asks to shut down: not a pause the doctor chose.
+INTERNAL_PAUSES = frozenset({"stop_requested", "pc_shutdown_pending"})
+
+
 @router.post("/session/pause")
 async def pause_session(body: ChainEntryRequest, device=Depends(require_device)):
     return await _append_lifecycle_entry(body, device, "pause")
@@ -1425,6 +1430,18 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
         logger.info("%s %s entry for %s: %s", outcome.capitalize(), expected_type,
                     session_id, reason)
         return {"status": outcome, "reason": reason}
+
+    # 18 Nov 2026: the recording shows as paused on the dashboard, and the
+    # alerts see it. The recorder's own short holds (Stop pressed and the form
+    # open, Windows shutting down) are not the doctor's pause.
+    try:
+        if expected_type == "pause" and entry.payload.get("reason") not in INTERNAL_PAUSES:
+            await repo.note_pause(session_id, entry.payload.get("at"),
+                                  str(entry.payload.get("reason") or ""))
+        elif expected_type == "resume":
+            await repo.note_pause(session_id, None, None)
+    except Exception as exc:                    # never fails the chain entry itself
+        logger.warning("Could not note the %s of %s: %s", expected_type, session_id, exc)
 
     await repo.audit(
         event_type=f"session.{expected_type}", actor_type="device",
