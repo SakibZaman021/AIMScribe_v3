@@ -182,6 +182,20 @@
           <span id="patientMsg" class="hint" role="status"></span>
         </form>
       </section>
+      <section class="panel" aria-labelledby="h-clinicalCsv">
+        <div class="head wrap"><h3 id="h-clinicalCsv">Download as CSV</h3>
+          <button type="button" class="q" aria-label="About the downloads" data-tip="Every visit in the dates and clinic chosen, one file each: Demographics is one row per visit with sex, age, blood group and vitals (API 2); Prescriptions is one row per visit with complaints, examination, diagnoses, medicines, tests and advice (API 3); Medicines is one row per medicine. No dates: every visit. Each download is logged by your name.">?</button></div>
+        <div class="body pfind">
+          <label class="field col"><span>From</span> <input type="date" id="csvFrom"></label>
+          <label class="field col"><span>To</span> <input type="date" id="csvTo"></label>
+          <label class="field col"><span>Clinic</span>
+            <select id="csvClinic"><option value="">All clinics</option></select></label>
+          <button type="button" class="primary" data-csv="demographics">Demographics (CSV)</button>
+          <button type="button" class="ghost" data-csv="prescriptions">Prescriptions (CSV)</button>
+          <button type="button" class="ghost" data-csv="medicines">Medicines (CSV)</button>
+          <span id="csvMsg" class="hint" role="status"></span>
+        </div>
+      </section>
       <div id="patientOut"></div>
     </section>
 

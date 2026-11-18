@@ -863,6 +863,95 @@ def _recording_row(row) -> Dict[str, Any]:
     }
 
 
+# ============================================================
+# The clinical tables as CSV (19 Nov 2026)
+# ============================================================
+
+# What a researcher may download, and the by_visit table each one is.
+_CLINICAL_CSV = {"demographics": "demographics",     # one row per visit with API 2
+                 "prescriptions": "prescription",    # one row per visit with API 3
+                 "medicines": "medicines"}           # one row per medicine prescribed
+_CSV_MOST = 200_000          # more than this, and the dates must be narrowed
+
+
+def _cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+@router.get("/clinical.csv")
+async def clinical_csv(request: Request, table: str = "demographics",
+                       from_date: Optional[str] = Query(None, alias="from"),
+                       to_date: Optional[str] = Query(None, alias="to"),
+                       hospital_id: Optional[str] = None,
+                       patient_id: Optional[str] = None,
+                       _: None = Depends(require_viewer),
+                       scope: Any = Depends(collectors.hospital_scope)):
+    """
+    19 Nov 2026: the demographics (API 2), prescriptions (API 3) or medicines
+    of every visit in a date range, as one CSV - read from the same by_visit
+    tables as the Patients page. Researchers and admins only, and every
+    download is logged by name in clinical_access_log. No dates: every visit.
+    The clinic is ours (the dashboard's) or CMED's code for it.
+    """
+    actor = await _clinical_reader(request)
+    view = _CLINICAL_CSV.get(table if isinstance(table, str) else "")
+    if view is None:
+        raise HTTPException(status_code=400,
+                            detail="table is demographics, prescriptions or medicines.")
+    where: List[str] = []
+    args: List[Any] = []
+    start = _day(from_date, None) if from_date else None
+    end = _day(to_date, None) if to_date else None
+    if start is not None:
+        args.append(start)
+        where.append(f"visit_date >= ${len(args)}")
+    if end is not None:
+        args.append(end)
+        where.append(f"visit_date <= ${len(args)}")
+    clinic = _clinic(hospital_id)
+    if clinic is not None:
+        args.append(clinic)
+        where.append(f"(clinic = ${len(args)} OR cmed_clinic_code = ${len(args)})")
+    if isinstance(scope, list):
+        args.append(scope)
+        where.append(f"clinic = ANY(${len(args)}::text[])")
+    patient = None
+    if isinstance(patient_id, str) and patient_id.strip():
+        try:
+            patient = safe_identifier(patient_id.strip(), field="patient_id")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="patient_id is not an identifier")
+        args.append(patient)
+        where.append(f"patient_id = ${len(args)}")
+    store = api_v2.ctx.clinical
+    if store is None:
+        raise HTTPException(status_code=503, detail="The clinical database is not connected.")
+    sql = (f"SELECT * FROM by_visit.{view}"
+           + (f" WHERE {' AND '.join(where)}" if where else "")
+           + f" LIMIT {_CSV_MOST + 1}")
+    async with store._pool.acquire() as conn:
+        statement = await conn.prepare(sql)
+        columns = [a.name for a in statement.get_attributes() if a.name != "visit_key"]
+        rows = await statement.fetch(*args)
+    if len(rows) > _CSV_MOST:
+        raise HTTPException(status_code=413, detail=f"Over {_CSV_MOST:,} rows: choose fewer "
+                                                    "days or one clinic.")
+    await store.log_access(actor=actor, action="dashboard.csv", patient_id=patient,
+                           detail={"table": table, "rows": len(rows),
+                                   "from": start.isoformat() if start else None,
+                                   "to": end.isoformat() if end else None,
+                                   "hospital_id": clinic})
+    out = [{k: _cell(r[k]) for k in columns} for r in rows]
+    span = "_".join(d.isoformat() for d in (start, end) if d) or "all"
+    name = f"{table}_{clinic + '_' if clinic else ''}{span}.csv"
+    return Response(_csv(out, columns), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.get("/clinics")
 async def clinics(_: None = Depends(require_viewer),
                   scope: Any = Depends(collectors.hospital_scope)):
