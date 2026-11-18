@@ -2034,6 +2034,54 @@ $("patientForm").addEventListener("submit", (e) => {
   if (ref) loadPatient(ref, $("visitRef").value.trim());
 });
 
+/* 19 Nov 2026: the demographics, prescriptions or medicines of every visit
+   in the dates chosen, as a CSV. The server checks the dates and the role. */
+function fillCsvClinics() {
+  const sel = $("csvClinic");
+  const chosen = sel.value;
+  sel.innerHTML = `<option value="">All clinics</option>`
+    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+  sel.value = chosen;
+}
+// Fetched rather than opened, so the admin key goes with it and a refusal
+// (too many rows, a bad date) is said here instead of replacing the page.
+document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click", async () => {
+  const from = $("csvFrom").value, to = $("csvTo").value;
+  const msg = $("csvMsg");
+  if (from && to && from > to) {
+    msg.textContent = "From is after To.";
+    return;
+  }
+  const query = new URLSearchParams(Object.entries(
+    { table: b.dataset.csv, from, to, hospital_id: $("csvClinic").value })
+    .filter(([, v]) => v !== "" && v != null));
+  msg.textContent = "Preparing...";
+  b.disabled = true;
+  try {
+    const response = await fetch(`/api/v2/dashboard/clinical.csv?${query}`,
+      { headers: portalHeaders() });
+    if (!response.ok) {
+      let detail = `Server error ${response.status}`;
+      try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    const named = /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = named ? named[1] : `${b.dataset.csv}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    msg.textContent = `Downloaded ${link.download}.`;
+  } catch (err) {
+    msg.textContent = `Not downloaded: ${err.message}`;
+  } finally {
+    b.disabled = false;
+  }
+}));
+
 function startBulk() {
   $("bulkPanel").hidden = false;
   $("batchesPanel").hidden = false;
@@ -2061,7 +2109,10 @@ async function start() {
   } catch { /* refresh reports it */ }
   if (PORTAL && PORTAL.role !== "collector") startBulk();
   // 18 Nov: a patient's clinical record - researchers and admins only.
-  if (!PORTAL || PORTAL.role !== "collector") $("navPatient").hidden = false;
+  if (!PORTAL || PORTAL.role !== "collector") {
+    $("navPatient").hidden = false;
+    fillCsvClinics();
+  }
   // A data collector views the event log but downloads nothing (036).
   if (PORTAL && PORTAL.role === "collector") $("eventFiles").querySelectorAll("button").forEach((b) => { b.hidden = true; });
   showView(location.hash.slice(1));
