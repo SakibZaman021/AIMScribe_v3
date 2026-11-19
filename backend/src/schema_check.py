@@ -213,6 +213,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("sessions", "paused_since")),
     ("047_v3_pause_and_cards.sql", "recordings", "table telegram_boards",
      _table("telegram_boards")),
+    # Without it a 3.9.6 PC's report of the pieces it still holds is not kept.
+    ("048_v3_pc_piece_report.sql", "recordings", "column sessions.pc_waiting_numbers",
+     _column("sessions", "pc_waiting_numbers")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

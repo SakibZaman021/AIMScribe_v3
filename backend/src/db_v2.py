@@ -994,6 +994,37 @@ class V2Repository:
             """, session_id)
         return [dict(row) for row in rows]
 
+    async def note_piece_reports(self, device_id, reports: List[Dict[str, Any]], *,
+                                 complete: bool = True) -> None:
+        """
+        Recorder 3.9.6+: what the PC still holds of each recording. Kept only on
+        that PC's own recordings. A recording it reported before and lists no
+        longer has nothing left waiting - when the list is complete.
+        """
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                for r in reports:
+                    await conn.execute("""
+                        UPDATE sessions
+                           SET pc_pieces_recorded = $3, pc_pieces_sent = $4,
+                               pc_pieces_waiting = $5, pc_waiting_numbers = $6,
+                               pc_rejected_numbers = $7, pc_finished_recording = $8,
+                               pc_reported_at = now()
+                         WHERE session_id = $1 AND device_id = $2
+                    """, r["session_id"], device_id, r["recorded"], r["sent"],
+                         r["waiting"] if r["waiting"] is not None else len(r["waiting_numbers"]),
+                         r["waiting_numbers"], r["rejected_numbers"], r["finished"])
+                if complete:
+                    await conn.execute("""
+                        UPDATE sessions
+                           SET pc_pieces_waiting = 0, pc_waiting_numbers = '{}',
+                               pc_rejected_numbers = '{}', pc_reported_at = now()
+                         WHERE device_id = $1
+                           AND (pc_pieces_waiting > 0
+                                OR cardinality(pc_rejected_numbers) > 0)
+                           AND session_id <> ALL($2::text[])
+                    """, device_id, [r["session_id"] for r in reports])
+
     # ------------------------------------------------------------------
     # 20 Nov 2026: the segment store in the archive's layout (segment_layout.py)
     # ------------------------------------------------------------------
