@@ -1067,6 +1067,7 @@ class SessionController:
         if active is None:
             return {"status": "not_recording", "session_id": None}
         active.stop_pending = True
+        active.spool.log_event("stop_pressed")
         return {"status": self.state, "session_id": active.session_id, "held": False}
 
     async def stop_cancelled(self) -> Dict[str, Any]:
@@ -1075,6 +1076,7 @@ class SessionController:
         if active is None:
             return {"status": "unchanged", "session_id": None}
         active.stop_pending = False
+        active.spool.log_event("stop_cancelled")
         return {"status": self.state, "session_id": active.session_id}
 
     async def hold_for_stop(self) -> Dict[str, Any]:
@@ -1870,7 +1872,32 @@ class SessionController:
             return value
         return crypto.pseudonymise(value, self._log_salt)
 
+    # 3.9.5: what goes into the recording's own log (spool.log_event).
+    _LOGGED = {"recording_started": "", "recording_paused": "reason",
+               "recording_resumed": "paused_seconds", "integrity_alert": "alert_type",
+               "session_held": "code", "session_authorised": "", "session_confirmed": "",
+               "session_unconfirmed": "", "sound_restored": "", "patient_opened": "patient_ref",
+               "gate_armed": "by"}
+
+    def _log(self, event: str, data: Dict[str, Any]) -> None:
+        """One line in the open recording's log, never failing what it describes."""
+        active = self._active
+        if active is None or event not in self._LOGGED:
+            return
+        sid = data.get("session_id")
+        if sid is not None and sid != active.session_id:
+            return
+        key = self._LOGGED[event]
+        detail = data.get(key, "") if key else ""
+        if event == "integrity_alert" and data.get("detail"):
+            detail = f"{detail}: {data.get('detail')}"
+        try:
+            active.spool.log_event(event, detail)
+        except Exception as exc:
+            logger.debug("Could not log %s: %s", event, exc)
+
     def _emit(self, event: str, data: Dict[str, Any]) -> None:
+        self._log(event, data)
         if event == "integrity_alert":
             self.last_alert = f"{data.get('alert_type')}: {data.get('detail', '')}"
         if self._on_event:

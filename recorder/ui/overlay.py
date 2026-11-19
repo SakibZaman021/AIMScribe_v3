@@ -35,6 +35,7 @@ import logging
 import queue
 import sys
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from ui.overlay_model import (DELETE_QUESTION, NEEDS_DELETE_CONFIRMATION, OverlayActions,
@@ -421,18 +422,21 @@ class Overlay:
 
         canvas.create_rectangle(0, 0, WIDTH, height + NOTE_HEIGHT,
                                 fill=self._backdrop, outline=self._backdrop)
-        self._round_rect(canvas, 1, 1, WIDTH - 1, height - 1, 14,
-                         fill=PAPER, outline=EDGE, width=1)
+        # 3.9.5: paused two minutes - the border blinks red, twice a second.
+        blink = bool(getattr(view, "alarm", False)) and int(time.monotonic() * 2) % 2 == 0
+        self._round_rect(canvas, 1, 1, WIDTH - 1, height - 1, 14, fill=PAPER,
+                         outline=RED if blink else EDGE, width=3 if blink else 1)
 
+        if getattr(view, "alarm", False):
+            accent = RED
         canvas.create_oval(18, 26, 26, 34, fill=accent, outline=accent)
         canvas.create_text(33, 30, text="Paused" if paused else
                            ("Recording" if recording else "Ready"),
                            anchor="w", fill=INK, font=(FONT, 10, "bold"))
-        # 3.9.4: paused, the clock shows how long it has been paused.
-        clock = (format_duration((status.get("pause") or {}).get("seconds", 0)) if paused
-                 else format_duration(status.get("duration_seconds", 0)))
-        canvas.create_text(18, 55, text=clock,
-                           anchor="w", fill=MUTED, font=("Consolas", 13))
+        # 3.9.5: no clock while paused - a running clock looked like recording.
+        if not paused:
+            canvas.create_text(18, 55, text=format_duration(status.get("duration_seconds", 0)),
+                               anchor="w", fill=MUTED, font=("Consolas", 13))
 
         if note:
             canvas.create_text(18, height - 14, text=note[:44], anchor="w",

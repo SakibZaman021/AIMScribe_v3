@@ -168,6 +168,10 @@ def test_a_long_pause_is_pointed_out_on_the_card():
     assert short.headline == "Paused" and short.note != PAUSE_REMINDER
     long = state.view({"is_paused": True, "pause": {"reason": "other", "seconds": 125}})
     assert long.note == PAUSE_REMINDER
+    # 3.9.5: no clock while paused, just words; at two minutes red and blinking.
+    from ui.overlay_model import PAUSED_NOTE
+    assert short.note == PAUSED_NOTE and short.alarm is False
+    assert long.alarm is True
 
 
 async def test_stop_pressed_keeps_recording_until_a_reason_is_saved(ctl):
@@ -179,6 +183,23 @@ async def test_stop_pressed_keeps_recording_until_a_reason_is_saved(ctl):
     assert not [e for e in active.spool.chain if e.entry_type == "pause"]
     result = await ctl.stop_session(reason="doctor_stopped:patient_left")
     assert result["status"] == "stopped" and result["paused_seconds"] == 0
+
+
+async def test_each_recording_keeps_its_own_log_and_sends_it(ctl, spool, device_key):
+    """3.9.5: started, paused (why), resumed, Stop pressed and cancelled - in the
+    recording's journal, so it survives a restart, and in its manifest."""
+    await ctl.open_session(trigger())
+    session = ctl._active.spool
+    await ctl.pause_session(reason="patient_declined")
+    await ctl.resume_session()
+    await ctl.stop_requested()
+    await ctl.stop_cancelled()
+    events = [(e["event"], e["detail"]) for e in session.manifest()["events"]]
+    assert ("recording_paused", "patient_declined") in events
+    assert ("stop_pressed", "") in events and ("stop_cancelled", "") in events
+    assert any(e == "recording_resumed" for e, _ in events)
+    again = SessionSpool.load(session.directory, device_key=device_key, spool_key=spool._key)
+    assert [e["event"] for e in again.events] == [e for e, _ in events]
 
 
 @pytest.mark.parametrize("reason,detail,problem", [

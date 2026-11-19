@@ -57,6 +57,8 @@ MESSAGE_SECONDS = 8.0
 # 3.9.4: a pause this long is pointed out on the card (and alerted on the server).
 PAUSE_REMINDER_SECONDS = 120
 PAUSE_REMINDER = "Paused over 2 min - press Resume to record"
+# 3.9.5: no clock while paused - it looked like recording time. Just this.
+PAUSED_NOTE = "Press Resume to record"
 
 
 def pause_reasons(configured: Iterable[str]) -> List[Tuple[str, str]]:
@@ -98,6 +100,8 @@ class OverlayView:
     pause_label: str          # "Pause" or "Resume"
     stop_enabled: bool
     pause_enabled: bool
+    # 3.9.5: paused two minutes or more - the card turns red and blinks.
+    alarm: bool = False
 
 
 class OverlayState:
@@ -173,8 +177,10 @@ class OverlayState:
             headline = ""
 
         note = self.note
-        if paused and not holding and float(pause.get("seconds") or 0) >= PAUSE_REMINDER_SECONDS:
-            note = PAUSE_REMINDER
+        alarm = False
+        if paused and not holding:
+            alarm = float(pause.get("seconds") or 0) >= PAUSE_REMINDER_SECONDS
+            note = PAUSE_REMINDER if alarm else PAUSED_NOTE
         if active and not note:
             if status.get("authorisation") == "pending":
                 note = "Recording - waiting for the AIMS LAB server"
@@ -194,6 +200,7 @@ class OverlayState:
             pause_label="Resume" if paused and not holding else "Pause",
             stop_enabled=active,
             pause_enabled=active and not holding,
+            alarm=alarm,
         )
 
 
@@ -247,4 +254,4 @@ class OverlayActions:
 __all__ = ["STOP_REASONS", "PAUSE_LABELS", "DELETE_QUESTION", "NEEDS_DELETE_CONFIRMATION",
            "OverlayView", "OverlayState", "OverlayActions", "pause_reasons",
            "close_reason_for", "check_reason", "format_duration", "REFUSAL",
-           "PAUSE_REMINDER"]
+           "PAUSE_REMINDER", "PAUSED_NOTE"]

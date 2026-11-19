@@ -175,6 +175,10 @@ class SessionSpool:
         # The doctor's own words from the Stop form (SRS-UIX-04). Travels in the
         # manifest; the signed close entry carries the reason itself.
         self.close_detail = ""
+        # 3.9.5: everything that happened to this recording, in order - start,
+        # pause and resume with the reason, Stop pressed and cancelled, alerts,
+        # held, confirmed - kept in its journal and sent in its manifest.
+        self.events: List[Dict[str, Any]] = []
         # Chain entries the backend has acknowledged. Segments track their own
         # state; this covers pause and resume, which are links in the same chain
         # and were previously sent once and forgotten.
@@ -361,6 +365,9 @@ class SessionSpool:
                     spool.close_detail = record.get("detail", "")
                 elif kind == "close_reported":
                     spool.close_reported = True
+                elif kind == "event":
+                    spool.events.append({"at": record.get("at"), "event": record.get("event"),
+                                         "detail": record.get("detail", "")})
                 elif kind == "entry_reported":
                     spool.reported_entries.add(record["entry_no"])
                 elif kind == "authorised":
@@ -831,6 +838,19 @@ class SessionSpool:
             })
             return entry
 
+    def log_event(self, event: str, detail: Any = "") -> None:
+        """3.9.5: one line of this recording's log. Never fails the recording."""
+        record = {"at": crypto.iso_utc(datetime.now(timezone.utc)), "event": str(event)[:64],
+                  "detail": str(detail or "")[:300]}
+        try:
+            with self._lock:
+                if len(self.events) >= 500:
+                    return
+                self.events.append(record)
+                self._append_journal({"rec": "event", **record})
+        except Exception as exc:                       # a log line is never worth a recording
+            logger.debug("Recording log line not kept: %s", exc)
+
     def mark_entry_reported(self, entry_no: int) -> None:
         with self._lock:
             if entry_no in self.reported_entries:
@@ -901,6 +921,7 @@ class SessionSpool:
             **self.meta,
             "close_reason": self.close_reason,
             "close_detail": self.close_detail,
+            "events": list(self.events),
             "chain_head": self.head_hash.hex() if self.head_hash else None,
             "device_pubkey": self._device_key.public_bytes_raw().hex(),
             "segments": [
