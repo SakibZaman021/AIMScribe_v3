@@ -172,11 +172,11 @@
     <section class="view" data-view="patient" aria-label="Patients" hidden>
       <section class="panel" aria-labelledby="h-patient">
         <div class="head wrap"><h3 id="h-patient">Find a patient</h3>
-          <button type="button" class="q" aria-label="About patients" data-tip="Patient ID alone: every visit of that patient, newest first. Patient ID and visit ID: that one consultation. Each shows the demographics and vitals, the prescription and the recordings. Each look-up is logged by your name.">?</button></div>
+          <button type="button" class="q" aria-label="About patients" data-tip="Patient ID alone: every visit of that patient, newest first. Visit ID alone, or patient ID and visit ID: that one consultation. Each visit shows every demographics, vitals and prescription field CMED sent, and the recordings; the patient and each visit can be downloaded as CSV. Each look-up and download is logged by your name.">?</button></div>
         <form class="body pfind" id="patientForm" autocomplete="off">
           <label class="field col"><span>Patient ID</span>
-            <input type="search" id="patientRef" placeholder="P4347353" required></label>
-          <label class="field col"><span>Visit ID (optional: one consultation)</span>
+            <input type="search" id="patientRef" placeholder="P4347353"></label>
+          <label class="field col"><span>Visit ID (one consultation; alone or with the patient ID)</span>
             <input type="search" id="visitRef" placeholder="VIS-T-31492"></label>
           <button type="submit" class="primary" id="patientGo">Show</button>
           <span id="patientMsg" class="hint" role="status"></span>

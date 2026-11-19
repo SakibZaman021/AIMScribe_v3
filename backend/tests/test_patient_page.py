@@ -232,7 +232,94 @@ async def test_the_dashboard_button_downloads_through_the_real_address(dbs, monk
     _unserve()
     assert got.status_code == 200, got.text
     assert got.headers["content-disposition"] == (
-        'attachment; filename="demographics_2026-11-01_2026-11-30.csv"')
+        f'attachment; filename="demographics_{patient}_2026-11-01_2026-11-30.csv"')
     rows = _read_csv(SimpleNamespace(body=got.content))
     assert [r["visit_id"] for r in rows] == [f"VIS-{patient}-2"]
     assert wrong.status_code == 400
+
+
+# ============================================================
+# 19 Nov 2026: one patient, or one visit, as a CSV from the Patients page
+# ============================================================
+
+async def test_one_patient_downloads_as_one_row_per_visit_with_everything(dbs, monkeypatch):
+    """Demographics, vitals and prescription side by side, one row per visit."""
+    import dashboard
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    _server(dbs)
+    try:
+        await _two_visits(patient)
+        response = await dashboard.clinical_csv(as_person(monkeypatch, "researcher"),
+                                                table="visits", patient_id=patient)
+    finally:
+        _unserve()
+    rows = _read_csv(response)
+    assert [r["visit_id"] for r in rows] == [f"VIS-{patient}-2", f"VIS-{patient}-1"]
+    newest = rows[0]
+    assert (newest["sex"], newest["age"], newest["temperature"]) == ("female", "6Y 2M", "98 F")
+    assert newest["diagnoses"] == "Fever" and "Fexo" in newest["medicines"]
+    assert newest["demographics_received_at"] and newest["prescription_received_at"]
+    assert "visit_key" not in rows[0]
+    assert response.headers["content-disposition"] == f'attachment; filename="visits_{patient}.csv"'
+
+
+async def test_one_visit_downloads_alone(dbs, monkeypatch):
+    import dashboard
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    _server(dbs)
+    try:
+        await _two_visits(patient)
+        response = await dashboard.clinical_csv(as_person(monkeypatch, "admin"), table="visits",
+                                                patient_id=patient, visit_id=f"VIS-{patient}-1")
+        with pytest.raises(HTTPException) as bad:
+            await dashboard.clinical_csv(as_person(monkeypatch, "admin"), table="visits",
+                                         visit_id="VIS 1; DROP")
+    finally:
+        _unserve()
+    rows = _read_csv(response)
+    assert [(r["visit_id"], r["temperature"]) for r in rows] == [(f"VIS-{patient}-1", "99 F")]
+    assert bad.value.status_code == 400
+
+
+async def test_a_visit_without_a_prescription_is_still_a_row(dbs, monkeypatch):
+    """API 2 came, API 3 did not: the row is there, the prescription columns are empty."""
+    import clinical_v4
+    import dashboard
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    five = {"visit_id": f"VIS-{patient}-9", "patient_id": patient, "doctor_id": "DR4290371",
+            "hospital_id": "Susastho-Clinic-Test-1", "start_time": "2026-11-18T09:00:00+06:00",
+            "date": "2026-11-18"}
+    info = {**five, "demographics": {"sex": "male", "age": "40Y"}}
+    _server(dbs)
+    try:
+        await clinical_v4.file_message("patient_information", info, five["hospital_id"],
+                                       five["visit_id"], patient,
+                                       clinical_v4.read("patient_information", info), "t")
+        response = await dashboard.clinical_csv(as_person(monkeypatch, "admin"), table="visits",
+                                                patient_id=patient)
+    finally:
+        _unserve()
+    rows = _read_csv(response)
+    assert len(rows) == 1
+    assert rows[0]["sex"] == "male" and rows[0]["demographics_received_at"]
+    assert rows[0]["prescription_received_at"] == "" and rows[0]["diagnoses"] == ""
+
+
+async def test_a_visit_id_alone_shows_that_one_consultation(dbs, monkeypatch):
+    """The page sends a visit ID alone as both the look-up and the visit."""
+    import dashboard
+    patient = f"P{uuid.uuid4().hex[:7]}"
+    _server(dbs)
+    try:
+        await _two_visits(patient)
+        visit = f"VIS-{patient}-2"
+        found = await dashboard.patient_history(visit, as_person(monkeypatch, "researcher"),
+                                                visit_id=visit)
+    finally:
+        _unserve()
+    assert found["found"] and found["patient"]["patient_id"] == patient
+    assert [v["visit_id"] for v in found["visits"]] == [visit]
+    shown = found["visits"][0]
+    assert shown["demographics"]["temperature"] == "98 F"
+    assert shown["prescription"]["diagnoses"] == "Fever"
+    assert [m["medicine"] for m in shown["medicines"]] == ["Fexo"]
