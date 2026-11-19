@@ -214,7 +214,8 @@ async def gather(conn, hospital_id: str, start: datetime, end: datetime) -> Dict
           LEFT JOIN devices d ON d.device_id = n.device_id
          WHERE n.hospital_id = $1 AND n.created_at >= $2 AND n.created_at < $3
            AND n.event = ANY($4::text[])
-         ORDER BY n.event_key, n.created_at
+         -- The collector's copy first: a researcher's copy may be a one-line message.
+         ORDER BY n.event_key, (n.audience <> 'collector'), n.created_at
     """, hospital_id, start, end, list(ALERT_EVENTS))]
     alerts.sort(key=lambda a: a["created_at"])
 
@@ -583,20 +584,31 @@ ALERT_COLUMNS = [("File name", 30), ("PID", 14), ("DID", 10), ("VID", 16), ("Dat
                  ("Reminders", 9)]
 
 
+# An alert nobody marked fixed or ended within the follow-up time is not "open".
+FOLLOW_UP = timedelta(hours=6)
+
+
 def _alert_values(a: Dict[str, Any]) -> List[Any]:
     seen_after = round((a["seen_at"] - a["created_at"]).total_seconds() / 60) \
         if a["seen_at"] else ""
     fixed_after = round((a["resolved_at"] - a["created_at"]).total_seconds() / 60) \
         if a["resolved_at"] else ""
     what = ALERT_NAMES.get(a["event"], a["event"])
-    if a["event"] == "stopped_unusually" and a.get("subject"):
-        what = a["subject"].split(" - ")[0].replace("Recording stopped: ", "Stopped: ")
-    return [_hhmm(a["created_at"]), what, a["seen_by"] or "", seen_after, fixed_after,
-            a["resolution"] or ("open" if a["event"] in ("recording_without_jabra",
-                                                         "jabra_unplugged", "recording_problem",
-                                                         "pc_silent", "still_paused",
-                                                         "recording_too_long")
-                                 and not a["resolved_at"] else ""),
+    subject = a.get("subject") or ""
+    if a["event"] == "stopped_unusually" and subject.startswith("Recording stopped: "):
+        what = "Stopped: " + subject.split(" - ")[0][len("Recording stopped: "):]
+    elif a["event"] == "stopped_unusually" and " - " in subject:
+        what = "Stopped: " + subject.split(" - ", 1)[1]      # a one-line message
+    lasting = a["event"] in ("recording_without_jabra", "jabra_unplugged", "recording_problem",
+                             "pc_silent", "still_paused", "recording_too_long")
+    if a["resolution"]:
+        how = a["resolution"]
+    elif lasting and not a["resolved_at"]:
+        recent = datetime.now(timezone.utc) - a["created_at"] < FOLLOW_UP
+        how = "open" if recent else "not followed up"
+    else:
+        how = ""
+    return [_hhmm(a["created_at"]), what, a["seen_by"] or "", seen_after, fixed_after, how,
             a["reminders"] or ""]
 
 
