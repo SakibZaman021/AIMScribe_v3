@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 # Identifiers allowed into a filename. Anything else and the clip goes unnamed
 # rather than letting a separator or a path fragment into the archive.
 _NAME_SAFE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# A folder name in the segment store (20 Nov 2026): an identifier as
+# safe_identifier() allows it, so a clinic code such as AALO_KARAIL is a
+# folder and not, as _NAME_SAFE made it, a reason to fall back to the ULID.
+_PATH_SAFE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # The recording's own name (SRS-SES-05): the same characters plus the
 # underscores that separate its fields.
 _STEM_SAFE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
@@ -961,6 +965,11 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
 
     opened_at = _parse_time(body.opened_at)
     local_opened = await _local_time(hospital_id, opened_at)
+    # 20 Nov 2026: CMED's visit_id is known from the start (API 1, carried in
+    # the grant), so it is on the recording from the start - it was written
+    # only at close, and the dashboard showed none while recording.
+    opening_visit = await _opening_visit_id(body.grant_jti, patient_ref, doctor_id,
+                                            session_id, device, body.continues_session_id)
     await _repo().open_session(
         session_id=session_id,
         hospital_id=hospital_id,
@@ -969,8 +978,14 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         device_id=device["device_id"],
         session_date=await _local_date(hospital_id, opened_at),
         opened_at=opened_at,
-        object_prefix=object_prefix(patient_ref, doctor_id, hospital_id,
-                                    local_opened, session_id),
+        # 20 Nov 2026: the recording's own folder in the segment store, in the
+        # archive's layout; the readable flat name only where that cannot be
+        # formed, and the ULID where neither can.
+        object_prefix=(segment_folder(hospital_id, doctor_id, local_opened, session_id,
+                                      visit_key(patient_ref, doctor_id, opening_visit,
+                                                fallback=f"{local_opened:%Y%m%dT%H%M%S}"))
+                       or object_prefix(patient_ref, doctor_id, hospital_id,
+                                        local_opened, session_id)),
         audio=body.audio.model_dump(),
         consent_method=body.consent_method,
         genesis=genesis,
@@ -978,6 +993,11 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
 
     state = await _link_grant(session_id, body.grant_jti, patient_ref, device,
                               doctor_id=doctor_id)
+    if opening_visit:
+        try:
+            await _repo().set_session_visit(session_id, opening_visit)
+        except Exception as exc:          # it is written again at close
+            logger.warning("Could not note the visit of %s: %s", session_id, exc)
     if body.continues_session_id:
         state = await _link_continuation(session_id, body.continues_session_id,
                                          patient_ref, device, state)
@@ -1019,9 +1039,7 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
     # Readable where a human will see it. Falls back to the session ULID when
     # the prefix could not be formed, because a key that does not identify its
     # session is worse than one that cannot be read.
-    prefix = session.get("object_prefix") or session["session_id"]
-    name = unique_clip_name(session, body.seq_no) or f"seg_{body.seq_no:05d}.wav"
-    object_key = f"audio/{prefix}/{name}"
+    object_key = piece_key(session, body.seq_no)
 
     loop = asyncio.get_event_loop()
     upload_url = await loop.run_in_executor(
@@ -1268,6 +1286,77 @@ def object_prefix(patient: str, doctor: str, hospital: str,
             f"_{local_opened.strftime('%H%M%S')}"
             f"_{local_opened.strftime('%Y%m%d')}"
             f"_{session_id[-5:]}")
+
+
+def segment_folder(hospital: str, doctor: str, local_opened: datetime, session_id: str,
+                   visit_folder: Optional[str]) -> Optional[str]:
+    """
+    20 Nov 2026: a recording's folder in the segment store, laid out as the
+    archive is - clinic, doctor, day, the visit's folder - and then the
+    recording's own folder, its start time and the last five characters of
+    its ID, holding its pieces in order:
+
+        <hospital>/<doctor>/<YYYY-MM-DD>/<patient>_<doctor>_<visit_id>/<HHMMSS>_<tail>
+        AALO_KARAIL/DR4290373/2026-11-19/P4347510_DR4290373_VIS-T-31508/105225_JWRS5
+
+    The visit's folder is visit_key(): the archive's own name for it, and
+    <patient>_<doctor>_<YYYYMMDD>T<HHMMSS> when no visit_id is known. Two
+    recordings of one visit sit side by side in it. None if any part is not
+    a safe identifier; the caller then falls back.
+    """
+    for value in (hospital, doctor):
+        if not value or not _PATH_SAFE.match(str(value)):
+            return None
+    if not visit_folder or not _VISIT_KEY_SAFE.match(visit_folder)             or not _NAME_SAFE.match(str(session_id)[-5:]):
+        return None
+    return (f"{hospital}/{doctor}/{local_opened:%Y-%m-%d}/{visit_folder}"
+            f"/{local_opened:%H%M%S}_{str(session_id)[-5:]}")
+
+
+def piece_key(session: Dict[str, Any], seq_no: int) -> str:
+    """
+    Where one piece is put in the segment store. A recording opened in the
+    20 Nov layout (its folder has a "/") names its pieces piece_0001.wav,
+    piece_0002.wav, ...; one opened earlier keeps its earlier names to the
+    end, so a recording that spans the deploy is never split across layouts.
+    """
+    prefix = session.get("object_prefix")
+    if prefix and "/" in prefix:
+        return f"audio/{prefix}/piece_{seq_no:04d}.wav"
+    prefix = prefix or session["session_id"]
+    name = unique_clip_name(session, seq_no) or f"seg_{seq_no:05d}.wav"
+    return f"audio/{prefix}/{name}"
+
+
+async def _opening_visit_id(grant_jti: Optional[str], patient_ref: str, doctor_id: str,
+                            session_id: str, device: Dict[str, Any],
+                            continues: Optional[str] = None) -> Optional[str]:
+    """
+    CMED's visit_id for a recording being opened: from the grant it opens
+    under, when that grant is this PC's, for this patient and doctor, and not
+    another recording's; else, for a recording that continues another after a
+    crash, the one it continues. None when neither says.
+    """
+    repo = _repo()
+    try:
+        grant = await repo.get_authorisation(grant_jti) if grant_jti else None
+    except Exception as exc:
+        logger.warning("Could not read the grant of %s: %s", session_id, exc)
+        grant = None
+    if grant is not None             and str(grant.get("device_id")) == str(device["device_id"])             and grant.get("patient_id") == patient_ref             and grant.get("doctor_id") in (None, doctor_id)             and grant.get("session_id") in (None, session_id):
+        visit = grant.get("visit_id")
+        if isinstance(visit, str) and VISIT_ID.match(visit):
+            return visit
+    if continues:
+        try:
+            previous = await repo.get_session(safe_session_id(continues))
+        except Exception:
+            previous = None
+        if previous and str(previous.get("device_id")) == str(device["device_id"])                 and previous.get("patient_id") == patient_ref:
+            visit = previous.get("visit_id")
+            if isinstance(visit, str) and VISIT_ID.match(visit):
+                return visit
+    return None
 
 
 def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:

@@ -42,6 +42,10 @@ def _utcnow() -> datetime:
 _SESSION_TX: ContextVar[Optional[tuple]] = ContextVar("aims_session_tx", default=None)
 
 
+class _MoveRefused(Exception):
+    """A piece's address changed during a move: the whole move is undone."""
+
+
 class _Borrowed:
     """The transaction's connection, lent without being released."""
 
@@ -989,6 +993,89 @@ class V2Repository:
                 FROM segments WHERE session_id = $1 ORDER BY seq_no
             """, session_id)
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # 20 Nov 2026: the segment store in the archive's layout (segment_layout.py)
+    # ------------------------------------------------------------------
+
+    # A recording whose pieces may be moved: the PC has finished sending it,
+    # every piece is in, and nothing else can be working on it - not the
+    # archiver (it takes confirmed recordings only), not an erase.
+    _MOVABLE = """
+        s.closed_at IS NOT NULL
+        AND s.archived_at IS NULL
+        AND s.confirmation NOT IN ('confirmed', 'refused', 'expired')
+        AND s.quarantine_reason IS NULL
+        AND s.status NOT IN ('quarantined', 'refused', 'expired', 'archived')
+        AND s.patient_id <> 'REDACTED'
+        AND s.protocol_version >= 2"""
+
+    async def pieces_waiting_to_move(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Finished recordings still waiting in the segment store, oldest first."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id,
+                       s.session_date, s.opened_at, s.object_prefix, s.grant_jti,
+                       s.visit_id, s.segment_count,
+                       (SELECT count(*) FROM segments g
+                         WHERE g.session_id = s.session_id) AS pieces
+                  FROM sessions s
+                 WHERE {self._MOVABLE}
+                   AND EXISTS (SELECT 1 FROM segments g
+                                WHERE g.session_id = s.session_id
+                                  AND g.object_deleted_at IS NULL)
+                 ORDER BY s.opened_at
+                 LIMIT $1
+            """, limit)
+        return [dict(row) for row in rows]
+
+    async def move_pieces(self, session_id: str, moves: List[Tuple[int, str, str]],
+                          prefix: str) -> bool:
+        """
+        Point a recording's pieces at their new addresses, all or none.
+
+        The recording's row is locked first, and the move is made only if it is
+        still waiting: CMED confirming it, or an erase, waits on that lock and
+        then sees the new addresses - or, having come first, makes this return
+        False and the pieces stay where they were. `moves` is
+        (seq_no, old key, new key); a piece whose address changed meanwhile
+        also refuses the whole move.
+        """
+        try:
+            return await self._move_pieces(session_id, moves, prefix)
+        except _MoveRefused:
+            return False                        # rolled back: nothing changed
+
+    async def _move_pieces(self, session_id: str, moves: List[Tuple[int, str, str]],
+                           prefix: str) -> bool:
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                still = await conn.fetchval(f"""
+                    SELECT 1 FROM sessions s WHERE s.session_id = $1 AND {self._MOVABLE}
+                       FOR UPDATE
+                """, session_id)
+                if not still:
+                    return False
+                for seq_no, old, new in moves:
+                    done = await conn.execute("""
+                        UPDATE segments SET object_key = $4
+                         WHERE session_id = $1 AND seq_no = $2 AND object_key = $3
+                           AND object_deleted_at IS NULL
+                    """, session_id, seq_no, old, new)
+                    if done.split()[-1] != "1":
+                        raise _MoveRefused(seq_no)
+                await conn.execute("""
+                    UPDATE sessions SET object_prefix = $2, updated_at = now()
+                     WHERE session_id = $1
+                """, session_id, prefix)
+                # v1's mirror of each clip, where that table is still kept.
+                if await conn.fetchval("SELECT to_regclass('public.clips') IS NOT NULL"):
+                    for seq_no, old, new in moves:
+                        await conn.execute("""
+                            UPDATE clips SET object_key = $4
+                             WHERE session_id = $1 AND clip_number = $2 AND object_key = $3
+                        """, session_id, seq_no, old, new)
+        return True
 
     async def doctor_is_credentialed(self, doctor_id: str, hospital_id: str) -> bool:
         """
