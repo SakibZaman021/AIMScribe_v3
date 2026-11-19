@@ -888,6 +888,16 @@ function cmedArrival(r, iso, what) {
   return tag("good", other ? `${day} ${time}` : time, `CMED's ${what} arrived ${at.toLocaleString([], { timeZone: "Asia/Dhaka" })}`);
 }
 
+/* 20 Nov: each pause - when it began and how long - without the reason. */
+function pauseLine(r) {
+  const list = r.pause_list || [];
+  if (!list.length) return "";
+  const at = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" });
+  const parts = list.map((p) => `${p.at ? at(p.at) : "?"} · ${num(p.minutes)} min${p.open ? " (still)" : ""}`);
+  return `<span class="sub2" title="Paused by the doctor: nothing was recorded then">`
+    + `Paused ${list.length}×: ${esc(parts.join(", "))}</span>`;
+}
+
 function recordingsTable(list) {
   if (!list.length) {
     return STATE
@@ -931,9 +941,7 @@ function recordingsTable(list) {
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
           + td("Visit", r.visit_id ? esc(r.visit_id) : `<span class="hint">–</span>`)
-          + td("Length", `${num(r.minutes || 0)} min`
-            + (r.pauses ? `<span class="sub2" title="Paused by the doctor ${r.pauses} time(s): nothing was recorded then">`
-              + `paused ${num(r.paused_minutes || 0)} min (${r.pauses})</span>` : ""), "num")
+          + td("Length", `${num(r.minutes || 0)} min` + pauseLine(r), "num")
           + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
           + td("Demographics", cmedArrival(r, r.api2_at, "demographics (API 2)"))
@@ -965,6 +973,7 @@ function drawStateFilters() {
   const counts = {
     pending: c.pending, unconfirmed: c.unconfirmed, confirmed: c.confirmed,
     quarantined: i.quarantined_total, stopped_early: i.stopped_early_total,
+    not_jabra: i.not_jabra_total, unarchived: i.unarchived_total,
     uncopied: LAST && LAST.copies.recordings_without_a_cloud_copy,
     refused: c.refused, expired: c.expired, legacy: c.legacy,
   };
@@ -2241,7 +2250,7 @@ const EVENT_LABELS = {
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
   recording_too_long: "Recording not stopped", handled: "Seen", daily_report: "Daily report",
   still_not_fixed: "Still not fixed", problem_fixed: "Fixed", repeated_stops: "Repeated stops",
-  shift_report: "Shift summary", summary_csv: "Summary CSV",
+  shift_report: "Shift summary", summary_csv: "Summary CSV", summary_xlsx: "Summary workbook",
   stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
 };
 
@@ -2601,8 +2610,10 @@ $("wRepShow").addEventListener("click", async () => {
   } catch (err) { $("wReport").textContent = `Could not build it: ${err.message}`; }
 });
 $("wRepCsv").addEventListener("click", () => {
+  // 20 Nov: the chosen hospital's workbook (four sheets), not one CSV of all.
   const link = document.createElement("a");
-  link.href = `/api/v2/dashboard/watch/summary.csv?shift=${encodeURIComponent($("wRepShift").value)}`
+  link.href = `/api/v2/dashboard/watch/summary.xlsx?hospital_id=${encodeURIComponent($("wRepHosp").value)}`
+    + `&shift=${encodeURIComponent($("wRepShift").value)}`
     + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : "");
   link.rel = "noopener";
   document.body.appendChild(link);

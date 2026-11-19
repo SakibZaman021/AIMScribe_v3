@@ -921,7 +921,7 @@ async def _telegram_upload(method: str, fields: Dict[str, Any], filename: str,
             reply = await client.post(
                 f"{TELEGRAM_API}/bot{token}/{method}",
                 data={k: str(v) for k, v in fields.items()},
-                files={"document": (filename, content, "text/csv")})
+                files={"document": (filename, content, _file_type(filename))})
         try:
             body = reply.json()
         except ValueError:
@@ -932,6 +932,13 @@ async def _telegram_upload(method: str, fields: Dict[str, Any], filename: str,
                            f"{body.get('description') or reply.text[:200]}")[:500]
     except Exception as exc:
         return None, _hide(f"Telegram could not be reached: {type(exc).__name__} {exc}")[:500]
+
+
+def _file_type(filename: str) -> str:
+    """20 Nov: the shift summary is an Excel workbook; older files were CSV."""
+    if filename.endswith(".xlsx"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return "text/csv"
 
 
 async def send_telegram_file(chat_id: int, filename: str, content: bytes,
@@ -945,8 +952,16 @@ async def send_telegram_file(chat_id: int, filename: str, content: bytes,
 
 
 async def _summary_file(conn, note: Dict[str, Any]) -> Tuple[str, bytes]:
-    """The researcher's shift CSV, built when it is sent (and again if it is retried)."""
+    """
+    The researcher's shift file, built when it is sent (and again if retried):
+    20 Nov, one Excel workbook per hospital (summary-xlsx:<day>:<shift>:<hospital>);
+    before, one CSV of all their hospitals (summary-csv:<day>:<shift>).
+    """
     import watchers
+    if note["event"] == "summary_xlsx":
+        import workbook
+        _, day, shift, hospital = note["event_key"].split(":", 3)
+        return await workbook.build_cached(conn, hospital, date.fromisoformat(day), shift)
     _, day, shift = note["event_key"].split(":", 2)
     return await watchers.summary_csv_for(conn, note["email"], date.fromisoformat(day), shift)
 
@@ -970,8 +985,14 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
         if channel == "telegram":
             if chat is None or not telegram_ready():
                 continue
-            if note["event"] == "summary_csv":
-                filename, content = await _summary_file(conn, note)
+            if note["event"] in ("summary_csv", "summary_xlsx"):
+                try:
+                    filename, content = await _summary_file(conn, note)
+                except Exception as exc:
+                    logger.warning("The shift file for %s could not be built: %s",
+                                   note["email"], exc)
+                    errors.append((channel, f"the file could not be built: {exc}"[:300]))
+                    continue
                 ok, error = await send_telegram_file(
                     chat, filename, content, f"{note['subject']}\n\n{note['body']}")
                 if ok:
@@ -2141,7 +2162,8 @@ class Notifier:
                                 "one-line messages. A pinned board shows each hospital live. "
                                 "You also get a summary of each shift "
                                 f"at {watchers.midday_time():%H:%M} and "
-                                f"{watchers.report_time():%H:%M}, with a CSV. Nothing comes "
+                                f"{watchers.report_time():%H:%M}, with an Excel workbook "
+                                "for each of your hospitals. Nothing comes "
                                 "at night: it waits for the next summary.")
             return
         await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "

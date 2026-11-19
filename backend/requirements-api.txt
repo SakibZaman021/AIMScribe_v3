@@ -36,3 +36,5 @@ tzdata>=2024.1
 httpx>=0.26.0
 requests>=2.31.0
 aiohttp>=3.9.0
+# 20 Nov 2026: the shift summary is an Excel workbook (watchers / workbook.py).
+openpyxl>=3.1.2

@@ -249,7 +249,22 @@ async def _integrity(conn, start: date, end: date,
          ORDER BY n DESC
     """, start, end, clinic)
 
+    # 20 Nov: the two filters that showed no number.
+    more = await conn.fetchrow("""
+        SELECT count(*) FILTER (WHERE closed_at IS NOT NULL AND archived_at IS NULL)
+                   AS unarchived,
+               count(*) FILTER (WHERE EXISTS (SELECT 1 FROM unnest(microphones) m
+                                               WHERE m NOT ILIKE '%jabra%'
+                                                 AND m NOT ILIKE 'echo cancelling speakerphone (j%'))
+                   AS not_jabra
+          FROM sessions
+         WHERE session_date BETWEEN $1 AND $2
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
+    """, start, end, clinic)
+
     return {
+        "not_jabra_total": int(more["not_jabra"] or 0) if more else 0,
+        "unarchived_total": int(more["unarchived"] or 0) if more else 0,
         "quarantined": [dict(r) for r in quarantined],
         "quarantined_total": sum(r["n"] for r in quarantined),
         "stopped_early": [dict(r) for r in stopped],
@@ -600,6 +615,13 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                       AND c.entry_type = 'pause'
                       AND COALESCE(c.payload->>'reason', '') <> ALL({holds}::text[]))
                        AS pauses,
+                   -- 20 Nov: each pause, when and how long (no reasons on the dashboard).
+                   (SELECT json_agg(json_build_object('entry_type', c.entry_type,
+                                                      'payload', c.payload,
+                                                      'occurred_at', c.occurred_at)
+                                    ORDER BY c.entry_no)
+                      FROM chain_entries c WHERE c.session_id = s.session_id
+                       AND c.entry_type IN ('pause', 'resume')) AS pause_entries,
                    -- 18 Nov: an open recording on a PC gone quiet is not "active".
                    (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
                        AS pc_last_seen,
@@ -860,7 +882,24 @@ def _recording_row(row) -> Dict[str, Any]:
         "paused_minutes": round(float(row["paused_seconds"] or 0) / 60, 1)
         if "paused_seconds" in row.keys() else 0,
         "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
+        "pause_list": _pause_list(row),
     }
+
+
+def _pause_list(row) -> List[Dict[str, Any]]:
+    """20 Nov: each pause the doctor made - when it began and its minutes."""
+    if "pause_entries" not in row.keys() or not row["pause_entries"]:
+        return []
+    import workbook
+    entries = row["pause_entries"]
+    if isinstance(entries, str):
+        entries = json.loads(entries)
+    out = []
+    for p in workbook.pair_pauses(entries, row["closed_at"]):
+        out.append({"at": p["at"].isoformat() if p["at"] else None,
+                    "minutes": round((p["seconds"] or 0) / 60, 1),
+                    "open": bool(p.get("open"))})
+    return out
 
 
 # ============================================================

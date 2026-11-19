@@ -61,13 +61,14 @@ admin_router = APIRouter(prefix="/api/v2/admin", tags=["researchers"])
 EVERYTHING_ONLY = {"recording_finished", "jabra_back", "handled"}
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
                  "recording_too_long", "stopped_technical", "daily_report", "shift_report",
-                 "summary_csv", "still_not_fixed", "problem_fixed", "repeated_stops",
+                 "summary_csv", "summary_xlsx", "still_not_fixed", "problem_fixed",
+                 "repeated_stops",
                  "stopped_unusually", "jabra_unplugged", "jabra_not_plugged",
                  "recording_without_jabra", "recording_paused", "recording_resumed",
                  "still_paused"}
 MODES = ("everything", "problems")
 # The summaries themselves go out at their time, quiet hours or not.
-SUMMARY_EVENTS = ("shift_report", "summary_csv", "daily_report")
+SUMMARY_EVENTS = ("shift_report", "summary_csv", "summary_xlsx", "daily_report")
 UNHANDLED_AFTER = timedelta(minutes=15)
 SHORT_SECONDS = 60
 LATE_MINUTES = 15
@@ -868,7 +869,6 @@ async def shift_summaries(conn, now: Optional[datetime] = None) -> None:
              ORDER BY r.hospital_id, r.email
         """, f"{day.isoformat()}:{shift}")
         texts: Dict[str, str] = {}
-        people: List[str] = []
         for r in rows:
             hid = r["hospital_id"]
             if hid not in texts:
@@ -880,17 +880,18 @@ async def shift_summaries(conn, now: Optional[datetime] = None) -> None:
                 audience="watcher")
             if note_id is not None:
                 await collectors._deliver(conn, note_id)
-            if r["email"] not in people:
-                people.append(r["email"])
-        # Then one CSV each, of every hospital they look after.
-        for email in people:
+        # 20 Nov: then one Excel workbook per hospital they look after - only
+        # their own hospitals, four sheets each (workbook.py).
+        for r in rows:
+            hid = r["hospital_id"]
             note_id = await collectors._record(
-                conn, email=email, event="summary_csv",
-                subject=f"{SHIFT_NAMES[shift]} CSV, {day:%d %b}",
-                body=(f"Every recording and alert at your hospitals, "
-                      f"{shift_window(day, shift)[2]} on {day:%d %b}: one row each, to open "
-                      "in Excel. Also on the dashboard, My alerts > Shift summaries."),
-                event_key=f"summary-csv:{day.isoformat()}:{shift}", audience="watcher")
+                conn, email=r["email"], event="summary_xlsx",
+                subject=f"{SHIFT_NAMES[shift]} workbook: {hid}, {day:%d %b}",
+                body=(f"{hid}, {shift_window(day, shift)[2]} on {day:%d %b}: Summary by "
+                      "doctor; every audio file with its pauses and stops; what CMED did not "
+                      "send; the alerts of each file. Also on the dashboard, My alerts."),
+                event_key=f"summary-xlsx:{day.isoformat()}:{shift}:{hid}", hospital_id=hid,
+                audience="watcher")
             if note_id is not None:
                 await collectors._deliver(conn, note_id)
 
@@ -1594,6 +1595,29 @@ async def report(request: Request, hospital_id: str, day: Optional[str] = None,
             raise HTTPException(status_code=404, detail="no such hospital")
         text = await hospital_report(conn, hospital_id, when, shift)
     return {"hospital_id": hospital_id, "day": when.isoformat(), "shift": shift, "text": text}
+
+
+@router.get("/summary.xlsx")
+async def summary_workbook(request: Request, hospital_id: str, day: Optional[str] = None,
+                           shift: Optional[str] = None):
+    """20 Nov: one hospital's shift workbook - a researcher's own hospitals only; an
+    admin, any."""
+    from fastapi.responses import Response
+    import workbook
+    person = await _watcher(request)
+    when, shift = _day_and_shift(day, shift)
+    async with _pool().acquire() as conn:
+        if not await conn.fetchval("SELECT 1 FROM hospitals WHERE hospital_id = $1",
+                                   hospital_id):
+            raise HTTPException(status_code=404, detail="no such hospital")
+        if person.role != "admin" and hospital_id not in await watched_hospitals(
+                person.email, conn):
+            raise HTTPException(status_code=403, detail="you do not look after this hospital")
+        name, content = await workbook.build_cached(conn, hospital_id, when, shift)
+    await portal._audit("researcher.summary_xlsx", person.email,
+                        {"day": when.isoformat(), "shift": shift, "hospital_id": hospital_id})
+    return Response(content=content, media_type=workbook.XLSX_TYPE,
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @router.get("/summary.csv")

@@ -3617,13 +3617,15 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
             await watchers.shift_summaries(conn, now=at[(20, 0)])
             morning = mine()
             assert sorted(x.split(",")[0] for x in morning) == [
-                "Morning shift summary CSV", "Morning shift summary: HOSP555",
+                "Morning shift summary workbook: HOSP555",
+                "Morning shift summary workbook: HOSP556", "Morning shift summary: HOSP555",
                 "Morning shift summary: HOSP556"]
             await watchers.shift_summaries(conn, now=at[(20, 45)])
             await watchers.shift_summaries(conn, now=at[(20, 45)])
         evening = [x for x in mine() if x not in morning]
         assert sorted(x.split(",")[0] for x in evening) == [
-            "Evening shift summary CSV", "Evening shift summary: HOSP555",
+            "Evening shift summary workbook: HOSP555", "Evening shift summary workbook: HOSP556",
+            "Evening shift summary: HOSP555",
             "Evening shift summary: HOSP556"]
     _unserve()
 
@@ -4096,11 +4098,13 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
             subjects = [x[1] for x in sent if x[0] == 661002]
             assert any(x.startswith("\U0001F4CB Evening shift summary: HOSP661") or
                        "Evening shift summary: HOSP661" in x for x in subjects)
+            # 20 Nov: one Excel workbook per hospital they look after, per shift.
             mine = [f for f in files if f[0] == 661002]
             assert len(mine) == 2                                      # morning and evening
-            assert {f[1] for f in mine} == {f"aimscribe_{day.isoformat()}_morning.csv",
-                                            f"aimscribe_{day.isoformat()}_evening.csv"}
-            assert all(f[2].startswith(b"\xef\xbb\xbf") for f in mine)
+            assert {f[1] for f in mine} == {
+                f"aimscribe_HOSP661_{day.isoformat()}_morning.xlsx",
+                f"aimscribe_HOSP661_{day.isoformat()}_evening.xlsx"}
+            assert all(f[2].startswith(b"PK") for f in mine)           # an .xlsx is a zip
 
         # And on the dashboard, for any day and shift.
         client.cookies.clear()
@@ -4113,6 +4117,12 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
         assert got.content.decode("utf-8-sig").count("\n") >= 2      # header and the recording
         assert (await client.get("/api/v2/dashboard/watch/summary.csv",
                                  params={"shift": "night"})).status_code == 400
+        book = await client.get("/api/v2/dashboard/watch/summary.xlsx",
+                                params={"hospital_id": "HOSP661", "day": day.isoformat(),
+                                        "shift": "day"})
+        assert book.status_code == 200 and book.content.startswith(b"PK")
+        assert (await client.get("/api/v2/dashboard/watch/summary.xlsx",
+                                 params={"hospital_id": "HOSP003"})).status_code == 403
         page = (await client.get("/api/v2/dashboard/watch/me")).json()
         assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
     _unserve()
@@ -4599,3 +4609,98 @@ async def test_the_event_log_lists_pauses_and_what_cmed_never_sent(dbs, monkeypa
                                    params={"hospital_id": "HOSP9E1"})
         assert missing.status_code == 200
         assert missing.content.decode("utf-8-sig").startswith("cmed_hospital_id,")
+
+
+async def test_the_shift_workbook_has_four_sheets_built_around_the_audio_file(dbs, monkeypatch):
+    """
+    20 Nov 2026, the lab's design: per hospital, a Summary by doctor; every audio
+    file as one block with its pauses (when, how long, why) and how it stopped,
+    and where its audio is; what CMED did not send; and each file's alerts.
+    """
+    import io as _io
+    import collectors
+    import workbook
+    from openpyxl import load_workbook
+    device = await enrolled_device(dbs.repo)
+    await dbs.repo.upsert_hospital("HOSP9X1", "Workbook clinic", "Asia/Dhaka")
+    sid = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(minutes=30))
+    other = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(minutes=10))
+    async with dbs.rec.acquire() as conn:
+        began = datetime.now(timezone.utc) - timedelta(minutes=25)
+        await conn.execute("""
+            INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
+                payload_sha256, prev_hash, entry_hash, device_signature, occurred_at)
+            VALUES ($1, 2, 'pause', $2::jsonb, $3, $3, $3, $3, $4),
+                   ($1, 3, 'resume', $5::jsonb, $6, $6, $6, $6, $4),
+                   ($1, 4, 'pause', $7::jsonb, $8, $8, $8, $8, $4)
+        """, sid, json.dumps({"reason": "sensitive_personal_matter", "at": began.isoformat()}),
+            os.urandom(32), began, json.dumps({"paused_seconds": 120.0}), os.urandom(32),
+            json.dumps({"reason": "patient_declined",
+                        "at": (began + timedelta(minutes=5)).isoformat()}), os.urandom(32))
+        await conn.execute("""
+            UPDATE sessions SET closed_at = $2, close_reason = 'doctor_stopped:other',
+                   total_duration_seconds = 600, segment_count = 4,
+                   manifest = '{"close_detail": "phone call"}'::jsonb,
+                   microphones = ARRAY['Microphone Array (Realtek)']
+             WHERE session_id = $1
+        """, sid, began + timedelta(minutes=6))
+        await conn.execute("UPDATE sessions SET microphones = ARRAY['Jabra Speak2 55'] "
+                           "WHERE session_id = $1", other)
+        await collectors._record(conn, email="lead9x@uni.example", event="recording_without_jabra",
+                                 subject="Patient recorded without the Jabra", body="b",
+                                 event_key=f"nojabra:{sid}", urgent=True, hospital_id="HOSP9X1",
+                                 device_id=device["device_id"], session_id=sid)
+        day = datetime.now(collectors.zone()).date()
+        name, content = await workbook.build(conn, "HOSP9X1", day, "day")
+    assert name == f"aimscribe_HOSP9X1_{day.isoformat()}_day.xlsx"
+    book = load_workbook(_io.BytesIO(content))
+    assert book.sheetnames == ["Summary", "Audio files", "Missing from CMED",
+                               "Alerts per audio file"]
+
+    summary = book["Summary"]
+    head = [c.value for c in summary[5]]
+    row = {head[i]: c.value for i, c in enumerate(summary[6])}
+    assert row["Doctor (DID)"] == "DR9CARD" and row["Audio files"] == 2
+    assert row["Files paused"] == 1 and row["Pauses"] == 2 and row["Other"] == 1
+    assert row["Not Jabra"] == 1 and row["Jabra"] == 1 and row["Alerts"] == 1
+    assert row["Still on doctor's PC"] == 2         # 0 of 4 pieces here; the other runs on
+    assert summary.cell(row=7, column=1).value == "Total"
+
+    files = book["Audio files"]
+    head = [c.value for c in files[5]]
+    rows = [{head[i]: c.value for i, c in enumerate(r)} for r in files.iter_rows(min_row=6)]
+    block = [r for r in rows[:3]]
+    assert block[0]["File name"] == sid and block[0]["Pauses"] == 2
+    assert [r["Event"] for r in block] == ["Pause", "Pause", "Stop"]
+    assert block[0]["Reason"] == "Sensitive personal matter" and block[0]["Event min"] == 2.0
+    assert block[1]["Reason"] == "Patient asked to pause" and block[1]["Event min"] == 1.0
+    assert block[2]["Reason"].endswith("phone call")
+    assert block[0]["On doctor's PC"] == "Yes, 4 pieces waiting"
+    assert block[0]["Pieces on server"] == "0 of 4"
+    merged = {str(m) for m in files.merged_cells.ranges}
+    assert "A6:A8" in merged                       # one block per file
+    assert rows[3]["File name"] == other and rows[3]["On doctor's PC"] == "Yes, still recording"
+
+    alerts = book["Alerts per audio file"]
+    head = [c.value for c in alerts[5]]
+    first = {head[i]: c.value for i, c in enumerate(alerts[6])}
+    assert first["File name"] == sid and first["Alert"] == "Recorded without the Jabra"
+    assert book["Missing from CMED"].cell(row=6, column=1).value.startswith("Nothing missing")
+
+
+def test_pauses_pair_with_their_resumes_and_skip_the_recorders_own_holds():
+    import workbook
+    t = datetime(2026, 11, 20, 1, 44, tzinfo=timezone.utc)
+    entries = [
+        {"entry_type": "pause", "payload": {"reason": "stop_requested", "at": t.isoformat()}},
+        {"entry_type": "resume", "payload": {"paused_seconds": 9}},
+        {"entry_type": "pause", "payload": {"reason": "other", "reason_detail": "call",
+                                            "at": t.isoformat()}},
+        {"entry_type": "resume", "payload": {"paused_seconds": 120}},
+        {"entry_type": "pause", "payload": {"reason": "patient_declined",
+                                            "at": (t + timedelta(minutes=5)).isoformat()}},
+    ]
+    got = workbook.pair_pauses(entries, closed_at=t + timedelta(minutes=6))
+    assert [(p["reason"], p["seconds"]) for p in got] == [("other", 120.0),
+                                                         ("patient_declined", 60.0)]
+    assert workbook.pause_words(got[0]) == "Other: call"
