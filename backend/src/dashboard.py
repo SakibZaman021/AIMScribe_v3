@@ -269,7 +269,8 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
                approval, registered_via, microphone, microphone_is_clinic,
-               blocked_at, revoked_reason, octet_length(tpm_pubkey) AS key_bytes
+               blocked_at, revoked_reason, octet_length(tpm_pubkey) AS key_bytes,
+               update_status, update_status_at
           FROM devices
          WHERE ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
          ORDER BY hospital_id, machine_name
@@ -326,6 +327,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             # 3.9.2: where its identity key lives - 65 bytes P-256 in its TPM
             # chip, 32 bytes Ed25519 in software (no usable chip, or before 3.6).
             "key": {65: "tpm", 32: "software"}.get(row["key_bytes"]),
+            # 048: what its updater last reported (installed, waiting, failed...).
+            "update_status": _json(row["update_status"]),
+            "update_status_at": row["update_status_at"].isoformat()
+                                if row["update_status_at"] else None,
         })
         if is_silent:
             silent += 1
@@ -340,6 +345,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                                      if r["approval"] == "pending" and not r["revoked"]),
             "unencrypted": sum(1 for r in rooms
                                if r["disk_encrypted"] is False and not r["revoked"])}
+
+
+def _json(value):
+    return json.loads(value) if isinstance(value, str) else value
 
 
 REVIEW_ALERTS = ("labelling_review", "relabelled_after_archive")

@@ -416,6 +416,10 @@ class Config:
     app_name: str = APP_NAME
     app_version: str = APP_VERSION
     protocol_version: int = PROTOCOL_VERSION
+    # Whose Authenticode signature an update must carry (core.updater): the
+    # certificate's common name or organisation, exactly. From .env, which
+    # only an administrator can change; the installer carries it over.
+    update_publisher: str = "AIMS LAB"
 
     # ---- construction ----
 
@@ -508,6 +512,7 @@ class Config:
         return cls(
             audio=audio, segment=segment, spool=spool, backend=backend,
             security=security, pause=pause, paths=PathConfig(), ops=ops,
+            update_publisher=_str("AIMS_UPDATE_PUBLISHER", "AIMS LAB") or "AIMS LAB",
         )
 
     # ---- runtime helpers ----

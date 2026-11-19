@@ -58,6 +58,10 @@ RECEIPT_DOMAIN = b"aimscribe.receipt.v2"
 # The list of CMED's EHR addresses recorders obey: signed with the receipt key,
 # under a domain of its own, so a list can never pass for a receipt.
 ORIGINS_DOMAIN = b"aimscribe.trusted-origins.v1"
+# A notice that tells one recorder to install a version: the same key again,
+# its own domain, so a notice is never a list or a receipt, nor they a notice.
+# MUST match recorder/core/updater.py.
+UPDATE_DOMAIN = b"aimscribe.recorder-update.v1"
 AUDIT_DOMAIN = b"aimscribe.audit.v2"
 
 # "reassign" moves the recording to the patient the prescription was built for,
@@ -523,6 +527,21 @@ class ReceiptSigner:
         payload = {"scope": "trusted_origins", "origins": sorted(origins),
                    "version": version, "issued_at": iso_utc(issued_at)}
         signature = self._key.sign(digest(ORIGINS_DOMAIN, canonical_json(payload)))
+        return {"payload": payload, "signature": signature.hex()}
+
+    def sign_recorder_update(self, *, device_id: str, release_id: int, version: str,
+                             url: str, sha256_hex: str, rollback: bool,
+                             issued_at: datetime) -> Dict[str, Any]:
+        """
+        The notice one PC's updater acts on. Named to that PC, so a notice for
+        a test PC cannot be handed to another ahead of its stage; numbered by
+        release, so an older notice replayed later is refused.
+        """
+        payload = {"scope": "recorder_update", "device_id": str(device_id),
+                   "release_id": int(release_id), "version": version, "url": url,
+                   "sha256": sha256_hex, "rollback": bool(rollback),
+                   "issued_at": iso_utc(issued_at)}
+        signature = self._key.sign(digest(UPDATE_DOMAIN, canonical_json(payload)))
         return {"payload": payload, "signature": signature.hex()}
 
 

@@ -213,6 +213,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("sessions", "paused_since")),
     ("047_v3_pause_and_cards.sql", "recordings", "table telegram_boards",
      _table("telegram_boards")),
+    # Without it no recorder can be told of a new version.
+    ("048_v3_recorder_releases.sql", "recordings", "table recorder_releases",
+     _table("recorder_releases")),
+    ("048_v3_recorder_releases.sql", "recordings", "column devices.update_status",
+     _column("devices", "update_status")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

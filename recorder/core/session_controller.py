@@ -45,6 +45,7 @@ from core.recorder import AudioCaptureError, AudioRecorder
 from core.simple_splitter import SealedSegment, Segmenter
 from core.spool import SessionSpool, Spool
 from core.start_keeper import StartKeeper
+from core import updater
 from core.uploader import UploadManager
 
 logger = logging.getLogger(__name__)
@@ -225,7 +226,8 @@ class SessionController:
         # The consultation CMED last asked for, until it ends normally: in
         # memory, and on disk so a restart can pick it up (see start_keeper).
         paths = getattr(cfg, "paths", None)
-        self._keeper = StartKeeper(getattr(paths, "state_dir", None))
+        self._state_dir = getattr(paths, "state_dir", None)
+        self._keeper = StartKeeper(self._state_dir)
         self._wanted: Optional[Dict[str, str]] = None
         self._start_retry: Optional[asyncio.Task] = None
 
@@ -848,6 +850,10 @@ class SessionController:
         if isinstance(reply, dict) and reply.get("trusted_origins"):
             from core import trusted_origins
             trusted_origins.apply(reply["trusted_origins"])
+        if isinstance(reply, dict) and reply.get("status") == "ok":
+            # The server's word on a new version, for the updater; a reply
+            # without one withdraws any notice held (a paused rollout).
+            updater.keep_notice(self._state_dir, reply.get("update"))
         notice = reply.get("prescription_received") if isinstance(reply, dict) else None
         if isinstance(notice, dict) and notice.get("session_id"):
             try:
@@ -1654,6 +1660,15 @@ class SessionController:
         # doctor goes without touching the keyboard.
         self._state = value
         keep_awake(value != IDLE)
+        # The updater (SYSTEM) waits for this to say idle before it installs.
+        self._note_state_for_updater()
+
+    def _note_state_for_updater(self) -> None:
+        state_dir = getattr(self, "_state_dir", None)
+        if state_dir:
+            active = getattr(self, "_active", None)
+            updater.note_agent_state(state_dir, self._state,
+                                     active.session_id if active is not None else None)
 
     async def _ready_microphone(self) -> None:
         """
@@ -1684,6 +1699,7 @@ class SessionController:
                 await asyncio.sleep(interval)
                 if self._active is not None:
                     self._keeper.touch()           # still live, for a restart to see
+                self._note_state_for_updater()     # still here, for the updater to see
                 self._check_disk()
                 # 16 Nov: a PC that has not joined has no token, and every
                 # heartbeat it sent was refused (401) - 2,880 a day in the
@@ -1761,6 +1777,8 @@ class SessionController:
             **self._microphone_report(active),
             # The list of CMED addresses held: the server sends a newer one.
             "trusted_origins_version": _origins_version(),
+            # What the updater last did: installed, waiting, failed and why.
+            "update_status": updater.last_report(self._state_dir),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
 

@@ -3,10 +3,10 @@ setlocal enabledelayedexpansion
 title AIMScribe Agent - Build
 
 REM ============================================================
-REM Builds a release: dist\AIMScribe_Agent\ (the program, every file signed)
+REM Builds a release: dist\AIMScribe_Agent\ (the program, AIMScribe_Agent.exe signed)
 REM and dist\AIMScribeSetup.exe (the signed installer).
 REM
-REM   Release:  set AIMS_SIGN_PROVIDER=azure ^| thumbprint ^| signpath
+REM   Release:  set AIMS_SIGN_PROVIDER=thumbprint ^| azure ^| signpath
 REM             (and its settings - see signing\sign.ps1 and INSTALL_FOR_IT.md)
 REM             set AIMS_BACKEND=https://<the AIMS LAB server>
 REM             (optional) set AIMS_ORIGIN=https://<a bench page> - CMED's come from the server
@@ -118,7 +118,7 @@ if defined KEEPENV (
     echo       restored the installed .env
 )
 
-echo [7/9] Signing every program file...
+echo [7/9] Signing the program (AIMScribe_Agent.exe)...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File signing\sign.ps1 -Folder dist\AIMScribe_Agent
 if errorlevel 1 (
     echo ERROR: signing failed - nothing was released.
@@ -126,6 +126,9 @@ if errorlevel 1 (
 )
 
 echo [8/9] Building the installer...
+REM The publisher the program files are verified against is the one the
+REM updater on each PC will require of every update (installer.iss).
+if "%AIMS_SIGN_PUBLISHER%"=="" set "AIMS_SIGN_PUBLISHER=AIMS LAB"
 set "ISCC="
 REM Outside the loop: the ")" in ProgramFiles(x86) would end a ( ) block.
 set "PF86=%ProgramFiles(x86)%"
@@ -144,7 +147,7 @@ if "%DEV_UNSIGNED%"=="1" (
         "%ISCC%" /Q "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" "/DKeysDir=%AIMS_KEYS_DIR%" installer.iss
     )
 ) else (
-    "%ISCC%" /Q /DSignedBuild "/Saimssign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File %~dp0signing\sign.ps1 -File $f" "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
+    "%ISCC%" /Q /DSignedBuild "/DUpdatePublisher=%AIMS_SIGN_PUBLISHER%" "/Saimssign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File %~dp0signing\sign.ps1 -File $f" "/DDefaultBackend=%AIMS_BACKEND%" "/DDefaultOrigin=%AIMS_ORIGIN%" installer.iss
 )
 if errorlevel 1 (
     echo ERROR: the installer did not build.

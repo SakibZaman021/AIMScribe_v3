@@ -6,10 +6,12 @@
     Two ways to call it:
 
       sign.ps1 -Folder dist\AIMScribe_Agent
-          Every .exe, .dll and .pyd in the folder that is not already validly
-          signed by its own maker is signed (Python's and OpenSSL's DLLs keep
-          their vendors' signatures). Then every file is verified, and the
-          script fails if any shipped file is left unsigned.
+          Only the program a clinic PC runs, AIMScribe_Agent.exe, is signed
+          and then verified (19 Nov 2026: three signatures a release - this,
+          the setup and its uninstaller - instead of about 27; the eSigner
+          plan is priced per signature). The updater checks the setup's
+          signature; Windows shows the program's. The Python modules and
+          DLLs beside it are left as their makers shipped them.
 
       sign.ps1 -File AIMScribeSetup.exe
           One file. Inno Setup calls this for the setup and its uninstaller
@@ -33,12 +35,23 @@
       thumbprint  A certificate in the Windows certificate store, found by its
                   SHA-1 thumbprint: an OV or EV certificate whose key is on a
                   hardware token, or in a cloud HSM through its vendor's
-                  Windows key storage provider (SSL.com eSigner, DigiCert
-                  KeyLocker, Sectigo). AIMS_SIGN_THUMBPRINT=<40 hex characters>.
+                  Windows key storage provider - SSL.com eSigner CKA (the
+                  chosen route, 19 Nov 2026), DigiCert KeyLocker, Sectigo.
+                  AIMS_SIGN_THUMBPRINT=<40 hex characters>.
 
-      signpath    SignPath (free for open-source projects). Signing happens in
-                  SignPath's CI, not here: the build artefact is uploaded and
-                  comes back signed. This script then only verifies.
+      signpath    SignPath. The files are submitted to SignPath through its
+                  PowerShell module (installed from the PowerShell Gallery if
+                  missing) and come back signed: the program folder as one
+                  zip, the setup and its uninstaller one file at a time.
+                    SIGNPATH_API_TOKEN          a CI user's API token (a secret)
+                    SIGNPATH_ORGANIZATION_ID
+                    SIGNPATH_PROJECT_SLUG
+                    SIGNPATH_POLICY_SLUG        e.g. release-signing
+                    SIGNPATH_ARTIFACT_CONFIG_ZIP  signs every PE file in a zip
+                    SIGNPATH_ARTIFACT_CONFIG_PE   signs one PE file
+                  The signing policy must accept API submissions; a policy that
+                  requires SignPath's GitHub origin verification needs its own
+                  workflow instead (see INSTALL_FOR_IT.md).
 
     AIMS_SIGN_TIMESTAMP  timestamp server (default: the provider's, or
                          http://timestamp.digicert.com for a store certificate)
@@ -62,6 +75,8 @@ $ErrorActionPreference = 'Stop'
 $Provider  = ($env:AIMS_SIGN_PROVIDER, 'thumbprint' | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
 $Publisher = ($env:AIMS_SIGN_PUBLISHER, 'AIMS LAB' | Where-Object { $_ } | Select-Object -First 1)
 $Shipped   = '*.exe', '*.dll', '*.pyd'
+# The program files AIMS LAB signs; everything else keeps its maker's state.
+$OurPrograms = @('AIMScribe_Agent.exe')
 
 function Write-Banner([string] $Text, [string] $Colour = 'Yellow') {
     $line = '*' * 68
@@ -101,11 +116,65 @@ function Test-OurSignature([string] $Path) {
             $null -ne $sig.TimeStamperCertificate)
 }
 
-function Invoke-Sign([string[]] $Paths) {
+function Invoke-SignPath([string[]] $Paths, [string] $Root) {
+    foreach ($name in 'SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG',
+                      'SIGNPATH_POLICY_SLUG') {
+        if (-not [Environment]::GetEnvironmentVariable($name)) {
+            throw "AIMS_SIGN_PROVIDER=signpath needs $name (see INSTALL_FOR_IT.md)"
+        }
+    }
+    if (-not (Get-Module -ListAvailable -Name SignPath)) {
+        Install-Module -Name SignPath -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module SignPath
+    $common = @{
+        ApiToken          = $env:SIGNPATH_API_TOKEN
+        OrganizationId    = $env:SIGNPATH_ORGANIZATION_ID
+        ProjectSlug       = $env:SIGNPATH_PROJECT_SLUG
+        SigningPolicySlug = $env:SIGNPATH_POLICY_SLUG
+    }
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('aimssign-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        if ($Paths.Count -eq 1 -or -not $Root) {
+            foreach ($p in $Paths) {
+                $out = Join-Path $work ([IO.Path]::GetFileName($p))
+                Submit-SigningRequest @common -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIG_PE `
+                    -InputArtifactPath $p -OutputArtifactPath $out -WaitForCompletion -Force
+                Copy-Item -LiteralPath $out -Destination $p -Force
+            }
+            return
+        }
+        # The whole folder in one request: a zip that keeps each file's place.
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $zip = Join-Path $work 'unsigned.zip'
+        $signed = Join-Path $work 'signed.zip'
+        $archive = [IO.Compression.ZipFile]::Open($zip, 'Create')
+        try {
+            foreach ($p in $Paths) {
+                $rel = $p.Substring($Root.Length).TrimStart('')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $p, $rel) | Out-Null
+            }
+        } finally { $archive.Dispose() }
+        Submit-SigningRequest @common -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIG_ZIP `
+            -InputArtifactPath $zip -OutputArtifactPath $signed -WaitForCompletion -Force
+        $back = Join-Path $work 'signed'
+        [IO.Compression.ZipFile]::ExtractToDirectory($signed, $back)
+        foreach ($p in $Paths) {
+            $rel = $p.Substring($Root.Length).TrimStart('')
+            $from = Join-Path $back $rel
+            if (-not (Test-Path -LiteralPath $from)) { throw "SignPath did not return $rel" }
+            Copy-Item -LiteralPath $from -Destination $p -Force
+        }
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-Sign([string[]] $Paths, [string] $Root = '') {
     if ($Provider -eq 'signpath') {
-        throw ("AIMS_SIGN_PROVIDER=signpath: signing is done in SignPath's CI. Upload " +
-               "dist\AIMScribe_Agent as the artefact, download the signed result, then run " +
-               "sign.ps1 -Folder ... -VerifyOnly.")
+        Invoke-SignPath $Paths $Root
+        return
     }
     $signtool = Find-SignTool
     $common = @('sign', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'AIMScribe',
@@ -173,20 +242,26 @@ if ($PSCmdlet.ParameterSetName -eq 'File') {
     exit 0
 }
 
-# ---------------------------------------------------------------- the whole folder
+# ---------------------------------------------------------------- the program folder
 $root = (Resolve-Path $Folder).Path
 $all = @(Get-ChildItem $root -Recurse -File -Include $Shipped | Select-Object -ExpandProperty FullName)
 if (-not $all) { throw "No program files under $root - build first." }
 
-$ours = @($all | Where-Object { -not (Test-VendorSigned $_) })
-Write-Host ("{0} program files: {1} already signed by their makers, {2} to sign" -f
-            $all.Count, ($all.Count - $ours.Count), $ours.Count) -ForegroundColor Cyan
+$ours = @(foreach ($name in $OurPrograms) {
+    $path = Join-Path $root $name
+    if (-not (Test-Path -LiteralPath $path)) { throw "$name is missing from $root - build first." }
+    $path
+})
+$vendor = @($all | Where-Object { $ours -notcontains $_ -and (Test-VendorSigned $_) }).Count
+Write-Host ("{0} program files: signing {1} ({2}); {3} carry their makers' signatures, the rest none" -f
+            $all.Count, $ours.Count, ($OurPrograms -join ', '), $vendor) -ForegroundColor Cyan
 
-if (-not $VerifyOnly -and $ours) { Invoke-Sign $ours }
+if (-not $VerifyOnly) { Invoke-Sign $ours $root }
 
-Assert-Verified $all
-$main = Join-Path $root 'AIMScribe_Agent.exe'
-if ((Test-Path $main) -and -not (Test-OurSignature $main)) {
-    throw "AIMScribe_Agent.exe is not signed by '$Publisher' with a timestamp."
+Assert-Verified $ours
+foreach ($path in $ours) {
+    if (-not (Test-OurSignature $path)) {
+        throw "$([IO.Path]::GetFileName($path)) is not signed by '$Publisher' with a timestamp."
+    }
 }
-Write-Host "All $($all.Count) program files are validly signed." -ForegroundColor Green
+Write-Host "Signed by $Publisher, timestamped: $($OurPrograms -join ', ')" -ForegroundColor Green
