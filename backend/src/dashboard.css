@@ -516,3 +516,17 @@ details.sent dd { margin: 0; word-break: break-word; }
 .prec { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 2px 0; }
 .pvisit .head h3 .hint { font-weight: 400; margin-left: 6px; }
 @media (max-width: 640px) { .prow { grid-template-columns: 1fr; gap: 2px; } }
+/* 19 Nov: a visit's demographics and prescription, every field shown. */
+.psec { padding: 10px 0; border-top: 1px solid var(--line); }
+.psec:first-child { border-top: 0; padding-top: 0; }
+.psh { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.psh h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr)); gap: 8px 16px; }
+.pf { display: grid; gap: 1px; min-width: 0; }
+.pf .pl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.pf .pv { overflow-wrap: anywhere; }
+.pnote { margin: 0 0 8px; font-size: 13px; text-align: left; }
+.pnote.empty { color: var(--warn-ink); background: var(--warn-bg); border-radius: var(--radius-s); padding: 6px 10px; }
+.pdl { margin-top: 12px; }
+.pscroll { overflow-x: auto; max-width: 100%; }
+.pvisit .head .ghost.small { margin-left: auto; }

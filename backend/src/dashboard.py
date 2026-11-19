@@ -867,10 +867,30 @@ def _recording_row(row) -> Dict[str, Any]:
 # The clinical tables as CSV (19 Nov 2026)
 # ============================================================
 
-# What a researcher may download, and the by_visit table each one is.
-_CLINICAL_CSV = {"demographics": "demographics",     # one row per visit with API 2
-                 "prescriptions": "prescription",    # one row per visit with API 3
-                 "medicines": "medicines"}           # one row per medicine prescribed
+# What a researcher may download, and where each is read from.
+# 19 Nov: "visits" is every visit with its demographics and prescription side by
+# side - one row per visit, whether or not CMED's API 2 or API 3 came - the
+# file the Patients page downloads for one patient.
+_VISITS_SQL = """(
+    SELECT o.clinic, o.cmed_clinic_code, o.patient_id, o.doctor_id, o.visit_id,
+           o.visit_date, o.start_time,
+           o.api2_received_at AS demographics_received_at,
+           d.sex, d.date_of_birth, d.age, d.blood_group, d.blood_pressure, d.pulse,
+           d.temperature, d.weight, d.height, d.spo2,
+           o.api3_received_at AS prescription_received_at,
+           p.chief_complaints, p.examination, p.diagnoses, p.medicines, p.investigations,
+           p.advice, p.follow_up, p.issued_at,
+           o.recordings, o.archive_folder, o.visit_key
+      FROM by_visit.overview o
+      LEFT JOIN LATERAL (SELECT * FROM by_visit.demographics x
+                          WHERE x.visit_key = o.visit_key LIMIT 1) d ON true
+      LEFT JOIN LATERAL (SELECT * FROM by_visit.prescription x
+                          WHERE x.visit_key = o.visit_key LIMIT 1) p ON true
+) visits"""
+_CLINICAL_CSV = {"demographics": "by_visit.demographics",   # one row per visit with API 2
+                 "prescriptions": "by_visit.prescription",  # one row per visit with API 3
+                 "medicines": "by_visit.medicines",         # one row per medicine prescribed
+                 "visits": _VISITS_SQL}                     # one row per visit, both together
 _CSV_MOST = 200_000          # more than this, and the dates must be narrowed
 
 
@@ -888,20 +908,22 @@ async def clinical_csv(request: Request, table: str = "demographics",
                        to_date: Optional[str] = Query(None, alias="to"),
                        hospital_id: Optional[str] = None,
                        patient_id: Optional[str] = None,
+                       visit_id: Optional[str] = None,
                        _: None = Depends(require_viewer),
                        scope: Any = Depends(collectors.hospital_scope)):
     """
-    19 Nov 2026: the demographics (API 2), prescriptions (API 3) or medicines
-    of every visit in a date range, as one CSV - read from the same by_visit
-    tables as the Patients page. Researchers and admins only, and every
-    download is logged by name in clinical_access_log. No dates: every visit.
-    The clinic is ours (the dashboard's) or CMED's code for it.
+    19 Nov 2026: the demographics (API 2), prescriptions (API 3), medicines,
+    or all of a visit together ("visits"), as one CSV - read from the same
+    by_visit tables as the Patients page. Researchers and admins only, and
+    every download is logged by name in clinical_access_log. No dates: every
+    visit. The clinic is ours (the dashboard's) or CMED's code for it. A
+    patient ID, a visit ID, or both narrow it to one patient or consultation.
     """
     actor = await _clinical_reader(request)
     view = _CLINICAL_CSV.get(table if isinstance(table, str) else "")
     if view is None:
         raise HTTPException(status_code=400,
-                            detail="table is demographics, prescriptions or medicines.")
+                            detail="table is demographics, prescriptions, medicines or visits.")
     where: List[str] = []
     args: List[Any] = []
     start = _day(from_date, None) if from_date else None
@@ -927,10 +949,18 @@ async def clinical_csv(request: Request, table: str = "demographics",
             raise HTTPException(status_code=400, detail="patient_id is not an identifier")
         args.append(patient)
         where.append(f"patient_id = ${len(args)}")
+    visit = None
+    if isinstance(visit_id, str) and visit_id.strip():
+        visit = visit_id.strip()
+        if not api_v2.VISIT_ID.match(visit):
+            raise HTTPException(status_code=400,
+                                detail="A visit ID has letters, digits and '-' only.")
+        args.append(visit)
+        where.append(f"visit_id = ${len(args)}")
     store = api_v2.ctx.clinical
     if store is None:
         raise HTTPException(status_code=503, detail="The clinical database is not connected.")
-    sql = (f"SELECT * FROM by_visit.{view}"
+    sql = (f"SELECT * FROM {view}"
            + (f" WHERE {' AND '.join(where)}" if where else "")
            + f" LIMIT {_CSV_MOST + 1}")
     async with store._pool.acquire() as conn:
@@ -944,10 +974,14 @@ async def clinical_csv(request: Request, table: str = "demographics",
                            detail={"table": table, "rows": len(rows),
                                    "from": start.isoformat() if start else None,
                                    "to": end.isoformat() if end else None,
-                                   "hospital_id": clinic})
+                                   "hospital_id": clinic,
+                                   **({"visit_id": visit} if visit else {})})
     out = [{k: _cell(r[k]) for k in columns} for r in rows]
-    span = "_".join(d.isoformat() for d in (start, end) if d) or "all"
-    name = f"{table}_{clinic + '_' if clinic else ''}{span}.csv"
+    # e.g. demographics_all.csv, visits_P4347353.csv, visits_P4347353_VIS-T-31492.csv,
+    # demographics_TEST_2026-11-01_2026-11-30.csv
+    dates = [d.isoformat() for d in (start, end) if d]
+    named = [x for x in (clinic, patient, visit) if x]
+    name = "_".join([table, *named, *(dates or ([] if named else ["all"]))]) + ".csv"
     return Response(_csv(out, columns), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 

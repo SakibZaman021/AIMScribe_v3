@@ -1952,25 +1952,66 @@ $("bEveryone").addEventListener("change", loadBatches);
 /* ============================================================
    One patient's history (18 Nov 2026): type the ID, see every visit.
    ============================================================ */
+/* 19 Nov: every field is shown, filled or not, so a message CMED sent empty
+   reads as empty instead of looking like data the page failed to show. */
+const EMPTY = `<span class="hint">–</span>`;
 function pText(label, value) {
   return value ? `<div class="prow"><span class="pl">${esc(label)}</span><span class="pv">${esc(value)}</span></div>` : "";
+}
+function pField(label, value) {
+  const shown = value === null || value === undefined || value === "" ? EMPTY : esc(value);
+  return `<div class="pf"><span class="pl">${esc(label)}</span><span class="pv">${shown}</span></div>`;
+}
+function pRow(label, value) {
+  // A list joined on the server can start or end with an empty item ("; BP ...").
+  const text = value ? String(value).replace(/^(\s*;\s*)+|(\s*;\s*)+$/g, "") : "";
+  return `<div class="prow"><span class="pl">${esc(label)}</span><span class="pv">${text ? esc(text) : EMPTY}</span></div>`;
 }
 function pArrived(iso, ok) {
   if (!ok) return tag("warn", "not received");
   if (!iso) return tag("good", "received");
-  return tag("good", String(iso).replace("T", " ").slice(0, 16));
+  return tag("good", `received ${String(iso).replace("T", " ").slice(0, 16)}`);
 }
-function visitCard(v) {
-  const d = v.demographics || {}, p = v.prescription || {};
-  const vitals = [["BP", d.blood_pressure], ["Pulse", d.pulse], ["Temp", d.temperature],
-    ["Weight", d.weight], ["Height", d.height], ["SpO2", d.spo2]]
-    .filter(([, x]) => x).map(([n, x]) => `${n} ${x}`).join(" · ");
-  const meds = (v.medicines || []).length
-    ? `<table class="pmeds"><thead><tr><th>Medicine</th><th>Strength</th><th>Dose</th><th>How often</th><th>When</th><th>For</th></tr></thead><tbody>`
-      + v.medicines.map((m) => `<tr><td>${esc([m.form, m.medicine].filter(Boolean).join(" "))}</td>`
+// What the page says when a message has not come, or came carrying nothing.
+function pNote(received, filled, what) {
+  if (!received) return `<p class="pnote hint">CMED has not sent the ${what} for this visit.</p>`;
+  if (!filled) return `<p class="pnote empty">CMED sent the ${what} for this visit, but the message had nothing in it.</p>`;
+  return "";
+}
+function demographicsBlock(v) {
+  const d = v.demographics || {};
+  const fields = [["Sex", d.sex], ["Date of birth", d.date_of_birth], ["Age", d.age],
+    ["Blood group", d.blood_group], ["Blood pressure", d.blood_pressure], ["Pulse", d.pulse],
+    ["Temperature", d.temperature], ["Weight", d.weight], ["Height", d.height], ["SpO2", d.spo2]];
+  const filled = fields.some(([, x]) => x);
+  return `<div class="psec"><div class="psh"><h4>Demographics and vitals (API 2)</h4> ${pArrived(v.api2_received_at, v.api2_received)}</div>
+    ${pNote(v.api2_received, filled, "demographics")}
+    <div class="pgrid">${fields.map(([n, x]) => pField(n, x)).join("")}</div></div>`;
+}
+function prescriptionBlock(v) {
+  const p = v.prescription || {};
+  const meds = v.medicines || [];
+  const medTable = meds.length
+    ? `<div class="pscroll"><table class="pmeds"><thead><tr><th>Medicine</th><th>Strength</th><th>Dose</th><th>How often</th><th>When</th><th>For</th></tr></thead><tbody>`
+      + meds.map((m) => `<tr><td>${esc([m.form, m.medicine].filter(Boolean).join(" "))}</td>`
         + `<td>${esc(m.strength || "")}</td><td>${esc(m.dose || "")}</td><td>${esc(m.frequency || "")}</td>`
         + `<td>${esc(m.timing || "")}</td><td>${esc(m.duration || "")}</td></tr>`).join("")
-      + `</tbody></table>` : "";
+      + `</tbody></table></div>`
+    : (p.medicines ? esc(p.medicines) : EMPTY);
+  const before = [["Complaints", p.chief_complaints], ["Examination", p.examination],
+    ["Diagnoses", p.diagnoses]];
+  const after = [["Tests", p.investigations], ["Advice", p.advice], ["Follow-up", p.follow_up]];
+  const filled = meds.length > 0 || !!p.medicines || [...before, ...after].some(([, x]) => x);
+  return `<div class="psec"><div class="psh"><h4>Prescription (API 3)</h4> ${pArrived(v.api3_received_at, v.api3_received)}</div>
+    ${pNote(v.api3_received, filled, "prescription")}
+    <div class="pbody">
+      ${before.map(([n, x]) => pRow(n, x)).join("")}
+      <div class="prow"><span class="pl">Medicines</span><span class="pv">${medTable}</span></div>
+      ${after.map(([n, x]) => pRow(n, x)).join("")}
+      ${pText("Issued", p.issued_at)}
+    </div></div>`;
+}
+function visitCard(v) {
   const recs = (v.recordings_detail || []).map((r) => {
     const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}`;
     const links = r.copied && r.confirmation === "confirmed" && PORTAL
@@ -1979,84 +2020,32 @@ function visitCard(v) {
     return `<div class="prec">${confirmTag(r.confirmation)} <span class="mono">${esc(r.session_id)}</span>`
       + ` <span class="hint">${esc(String(r.local_start || "").slice(0, 5))} · ${num(r.minutes || 0)} min</span>${links}</div>`;
   }).join("");
+  const visitDl = v.visit_id
+    ? `<button type="button" class="ghost small" data-pcsv="visits" data-visit="${esc(v.visit_id)}">This visit (CSV)</button>`
+    : "";
   return `<section class="panel pvisit">
     <div class="head wrap"><h3>${esc(v.visit_date || "")} <span class="hint">${esc(v.start_time || "")}</span></h3>
       <span class="tags">${tag("quiet", v.visit_id || "no visit ID")} ${tag("quiet", v.doctor_id || "")}
-        ${tag("quiet", v.clinic ? clinicName(v.clinic) : v.cmed_clinic_code || "")}</span></div>
-    <div class="body pbody">
-      <div class="prow"><span class="pl">Demographics</span><span class="pv">${pArrived(v.api2_received_at, v.api2_received)}</span></div>
-      <div class="prow"><span class="pl">Prescription</span><span class="pv">${pArrived(v.api3_received_at, v.api3_received)}</span></div>
-      ${pText("Age", d.age)}
-      ${pText("Vitals", vitals)}
-      ${pText("Complaints", p.chief_complaints)}
-      ${pText("Examination", p.examination)}
-      ${pText("Diagnoses", p.diagnoses)}
-      ${meds ? `<div class="prow"><span class="pl">Medicines</span><span class="pv">${meds}</span></div>` : ""}
-      ${pText("Tests", p.investigations)}
-      ${pText("Advice", p.advice)}
-      ${pText("Follow-up", p.follow_up)}
-      <div class="prow"><span class="pl">Recordings</span><span class="pv">${recs || `<span class="hint">none</span>`}</span></div>
-      ${pText("Archive folder", v.archive_folder)}
+        ${tag("quiet", v.clinic ? clinicName(v.clinic) : v.cmed_clinic_code || "")}</span>
+      ${visitDl}</div>
+    <div class="body">
+      ${demographicsBlock(v)}
+      ${prescriptionBlock(v)}
+      <div class="psec pbody">
+        <div class="prow"><span class="pl">Recordings</span><span class="pv">${recs || `<span class="hint">none</span>`}</span></div>
+        ${pText("Archive folder", v.archive_folder)}
+      </div>
     </div>
   </section>`;
 }
-async function loadPatient(ref, visit) {
-  $("patientMsg").textContent = "Looking up…";
-  $("patientOut").innerHTML = "";
-  try {
-    const d = await api(`/patient/${encodeURIComponent(ref)}`, visit ? { visit_id: visit } : {});
-    if (!d.found) {
-      $("patientMsg").textContent = `No patient or visit "${ref}" is held.`;
-      return;
-    }
-    const pt = d.patient || {};
-    if (d.visit_found === false) {
-      $("patientMsg").textContent = `${pt.patient_id || ref} has no visit "${visit}". Clear the visit ID to see every visit.`;
-      return;
-    }
-    $("patientMsg").textContent = visit
-      ? `Visit ${visit} of ${pt.patient_id || ref}.`
-      : `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
-    $("patientOut").innerHTML = `<section class="panel"><div class="head wrap"><h3>${esc(pt.patient_id || ref)}</h3>
-      <span class="tags">${tag("quiet", pt.cmed_clinic_code || "")}</span></div>
-      <div class="body pbody">
-        ${pText("Sex", pt.sex)}${pText("Date of birth", pt.date_of_birth)}${pText("Age", pt.age)}
-        ${pText("Blood group", pt.blood_group)}${pText("Visits", String(pt.visits || d.visits.length))}
-        ${pText("First visit", pt.first_visit)}${pText("Last visit", pt.last_visit)}
-      </div></section>` + d.visits.map(visitCard).join("");
-  } catch (err) {
-    $("patientMsg").textContent = `Not shown: ${err.message}`;
-  }
-}
-$("patientForm").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const ref = $("patientRef").value.trim();
-  if (ref) loadPatient(ref, $("visitRef").value.trim());
-});
 
-/* 19 Nov 2026: the demographics, prescriptions or medicines of every visit
-   in the dates chosen, as a CSV. The server checks the dates and the role. */
-function fillCsvClinics() {
-  const sel = $("csvClinic");
-  const chosen = sel.value;
-  sel.innerHTML = `<option value="">All clinics</option>`
-    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
-  sel.value = chosen;
-}
-// Fetched rather than opened, so the admin key goes with it and a refusal
-// (too many rows, a bad date) is said here instead of replacing the page.
-document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click", async () => {
-  const from = $("csvFrom").value, to = $("csvTo").value;
-  const msg = $("csvMsg");
-  if (from && to && from > to) {
-    msg.textContent = "From is after To.";
-    return;
-  }
-  const query = new URLSearchParams(Object.entries(
-    { table: b.dataset.csv, from, to, hospital_id: $("csvClinic").value })
+// One CSV download, fetched so the admin key goes with it and a refusal is
+// said on the page instead of replacing it.
+async function downloadCsv(params, button, msg) {
+  const query = new URLSearchParams(Object.entries(params)
     .filter(([, v]) => v !== "" && v != null));
   msg.textContent = "Preparing...";
-  b.disabled = true;
+  button.disabled = true;
   try {
     const response = await fetch(`/api/v2/dashboard/clinical.csv?${query}`,
       { headers: portalHeaders() });
@@ -2069,7 +2058,7 @@ document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click
     const named = /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = named ? named[1] : `${b.dataset.csv}.csv`;
+    link.download = named ? named[1] : `${params.table}.csv`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -2078,8 +2067,90 @@ document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click
   } catch (err) {
     msg.textContent = `Not downloaded: ${err.message}`;
   } finally {
-    b.disabled = false;
+    button.disabled = false;
   }
+}
+
+// The patient (and visit) on screen, for its download buttons.
+let SHOWN_PATIENT = null;
+async function loadPatient(ref, visit) {
+  $("patientMsg").textContent = "Looking up…";
+  $("patientOut").innerHTML = "";
+  SHOWN_PATIENT = null;
+  try {
+    const d = await api(`/patient/${encodeURIComponent(ref)}`, visit ? { visit_id: visit } : {});
+    if (!d.found) {
+      $("patientMsg").textContent = ref === visit
+        ? `No visit "${visit}" is held.`
+        : `No patient or visit "${ref}" is held.`;
+      return;
+    }
+    const pt = d.patient || {};
+    if (d.visit_found === false) {
+      $("patientMsg").textContent = `${pt.patient_id || ref} has no visit "${visit}". Clear the visit ID to see every visit.`;
+      return;
+    }
+    SHOWN_PATIENT = { patient_id: pt.patient_id || ref, visit_id: visit || "" };
+    $("patientMsg").textContent = visit
+      ? `Visit ${visit} of ${pt.patient_id || ref}.`
+      : `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
+    const scope = visit ? "this visit" : "every visit of this patient";
+    $("patientOut").innerHTML = `<section class="panel"><div class="head wrap"><h3>${esc(pt.patient_id || ref)}</h3>
+      <span class="tags">${tag("quiet", pt.cmed_clinic_code || "")}</span></div>
+      <div class="body">
+        <div class="pgrid">
+          ${pField("Sex", pt.sex)}${pField("Date of birth", pt.date_of_birth)}${pField("Age", pt.age)}
+          ${pField("Blood group", pt.blood_group)}${pField("Visits", String(pt.visits || d.visits.length))}
+          ${pField("First visit", pt.first_visit)}${pField("Last visit", pt.last_visit)}
+        </div>
+        <div class="pfind pdl">
+          <button type="button" class="primary" data-pcsv="visits">Download ${scope} (CSV)</button>
+          <button type="button" class="ghost" data-pcsv="medicines">Medicines (CSV)</button>
+          <span id="pcsvMsg" class="hint" role="status"></span>
+        </div>
+        <p class="hint">One row per visit: demographics, vitals and prescription side by side.
+          The medicines file has one row per medicine.</p>
+      </div></section>` + d.visits.map(visitCard).join("");
+  } catch (err) {
+    $("patientMsg").textContent = `Not shown: ${err.message}`;
+  }
+}
+$("patientOut").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-pcsv]");
+  if (!b || !SHOWN_PATIENT) return;
+  const params = { table: b.dataset.pcsv, ...SHOWN_PATIENT };
+  if (b.dataset.visit) params.visit_id = b.dataset.visit;      // a visit card's own button
+  downloadCsv(params, b, $("pcsvMsg"));
+});
+// Patient ID, visit ID, or both. A visit ID alone finds its patient and shows
+// that one consultation.
+$("patientForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const ref = $("patientRef").value.trim();
+  const visit = $("visitRef").value.trim();
+  if (!ref && !visit) {
+    $("patientMsg").textContent = "Type a patient ID, a visit ID, or both.";
+    return;
+  }
+  loadPatient(ref || visit, visit);
+});
+
+/* 19 Nov 2026: the demographics, prescriptions or medicines of every visit
+   in the dates chosen, as a CSV. The server checks the dates and the role. */
+function fillCsvClinics() {
+  const sel = $("csvClinic");
+  const chosen = sel.value;
+  sel.innerHTML = `<option value="">All clinics</option>`
+    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+  sel.value = chosen;
+}
+document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click", () => {
+  const from = $("csvFrom").value, to = $("csvTo").value;
+  if (from && to && from > to) {
+    $("csvMsg").textContent = "From is after To.";
+    return;
+  }
+  downloadCsv({ table: b.dataset.csv, from, to, hospital_id: $("csvClinic").value }, b, $("csvMsg"));
 }));
 
 function startBulk() {
