@@ -3,10 +3,10 @@ setlocal enabledelayedexpansion
 title AIMScribe Agent - Build
 
 REM ============================================================
-REM Builds a release: dist\AIMScribe_Agent\ (the program, every file signed)
+REM Builds a release: dist\AIMScribe_Agent\ (the program, AIMScribe_Agent.exe signed)
 REM and dist\AIMScribeSetup.exe (the signed installer).
 REM
-REM   Release:  set AIMS_SIGN_PROVIDER=azure ^| thumbprint ^| signpath
+REM   Release:  set AIMS_SIGN_PROVIDER=thumbprint ^| azure ^| signpath
 REM             (and its settings - see signing\sign.ps1 and INSTALL_FOR_IT.md)
 REM             set AIMS_BACKEND=https://<the AIMS LAB server>
 REM             (optional) set AIMS_ORIGIN=https://<a bench page> - CMED's come from the server
@@ -68,7 +68,7 @@ if "%AIMS_BUILD_BOOTLOADER%"=="1" (
     python -m pip install --disable-pip-version-check -q pyinstaller==6.21.0
 )
 if errorlevel 1 goto :fail
-python -m pip install --disable-pip-version-check -q pytest pytest-asyncio pip-audit
+python -m pip install --disable-pip-version-check -q pytest pytest-asyncio pip-audit httpx
 if errorlevel 1 goto :fail
 
 echo [2/9] Auditing dependencies for known vulnerabilities...
@@ -118,7 +118,7 @@ if defined KEEPENV (
     echo       restored the installed .env
 )
 
-echo [7/9] Signing every program file...
+echo [7/9] Signing the program (AIMScribe_Agent.exe)...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File signing\sign.ps1 -Folder dist\AIMScribe_Agent
 if errorlevel 1 (
     echo ERROR: signing failed - nothing was released.
@@ -161,6 +161,16 @@ if errorlevel 1 (
     goto :fail
 )
 certutil -hashfile dist\AIMScribeSetup.exe SHA256 | findstr /v "hash CertUtil" > dist\AIMScribeSetup.exe.sha256
+
+REM The release record: version, commit, SHA-256, server, signature - so every
+REM installer handed out traces to one commit (scripts\release_record.py).
+set "SIGSTATE=signed"
+if "%DEV_UNSIGNED%"=="1" set "SIGSTATE=UNSIGNED development build"
+python scripts\release_record.py dist\AIMScribeSetup.exe "%AIMS_BACKEND%" "%SIGSTATE%"
+if errorlevel 1 (
+    echo ERROR: the release record was not written.
+    goto :fail
+)
 
 echo.
 echo ============================================================

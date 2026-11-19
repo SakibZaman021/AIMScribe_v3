@@ -136,6 +136,6 @@ $apiKey = $p12Password = $b64 = $null
 
 Write-Host ''
 Write-Host 'Done. Next, a dry run that signs but publishes nothing:' -ForegroundColor Green
-Write-Host '  git tag recorder-v3.8.4-dryrun'
-Write-Host '  git push origin recorder-v3.8.4-dryrun'
+Write-Host '  git tag recorder-v3.9.5-dryrun'
+Write-Host '  git push origin recorder-v3.9.5-dryrun'
 Write-Host "Then watch it:  gh run watch --repo $Repository"

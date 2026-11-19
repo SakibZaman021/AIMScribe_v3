@@ -76,6 +76,19 @@ def _row(row, *, drop: Tuple[str, ...] = ()) -> Dict[str, Any]:
     return out
 
 
+def _same_moment(stored, sent: Optional[str]) -> bool:
+    """A stored start time (timestamptz) and CMED's text one name the same second."""
+    if stored is None or not sent:
+        return False
+    try:
+        moment = datetime.datetime.fromisoformat(str(sent).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        return False
+    return abs((stored - moment).total_seconds()) < 1
+
+
 class ClinicalStore:
     def __init__(self, pool, *, separate: bool = True):
         self._pool = pool
@@ -535,6 +548,37 @@ class ClinicalStore:
                     found.add(visit.patient_id)
         return found
 
+    async def intake_for_visit(self, visit) -> Optional[Dict[str, Any]]:
+        """
+        The newest API 2 (else API 3) CMED's server sent for these five fields,
+        whatever clinic it was filed under - a message that arrived before its
+        CMED code was linked to a clinic is filed under none.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, kind FROM intake_records
+                 WHERE patient_id = $1 AND doctor_id = $2 AND cmed_hospital_id = $3
+                   AND start_time = $4 AND visit_date = $5
+                 ORDER BY (kind = 'patient_information') DESC, id DESC
+                 LIMIT 1
+            """, visit.patient_id, visit.doctor_id, visit.cmed_hospital_id,
+                visit.start_time, visit.day)
+        return dict(row) if row else None
+
+    async def link_visit_recording(self, *, cmed_hospital_id: str, visit_id: Optional[str],
+                                   patient_id: str, session_id: str) -> bool:
+        """Interface 4's visit row names its recording (patient_visit.aims_id)."""
+        if not visit_id:
+            return False
+        async with self._pool.acquire() as conn:
+            done = await conn.fetchval("""
+                UPDATE patient_visit SET aims_id = $4, updated_at = now()
+                 WHERE hospital_id = $1 AND visit_id = $2 AND hospital_patient_id = $3
+                   AND aims_id IS DISTINCT FROM $4
+                RETURNING id
+            """, cmed_hospital_id, visit_id, patient_id, session_id)
+        return done is not None
+
     async def link_session(self, visit, *, session_id: str, file_stem: Optional[str],
                            hospital_id: Optional[str]) -> bool:
         """Tie the visit to its recording by the shared file name (SRS-DBA-21)."""
@@ -549,6 +593,121 @@ class ClinicalStore:
         return linked is not None
 
     # ------------------------------------------------------------ refusal
+
+    async def record_visit_object(self, *, visit_key: str, patient_id: str, doctor_id: str,
+                                  visit_id: Optional[str], hospital_id: Optional[str],
+                                  session_id: str, part_no: Optional[int], kind: str,
+                                  object_key: str, version: int,
+                                  byte_length: Optional[int]) -> bool:
+        """One file of a visit in the cloud archive (clinical/006). Once per object."""
+        async with self._pool.acquire() as conn:
+            added = await conn.fetchval("""
+                INSERT INTO visit_objects (visit_key, patient_id, doctor_id, visit_id,
+                                           hospital_id, session_id, part_no, kind,
+                                           object_key, version, bytes)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                ON CONFLICT (object_key) DO NOTHING
+                RETURNING id
+            """, visit_key, patient_id, doctor_id, visit_id, hospital_id, session_id,
+                part_no, kind, object_key, version, byte_length)
+        return added is not None
+
+    async def message_times(self, visits: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        When CMED's API 2 and API 3 first reached us, for each visit given as
+        {key, cmed_hospital_id, visit_id, patient_id, start_time}: by CMED's
+        visit_id (interface 4), else by patient and start time (the older
+        copy). Two queries, whatever the number of visits. Times only:
+        nothing clinical leaves this database.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        if not visits:
+            return out
+        by_id = [v for v in visits if v.get("visit_id") and v.get("cmed_hospital_id")]
+        by_fields = [v for v in visits if v.get("patient_id") and v.get("start_time")
+                     and v.get("cmed_hospital_id")]
+
+        def keep(key, api2, api3):
+            have = out.setdefault(key, {"api2_at": None, "api3_at": None})
+            for name, value in (("api2_at", api2), ("api3_at", api3)):
+                if value is not None and (have[name] is None or value < have[name]):
+                    have[name] = value
+
+        async with self._pool.acquire() as conn:
+            if by_id:
+                rows = await conn.fetch("""
+                    SELECT pv.hospital_id, pv.visit_id, pv.hospital_patient_id,
+                           pv.start_time, pv.patient_information_at, pv.prescription_at
+                      FROM patient_visit pv
+                      JOIN unnest($1::text[], $2::text[]) AS w(code, visit)
+                        ON pv.hospital_id = w.code AND pv.visit_id = w.visit
+                """, [v["cmed_hospital_id"] for v in by_id], [v["visit_id"] for v in by_id])
+                found = {(r["hospital_id"], r["visit_id"]): r for r in rows}
+                for v in by_id:
+                    r = found.get((v["cmed_hospital_id"], v["visit_id"]))
+                    # 18 Nov: a visit_id alone is not enough. CMED's Karail system
+                    # sends one visit_id for a patient's every consultation, so
+                    # the message counts only when it is this consultation's:
+                    # the same patient and the same start time, to the second.
+                    if r is not None and r["hospital_patient_id"] == v.get("patient_id")                             and _same_moment(r["start_time"], v.get("start_time")):
+                        keep(v["key"], r["patient_information_at"], r["prescription_at"])
+            if by_fields:
+                rows = await conn.fetch("""
+                    SELECT i.cmed_hospital_id, i.patient_id, i.start_time,
+                           min(i.received_at) FILTER (WHERE i.kind = 'patient_information')
+                               AS api2,
+                           min(i.received_at) FILTER (WHERE i.kind = 'prescription') AS api3
+                      FROM intake_records i
+                      JOIN unnest($1::text[], $2::text[], $3::text[]) AS w(code, patient, start)
+                        ON i.cmed_hospital_id = w.code AND i.patient_id = w.patient
+                       AND i.start_time = w.start
+                     GROUP BY 1, 2, 3
+                """, [v["cmed_hospital_id"] for v in by_fields],
+                    [v["patient_id"] for v in by_fields], [v["start_time"] for v in by_fields])
+                found = {(r["cmed_hospital_id"], r["patient_id"], r["start_time"]): r
+                         for r in rows}
+                for v in by_fields:
+                    r = found.get((v["cmed_hospital_id"], v["patient_id"], v["start_time"]))
+                    if r is not None:
+                        keep(v["key"], r["api2"], r["api3"])
+        for key in [v["key"] for v in visits]:
+            out.setdefault(key, {"api2_at": None, "api3_at": None})
+        return out
+
+    async def visit_id_for(self, cmed_hospital_id: str, patient_id: str,
+                           start_time: str) -> Optional[str]:
+        """CMED's visit_id for a visit, from its interface-4 messages."""
+        try:
+            moment = datetime.datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("""
+                SELECT visit_id FROM patient_visit
+                 WHERE hospital_id = $1 AND hospital_patient_id = $2
+                   AND start_time = $3::timestamptz
+                 ORDER BY id DESC LIMIT 1
+            """, cmed_hospital_id, patient_id, moment)
+
+    async def forget_object(self, object_key: str) -> int:
+        """A file removed from the archive (moved on): its register row goes."""
+        async with self._pool.acquire() as conn:
+            done = await conn.execute("DELETE FROM visit_objects WHERE object_key = $1",
+                                      object_key)
+        return int(done.split()[-1]) if done else 0
+
+    async def forget_session_objects(self, session_id: str) -> int:
+        """A refused or expired recording: its files are erased, so is their register."""
+        async with self._pool.acquire() as conn:
+            done = await conn.execute("DELETE FROM visit_objects WHERE session_id = $1",
+                                      session_id)
+        return int(done.split()[-1]) if done else 0
+
+    async def visit_folder(self, patient_id: str) -> List[Dict[str, Any]]:
+        """Every visit of one patient, newest first (clinical/006 patient_folder)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM patient_folder($1)", patient_id)
+        return [dict(r) for r in rows]
 
     async def erase_visit(self, visit) -> int:
         """

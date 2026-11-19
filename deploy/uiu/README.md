@@ -189,6 +189,30 @@ docker compose exec postgres psql -U "$U" -d aims_recordings -c \
 docker compose logs --since 2h monitor | tail -20
 ```
 
+### The server's logs, kept across updates
+
+Docker keeps a program's log only as long as its container, and every update
+replaces the containers. So the deployer copies every program's new log
+lines every five minutes - and once more just before an update replaces
+them - into one file per day (UTC), which outlives every update:
+`/home/aims/.aimscribe-deploy/logs/2026-11-16.log` (today), earlier days
+compressed. 180 days are kept (`AIMS_LOG_KEEP_DAYS`), at most 5 GB
+(`AIMS_LOG_KEEP_MB`). Read them, from any update ago, with:
+
+```bash
+./server-logs.sh api 2h                       # the API, the last two hours
+./server-logs.sh api 3d error                 # three days, lines with "error"
+./server-logs.sh gateway today device/register
+./server-logs.sh all 2026-11-16               # one whole day, Dhaka time
+./server-logs.sh api 30m -f                   # then follow live
+```
+
+Programs: api, gateway, worker, archive-worker, monitor, backup, postgres,
+pgbouncer, redis, dbviewer, or all. Times on the lines are UTC (Dhaka is
+UTC+6). What the system did - every recording, alert, refusal, admin
+change and CMED request - is also in the database, for good, and readable
+from the dashboard's database viewer.
+
 ## 7. Backups and the restore drill
 
 Both databases are dumped nightly at `AIMS_BACKUP_AT`, encrypted with

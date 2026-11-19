@@ -428,7 +428,10 @@ class Overlay:
         canvas.create_text(33, 30, text="Paused" if paused else
                            ("Recording" if recording else "Ready"),
                            anchor="w", fill=INK, font=(FONT, 10, "bold"))
-        canvas.create_text(18, 55, text=format_duration(status.get("duration_seconds", 0)),
+        # 3.9.4: paused, the clock shows how long it has been paused.
+        clock = (format_duration((status.get("pause") or {}).get("seconds", 0)) if paused
+                 else format_duration(status.get("duration_seconds", 0)))
+        canvas.create_text(18, 55, text=clock,
                            anchor="w", fill=MUTED, font=("Consolas", 13))
 
         if note:
@@ -449,7 +452,7 @@ class Overlay:
 
     @staticmethod
     def _note_colour(note: str) -> str:
-        if "no signal" in note:
+        if "no signal" in note or note.startswith("Paused over"):
             return RED
         if "Confirmed" in note:
             return TEAL

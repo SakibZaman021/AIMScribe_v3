@@ -144,11 +144,21 @@ async def require_device(
     stops working the day the PC is upgraded.
     """
     if not x_device_token:
-        raise HTTPException(status_code=401, detail="device token required")
+        # 16 Nov: the Device log showed only "device token required" for a PC
+        # that had never joined; say what that means and how it is put right.
+        raise HTTPException(
+            status_code=401,
+            detail="device token required: this PC has not joined the AIMS LAB server yet. "
+                   "It joins by itself at its first CMED patient once CMED's clinic code "
+                   "is linked (AIMS LAB dashboard > CMED > Clinic codes), or with an "
+                   "enrolment token from AIMS LAB. Until then it cannot record or upload.")
 
     device = await _repo().device_by_token(x_device_token)
     if device is None:
         raise HTTPException(status_code=401, detail="unknown device token")
+    import device_log                         # 042: which PC this reply goes to
+    device_log.note(device_id=device.get("device_id"), machine_name=device.get("machine_name"),
+                    app_version=device.get("app_version"), hospital_id=device.get("hospital_id"))
     if device["revoked_at"] is not None:
         raise HTTPException(status_code=403, detail="device has been revoked")
     await _check_device_signature(request, device)
@@ -288,9 +298,10 @@ class EnrollRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    # Only a P-256 key inside the PC's TPM (65 bytes, 130 hex) may register
-    # itself: it cannot be copied off the PC. A software key needs a token.
-    device_pubkey: str = Field(..., min_length=130, max_length=130)
+    # A P-256 key inside the PC's TPM (65 bytes, 130 hex), or (3.9.2) the
+    # Ed25519 software key of a PC with no usable chip (32 bytes, 64 hex).
+    # integrity.device_key_problem refuses any other length or shape.
+    device_pubkey: str = Field(..., min_length=64, max_length=130)
     key_proof: str = Field(..., min_length=40, max_length=200)
     # CMED's code for the clinic, from CMED's own trigger on this PC.
     cmed_hospital_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
@@ -400,7 +411,7 @@ class HeartbeatRequest(BaseModel):
     microphone_is_clinic: Optional[bool] = None
     # The version of CMED's address list it holds (recorder 3.8+).
     trusted_origins_version: Optional[int] = None
-    # What this PC's updater last did (recorder 3.8.4+): installed, waiting,
+    # What this PC's updater last did (recorder 3.9.5+): installed, waiting,
     # failed and why, gave up. Shown per PC on the dashboard.
     update_status: Optional[Dict[str, Any]] = None
 
@@ -646,6 +657,8 @@ async def enroll_device(body: EnrollRequest):
     credential yet. The token is single-use, expiring, and carries both the
     hospital and the doctor, so a device can never assert its own identity.
     """
+    import device_log                         # 042: who tried to join
+    device_log.note(machine_name=body.machine_name, app_version=body.app_version)
     try:
         pubkey = bytes.fromhex(body.device_pubkey)
     except ValueError:
@@ -737,12 +750,31 @@ _REGISTER_REFUSALS = {
 }
 
 
+async def _register_refused(repo, code: str, body, device_id, address: str, *,
+                            hospital_id: Optional[str] = None) -> None:
+    """A PC that proved its key but could not join: one dashboard alert per reason and
+    CMED code a day, its detail the latest attempt (CMED > Clinic codes shows them)."""
+    try:
+        await repo.alert_once(
+            alert_type="device_register_refused",
+            group=f"register_refused:{code}:{body.cmed_hospital_id}",
+            window=timedelta(days=1), severity="warning",
+            detail={"code": code, "cmed_hospital_id": body.cmed_hospital_id,
+                    "hospital_id": hospital_id, "device_id": str(device_id),
+                    "machine_name": body.machine_name, "app_version": body.app_version,
+                    "address": address,
+                    "last_at": datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:                       # never the reason a refusal is lost
+        logger.warning("Could not record the refused registration: %s", exc)
+
+
 @router.post("/device/register")
 async def register_device(body: RegisterRequest, request: Request):
     """
     A clinic PC joins without an enrolment token.
 
-    It shows it holds a key that lives in its TPM, and names the clinic CMED's
+    It shows it holds its key - in its TPM, or (3.9.2) a software key on a PC
+    without a usable chip - and names the clinic CMED's
     own trigger named on it. It joins as *pending*: it records and uploads as
     any PC does, up to AIMS_PENDING_UPLOAD_MB, and nothing it records is kept
     unless CMED's server confirms that visit. Once CMED has confirmed two of
@@ -750,6 +782,9 @@ async def register_device(body: RegisterRequest, request: Request):
     An outsider can register, but cannot get past pending: approval needs
     CMED's server to name, to the second, visits that PC really recorded.
     """
+    import device_log                         # 042: who tried to join, and with what code
+    device_log.note(machine_name=body.machine_name, app_version=body.app_version,
+                    cmed_hospital_id=body.cmed_hospital_id)
     if not self_registration_enabled():
         return _coded(403, "SELF_REGISTRATION_OFF",
                       "this server enrols PCs with an enrolment token only")
@@ -760,9 +795,11 @@ async def register_device(body: RegisterRequest, request: Request):
     problem = integrity.device_key_problem(pubkey)
     if problem is not None:
         return _coded(400, "BAD_KEY", problem)
-    if integrity.device_key_kind(pubkey) != "p256":
-        return _coded(400, "TPM_KEY_REQUIRED",
-                      "only a key held in the PC's TPM may register without a token")
+    # 17 Nov (recorder 3.9.2): a PC with no usable TPM chip joins with its
+    # software key too. The gate was never the key: the PC proves it holds it
+    # (below), joins as pending, and nothing it records is kept until CMED's
+    # server confirms its visits. The kind is recorded and shown per PC.
+    key_kind = "TPM chip" if integrity.device_key_kind(pubkey) == "p256" else "software key"
     if abs(time.time() - body.timestamp) > DEVICE_SIGNATURE_WINDOW:
         return _coded(401, "CLOCK", "the registration's time is more than five minutes "
                                     "from the server's; check the PC's clock")
@@ -777,14 +814,22 @@ async def register_device(body: RegisterRequest, request: Request):
                       "key_proof does not verify: this PC did not show it holds the key")
 
     repo = _repo()
-    hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
-    if hospital_id is None:
-        return _coded(403, "UNKNOWN_CLINIC",
-                      "CMED's clinic code is not a clinic this server runs")
-
     import security
     address = security.client_ip(request)
     device_id = integrity.device_id_for_key(pubkey)
+    device_log.note(device_id=device_id)
+    hospital_id = await repo.active_clinic_for_cmed(body.cmed_hospital_id)
+    if hospital_id is None:
+        # 16 Nov: say which code, and what to do - and keep it on the dashboard,
+        # so AIMS LAB sees it without asking CMED for the PC's log.
+        await _register_refused(repo, "UNKNOWN_CLINIC", body, device_id, address)
+        return _coded(403, "UNKNOWN_CLINIC",
+                      f"CMED's clinic code '{body.cmed_hospital_id}' is not set up on the "
+                      "AIMS LAB server. AIMS LAB links it to one of its clinics "
+                      "(dashboard > CMED > Clinic codes); then this PC joins by itself at "
+                      "the next patient. Check that hospital_id in the start command is "
+                      "exactly the code AIMS LAB was given (CMED-TEST while testing).",
+                      cmed_hospital_id=body.cmed_hospital_id)
     result = await repo.register_device(
         device_id=device_id, tpm_pubkey=pubkey, hospital_id=hospital_id,
         machine_name=body.machine_name, os_version=body.os_version,
@@ -795,13 +840,14 @@ async def register_device(body: RegisterRequest, request: Request):
     if "refused" in result:
         status, code, message = _REGISTER_REFUSALS[result["refused"]]
         logger.warning("Registration of %s at %s refused: %s", device_id, hospital_id, code)
-        return _coded(status, code, message)
+        await _register_refused(repo, code, body, device_id, address, hospital_id=hospital_id)
+        return _coded(status, code, message, cmed_hospital_id=body.cmed_hospital_id)
 
     await repo.audit(event_type="device.registered", actor_type="device",
                      device_id=device_id,
                      detail={"machine_name": body.machine_name, "hospital_id": hospital_id,
                              "app_version": body.app_version, "address": address,
-                             "approval": result["approval"]})
+                             "approval": result["approval"], "key": key_kind})
     await repo.alert_once(
         alert_type="device_registered", group=f"device_registered:{device_id}",
         window=timedelta(days=7), severity="info",
@@ -852,8 +898,16 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     claimed_hospital = hospital_id
     hospital_id = device["hospital_id"]
     if claimed_hospital != hospital_id:
+        # 17 Nov: an administrator moved the PC while it held recordings made
+        # under its old clinic. From 3.9.3 the recorder learns the move and
+        # sends them; that is expected, not an intrusion, so it is noted
+        # quietly. Any other disagreement is still critical.
+        moved = hasattr(_repo(), "device_moved_between") and \
+            await _repo().device_moved_between(device["device_id"], claimed_hospital,
+                                               hospital_id)
         await _repo().raise_alert(
-            alert_type="clinic_mismatch", severity="critical",
+            alert_type="recorded_before_move" if moved else "clinic_mismatch",
+            severity="info" if moved else "critical",
             session_id=session_id, device_id=device["device_id"],
             detail={"device_hospital": hospital_id, "claimed": claimed_hospital},
         )
@@ -1305,7 +1359,7 @@ def _remove_object(object_key: str) -> None:
     # The copies are never deleted here (SRS-ARC-12). The credential should not
     # even reach them, but a bucket misconfigured into holding both would make
     # this the code that destroyed the only remaining copy.
-    if ctx.copy is not None and (object_key.startswith("copies/")
+    if ctx.copy is not None and (is_copy_key(object_key)
                                  or ctx.minio.bucket == ctx.copy.bucket):
         raise RuntimeError(f"refusing to delete {object_key}: it is in the copy bucket")
     ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
@@ -1343,6 +1397,11 @@ async def _queue_transcription(session_id: str, body: CommitRequest,
                      session_id, body.seq_no, exc)
 
 
+# The recorder pauses by itself while the Stop form is open (older recorders)
+# and while Windows asks to shut down: not a pause the doctor chose.
+INTERNAL_PAUSES = frozenset({"stop_requested", "pc_shutdown_pending"})
+
+
 @router.post("/session/pause")
 async def pause_session(body: ChainEntryRequest, device=Depends(require_device)):
     return await _append_lifecycle_entry(body, device, "pause")
@@ -1374,6 +1433,18 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
         logger.info("%s %s entry for %s: %s", outcome.capitalize(), expected_type,
                     session_id, reason)
         return {"status": outcome, "reason": reason}
+
+    # 18 Nov 2026: the recording shows as paused on the dashboard, and the
+    # alerts see it. The recorder's own short holds (Stop pressed and the form
+    # open, Windows shutting down) are not the doctor's pause.
+    try:
+        if expected_type == "pause" and entry.payload.get("reason") not in INTERNAL_PAUSES:
+            await repo.note_pause(session_id, entry.payload.get("at"),
+                                  str(entry.payload.get("reason") or ""))
+        elif expected_type == "resume":
+            await repo.note_pause(session_id, None, None)
+    except Exception as exc:                    # never fails the chain entry itself
+        logger.warning("Could not note the %s of %s: %s", expected_type, session_id, exc)
 
     await repo.audit(
         event_type=f"session.{expected_type}", actor_type="device",
@@ -1817,7 +1888,10 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
             detail={"spool_bytes": body.spool_bytes,
                     "pending_segments": body.pending_segments})
     await _check_clock(device, body)
-    reply: Dict[str, Any] = {"status": "ok"}
+    # The clinic this PC belongs to now. A PC moved on the dashboard learns it
+    # here within 30 seconds; before 3.9.3 it kept the clinic it joined at and
+    # refused every grant for the new one (17 Nov, CMED's PC at TEST/Karail).
+    reply: Dict[str, Any] = {"status": "ok", "hospital_id": device["hospital_id"]}
     # Interface 4: CMED's API 3 for the recording this PC has open has arrived.
     # The recorder ends it about two minutes after that, unless the next
     # patient is opened first; it is told on every heartbeat until it closes.
@@ -1938,7 +2012,7 @@ async def admin_remove_trusted_origin(body: TrustedOriginRequest,
 
 
 # ============================================================
-# Recorder updates (036)
+# Recorder updates (048)
 #
 # A release is a version the cloud build published (recorder-release.yml):
 # where AIMScribeSetup.exe is, and its SHA-256. It reaches PCs in stages -
@@ -2336,12 +2410,25 @@ async def device_health(body: HealthLogRequest, device=Depends(require_device)):
             continue
         kind = str(e["data"].get("alert_type") or "recorder_alert")[:64]
         late = (now - e["at"]).total_seconds() > 120
+        detail = {"detail": e["data"].get("detail"), "from": "recorder",
+                  "occurred_at": e["at"].isoformat(), "reported_late": late}
+        microphone = e["data"].get("device")
+        if kind == "microphone_switched" and isinstance(microphone, str) and microphone:
+            # 036: the microphone it moved to, so the recording's Microphone
+            # column also shows an unplug shorter than one heartbeat.
+            detail["microphone"] = microphone[:200]
+            session_id = e["data"].get("session_id")
+            if session_id:
+                try:
+                    await repo.note_session_microphone(device["device_id"],
+                                                       str(session_id)[:64], microphone[:200])
+                except Exception as exc:
+                    logger.warning("Could not note the switched microphone: %s", exc)
         await repo.raise_alert(
             alert_type=kind,
             severity="critical" if kind in RECORDER_CRITICAL else "warning",
             session_id=e["data"].get("session_id"), device_id=device["device_id"],
-            detail={"detail": e["data"].get("detail"), "from": "recorder",
-                    "occurred_at": e["at"].isoformat(), "reported_late": late})
+            detail=detail)
     return {"status": "stored", "stored": len(new), "last_seq": max(e["seq"] for e in entries)}
 
 
@@ -2644,23 +2731,147 @@ class CopyFailedRequest(BaseModel):
     message: str = Field("", max_length=1000)
 
 
-def copy_object_key(session: Dict[str, Any], kind: str, version: int) -> str:
+_VISIT_KEY_SAFE = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+
+
+def visit_key(patient_id: str, doctor_id: Optional[str], visit_id: Optional[str] = None,
+              start_time: Optional[str] = None, *, fallback: Optional[str] = None
+              ) -> Optional[str]:
     """
-    Where a copy lives in the copy bucket. The same shape as the archive tree,
-    so a restore can walk one clinic or one day without an index.
+    One visit's name, and its folder in the cloud archive:
+
+        <patient_id>_<doctor_id>_<visit_id>             P4347460_DR4290371_VIS-T-31496
+        <patient_id>_<doctor_id>_<YYYYMMDD>T<HHMMSS>    no visit_id: CMED's start_time
+                                                        as written (clinic time)
+        <patient_id>_<doctor_id>_<fallback>             neither (a legacy recording)
+
+    clinical/006 computes the same in SQL (patient_visit.visit_key,
+    encounters.visit_key); test_visit_layout.py keeps the two in step.
+    """
+    if not patient_id:
+        return None
+    if visit_id:
+        tail = visit_id
+    elif start_time:
+        tail = str(start_time)[:19].replace("-", "").replace(":", "")
+    else:
+        tail = fallback
+    if not tail:
+        return None
+    key = f"{patient_id}_{doctor_id or 'unknown'}_{tail}"
+    return key if _VISIT_KEY_SAFE.match(key) else None
+
+
+def copy_object_key(session: Dict[str, Any], kind: str, version: int,
+                    visit: Optional[str] = None) -> str:
+    """
+    Where a copy lives in the copy bucket - the user's layout (18 Nov 2026):
+    the hospital at the top, then the doctor, the day, and the visit's own
+    folder, which holds every file of that visit (the audio and CMED's JSON
+    now; the transcript and NER later):
+
+        <hospital_id>/<doctor_id>/<YYYY-MM-DD>/<patient>_<doctor>_<visit_id>/<file>.vN.wav.enc
+
+    Without a visit key (none can be found for it) the file sits in the
+    day's folder. The file name is the same either way: the encryption binds
+    it (cloudcopy.binding), so a copy can move folder and still restore.
     """
     stem = session.get("file_stem") or safe_session_id(str(session["session_id"]))
     if not _STEM_SAFE.match(str(stem)):
         raise HTTPException(status_code=409, detail="unsafe file name for this session")
-    day = session.get("session_date")
-    day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
     # The raw WAV, encrypted (decided with CMED and the study team): no
     # transcoding stands between the archive and its copy. Older copies made
     # as FLAC keep their .flac.enc names and still restore.
     suffix = "wav.enc" if kind == "audio" else "json.enc"
-    return (f"copies/{safe_identifier(session['hospital_id'], field='hospital_id')}"
-            f"/{safe_identifier(session['doctor_id'], field='doctor_id')}"
-            f"/{day}/{stem}.v{version}.{suffix}")
+    day = session.get("session_date")
+    day = day.isoformat() if hasattr(day, "isoformat") else str(day or "undated")
+    folder = (f"{safe_identifier(session['hospital_id'], field='hospital_id')}"
+              f"/{safe_identifier(session['doctor_id'], field='doctor_id')}/{day}")
+    if visit and _VISIT_KEY_SAFE.match(visit):
+        folder += f"/{visit}"
+    return f"{folder}/{stem}.v{version}.{suffix}"
+
+
+_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Folders that are never a hospital's: the earlier layouts, and the pieces.
+_NOT_A_HOSPITAL = ("copies", "visits", "audio")
+
+
+def visit_folder_of(object_key: str) -> Optional[str]:
+    """
+    The visit key a copy's path names, or None for a copy loose in a day's
+    folder. Two shapes hold one: the current <hospital>/<doctor>/<day>/
+    <visit>/<file>, and visits/<patient>/<visit>/<file> (17 Nov only).
+    """
+    parts = object_key.split("/")
+    if (len(parts) == 5 and parts[0] not in _NOT_A_HOSPITAL and _DAY.match(parts[2])
+            and _VISIT_KEY_SAFE.match(parts[3])):
+        return parts[3]
+    if len(parts) == 4 and parts[0] == "visits":
+        return parts[2]
+    return None
+
+
+def is_copy_key(object_key: str) -> bool:
+    """A key in the copy bucket's own layouts - never the pieces'."""
+    parts = object_key.split("/")
+    return (object_key.startswith(("copies/", "visits/"))
+            or (len(parts) >= 4 and parts[0] not in _NOT_A_HOSPITAL
+                and bool(_DAY.match(parts[2]))))
+
+
+def layout_of(object_key: str) -> str:
+    return "by_visit" if visit_folder_of(object_key) else "by_day"
+
+
+async def visit_key_of(session: Dict[str, Any],
+                       part: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    The visit key of a recording, or of one patient's part of it:
+    <patient>_<doctor>_<visit_id>. CMED gives every visit a visit_id. It is
+    taken from the grant the recording (or part) opened under - while that
+    grant is still this recording's patient (a reassigned recording keeps its
+    first grant) - and, when the start command carried none (recorders before
+    3.8), from CMED's own API 2 for the same patient and start time. Only
+    when neither has one does CMED's start time stand in.
+    """
+    repo = _repo()
+    if part is not None:
+        grant = (await repo.get_authorisation(part["grant_jti"])
+                 if part.get("grant_jti") else None)
+        same = (grant or {}).get("patient_id") == part["patient_id"]
+        visit = (grant or {}).get("visit_id") if same else None
+        if not visit:
+            visit = await _cmed_visit_id(part.get("cmed_hospital_id"), part["patient_id"],
+                                         part.get("start_time"))
+        return visit_key(part["patient_id"], part["doctor_id"], visit, part["start_time"],
+                         fallback=f"{session['session_id']}-p{part['part_no']}")
+    grant = (await repo.get_authorisation(session["grant_jti"])
+             if session.get("grant_jti") else None)
+    same = grant is not None and grant.get("patient_id") == session.get("patient_id")
+    visit = session.get("visit_id") or ((grant or {}).get("visit_id") if same else None)
+    if grant is not None and not same:
+        visit = None
+    if not visit and same:
+        visit = await _cmed_visit_id(grant.get("cmed_hospital_id"), grant["patient_id"],
+                                     grant.get("start_time"))
+    return visit_key(session.get("patient_id"), session.get("doctor_id"), visit,
+                     grant["start_time"] if same else None,
+                     fallback=str(session["session_id"]))
+
+
+async def _cmed_visit_id(cmed_hospital_id: Optional[str], patient_id: Optional[str],
+                         start_time: Optional[str]) -> Optional[str]:
+    """CMED's visit_id for this visit, from its API 2 or API 3 (interface 4)."""
+    if ctx.clinical is None or not (cmed_hospital_id and patient_id and start_time) \
+            or not hasattr(ctx.clinical, "visit_id_for"):
+        return None
+    try:
+        found = await ctx.clinical.visit_id_for(cmed_hospital_id, patient_id, start_time)
+    except Exception as exc:
+        logger.warning("Could not look up CMED's visit_id: %s", exc)
+        return None
+    return found if found and VISIT_ID.match(found) else None
 
 
 @router.get("/archive/copy/pending")
@@ -2839,15 +3050,19 @@ async def archive_copy_authorize(body: CopyAuthorizeRequest,
         raise HTTPException(status_code=409, detail="session is not archived yet")
 
     version = await repo.next_copy_version(session_id, body.kind)
-    named = session
+    named, part = session, None
     if body.part_no is not None:
         part = next((p for p in await repo.parts_for(session_id)
                      if p["part_no"] == body.part_no), None)
         if part is None or not part.get("file_stem"):
             raise HTTPException(status_code=404, detail="no such part")
         named = {**session, "file_stem": part["file_stem"],
-                 "doctor_id": part["doctor_id"]}
-    object_key = copy_object_key(named, body.kind, version)
+                 "doctor_id": part["doctor_id"], "patient_id": part["patient_id"]}
+    # Into the visit's folder (044): the key is kept with the recording.
+    visit = await visit_key_of(session, part)
+    if visit:
+        await repo.set_visit_key(session_id, visit, part_no=body.part_no)
+    object_key = copy_object_key(named, body.kind, version, visit)
     loop = asyncio.get_event_loop()
     upload = await loop.run_in_executor(
         None, copy.get_presigned_upload_url, object_key, 3600)
@@ -2934,7 +3149,10 @@ async def _record_copies(body: "CopyCompleteRequest", session_id: str, session):
         await repo.record_cloud_copy(
             session_id=session_id, kind=copy.kind, object_key=copy.object_key,
             version=copy.version, byte_length=copy.bytes, sha256=digest,
-            plain_sha256=plain)
+            plain_sha256=plain, layout=layout_of(copy.object_key))
+        await register_visit_object(session, copy.object_key, kind=copy.kind,
+                                    version=copy.version, byte_length=copy.bytes,
+                                    part_no=body.part_no)
 
     if body.part_no is not None:
         # One patient's part of a recording cut into several. The recording
@@ -2973,6 +3191,36 @@ async def _record_copies(body: "CopyCompleteRequest", session_id: str, session):
     logger.info("Cloud copy complete for %s; deleted %s piece(s) from the segment "
                 "bucket", session_id, removed)
     return {"status": "copied", "objects_deleted": removed}
+
+
+async def register_visit_object(session: Dict[str, Any], object_key: str, *, kind: str,
+                                version: int, byte_length: Optional[int],
+                                part_no: Optional[int] = None) -> bool:
+    """
+    Tell the clinical database where a visit's file now is (clinical/006
+    visit_objects; by_visit.files), so the visit's tables name it. Only a
+    copy in a visit's folder. Best effort - visit_layout.py writes any row
+    missed here.
+    """
+    key = visit_folder_of(object_key)
+    if ctx.clinical is None or key is None:
+        return False
+    patient_id, doctor_id = session.get("patient_id"), session.get("doctor_id")
+    if part_no is not None:
+        part = next((p for p in await _repo().parts_for(session["session_id"])
+                     if p["part_no"] == part_no), None)
+        patient_id = (part or {}).get("patient_id") or patient_id
+        doctor_id = (part or {}).get("doctor_id") or doctor_id
+    try:
+        return await ctx.clinical.record_visit_object(
+            visit_key=key, patient_id=patient_id, doctor_id=doctor_id or "unknown",
+            visit_id=session.get("visit_id") if part_no is None else None,
+            hospital_id=session.get("hospital_id"), session_id=session["session_id"],
+            part_no=part_no, kind=kind, object_key=object_key, version=version,
+            byte_length=byte_length)
+    except Exception as exc:
+        logger.warning("Could not register %s in the clinical database: %s", object_key, exc)
+        return False
 
 
 @router.post("/archive/copy/failed")
@@ -3172,13 +3420,19 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         # way off it. It is taken instead, filed under the PC's own clinic and
         # marked unconfirmed: it cannot be matched to CMED's API 2 until the
         # hospital is sorted out, so it never enters the dataset by itself.
+        mapped_to = await repo.hospital_for_cmed_id(visit.cmed_hospital_id)
         await repo.raise_alert(
             alert_type="clinic_mismatch", severity="critical",
             device_id=device["device_id"],
             detail={"device_hospital": device["hospital_id"],
                     "cmed_hospital_id": visit.cmed_hospital_id,
-                    "mapped_to": await repo.hospital_for_cmed_id(visit.cmed_hospital_id),
-                    "kept": "uploaded and marked unconfirmed"})
+                    "mapped_to": mapped_to,
+                    "kept": "uploaded and marked unconfirmed",
+                    # What a person does; its waiting recordings then confirm.
+                    "fix": (f"move this PC to clinic {mapped_to}" if mapped_to else
+                            f"link CMED code {visit.cmed_hospital_id} to the clinic this PC "
+                            f"serves ({device['hospital_id']}), or to its real clinic and "
+                            f"move this PC there")})
         clinic = device["hospital_id"]
 
     # Decision D4: the doctor register is a directory, not a gate. CMED
@@ -3422,6 +3676,10 @@ async def _erase_session(session_id: str, *, state: str):
         await repo.delete_notices_for(visit)
         if ctx.clinical is not None:
             await ctx.clinical.erase_visit(visit)
+    if ctx.clinical is not None and hasattr(ctx.clinical, "forget_session_objects"):
+        # The visit's file register names the patient: it goes with the files,
+        # which the erase task removes from the cloud (cloud_copies, all layouts).
+        await ctx.clinical.forget_session_objects(session_id)
     await repo.erase_session(session_id, state=state)
     return removed, visit
 
@@ -3476,6 +3734,13 @@ async def _record_file_name(session_id: str) -> Optional[str]:
                                 session["hospital_id"], start, end, visit=visit_id),
         local_start=start.time().replace(tzinfo=None),
         local_end=end.time().replace(tzinfo=None))
+    # The visit's key (044): v_visit_recordings, and later its cloud folder.
+    try:
+        key = await visit_key_of({**session, "visit_id": visit_id or session.get("visit_id")})
+        if key and hasattr(repo, "set_visit_key"):
+            await repo.set_visit_key(session_id, key)
+    except Exception as exc:
+        logger.warning("Could not set the visit key of %s: %s", session_id, exc)
 
     # A resumed recording leaves the visit linked to the first one (S4); it is
     # found from there through continuation_links.
@@ -3917,6 +4182,12 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
         logger.info("Sweep confirmed %s recording(s) whose notice had arrived",
                     len(reconciled))
 
+    # Then anything a clinic set-up mistake left waiting, once the PC has been
+    # moved or CMED's code linked: every few minutes, not every pass.
+    rematched = await rematch_after_clinic_fix()
+    # And the other recordings of a visit CMED has confirmed, from the same PC.
+    same_visit = await confirm_same_visit_safely()
+
     marked = 0
     for row in await repo.sessions_in_confirmation(
             ["pending"], opened_before=now - conf.CONFIRM_DEADLINE):
@@ -3943,7 +4214,45 @@ async def maintenance_sweep(_: None = Depends(require_worker)):
             "erase_held_clinics": held, "erase_stopped_clinics": stopped,
             "devices_rejected": rejected,
             "devices_approved": approved, "clinical_loaded": loaded,
-            "copies_overdue": len(overdue), "reconciled": len(reconciled)}
+            "copies_overdue": len(overdue), "reconciled": len(reconciled),
+            "rematched": len(rematched), "same_visit": len(same_visit)}
+
+
+REMATCH_EVERY = timedelta(minutes=5)
+_LAST_REMATCH: Optional[datetime] = None
+
+
+async def rematch_after_clinic_fix(*, now: bool = False) -> List[str]:
+    """
+    clinical.rematch_waiting, at most every REMATCH_EVERY - or at once
+    (`now`) right after a PC is moved or a CMED code linked. Never fails
+    the caller.
+    """
+    global _LAST_REMATCH
+    at = datetime.now(timezone.utc)
+    if not now and _LAST_REMATCH is not None and at - _LAST_REMATCH < REMATCH_EVERY:
+        return []
+    _LAST_REMATCH = at
+    try:
+        import clinical
+        rematched = await clinical.rematch_waiting()
+    except Exception as exc:
+        logger.warning("Rematching waiting recordings failed: %s", exc)
+        rematched = []
+    if now:
+        # A move or a link: the visit's other recordings from that PC too, at once.
+        rematched += await confirm_same_visit_safely()
+    return rematched
+
+
+async def confirm_same_visit_safely() -> List[str]:
+    """clinical.confirm_same_visit, never failing the caller."""
+    try:
+        import clinical
+        return await clinical.confirm_same_visit()
+    except Exception as exc:
+        logger.warning("Confirming a visit's other recordings failed: %s", exc)
+        return []
 
 
 ERASE_BATCH = 100                       # per sweep; the worker sweeps every 30 s
@@ -4163,10 +4472,64 @@ async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)
     cmed_id = (safe_identifier(body.cmed_hospital_id, field="cmed_hospital_id")
                if body.cmed_hospital_id else None)
     if cmed_id:
+        holder = await _repo().hospital_for_cmed_id(cmed_id)
+        if holder is not None and holder != hospital_id:
+            raise HTTPException(status_code=409,
+                                detail=f"CMED code '{cmed_id}' is already linked to clinic "
+                                       f"{holder}; one CMED code belongs to one clinic")
         await _repo().set_cmed_hospital_id(hospital_id, cmed_id)
+        _CLINIC_CACHE.clear()        # a newly linked code works at once here; elsewhere in a minute
         await _repo().audit(event_type="hospital.mapped", actor_type="admin",
                             actor_id=hospital_id, detail={"cmed_hospital_id": cmed_id})
+        rematched = await rematch_after_clinic_fix(now=True)
+        return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id,
+                "confirmed_now": len(rematched)}
     return {"status": "ok", "hospital_id": hospital_id, "cmed_hospital_id": cmed_id}
+
+
+@router.get("/admin/clinic-codes")
+async def admin_clinic_codes(_: None = Depends(require_admin)):
+    """
+    Each clinic's CMED code, and the PCs refused in the last 30 days with the
+    code they sent (16 Nov) - the dashboard's CMED > Clinic codes.
+    """
+    repo = _repo()
+    async with repo._acquire() as conn:
+        clinics = await conn.fetch("""
+            SELECT h.hospital_id, h.name, h.timezone, h.active, h.cmed_hospital_id,
+                   h.cmed_last_message_at,
+                   (SELECT count(*) FROM devices d WHERE d.hospital_id = h.hospital_id
+                       AND d.revoked_at IS NULL) AS pcs
+              FROM hospitals h ORDER BY h.hospital_id
+        """)
+        refused = await conn.fetch("""
+            SELECT id, raised_at, detail FROM integrity_alerts
+             WHERE alert_type = 'device_register_refused'
+               AND raised_at > now() - interval '30 days'
+             ORDER BY id DESC LIMIT 100
+        """)
+
+    def iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    out = []
+    for r in refused:
+        detail = r["detail"]
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = {}
+        detail = detail or {}
+        out.append({"id": r["id"], "first_at": iso(r["raised_at"]),
+                    "last_at": detail.get("last_at") or iso(r["raised_at"]),
+                    "code": detail.get("code"), "cmed_hospital_id": detail.get("cmed_hospital_id"),
+                    "machine_name": detail.get("machine_name"),
+                    "app_version": detail.get("app_version"), "address": detail.get("address"),
+                    "linked_now": await repo.active_clinic_for_cmed(
+                        detail.get("cmed_hospital_id") or "") is not None})
+    return {"clinics": [{k: iso(v) for k, v in dict(c).items()} for c in clinics],
+            "refused": out}
 
 
 class DoctorRequest(BaseModel):
@@ -4331,8 +4694,11 @@ async def admin_move_device(device_id: str, body: DeviceMove,
                         detail={"from": was, "to": hospital_id, "reason": body.reason,
                                 "register_again": body.register_again})
     forget_directory()
+    # Its recordings left waiting by the wrong clinic are confirmed now, when
+    # CMED's messages for them are here.
+    rematched = await rematch_after_clinic_fix(now=True)
     return {"status": "moved", "device_id": str(did), "from": was, "to": hospital_id,
-            "register_again": body.register_again}
+            "register_again": body.register_again, "confirmed_now": len(rematched)}
 
 
 @router.post("/admin/device/{device_id}/unblock")

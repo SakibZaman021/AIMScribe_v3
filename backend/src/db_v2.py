@@ -547,7 +547,7 @@ class V2Repository:
             """, origin, by)
         return result.endswith(" 1")
 
-    # ---- recorder updates (036) ----
+    # ---- recorder updates (048) ----
 
     _RELEASE_COLUMNS = """release_id, version, download_url, sha256, rollback, stage,
                           test_devices, hospitals, paused, note, created_by, created_at,
@@ -790,7 +790,8 @@ class V2Repository:
                        quarantine_reason, sample_rate, channels, sample_width,
                        object_prefix, confirmation, grant_jti, file_stem,
                        local_start, local_end, copied_at, segments_deleted_at,
-                       json_stale, parts_count, parts_stale, continues_session_id
+                       json_stale, parts_count, parts_stale, continues_session_id,
+                       visit_id
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -822,6 +823,7 @@ class V2Repository:
                        chain_head_hash = $6, chain_verified_at = now(),
                        manifest = $7, close_reason = $8,
                        status = 'closed', updated_at = now(),
+                       paused_since = NULL, pause_reason = NULL,
                        recording_date = COALESCE($9::date, recording_date),
                        start_time     = COALESCE($10::time, start_time),
                        end_time       = COALESCE($11::time, end_time)
@@ -834,6 +836,30 @@ class V2Repository:
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
                  close_reason or None, local_date, local_start, local_end)
+
+    async def note_pause(self, session_id: str, at: Optional[str],
+                         reason: Optional[str]) -> None:
+        """
+        18 Nov 2026: the doctor paused this recording (`at` and `reason`), or
+        resumed it (both None). Only while it is open; the signed pause or
+        resume itself is in chain_entries.
+        """
+        moment = None
+        if at:
+            try:
+                moment = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+            except ValueError:
+                moment = None
+        async with self._acquire() as conn:
+            if reason is None:
+                await conn.execute("UPDATE sessions SET paused_since = NULL, pause_reason = NULL "
+                                   "WHERE session_id = $1", session_id)
+            else:
+                await conn.execute("""
+                    UPDATE sessions SET paused_since = COALESCE($2::timestamptz, now()),
+                                        pause_reason = $3
+                     WHERE session_id = $1 AND closed_at IS NULL
+                """, session_id, moment, reason[:100])
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
         async with self._acquire() as conn:
@@ -888,6 +914,16 @@ class V2Repository:
                  WHERE session_id = $1 ORDER BY entry_no DESC LIMIT 1
             """, session_id)
         return (int(row["entry_no"]), bytes(row["entry_hash"])) if row else None
+
+    async def device_moved_between(self, device_id, from_clinic: str, to_clinic: str) -> bool:
+        """An administrator moved this PC from one clinic to the other (audit log)."""
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM audit_log
+                 WHERE device_id = $1 AND event_type = 'device.moved'
+                   AND detail::jsonb ->> 'from' = $2 AND detail::jsonb ->> 'to' = $3
+                 LIMIT 1
+            """, device_id, from_clinic, to_clinic))
 
     async def genesis_in_use(self, entry_hash: bytes, session_id: str) -> bool:
         """Another recording already opened with this exact genesis entry."""
@@ -1290,9 +1326,114 @@ class V2Repository:
                  WHERE session_id = $1 AND kind = $2
             """, session_id, kind))
 
+    async def set_visit_key(self, session_id: str, visit_key: str, *,
+                            part_no: Optional[int] = None) -> None:
+        """The recording's (or one part's) visit key: its folder in the cloud archive (044)."""
+        async with self._acquire() as conn:
+            if part_no is None:
+                await conn.execute("UPDATE sessions SET visit_key = $2 WHERE session_id = $1 "
+                                   "AND visit_key IS DISTINCT FROM $2", session_id, visit_key)
+            else:
+                await conn.execute("UPDATE consultation_parts SET visit_key = $3 "
+                                   "WHERE session_id = $1 AND part_no = $2 "
+                                   "AND visit_key IS DISTINCT FROM $3",
+                                   session_id, part_no, visit_key)
+
+    async def without_visit_key(self, limit: int = 5000) -> Tuple[List[Dict[str, Any]],
+                                                                  List[Dict[str, Any]]]:
+        """Recordings, and patients' parts of them, not yet given a visit key."""
+        async with self._acquire() as conn:
+            sessions = await conn.fetch("""
+                SELECT * FROM sessions
+                 WHERE visit_key IS NULL AND patient_id <> 'REDACTED'
+                   AND COALESCE(confirmation, '') NOT IN ('refused', 'expired')
+                 ORDER BY opened_at LIMIT $1
+            """, limit)
+            parts = await conn.fetch("""
+                SELECT p.* FROM consultation_parts p JOIN sessions s USING (session_id)
+                 WHERE p.visit_key IS NULL AND s.patient_id <> 'REDACTED'
+                   AND COALESCE(s.confirmation, '') NOT IN ('refused', 'expired')
+                 ORDER BY p.session_id, p.part_no LIMIT $1
+            """, limit)
+        return [dict(r) for r in sessions], [dict(r) for r in parts]
+
+    async def copies_to_move(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Copies not yet in their visit's folder inside the day's folder: loose in
+        a day's folder, or in the 17 Nov visits/<patient>/ layout. Not yet
+        copied on, and still in the store. For visit_layout.move_copies.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT c.id, c.session_id, c.kind, c.object_key, c.version, c.bytes,
+                       c.sha256, c.plain_sha256
+                  FROM cloud_copies c
+                 WHERE (c.layout = 'by_day' OR c.object_key LIKE 'visits/%')
+                   AND c.removed_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM cloud_copies n
+                                    WHERE n.copied_from = c.object_key)
+                 ORDER BY c.id
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def old_copies_with_twin(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Copies still in the store whose moved-on twin is recorded (045)."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT o.id, o.session_id, o.kind, o.object_key, o.bytes, o.sha256,
+                       n.object_key AS twin_key, n.bytes AS twin_bytes, n.sha256 AS twin_sha256
+                  FROM cloud_copies o
+                  JOIN cloud_copies n ON n.copied_from = o.object_key AND n.layout = 'by_visit'
+                                     AND n.removed_at IS NULL
+                 WHERE o.removed_at IS NULL
+                 ORDER BY o.id LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def mark_copy_removed(self, copy_id: int) -> None:
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE cloud_copies SET removed_at = now() "
+                               "WHERE id = $1 AND removed_at IS NULL", copy_id)
+
+    async def record_moved_copy(self, old: Dict[str, Any], new_key: str) -> int:
+        """
+        A copy placed in its visit's folder by the backfill: a new row, the old
+        one untouched. The same bytes, so the same fingerprints and version.
+        """
+        async with self._acquire() as conn:
+            return int(await conn.fetchval("""
+                INSERT INTO cloud_copies
+                    (session_id, kind, object_key, version, bytes, sha256, plain_sha256,
+                     verified_at, layout, copied_from)
+                VALUES ($1,$2,$3,$4,$5,$6,$7, now(), 'by_visit', $8)
+                ON CONFLICT (object_key) DO UPDATE SET verified_at = now()
+                RETURNING id
+            """, old["session_id"], old["kind"], new_key, old["version"], old["bytes"],
+                 old["sha256"], old["plain_sha256"], old["object_key"]))
+
+    async def by_visit_copies(self, limit: int = 100000) -> List[Dict[str, Any]]:
+        """Every copy in a visit's folder, for registering in the clinical database."""
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT c.session_id, c.kind, c.object_key, c.version, c.bytes,
+                       COALESCE(p.doctor_id, s.doctor_id) AS doctor_id,
+                       COALESCE(p.patient_id, s.patient_id) AS patient_id,
+                       CASE WHEN p.part_no IS NULL THEN s.visit_id END AS visit_id,
+                       s.hospital_id, p.part_no
+                  FROM cloud_copies c JOIN sessions s ON s.session_id = c.session_id
+                  LEFT JOIN consultation_parts p
+                         ON p.session_id = c.session_id AND p.file_stem IS NOT NULL
+                        AND c.object_key LIKE '%/' || p.file_stem || '.v%'
+                 WHERE c.layout = 'by_visit' AND c.removed_at IS NULL
+                 ORDER BY c.id LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
     async def record_cloud_copy(
         self, *, session_id: str, kind: str, object_key: str, version: int,
         byte_length: int, sha256: bytes, plain_sha256: Optional[bytes],
+        layout: str = "by_day",
     ) -> int:
         """
         One verified object in the copy bucket, recorded only after the worker
@@ -1306,15 +1447,15 @@ class V2Repository:
             return int(await conn.fetchval("""
                 INSERT INTO cloud_copies
                     (session_id, kind, object_key, version, bytes, sha256,
-                     plain_sha256, verified_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+                     plain_sha256, verified_at, layout)
+                VALUES ($1,$2,$3,$4,$5,$6,$7, now(), $8)
                 ON CONFLICT (object_key) DO UPDATE
                     SET bytes = EXCLUDED.bytes, sha256 = EXCLUDED.sha256,
                         plain_sha256 = EXCLUDED.plain_sha256,
                         uploaded_at = now(), verified_at = now()
                 RETURNING id
             """, session_id, kind, object_key, version, byte_length, sha256,
-                 plain_sha256))
+                 plain_sha256, layout))
 
     async def copies_for(self, session_id: str) -> List[Dict[str, Any]]:
         async with self._acquire() as conn:
@@ -1322,6 +1463,7 @@ class V2Repository:
                 SELECT kind, object_key, version, bytes, sha256, plain_sha256,
                        uploaded_at, verified_at
                   FROM cloud_copies WHERE session_id = $1
+                   AND removed_at IS NULL           -- 045: a removed copy is not there
                  ORDER BY kind, version
             """, session_id)
         return [dict(row) for row in rows]
@@ -1830,6 +1972,97 @@ class V2Repository:
             """, limit)
         return [r["session_id"] for r in rows]
 
+    async def waiting_at_cmed_clinic(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Recordings still waiting for CMED whose PC now sits at the clinic CMED's
+        code names - the code linked to that clinic, or CMED using our own code
+        for a clinic with none linked. Newest grant first.
+
+        These are the recordings a clinic set-up mistake left waiting: the PC
+        enrolled at one clinic while CMED's code named another, or CMED's
+        messages arriving before its code was linked to any clinic. Once a
+        person has moved the PC or linked the code, their grant and CMED's
+        message can meet (clinical.rematch_waiting).
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.session_id, s.device_id, s.archived_at, s.closed_at,
+                       g.jti, g.hospital_id AS grant_hospital, d.hospital_id AS clinic,
+                       g.patient_id, g.doctor_id, g.cmed_hospital_id, g.start_time,
+                       g.visit_date, g.visit_id, g.issued_at
+                  FROM sessions s
+                  JOIN grant_authorisations g ON g.jti = s.grant_jti
+                  JOIN devices d ON d.device_id = s.device_id AND d.revoked_at IS NULL
+                  JOIN hospitals h ON h.hospital_id = d.hospital_id
+                 WHERE s.confirmation IN ('pending', 'unconfirmed')
+                   AND g.notice_id IS NULL AND g.patient_id <> 'REDACTED'
+                   AND (h.cmed_hospital_id = g.cmed_hospital_id
+                        OR (h.cmed_hospital_id IS NULL
+                            AND h.hospital_id = g.cmed_hospital_id))
+                 ORDER BY g.issued_at DESC
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def waiting_same_visit(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Recordings still waiting whose visit CMED has confirmed through another
+        recording from the same PC: the doctor stopped and started again for
+        the same patient, and each start was a grant of its own. One API 2
+        confirms one grant (SRS-CNF-04), so the others waited to be erased.
+
+        Same PC and the same five fields as a confirmed recording, and no other
+        PC ever asked for that visit (a contested visit waits for a person).
+        `clinic` is where the confirmed one is filed.
+        """
+        async with self._acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT DISTINCT ON (s.session_id)
+                       s.session_id, s.hospital_id, s.closed_at, g.jti,
+                       g.patient_id, g.doctor_id, g.cmed_hospital_id, g.start_time,
+                       g.visit_date, c.session_id AS confirmed_by, c.hospital_id AS clinic
+                  FROM sessions s
+                  JOIN grant_authorisations g ON g.jti = s.grant_jti
+                  JOIN grant_authorisations g2
+                    ON g2.jti <> g.jti AND g2.notice_id IS NOT NULL
+                   AND g2.device_id = g.device_id
+                   AND g2.patient_id = g.patient_id AND g2.doctor_id = g.doctor_id
+                   AND g2.cmed_hospital_id = g.cmed_hospital_id
+                   AND g2.start_time = g.start_time AND g2.visit_date = g.visit_date
+                  JOIN sessions c ON c.grant_jti = g2.jti AND c.confirmation = 'confirmed'
+                 WHERE s.confirmation IN ('pending', 'unconfirmed')
+                   AND g.notice_id IS NULL AND g.patient_id <> 'REDACTED'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM grant_authorisations o
+                        WHERE o.device_id <> g.device_id
+                          AND o.patient_id = g.patient_id AND o.doctor_id = g.doctor_id
+                          AND o.cmed_hospital_id = g.cmed_hospital_id
+                          AND o.start_time = g.start_time AND o.visit_date = g.visit_date)
+                 ORDER BY s.session_id, c.opened_at DESC
+                 LIMIT $1
+            """, limit)
+        return [dict(r) for r in rows]
+
+    async def refile_session(self, session_id: str, jti: str, hospital_id: str) -> bool:
+        """
+        File a recording, and the grant it opened under, at another clinic: the
+        one its PC was moved to. Only before it is archived (a waiting
+        recording never is); its pieces keep their object keys.
+        """
+        async with self._acquire() as conn:
+            async with conn.transaction():
+                moved = await conn.fetchval("""
+                    UPDATE sessions SET hospital_id = $2, updated_at = now()
+                     WHERE session_id = $1 AND archived_at IS NULL
+                    RETURNING session_id
+                """, session_id, hospital_id)
+                if moved is None:
+                    return False
+                await conn.execute(
+                    "UPDATE grant_authorisations SET hospital_id = $2 WHERE jti = $1",
+                    jti, hospital_id)
+        return True
+
     async def set_erase_deadlines(self, days: int) -> int:
         """Every recording CMED has not confirmed gets its date (opened + days)."""
         async with self._acquire() as conn:
@@ -2082,6 +2315,15 @@ class V2Repository:
                            status = $2::text, confirmation = $2::text,
                            refused_at = CASE WHEN $2::text = 'refused' THEN now()
                                              ELSE refused_at END,
+                           -- 18 Nov: an erased recording has ended. Without this a
+                           -- refused one stayed "running" for ever, and the alert
+                           -- rules sent 283 "still running / not fixed" messages
+                           -- about 11 refused recordings on 16-17 Nov.
+                           closed_at = COALESCE(closed_at, now()),
+                           paused_since = NULL, pause_reason = NULL,
+                           close_reason = COALESCE(close_reason,
+                               CASE WHEN $2::text = 'refused'
+                                    THEN 'doctor_stopped:patient_did_not_consent' END),
                            updated_at = now()
                      WHERE session_id = $1
                 """, session_id, state)

@@ -480,3 +480,39 @@ dialog::backdrop { background: rgba(8, 10, 12, .55); }
   .bgo button.primary { width: 100%; white-space: normal; padding: 8px 12px; }
   .bnums { gap: 8px 16px; }
 }
+
+/* 036: data collectors - their shift page, and the admin's places and shift log */
+a.button.primary { background: var(--accent); border-color: var(--accent);
+                   color: var(--on-accent); font-weight: 600; }
+.shiftbody { display: flex; flex-direction: column; gap: 12px; }
+.shiftbody .row, .body.row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: end; }
+.shiftstate { font-size: 16px; font-weight: 600; margin: 0; }
+.placehosp { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* 038: the evening report, as Telegram shows it */
+pre.report { white-space: pre-wrap; font: inherit; font-size: 0.92em; line-height: 1.5; margin: 0; max-width: 72ch; }
+pre.report:empty { display: none; }
+
+/* 040: a collector's details not all saved yet */
+.panel.needs { border-color: var(--warn); background: var(--warn-bg); }
+
+/* 043: what a PC sent, in the device log */
+details.sent summary { cursor: pointer; color: var(--accent, inherit); }
+details.sent dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px;
+                  margin: 6px 0 0; font-size: 12px; }
+details.sent dt { color: var(--muted, inherit); font-family: ui-monospace, monospace; }
+details.sent dd { margin: 0; word-break: break-word; }
+
+/* 18 Nov 2026: one patient's history */
+.pfind { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.pfind input { min-width: 14rem; }
+.pbody { display: grid; gap: 6px; }
+.prow { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 12px; align-items: baseline; }
+.prow .pl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.prow .pv { min-width: 0; overflow-wrap: anywhere; }
+.pmeds { border-collapse: collapse; width: 100%; font-size: 13px; }
+.pmeds th, .pmeds td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.pmeds th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+.prec { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 2px 0; }
+.pvisit .head h3 .hint { font-weight: 400; margin-left: 6px; }
+@media (max-width: 640px) { .prow { grid-template-columns: 1fr; gap: 2px; } }

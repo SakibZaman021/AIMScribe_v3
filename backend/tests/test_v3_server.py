@@ -184,6 +184,64 @@ class FakeRepo:
                 confirmed.append(session_id)
         return confirmed
 
+    # a clinic set right after the fact (17 Nov 2026): device id -> clinic now
+    def clinic_of_device(self, device_id):
+        return getattr(self, "device_clinics", {}).get(str(device_id), "HOSP003")
+
+    async def waiting_at_cmed_clinic(self, limit=500):
+        rows = []
+        for s in self.sessions.values():
+            g = self.auths.get(s.get("grant_jti") or "")
+            if (not g or s["confirmation"] not in ("pending", "unconfirmed")
+                    or g["notice_id"] is not None or g["patient_id"] == "REDACTED"):
+                continue
+            clinic = self.clinic_of_device(s["device_id"])
+            code = self.hospitals.get(clinic)
+            if code != g["cmed_hospital_id"] and not (
+                    code is None and clinic == g["cmed_hospital_id"]):
+                continue
+            rows.append(dict(session_id=s["session_id"], device_id=s["device_id"],
+                             archived_at=s.get("archived_at"), closed_at=s.get("closed_at"),
+                             jti=g["jti"], grant_hospital=g["hospital_id"], clinic=clinic,
+                             patient_id=g["patient_id"], doctor_id=g["doctor_id"],
+                             cmed_hospital_id=g["cmed_hospital_id"],
+                             start_time=g["start_time"], visit_date=g["visit_date"],
+                             visit_id=g.get("visit_id"), issued_at=g["issued_at"]))
+        return sorted(rows, key=lambda r: r["issued_at"], reverse=True)[:limit]
+
+    async def waiting_same_visit(self, limit=500):
+        five = ("patient_id", "doctor_id", "cmed_hospital_id", "start_time", "visit_date")
+        rows = []
+        for s in self.sessions.values():
+            g = self.auths.get(s.get("grant_jti") or "")
+            if (not g or s["confirmation"] not in ("pending", "unconfirmed")
+                    or g["notice_id"] is not None or g["patient_id"] == "REDACTED"):
+                continue
+            same = [a for a in self.auths.values()
+                    if all(a[k] == g[k] for k in five)]
+            if any(str(a["device_id"]) != str(g["device_id"]) for a in same):
+                continue
+            done = [c for c in self.sessions.values()
+                    if c.get("confirmation") == "confirmed" and any(
+                        a["jti"] == c.get("grant_jti") and a["jti"] != g["jti"]
+                        and a["notice_id"] is not None for a in same)]
+            if not done:
+                continue
+            c = max(done, key=lambda c: c["opened_at"])
+            rows.append(dict(session_id=s["session_id"], hospital_id=s["hospital_id"],
+                             closed_at=s.get("closed_at"), jti=g["jti"],
+                             **{k: g[k] for k in five},
+                             confirmed_by=c["session_id"], clinic=c["hospital_id"]))
+        return rows[:limit]
+
+    async def refile_session(self, session_id, jti, hospital_id):
+        s = self.sessions[session_id]
+        if s.get("archived_at"):
+            return False
+        s["hospital_id"] = hospital_id
+        self.auths[jti]["hospital_id"] = hospital_id
+        return True
+
     async def sessions_in_confirmation(self, states, *, opened_before):
         return [dict(s) for s in self.sessions.values()
                 if s["confirmation"] in states and s["opened_at"] < opened_before]
@@ -318,6 +376,15 @@ class FakeRepo:
 
     async def copies_for(self, session_id):
         return [dict(c) for c in self.copies if c["session_id"] == session_id]
+
+    # the visit's folder (044)
+    async def set_visit_key(self, session_id, visit_key, *, part_no=None):
+        if part_no is None:
+            self.sessions[session_id]["visit_key"] = visit_key
+        else:
+            for part in self.parts.get(session_id, []):
+                if part["part_no"] == part_no:
+                    part["visit_key"] = visit_key
 
     async def mark_copied(self, session_id):
         self.sessions[session_id].update(copied_at=NOW(), json_stale=False)
@@ -575,6 +642,32 @@ class FakeClinical:
     async def link_session(self, visit, **kw):
         self.linked.append(kw)
         return True
+
+    async def intake_for_visit(self, visit):
+        found = [r for r in self.records
+                 if (r["patient_id"], r["doctor_id"], r["cmed_hospital_id"], r["start_time"],
+                     r["visit_date"]) == (visit.patient_id, visit.doctor_id,
+                                          visit.cmed_hospital_id, visit.start_time, visit.day)]
+        if not found:
+            return None
+        best = max(found, key=lambda r: (r["kind"] == "patient_information", r["id"]))
+        return {"id": best["id"], "kind": best["kind"]}
+
+    async def link_visit_recording(self, **kw):
+        self.__dict__.setdefault("visit_links", []).append(kw)
+        return bool(kw.get("visit_id"))
+
+    async def record_visit_object(self, **kw):
+        objects = self.__dict__.setdefault("visit_objects", [])
+        if any(o["object_key"] == kw["object_key"] for o in objects):
+            return False
+        objects.append(kw)
+        return True
+
+    async def forget_session_objects(self, session_id):
+        objects = self.__dict__.setdefault("visit_objects", [])
+        self.visit_objects = [o for o in objects if o["session_id"] != session_id]
+        return len(objects) - len(self.visit_objects)
 
     async def prescribed(self, visits):
         return {v.patient_id for v in visits
@@ -1235,8 +1328,10 @@ async def test_the_copy_goes_to_its_own_bucket_under_the_recording_name(server):
     for kind, suffix in (("audio", "wav.enc"), ("json", "json.enc")):
         place = await api_v2.archive_copy_authorize(
             api_v2.CopyAuthorizeRequest(session_id=sid, kind=kind))
-        assert place["object_key"] == \
-            f"copies/HOSP003/DR0042/2026-09-13/{STEM}.v1.{suffix}"
+        # Hospital, doctor, day, then the visit's folder (18 Nov): no visit_id came, so
+        # CMED's start_time names the visit.
+        assert place["object_key"] == (f"HOSP003/DR0042/2026-09-13/"
+                                       f"P0012345_DR0042_20260913T101432/{STEM}.v1.{suffix}")
         assert place["version"] == 1
         # The audio goes to cold storage; the JSON to the warm bucket beside it.
         assert place["bucket"] == ("aimscribe-copies" if kind == "audio"

@@ -4,12 +4,14 @@ What the on-screen control shows, and what its two buttons do.
 SRS 3.2 §7.8 (the control) and §7.8a (a patient's refusal). No tkinter here, so
 every rule can be tested; ui/overlay.py only draws what this decides.
 
-    Stop   - red circle.     The microphone cuts on the press (SRS-UIX-08); the
-                             reason form then closes the session, or Cancel
-                             resumes it. "Patient did not consent" comes first
-                             and asks once before deleting (SRS-CNS-02, -08).
+    Stop   - red circle.     3.9.4: the recording carries on while the reason
+                             form is open; a saved reason closes the session,
+                             Cancel changes nothing. "Patient did not consent"
+                             comes first and asks once before deleting - all
+                             of it, the form's seconds too (SRS-CNS-02, -08).
     Pause  - blue rectangle. Takes effect only after a reason (SRS-UIX-05).
-                             While paused the same button resumes.
+                             While paused the same button resumes; after two
+                             minutes paused the card says so in red.
 """
 from __future__ import annotations
 
@@ -52,6 +54,9 @@ NOTES = {
     "session_unconfirmed": "Not confirmed by CMED yet - still recording",
 }
 MESSAGE_SECONDS = 8.0
+# 3.9.4: a pause this long is pointed out on the card (and alerted on the server).
+PAUSE_REMINDER_SECONDS = 120
+PAUSE_REMINDER = "Paused over 2 min - press Resume to record"
 
 
 def pause_reasons(configured: Iterable[str]) -> List[Tuple[str, str]]:
@@ -168,6 +173,8 @@ class OverlayState:
             headline = ""
 
         note = self.note
+        if paused and not holding and float(pause.get("seconds") or 0) >= PAUSE_REMINDER_SECONDS:
+            note = PAUSE_REMINDER
         if active and not note:
             if status.get("authorisation") == "pending":
                 note = "Recording - waiting for the AIMS LAB server"
@@ -202,12 +209,12 @@ class OverlayActions:
         self.stop_choices = STOP_REASONS
 
     def press_stop(self) -> None:
-        """The microphone cuts now; the form follows (SRS-UIX-08)."""
-        self._submit(lambda c: c.hold_for_stop())
+        """3.9.4: the form opens and the recording carries on until a reason is saved."""
+        self._submit(lambda c: c.stop_requested())
 
     def cancel_stop(self) -> None:
-        """Cancelling the whole action resumes recording (SRS-UIX-07)."""
-        self._submit(lambda c: c.release_stop_hold())
+        """Cancelling the whole action changes nothing (SRS-UIX-07)."""
+        self._submit(lambda c: c.stop_cancelled())
 
     def confirm_stop(self, reason: Optional[str], detail: str = "", *,
                      deletion_confirmed: bool = False) -> Optional[str]:
@@ -239,4 +246,5 @@ class OverlayActions:
 
 __all__ = ["STOP_REASONS", "PAUSE_LABELS", "DELETE_QUESTION", "NEEDS_DELETE_CONFIRMATION",
            "OverlayView", "OverlayState", "OverlayActions", "pause_reasons",
-           "close_reason_for", "check_reason", "format_duration", "REFUSAL"]
+           "close_reason_for", "check_reason", "format_duration", "REFUSAL",
+           "PAUSE_REMINDER"]

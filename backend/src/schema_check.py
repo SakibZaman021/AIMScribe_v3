@@ -166,12 +166,73 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it CMED cannot see what happened to its requests.
     ("035_v3_cmed_request_log.sql", "recordings", "table cmed_request_log",
      _table("cmed_request_log")),
+    # Without it there are no data collectors, places, shifts or their mails.
+    ("036_v3_data_collectors.sql", "recordings", "table collector_shifts",
+     _table("collector_shifts")),
+    ("036_v3_data_collectors.sql", "recordings", "role 'collector' allowed",
+     _check_allows("portal_people", "role", "collector")),
+    # Without it collectors get no Telegram alerts and a failed alert is not retried.
+    ("037_v3_collector_telegram.sql", "recordings", "table collector_telegram",
+     _table("collector_telegram")),
+    ("037_v3_collector_telegram.sql", "recordings", "column collector_notifications.next_try_at",
+     _column("collector_notifications", "next_try_at")),
+    # Without it researchers cannot be given hospitals, nor hear about them.
+    ("038_v3_researcher_hospitals.sql", "recordings", "table researcher_hospitals",
+     _table("researcher_hospitals")),
+    ("038_v3_researcher_hospitals.sql", "recordings", "column collector_notifications.audience",
+     _column("collector_notifications", "audience")),
+    # Without it researchers are not told of a problem that lasts, nor who to call.
+    ("039_v3_collector_contacts.sql", "recordings", "column collector_notifications.resolved_at",
+     _column("collector_notifications", "resolved_at")),
+    ("039_v3_collector_contacts.sql", "recordings", "column portal_people.phone",
+     _column("portal_people", "phone")),
+    # Without it a collector cannot save their official name and lab ID.
+    ("040_v3_collector_identity.sql", "recordings", "column portal_people.collector_code",
+     _column("portal_people", "collector_code")),
+    # Without it nobody can see what a PC was told when it could not join.
+    ("042_v3_device_log.sql", "recordings", "table device_events", _table("device_events")),
+    ("043_v3_device_log_sent.sql", "recordings", "column device_events.sent",
+     _column("device_events", "sent")),
+    # Without it places keep the first-guess evening shift (14:00-20:00), not the lab's.
+    ("041_v3_shift_times.sql", "recordings", "evening shift ends 20:30 by default",
+     "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'places' "
+     "AND column_name = 'evening_end' AND column_default LIKE '%20:30%')"),
+    # Without it no copy can be recorded: the server writes cloud_copies.layout.
+    ("044_v3_visit_key.sql", "recordings", "column cloud_copies.layout",
+     _column("cloud_copies", "layout")),
+    ("044_v3_visit_key.sql", "recordings", "column sessions.visit_key",
+     _column("sessions", "visit_key")),
+    # Without it downloads and the bulk list cannot read the copies (removed_at).
+    ("045_v3_copy_removed.sql", "recordings", "column cloud_copies.removed_at",
+     _column("cloud_copies", "removed_at")),
+    # Without it no alert can be marked delivered: the notifier writes delivered_at.
+    ("046_v3_alert_delivery.sql", "recordings", "column collector_notifications.delivered_at",
+     _column("collector_notifications", "delivered_at")),
+    # Without it a pause cannot be recorded on its recording, nor a card edited.
+    ("047_v3_pause_and_cards.sql", "recordings", "column sessions.paused_since",
+     _column("sessions", "paused_since")),
+    ("047_v3_pause_and_cards.sql", "recordings", "table telegram_boards",
+     _table("telegram_boards")),
     # Without it no recorder can be told of a new version.
-    ("036_v3_recorder_releases.sql", "recordings", "table recorder_releases",
+    ("048_v3_recorder_releases.sql", "recordings", "table recorder_releases",
      _table("recorder_releases")),
-    ("036_v3_recorder_releases.sql", "recordings", "column devices.update_status",
+    ("048_v3_recorder_releases.sql", "recordings", "column devices.update_status",
      _column("devices", "update_status")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
+    # Without it a visit's files are not registered and v_visit_folder is missing.
+    ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",
+     _table("visit_objects")),
+    ("clinical/006_visit_folder.sql", "clinical", "view v_visit_folder",
+     _table("v_visit_folder")),
+    # Without it the visit tables a person opens first are missing.
+    ("clinical/007_by_visit_tables.sql", "clinical", "view by_visit.overview",
+     "SELECT to_regclass('by_visit.overview') IS NOT NULL"),
+    ("clinical/008_patient_list.sql", "clinical", "view by_visit.patient_list",
+     "SELECT to_regclass('by_visit.patient_list') IS NOT NULL"),
+    # Without it the database viewer cannot open by_visit.demographics.
+    ("clinical/009_qualified_functions.sql", "clinical", "visit_vital_value names its table",
+     "SELECT coalesce((SELECT position('public.visit_vital' IN prosrc) > 0 FROM pg_proc "
+     "WHERE proname = 'visit_vital_value' LIMIT 1), false)"),
     # Without it the doctor's findings in API 3 cannot be stored.
     ("clinical/003_consultation_findings.sql", "clinical", "table consultation_findings",
      _table("consultation_findings")),

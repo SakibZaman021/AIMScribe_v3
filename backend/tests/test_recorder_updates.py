@@ -1,5 +1,5 @@
 """
-Recorder updates, the server's half (036): a release, its rollout stage, and
+Recorder updates, the server's half (048): a release, its rollout stage, and
 the signed notice a PC inside the stage receives in its heartbeat reply.
 
 The notice is checked here with the recorder's own code (core/updater.py), so

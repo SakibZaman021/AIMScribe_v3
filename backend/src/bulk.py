@@ -219,6 +219,7 @@ SELECT f.session_id, f.part_no, f.hospital_id, f.doctor_id, f.session_date,
   JOIN LATERAL (
     SELECT c.object_key, c.plain_sha256, c.bytes FROM cloud_copies c
      WHERE c.session_id = f.session_id AND c.kind = 'audio' AND c.plain_sha256 IS NOT NULL
+       AND c.removed_at IS NULL
        AND regexp_replace(c.object_key, '^.*/', '') = f.stem || '.v' || c.version || '.wav.enc'
      ORDER BY c.version DESC LIMIT 1
   ) c ON true
@@ -316,6 +317,9 @@ async def _person(request: Request, *, write: bool = False) -> portal.Person:
     person = await portal.person_for(request)
     if person is None:
         raise HTTPException(status_code=401, detail="Sign in with Google to download recordings.")
+    if person.role == "collector":
+        raise HTTPException(status_code=403, detail="A data collector can view recordings but "
+                                                    "not download them.")
     if write:
         portal.check_csrf(request)
     return person
@@ -704,6 +708,9 @@ async def download_batch(batch_id: int, request: Request):
     person = await portal.person_for(request)
     if person is None:
         return downloads._refusal(request, 401, "Sign in with Google to download recordings.")
+    if person.role == "collector":
+        return downloads._refusal(request, 403, "A data collector can view recordings but "
+                                                "not download them.")
     if (request.headers.get("sec-fetch-site") or "same-origin") not in ("same-origin", "none"):
         return downloads._refusal(request, 403, "Downloads start from the dashboard only.")
     if not downloads._decrypt_url():

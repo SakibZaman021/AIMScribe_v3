@@ -206,8 +206,12 @@ async def lifespan(app: FastAPI):
     pools = _schema_pools()
     if pools[0] is not None:
         await schema_check.at_startup(*pools, repo=api_v2.ctx.repo)
+    # Mails the data collector on shift (036); one API process at a time.
+    import collectors
+    collectors.start()
     yield
     # Shutdown
+    await collectors.stop()
     await ctx.close()
 
 
@@ -254,6 +258,11 @@ app.add_middleware(
 # security middleware and sees the request id that middleware sets.
 import cmed_log  # noqa: E402
 cmed_log.install(app)
+# The device log (042): every PC's join attempts and every refusal sent to a
+# PC, with the exact reason - admins see it under CMED > Device log.
+import device_log  # noqa: E402
+device_log.install(app)
+app.include_router(device_log.router)
 
 # Every request: a per-address rate limit, and errors that never carry
 # internals (stack traces, SQL, file paths) back to the caller.
@@ -284,6 +293,16 @@ app.include_router(cmed_log.router)
 # The operational dashboard (SRS 3.3 §8.9). Reads the recordings database
 # only, behind the administrator key.
 app.include_router(dashboard_router)
+# Data collectors (036): their shifts and mails, and the admin's places and
+# monthly shift log (collectors.py).
+import collectors  # noqa: E402
+app.include_router(collectors.router)
+app.include_router(collectors.admin_router)
+# Researchers who look after hospitals (038): copies of the alerts, whether they
+# were handled, and an evening report (watchers.py).
+import watchers  # noqa: E402
+app.include_router(watchers.router)
+app.include_router(watchers.admin_router)
 
 
 # ============================================================================

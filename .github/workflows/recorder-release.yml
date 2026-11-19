@@ -12,11 +12,12 @@
 #
 # On windows-latest: the version is taken from the tag and written into
 # recorder/config.py (APP_VERSION), recorder/version_info.txt and
-# recorder/installer.iss; recorder/BUILD.bat builds and signs every program
-# file and the setup (the OV certificate in DigiCert KeyLocker by default;
-# Azure Trusted Signing or SignPath are kept as alternatives);
-# the job fails if the setup or any shipped file is unsigned or signed by
-# anyone but AIMS LAB; then dist/AIMScribeSetup.exe and its SHA-256 are
+# recorder/installer.iss; recorder/BUILD.bat builds and signs the program
+# (AIMScribe_Agent.exe), the setup and its uninstaller - three signatures a
+# release - with the OV certificate in SSL.com eSigner by default (DigiCert
+# KeyLocker, Azure Trusted Signing or SignPath are kept as alternatives);
+# the job fails if the program or the setup is unsigned or signed by
+# anyone but AIMS_SIGN_PUBLISHER; then dist/AIMScribeSetup.exe and its SHA-256 are
 # published as a GitHub Release. Nothing reaches a PC from here: an admin adds
 # the version on the dashboard (PCs -> Recorder updates) and picks a rollout
 # stage; each PC's updater then checks the signed notice, the SHA-256 and the
@@ -50,7 +51,7 @@ jobs:
       contents: write        # create the GitHub Release
       id-token: write        # Azure only: sign in with OIDC, no stored Azure secret
     env:
-      AIMS_SIGN_PROVIDER: ${{ vars.AIMS_SIGN_PROVIDER || 'keylocker' }}
+      AIMS_SIGN_PROVIDER: ${{ vars.AIMS_SIGN_PROVIDER || 'esigner' }}
       AIMS_SIGN_PUBLISHER: ${{ vars.AIMS_SIGN_PUBLISHER || 'AIMS LAB' }}
       AIMS_BACKEND: ${{ vars.AIMS_BACKEND || 'https://aimscribe.iriic.uiu.ac.bd' }}
       ALLOW_VULNERABLE_BUILD: ${{ vars.ALLOW_VULNERABLE_BUILD || 'false' }}
@@ -110,7 +111,70 @@ jobs:
             Where-Object { Test-Path $_ }
           if (-not $found) { choco install innosetup --no-progress -y; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
 
-      # ---------------------------------------------------------------- DigiCert KeyLocker (default)
+      # ---------------------------------------------------------------- SSL.com eSigner (default)
+      # The OV certificate's key never leaves SSL.com's cloud HSM. eSigner CKA
+      # (Cloud Key Adapter), in automated mode, puts the certificate into this
+      # runner's user certificate store; signtool then signs by thumbprint
+      # through it - the ordinary "thumbprint" route of signing\sign.ps1. Each
+      # file signed is one eSigner signature: three a release.
+      - name: SSL.com eSigner CKA
+        if: env.AIMS_SIGN_PROVIDER == 'esigner'
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          ES_MODE: ${{ vars.ES_MODE || 'product' }}
+          ES_CKA_URL: ${{ vars.ES_CKA_URL || 'https://github.com/SSLcom/eSignerCKA/releases/download/v1.1.2/SSL.COM.eSigner.CKA_1.1.2_build_202600624.exe' }}
+          THUMBPRINT: ${{ vars.ES_CERT_SHA1_HASH }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($n in 'ES_USERNAME', 'ES_PASSWORD', 'ES_TOTP_SECRET') {
+            if (-not [Environment]::GetEnvironmentVariable($n)) { throw "Set the secret $n in the recorder-release environment (INSTALL_FOR_IT.md 7.2)" }
+          }
+          if ($env:ES_MODE -notin 'product', 'sandbox') { throw "ES_MODE must be product or sandbox (got '$env:ES_MODE')" }
+          $dir = Join-Path $env:USERPROFILE 'eSignerCKA'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $setup = Join-Path $env:RUNNER_TEMP 'eSignerCKA-setup.exe'
+          Invoke-WebRequest -Uri $env:ES_CKA_URL -OutFile $setup
+          # Only SSL.com's own installer is run with the build's signing credentials in reach.
+          $sig = Get-AuthenticodeSignature -LiteralPath $setup
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'SSL Corp') {
+            throw "The eSigner CKA installer is not signed by SSL.com: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+          Start-Process -FilePath $setup -ArgumentList @('/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', "/DIR=`"$dir`"") -Wait
+          foreach ($exe in 'eSignerCKATool.exe', 'RegisterKSP.exe') {
+            if (-not (Test-Path (Join-Path $dir $exe))) { throw "$exe not found in $dir after the install" }
+          }
+          & (Join-Path $dir 'RegisterKSP.exe') | Out-Null
+          if (Test-Path (Join-Path $dir 'eSignerCSP.Config.exe')) { & (Join-Path $dir 'eSignerCSP.Config.exe') | Out-Null }
+          $tool = Join-Path $dir 'eSignerCKATool.exe'
+          # Automated mode: the TOTP secret answers the one-time code, so no phone is asked.
+          & $tool config -mode $env:ES_MODE -user $env:ES_USERNAME -pass $env:ES_PASSWORD -totp $env:ES_TOTP_SECRET -key (Join-Path $dir 'master.key') -r
+          Write-Host "eSignerCKATool config exited $LASTEXITCODE"
+          & $tool unload | Out-Null
+          & $tool load
+          Write-Host "eSignerCKATool load exited $LASTEXITCODE"
+          # Which certificate: the thumbprint variable when set, else the one
+          # code-signing certificate whose subject names the publisher.
+          $certs = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert)
+          if ($env:THUMBPRINT) {
+            $thumb = ($env:THUMBPRINT -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+            $cert = $certs | Where-Object Thumbprint -eq $thumb
+          } else {
+            $cert = @($certs | Where-Object { $_.Subject -like "*$env:AIMS_SIGN_PUBLISHER*" })
+            if ($cert.Count -gt 1) { throw "Several code-signing certificates name '$env:AIMS_SIGN_PUBLISHER': set the variable ES_CERT_SHA1_HASH" }
+            $cert = $cert | Select-Object -First 1
+          }
+          if (-not $cert) {
+            $seen = ($certs | ForEach-Object { "$($_.Thumbprint)  $($_.Subject)" }) -join "`n  "
+            throw "No eSigner code-signing certificate for '$env:AIMS_SIGN_PUBLISHER' in the user store after load. Found:`n  $seen"
+          }
+          Write-Host "Signing certificate: $($cert.Subject)  (valid until $($cert.NotAfter))"
+          "AIMS_SIGN_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+          "AIMS_SIGN_TIMESTAMP=http://ts.ssl.com" >> $env:GITHUB_ENV
+
+      # ---------------------------------------------------------------- DigiCert KeyLocker (alternative)
       # The OV certificate's key never leaves DigiCert's HSM. DigiCert's key
       # storage provider (KSP) puts the certificate into this runner's user
       # certificate store; signtool then signs by thumbprint through it - the
@@ -221,10 +285,11 @@ jobs:
           SIGNPATH_ARTIFACT_CONFIG_ZIP: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_ZIP }}
           SIGNPATH_ARTIFACT_CONFIG_PE: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_PE }}
         run: |
-          if not "%AIMS_SIGN_PROVIDER%"=="keylocker" if not "%AIMS_SIGN_PROVIDER%"=="azure" if not "%AIMS_SIGN_PROVIDER%"=="signpath" (
-            echo AIMS_SIGN_PROVIDER must be keylocker, azure or signpath in the cloud build & exit /b 1
+          if not "%AIMS_SIGN_PROVIDER%"=="esigner" if not "%AIMS_SIGN_PROVIDER%"=="keylocker" if not "%AIMS_SIGN_PROVIDER%"=="azure" if not "%AIMS_SIGN_PROVIDER%"=="signpath" (
+            echo AIMS_SIGN_PROVIDER must be esigner, keylocker, azure or signpath in the cloud build & exit /b 1
           )
-          REM KeyLocker's certificate is in this runner's store: signing\sign.ps1 signs by thumbprint.
+          REM eSigner's or KeyLocker's certificate is in this runner's store: signing\sign.ps1 signs by thumbprint.
+          if "%AIMS_SIGN_PROVIDER%"=="esigner" set "AIMS_SIGN_PROVIDER=thumbprint"
           if "%AIMS_SIGN_PROVIDER%"=="keylocker" set "AIMS_SIGN_PROVIDER=thumbprint"
           set DEV_UNSIGNED=
           call recorder\BUILD.bat
@@ -235,7 +300,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # Every .exe, .dll and .pyd: validly signed (ours, or its own maker's).
+          # The program: validly signed by us and timestamped (sign.ps1's rule).
           & recorder\signing\sign.ps1 -Folder recorder\dist\AIMScribe_Agent -VerifyOnly
           # The program and the setup: AIMS LAB exactly (common name or organisation),
           # timestamped - the rule each PC's updater applies (core/updater.py).
@@ -259,6 +324,15 @@ jobs:
           Assert-Ours recorder\dist\AIMScribe_Agent\AIMScribe_Agent.exe
           $shipped = (Get-Item recorder\dist\AIMScribe_Agent\AIMScribe_Agent.exe).VersionInfo.ProductVersion
           if ($shipped -ne "$env:VERSION.0") { throw "The program says it is $shipped, not $env:VERSION" }
+
+      - name: eSigner logs, when signing failed
+        if: failure() && env.AIMS_SIGN_PROVIDER == 'esigner'
+        uses: actions/upload-artifact@v4
+        with:
+          name: esigner-cka-logs
+          path: ~/AppData/Roaming/eSignerCKA/KSP
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: SHA-256
         id: hash

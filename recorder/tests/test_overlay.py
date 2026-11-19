@@ -153,10 +153,32 @@ def test_refusal_is_the_first_stop_reason():
 
 
 def test_stop_press_and_cancel():
+    """3.9.4: Stop no longer cuts the microphone; the recording carries on until a
+    reason is saved, and Cancel changes nothing."""
     act, calls = actions()
     act.press_stop()
     act.cancel_stop()
-    assert [name for name, _ in calls.made] == ["hold_for_stop", "release_stop_hold"]
+    assert [name for name, _ in calls.made] == ["stop_requested", "stop_cancelled"]
+
+
+def test_a_long_pause_is_pointed_out_on_the_card():
+    from ui.overlay_model import PAUSE_REMINDER
+    state = OverlayState()
+    short = state.view({"is_paused": True, "pause": {"reason": "other", "seconds": 30}})
+    assert short.headline == "Paused" and short.note != PAUSE_REMINDER
+    long = state.view({"is_paused": True, "pause": {"reason": "other", "seconds": 125}})
+    assert long.note == PAUSE_REMINDER
+
+
+async def test_stop_pressed_keeps_recording_until_a_reason_is_saved(ctl):
+    """3.9.4, the lab's rule (18 Nov): the recording carries on while the form is open."""
+    await ctl.open_session(trigger())
+    active = ctl._active
+    await ctl.stop_requested()
+    assert ctl.state == "recording" and active.recorder.is_running
+    assert not [e for e in active.spool.chain if e.entry_type == "pause"]
+    result = await ctl.stop_session(reason="doctor_stopped:patient_left")
+    assert result["status"] == "stopped" and result["paused_seconds"] == 0
 
 
 @pytest.mark.parametrize("reason,detail,problem", [

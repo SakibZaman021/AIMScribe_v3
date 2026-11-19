@@ -24,10 +24,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
 import api_v2
+import collectors
 from api_v2 import require_admin, require_viewer
 from integrity import safe_identifier
 
@@ -41,10 +42,20 @@ SILENT_AFTER = timedelta(seconds=3 * HEARTBEAT_SECONDS)
 
 # How a recording ends when nothing went wrong: the next patient opened, or
 # two minutes after the prescription (older recorders: at the prescription).
-# Anything else - the doctor's forced Stop, a shutdown, a reset - is "stopped
-# early" on the dashboard. Constants only, so safe to put in the SQL.
-_ENDED_NORMALLY = ("('prescription_built', 'superseded_by_new_patient', "
-                   "'counselling_limit', '')")
+# The lab's rule (15 Nov 2026): only two ends are ordinary - the next patient
+# came in, or the consultation finished (the doctor's Stop in CMED or
+# "Consultation finished" on the PC included). Everything else - the patient
+# left, did not consent, an emergency, a technical problem, a crash, a
+# shutdown - is "stopped early", the same list that alerts the collectors
+# (collectors.ORDINARY_ENDS). Constants only, so safe to put in the SQL.
+_ENDED_NORMALLY = "(" + ", ".join(f"'{r}'" for r in sorted(collectors.ORDINARY_ENDS)) + ")"
+
+
+def _stopped_early(alias: str = "") -> str:
+    """SQL: this recording ended in any way but the two ordinary ones."""
+    return (f"(({alias}close_reason IS NOT NULL AND {alias}close_reason NOT IN "
+            f"{_ENDED_NORMALLY}) OR EXISTS (SELECT 1 FROM session_refusals x "
+            f"WHERE x.session_id = {alias}session_id))")
 
 
 def _pool():
@@ -100,7 +111,8 @@ def _clinic(value: Optional[str]) -> Optional[str]:
 async def summary(from_date: Optional[str] = Query(None, alias="from"),
                   to_date: Optional[str] = Query(None, alias="to"),
                   hospital_id: Optional[str] = None,
-                  _: None = Depends(require_viewer)):
+                  _: None = Depends(require_viewer),
+                  scope: Any = Depends(collectors.hospital_scope)):
     """
     Everything §8.9 asks for, for a span of days: volume, confirmation,
     integrity, recorder health, reconciliation and the state of the copies.
@@ -110,19 +122,21 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
     end = _day(to_date, today)
     if end < start:
         start, end = end, start
-    clinic = _clinic(hospital_id)
+    # 036: a data collector sees their place's hospitals only.
+    clinic = collectors.narrow(scope, _clinic(hospital_id))
 
     async with _pool().acquire() as conn:
         return {
             "from": start.isoformat(), "to": end.isoformat(),
-            "hospital_id": clinic,
+            "hospital_id": _clinic(hospital_id),
+            "scope": clinic if isinstance(scope, list) else None,
             "volume": await _volume(conn, start, end, clinic),
             "confirmation": await _confirmation(conn, start, end, clinic),
             "integrity": await _integrity(conn, start, end, clinic),
             "recorders": await _recorders(conn, clinic),
             "review": await _review(conn, clinic),
             "reconciliation": await _reconciliation(conn, start, end, clinic),
-            "copies": await _copies(conn),
+            "copies": await _copies(conn, clinic),
         }
 
 
@@ -134,7 +148,7 @@ async def _volume(conn, start: date, end: date, clinic: Optional[str]) -> Dict[s
                COALESCE(sum(total_duration_seconds), 0) / 3600.0 AS hours
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND confirmation <> 'refused'
          GROUP BY session_date, hospital_id, doctor_id
          ORDER BY session_date, hospital_id, doctor_id
@@ -175,7 +189,7 @@ async def _confirmation(conn, start: date, end: date,
         SELECT session_date, hospital_id, confirmation, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
          GROUP BY session_date, hospital_id, confirmation
          ORDER BY session_date, hospital_id
     """, start, end, clinic)
@@ -205,30 +219,35 @@ async def _integrity(conn, start: date, end: date,
         SELECT hospital_id, doctor_id, quarantine_reason, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND quarantine_reason IS NOT NULL
          GROUP BY hospital_id, doctor_id, quarantine_reason
          ORDER BY n DESC
     """, start, end, clinic)
 
     stopped = await conn.fetch("""
-        SELECT hospital_id, doctor_id, close_reason, count(*) AS n
+        SELECT hospital_id, doctor_id,
+               CASE WHEN EXISTS (SELECT 1 FROM session_refusals x
+                                  WHERE x.session_id = sessions.session_id)
+                    THEN 'patient_did_not_consent' ELSE close_reason END AS close_reason,
+               count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR hospital_id = $3)
-           AND close_reason IS NOT NULL
-           AND close_reason NOT IN """ + _ENDED_NORMALLY + """
-         GROUP BY hospital_id, doctor_id, close_reason
+           AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
+           AND """ + _stopped_early("sessions.") + """
+         GROUP BY 1, 2, 3
          ORDER BY n DESC
     """, start, end, clinic)
 
     alerts = await conn.fetch("""
         SELECT a.alert_type, a.severity, count(*) AS n
           FROM integrity_alerts a
+          LEFT JOIN devices d ON d.device_id = a.device_id
          WHERE a.raised_at >= $1::date AND a.raised_at < ($2::date + 1)
+           AND ($3::text[] IS NULL OR d.hospital_id = ANY($3::text[]))
          GROUP BY a.alert_type, a.severity
          ORDER BY n DESC
-    """, start, end)
+    """, start, end, clinic)
 
     return {
         "quarantined": [dict(r) for r in quarantined],
@@ -250,9 +269,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                last_seen_at, spool_bytes, pending_segments, revoked_at,
                held_sessions, held_count, disk_encrypted, clock_offset_seconds,
                approval, registered_via, microphone, microphone_is_clinic,
-               blocked_at, revoked_reason, update_status, update_status_at
+               blocked_at, revoked_reason, octet_length(tpm_pubkey) AS key_bytes,
+               update_status, update_status_at
           FROM devices
-         WHERE ($1::text IS NULL OR hospital_id = $1)
+         WHERE ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
          ORDER BY hospital_id, machine_name
     """, clinic)
 
@@ -304,7 +324,10 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
             # 033: blocked by the sweep on evidence; an admin may unblock it.
             "blocked": row["blocked_at"] is not None,
             "blocked_reason": row["revoked_reason"] if row["blocked_at"] else None,
-            # 036: what its updater last reported (installed, waiting, failed...).
+            # 3.9.2: where its identity key lives - 65 bytes P-256 in its TPM
+            # chip, 32 bytes Ed25519 in software (no usable chip, or before 3.6).
+            "key": {65: "tpm", 32: "software"}.get(row["key_bytes"]),
+            # 048: what its updater last reported (installed, waiting, failed...).
             "update_status": _json(row["update_status"]),
             "update_status_at": row["update_status_at"].isoformat()
                                 if row["update_status_at"] else None,
@@ -344,7 +367,7 @@ async def _review(conn, clinic: Optional[str]) -> Dict[str, Any]:
           FROM integrity_alerts a
           LEFT JOIN sessions s ON s.session_id = a.session_id
          WHERE a.alert_type = ANY($1::text[]) AND a.resolved_at IS NULL
-           AND ($2::text IS NULL OR s.hospital_id = $2)
+           AND ($2::text[] IS NULL OR s.hospital_id = ANY($2::text[]))
          ORDER BY a.raised_at DESC
          LIMIT 100
     """, list(REVIEW_ALERTS), clinic)
@@ -435,7 +458,7 @@ async def _reconciliation(conn, start: date, end: date,
     without_record = await conn.fetchval("""
         SELECT count(*) FROM sessions s
          WHERE s.session_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR s.hospital_id = $3)
+           AND ($3::text[] IS NULL OR s.hospital_id = ANY($3::text[]))
            AND s.confirmation IN ('pending', 'unconfirmed')
     """, start, end, clinic)
 
@@ -443,7 +466,7 @@ async def _reconciliation(conn, start: date, end: date,
         SELECT n.hospital_id, n.visit_date, count(*) AS n
           FROM confirmation_notices n
          WHERE n.visit_date BETWEEN $1 AND $2
-           AND ($3::text IS NULL OR n.hospital_id = $3)
+           AND ($3::text[] IS NULL OR n.hospital_id = ANY($3::text[]))
            AND n.claimed_by_jti IS NULL
            AND n.received_at < now() - interval '15 minutes'
          GROUP BY n.hospital_id, n.visit_date
@@ -457,7 +480,7 @@ async def _reconciliation(conn, start: date, end: date,
     }
 
 
-async def _copies(conn) -> Dict[str, Any]:
+async def _copies(conn, clinic: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     `SRS-DSH-09`: what is not yet safe in two places - recordings without a
     cloud copy, pieces still in the segment store after 48 hours, and when
@@ -469,12 +492,15 @@ async def _copies(conn) -> Dict[str, Any]:
           FROM sessions
          WHERE archived_at IS NOT NULL AND copied_at IS NULL
            AND quarantine_reason IS NULL AND confirmation = 'confirmed'
-    """)
+           AND ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
+    """, clinic)
     stale_pieces = await conn.fetchval("""
-        SELECT count(*) FROM segments
-         WHERE object_deleted_at IS NULL
-           AND committed_at < now() - interval '48 hours'
-    """)
+        SELECT count(*) FROM segments g
+         WHERE g.object_deleted_at IS NULL
+           AND g.committed_at < now() - interval '48 hours'
+           AND ($1::text[] IS NULL OR g.session_id IN (
+                SELECT session_id FROM sessions WHERE hospital_id = ANY($1::text[])))
+    """, clinic)
     restore = await conn.fetchrow("""
         SELECT occurred_at, detail FROM audit_log
          WHERE event_type = 'operations.restore_tested'
@@ -514,18 +540,19 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                      state: Optional[str] = None,
                      search: Optional[str] = None,
                      limit: int = 100,
-                     _: None = Depends(require_viewer)):
+                     _: None = Depends(require_viewer),
+                     scope: Any = Depends(collectors.hospital_scope)):
     """
     Clinic, then doctor, then date, then patient - and a recording at any
     level (`SRS-DSH-02`). `state` opens one of the summary's counts:
 
         confirmed | pending | unconfirmed | refused | expired | legacy
-        quarantined | stopped_early | unarchived | uncopied
+        quarantined | stopped_early | unarchived | uncopied | not_jabra
     """
     today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
     end = _day(to_date, today)
-    clinic = _clinic(hospital_id)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
     doctor = _clinic(doctor_id) if doctor_id else None
     patient = _clinic(patient_id) if patient_id else None
     limit = max(1, min(limit if isinstance(limit, int) else 100, 500))
@@ -537,8 +564,8 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         args.append(value)
         where.append(clause.replace("$N", f"${len(args)}"))
 
-    if clinic:
-        add("s.hospital_id = $N", clinic)
+    if clinics is not None:
+        add("s.hospital_id = ANY($N::text[])", clinics)
     if doctor:
         add("s.doctor_id = $N", doctor)
     if patient:
@@ -549,26 +576,53 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
 
     states = {
         "quarantined": "s.quarantine_reason IS NOT NULL",
-        "stopped_early": "s.close_reason IS NOT NULL AND "
-                         "s.close_reason NOT IN " + _ENDED_NORMALLY,
+        "stopped_early": _stopped_early("s."),
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
         "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
                     "AND s.confirmation = 'confirmed'",
+        # 036: any part recorded on something other than the Jabra.
+        "not_jabra": "EXISTS (SELECT 1 FROM unnest(s.microphones) m "
+                     "WHERE m NOT ILIKE '%jabra%' "
+                     "AND m NOT ILIKE 'echo cancelling speakerphone (j%')",
     }
     if state in states:
         where.append(states[state])
     elif state:
         add("s.confirmation = $N", state)
 
+    args.append(sorted(api_v2.INTERNAL_PAUSES))
+    holds = f"${len(args)}"
     args.append(limit)
     async with _pool().acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT s.session_id, s.session_date, s.hospital_id, s.doctor_id,
-                   s.patient_id, s.file_stem, s.local_start, s.local_end,
+                   s.patient_id, s.visit_id, s.file_stem, s.local_start, s.local_end,
                    s.confirmation, s.status, s.total_duration_seconds,
                    s.segment_count, s.opened_at, s.closed_at, s.archived_at,
-                   s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason
+                   s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
+                   s.microphones,
+                   (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
+                      AND a.alert_type = 'microphone_switched') AS mic_switches,
+                   -- 18 Nov: paused now, and how much of it was paused.
+                   s.paused_since, s.pause_reason, s.paused_seconds,
+                   (SELECT count(*) FROM chain_entries c WHERE c.session_id = s.session_id
+                      AND c.entry_type = 'pause'
+                      AND COALESCE(c.payload->>'reason', '') <> ALL({holds}::text[]))
+                       AS pauses,
+                   -- 18 Nov: an open recording on a PC gone quiet is not "active".
+                   (SELECT d.last_seen_at FROM devices d WHERE d.device_id = s.device_id)
+                       AS pc_last_seen,
+                   -- 18 Nov: the PC it was recorded on, by its Windows name.
+                   (SELECT d.machine_name FROM devices d WHERE d.device_id = s.device_id)
+                       AS pc_name,
+                   s.device_id::text AS pc_id,
+                   -- 18 Nov: the visit CMED's API 2 and API 3 are matched on.
+                   g.cmed_hospital_id AS cmed_code,
+                   COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+                   g.start_time AS cmed_start_time
               FROM sessions s
+              LEFT JOIN grant_authorisations g
+                     ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
              WHERE {' AND '.join(where)}
              ORDER BY s.opened_at DESC NULLS LAST
              LIMIT ${len(args)}
@@ -590,9 +644,185 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                     "needs_review": p["needs_review"],
                     "start_seconds": p["start_seconds"], "end_seconds": p["end_seconds"]})
 
+    times = await _cmed_message_times(rows)
     return {"count": len(rows),
-            "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], [])}
+            "recordings": [{**_recording_row(r), "files": parts.get(r["session_id"], []),
+                            **times.get(r["session_id"], {})}
                            for r in rows]}
+
+
+# ============================================================
+# One patient's history (18 Nov 2026)
+# ============================================================
+
+_PATIENT_VIEWS = ("overview", "demographics", "prescription", "medicines", "files")
+
+
+async def _clinical_reader(request: Request) -> str:
+    """
+    Who may read a patient's clinical record here: an admin or a researcher
+    signed in to the portal, or the admin key. Never a data collector, who
+    sees no clinical value anywhere (036). Returns the name logged for it.
+    """
+    import portal
+    person = await portal.person_for(request)
+    if person is not None:
+        if person.role not in ("admin", "researcher"):
+            raise HTTPException(status_code=403,
+                                detail="A patient's clinical record is for researchers and admins.")
+        return person.email
+    if request.headers.get("x-admin-key"):
+        return "admin key"
+    raise HTTPException(status_code=401, detail="Sign in to look up a patient.")
+
+
+def _plain(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is not None and type(value).__name__ == "Decimal":
+        return float(value)
+    return value
+
+
+@router.get("/patient/{patient_ref}")
+async def patient_history(patient_ref: str, request: Request,
+                          visit_id: Optional[str] = None,
+                          _: None = Depends(require_viewer),
+                          scope: Any = Depends(collectors.hospital_scope)):
+    """
+    Everything held about one patient, newest visit first: who they are, and
+    for each visit the demographics and vitals (API 2), the prescription
+    (API 3), the medicines, and the recordings with their files. Found by
+    CMED's patient ID, or by a visit ID of theirs. Read from the by_visit
+    views (clinical/007, 008); every look-up is logged by name in
+    clinical_access_log.
+    """
+    actor = await _clinical_reader(request)
+    try:
+        ref = safe_identifier(patient_ref.strip(), field="patient_id")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Give a patient ID or a visit ID.")
+    # 18 Nov: with a visit ID as well, that one consultation only.
+    only_visit = None
+    if isinstance(visit_id, str) and visit_id.strip():
+        only_visit = visit_id.strip()
+        if not api_v2.VISIT_ID.match(only_visit):
+            raise HTTPException(status_code=400,
+                                detail="A visit ID has letters, digits and '-' only.")
+    store = api_v2.ctx.clinical
+    if store is None:
+        raise HTTPException(status_code=503, detail="The clinical database is not connected.")
+    async with store._pool.acquire() as conn:
+        patient_id = await conn.fetchval(
+            "SELECT patient_id FROM by_visit.overview WHERE patient_id = $1 LIMIT 1", ref)
+        if patient_id is None:                   # perhaps a visit ID
+            patient_id = await conn.fetchval(
+                "SELECT patient_id FROM by_visit.overview WHERE visit_id = $1 LIMIT 1", ref)
+        if patient_id is None:
+            await store.log_access(actor=actor, action="dashboard.patient", patient_id=ref,
+                                   detail={"found": False})
+            return {"query": ref, "found": False, "patient": None, "visits": []}
+        people = [dict(r) for r in await conn.fetch(
+            "SELECT * FROM by_visit.patient_list WHERE patient_id = $1", patient_id)]
+        rows = {name: [dict(r) for r in await conn.fetch(
+                    f"SELECT * FROM by_visit.{name} WHERE patient_id = $1", patient_id)]
+                for name in _PATIENT_VIEWS}
+
+    visible = None if not isinstance(scope, list) else set(scope)
+    visits: List[Dict[str, Any]] = []
+    for v in rows["overview"]:
+        if visible is not None and v.get("clinic") not in visible:
+            continue
+        if only_visit is not None and v.get("visit_id") != only_visit:
+            continue
+        key = v["visit_key"]
+        demo = next((d for d in rows["demographics"] if d["visit_key"] == key), None)
+        presc = next((d for d in rows["prescription"] if d["visit_key"] == key), None)
+        visits.append({
+            **{k: _plain(val) for k, val in v.items()},
+            "demographics": {k: _plain(val) for k, val in demo.items()} if demo else None,
+            "prescription": {k: _plain(val) for k, val in presc.items()} if presc else None,
+            "medicines": [{k: _plain(val) for k, val in m.items()}
+                          for m in rows["medicines"] if m["visit_key"] == key],
+            "files": [{k: _plain(val) for k, val in f.items()}
+                      for f in rows["files"] if f["visit_key"] == key],
+        })
+
+    # The recordings, for their download links: only copied, confirmed ones download.
+    sessions = sorted({f["recording"] for v in visits for f in v["files"] if f.get("recording")}
+                      | {s.strip() for v in visits for s in (v.get("recordings") or "").split(",")
+                         if s.strip()})
+    recorded: Dict[str, Dict[str, Any]] = {}
+    if sessions:
+        async with _pool().acquire() as conn:
+            for r in await conn.fetch("""
+                SELECT session_id, confirmation, copied_at IS NOT NULL AS copied,
+                       total_duration_seconds, parts_count, local_start
+                  FROM sessions WHERE session_id = ANY($1::text[])
+            """, sessions):
+                recorded[r["session_id"]] = {
+                    "session_id": r["session_id"], "confirmation": r["confirmation"],
+                    "copied": r["copied"], "parts": r["parts_count"],
+                    "minutes": round(float(r["total_duration_seconds"] or 0) / 60, 1),
+                    "local_start": _plain(r["local_start"])}
+    for v in visits:
+        ids = {f["recording"] for f in v["files"] if f.get("recording")} \
+            | {s.strip() for s in (v.get("recordings") or "").split(",") if s.strip()}
+        v["recordings_detail"] = [recorded[i] for i in sorted(ids) if i in recorded]
+
+    await store.log_access(actor=actor, action="dashboard.patient", patient_id=patient_id,
+                           detail={"visits": len(visits), "query": ref,
+                                   **({"visit_id": only_visit} if only_visit else {})})
+    return {"query": ref, "found": True, "visit_id": only_visit,
+            "visit_found": None if only_visit is None else bool(visits),
+            "patient": {k: _plain(val) for k, val in people[0].items()} if people else None,
+            "visits": visits}
+
+
+async def _cmed_message_times(rows) -> Dict[str, Dict[str, Any]]:
+    """
+    18 Nov 2026: when CMED's API 2 and API 3 for each listed recording reached
+    us, so the newest recording's row answers "did API 2 come?" at a glance.
+    `cmed_matched` is False for a recording with nothing to match on (no
+    grant: a legacy recording). Never fails the list: unknown is None.
+    """
+    visits, out = [], {}
+    for r in rows:
+        keys = r.keys()
+        code = r["cmed_code"] if "cmed_code" in keys else None
+        matched = bool(code)
+        out[r["session_id"]] = {"api2_at": None, "api3_at": None, "cmed_matched": matched}
+        if matched:
+            visits.append({"key": r["session_id"], "cmed_hospital_id": code,
+                           "visit_id": r["cmed_visit_id"], "patient_id": r["patient_id"],
+                           "start_time": r["cmed_start_time"]})
+    store = api_v2.ctx.clinical
+    if not visits or store is None or not hasattr(store, "message_times"):
+        return out
+    try:
+        found = await store.message_times(visits)
+    except Exception as exc:
+        logger.warning("Could not read when API 2 / API 3 arrived: %s", exc)
+        return out
+    for key, when in found.items():
+        out[key].update({name: value.isoformat() if hasattr(value, "isoformat") else value
+                         for name, value in when.items()})
+    return out
+
+
+PC_QUIET = timedelta(minutes=10)
+
+
+def _offline_since(row) -> Optional[str]:
+    keys = row.keys()
+    if "pc_last_seen" not in keys or row["closed_at"] is not None:
+        return None
+    seen = row["pc_last_seen"]
+    if seen is None or datetime.now(timezone.utc) - seen < PC_QUIET:
+        return None
+    return seen.isoformat()
 
 
 def _recording_row(row) -> Dict[str, Any]:
@@ -607,6 +837,8 @@ def _recording_row(row) -> Dict[str, Any]:
         # CMED's own patient number. The dashboard shows no name and nothing
         # clinical (SRS-DSH-06); this is how a clinic finds the consultation.
         "patient_id": row["patient_id"],
+        # CMED's visit_id (interface 4), when API 1 carried one.
+        "visit_id": row["visit_id"] if "visit_id" in row.keys() else None,
         "file_stem": row["file_stem"],
         "local_start": moment(row["local_start"]),
         "local_end": moment(row["local_end"]),
@@ -619,24 +851,137 @@ def _recording_row(row) -> Dict[str, Any]:
         "archive_relpath": row["archive_relpath"],
         "quarantine_reason": row["quarantine_reason"],
         "close_reason": row["close_reason"],
+        # 18 Nov: the PC it was recorded on (its Windows name), to track a PC's problems.
+        "pc": row["pc_name"] if "pc_name" in row.keys() else None,
+        "pc_id": row["pc_id"] if "pc_id" in row.keys() else None,
+        # Still open, and its PC not heard from for PC_QUIET: the audio is on
+        # that PC, waiting, and arrives (and the recording closes) when the PC
+        # is back online. Never closed from here - the PC still holds the audio.
+        "on_pc_offline_since": _offline_since(row),
+        # 036: which microphone(s) the recording used, and how often it switched.
+        "microphone": collectors.microphone_label(
+            row["microphones"] if "microphones" in row.keys() else None,
+            int(row["mic_switches"] or 0) if "mic_switches" in row.keys() else 0),
+        # 18 Nov: paused now (open only), and the pauses the doctor made.
+        "paused_since": moment(row["paused_since"])
+        if "paused_since" in row.keys() and row["closed_at"] is None else None,
+        "pause_reason": row["pause_reason"] if "pause_reason" in row.keys() else None,
+        "paused_minutes": round(float(row["paused_seconds"] or 0) / 60, 1)
+        if "paused_seconds" in row.keys() else 0,
+        "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
     }
 
 
+# ============================================================
+# The clinical tables as CSV (19 Nov 2026)
+# ============================================================
+
+# What a researcher may download, and the by_visit table each one is.
+_CLINICAL_CSV = {"demographics": "demographics",     # one row per visit with API 2
+                 "prescriptions": "prescription",    # one row per visit with API 3
+                 "medicines": "medicines"}           # one row per medicine prescribed
+_CSV_MOST = 200_000          # more than this, and the dates must be narrowed
+
+
+def _cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+@router.get("/clinical.csv")
+async def clinical_csv(request: Request, table: str = "demographics",
+                       from_date: Optional[str] = Query(None, alias="from"),
+                       to_date: Optional[str] = Query(None, alias="to"),
+                       hospital_id: Optional[str] = None,
+                       patient_id: Optional[str] = None,
+                       _: None = Depends(require_viewer),
+                       scope: Any = Depends(collectors.hospital_scope)):
+    """
+    19 Nov 2026: the demographics (API 2), prescriptions (API 3) or medicines
+    of every visit in a date range, as one CSV - read from the same by_visit
+    tables as the Patients page. Researchers and admins only, and every
+    download is logged by name in clinical_access_log. No dates: every visit.
+    The clinic is ours (the dashboard's) or CMED's code for it.
+    """
+    actor = await _clinical_reader(request)
+    view = _CLINICAL_CSV.get(table if isinstance(table, str) else "")
+    if view is None:
+        raise HTTPException(status_code=400,
+                            detail="table is demographics, prescriptions or medicines.")
+    where: List[str] = []
+    args: List[Any] = []
+    start = _day(from_date, None) if from_date else None
+    end = _day(to_date, None) if to_date else None
+    if start is not None:
+        args.append(start)
+        where.append(f"visit_date >= ${len(args)}")
+    if end is not None:
+        args.append(end)
+        where.append(f"visit_date <= ${len(args)}")
+    clinic = _clinic(hospital_id)
+    if clinic is not None:
+        args.append(clinic)
+        where.append(f"(clinic = ${len(args)} OR cmed_clinic_code = ${len(args)})")
+    if isinstance(scope, list):
+        args.append(scope)
+        where.append(f"clinic = ANY(${len(args)}::text[])")
+    patient = None
+    if isinstance(patient_id, str) and patient_id.strip():
+        try:
+            patient = safe_identifier(patient_id.strip(), field="patient_id")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="patient_id is not an identifier")
+        args.append(patient)
+        where.append(f"patient_id = ${len(args)}")
+    store = api_v2.ctx.clinical
+    if store is None:
+        raise HTTPException(status_code=503, detail="The clinical database is not connected.")
+    sql = (f"SELECT * FROM by_visit.{view}"
+           + (f" WHERE {' AND '.join(where)}" if where else "")
+           + f" LIMIT {_CSV_MOST + 1}")
+    async with store._pool.acquire() as conn:
+        statement = await conn.prepare(sql)
+        columns = [a.name for a in statement.get_attributes() if a.name != "visit_key"]
+        rows = await statement.fetch(*args)
+    if len(rows) > _CSV_MOST:
+        raise HTTPException(status_code=413, detail=f"Over {_CSV_MOST:,} rows: choose fewer "
+                                                    "days or one clinic.")
+    await store.log_access(actor=actor, action="dashboard.csv", patient_id=patient,
+                           detail={"table": table, "rows": len(rows),
+                                   "from": start.isoformat() if start else None,
+                                   "to": end.isoformat() if end else None,
+                                   "hospital_id": clinic})
+    out = [{k: _cell(r[k]) for k in columns} for r in rows]
+    span = "_".join(d.isoformat() for d in (start, end) if d) or "all"
+    name = f"{table}_{clinic + '_' if clinic else ''}{span}.csv"
+    return Response(_csv(out, columns), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.get("/clinics")
-async def clinics(_: None = Depends(require_viewer)):
-    """The clinics and doctors a dashboard filter can offer."""
+async def clinics(_: None = Depends(require_viewer),
+                  scope: Any = Depends(collectors.hospital_scope)):
+    """The clinics and doctors a dashboard filter can offer (a collector: their place's)."""
+    allowed = collectors.narrow(scope, None)
     async with _pool().acquire() as conn:
         rows = await conn.fetch("""
             SELECT h.hospital_id, h.name, h.timezone,
                    (SELECT count(*) FROM devices d
                      WHERE d.hospital_id = h.hospital_id AND d.revoked_at IS NULL)
                    AS recorders
-              FROM hospitals h ORDER BY h.hospital_id
-        """)
+              FROM hospitals h
+             WHERE ($1::text[] IS NULL OR h.hospital_id = ANY($1::text[]))
+             ORDER BY h.hospital_id
+        """, allowed)
         doctors = await conn.fetch("""
             SELECT DISTINCT hospital_id, doctor_id FROM sessions
-             WHERE session_date > now()::date - 90 ORDER BY hospital_id, doctor_id
-        """)
+             WHERE session_date > now()::date - 90
+               AND ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
+             ORDER BY hospital_id, doctor_id
+        """, allowed)
     return {"clinics": [dict(r) for r in rows], "doctors": [dict(r) for r in doctors]}
 
 
@@ -702,6 +1047,286 @@ async def static(name: str) -> Response:
         raise HTTPException(status_code=404, detail="not found")
     return Response(path.read_text(encoding="utf-8"), media_type=media_type,
                     headers={"Cache-Control": "no-cache"})
+
+
+# ============================================================ the event log (18 Nov 2026)
+
+EVENT_KINDS = ("recording", "pause", "consent", "microphone", "cmed", "alert")
+_EVENT_CSV = ["time", "hospital", "pc", "doctor", "patient_id", "visit_id", "kind", "event",
+              "detail", "session_id"]
+_PROBLEM_ALERTS = {
+    "capture_failed", "microphone_unavailable", "start_abandoned", "disk_full",
+    "local_chain_invalid", "local_segment_unreadable", "silent_session",
+    "microphone_switched", "unexpected_agent_exit"}
+
+
+async def _event_rows(conn, start: date, end: date, clinics: Optional[List[str]],
+                      doctor: Optional[str], kind: Optional[str],
+                      limit_sessions: int = 1000) -> List[Dict[str, Any]]:
+    """Everything that happened to each recording in these days, one row per event."""
+    import watchers
+    where = ["s.session_date BETWEEN $1 AND $2"]
+    args: List[Any] = [start, end]
+    if clinics is not None:
+        args.append(clinics)
+        where.append(f"s.hospital_id = ANY(${len(args)}::text[])")
+    if doctor:
+        args.append(doctor)
+        where.append(f"s.doctor_id = ${len(args)}")
+    args.append(limit_sessions)
+    sessions = await conn.fetch(f"""
+        SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id, s.opened_at,
+               s.closed_at, s.close_reason, s.confirmation, s.total_duration_seconds,
+               s.paused_seconds, s.microphones, s.device_id,
+               COALESCE(s.visit_id, g.visit_id) AS visit_id,
+               (SELECT r.refused_at FROM session_refusals r
+                 WHERE r.session_id = s.session_id LIMIT 1) AS refused_at,
+               d.machine_name,
+               g.cmed_hospital_id AS cmed_code,
+               COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+               g.start_time AS cmed_start_time
+          FROM sessions s
+          LEFT JOIN devices d ON d.device_id = s.device_id
+          LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
+         WHERE {' AND '.join(where)}
+         ORDER BY s.opened_at DESC NULLS LAST
+         LIMIT ${len(args)}
+    """, *args)
+    by_id = {r["session_id"]: r for r in sessions}
+    out: List[Dict[str, Any]] = []
+
+    def add(at, r, what_kind: str, event: str, detail: str = "") -> None:
+        if at is None or (kind and what_kind != kind):
+            return
+        out.append({"at": at, "hospital": r["hospital_id"], "pc": r["machine_name"] or "",
+                    "doctor": r["doctor_id"] or "", "patient_id": r["patient_id"] or "",
+                    "visit_id": r["visit_id"] or "", "kind": what_kind, "event": event,
+                    "detail": detail, "session_id": r["session_id"]})
+
+    ids = list(by_id)
+    for r in sessions:
+        mics = ", ".join(r["microphones"] or []) or "microphone not reported"
+        add(r["opened_at"], r, "recording", "Recording started", mics)
+        if r["refused_at"] is not None:
+            add(r["refused_at"], r, "consent", "Patient did not consent",
+                "the recording was deleted")
+        elif r["closed_at"] is not None:
+            ended = watchers._ended_words(r["close_reason"], False, True)
+            usual = collectors.stop_kind(r["close_reason"]) is None
+            minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
+            paused = round(float(r["paused_seconds"] or 0) / 60, 1)
+            add(r["closed_at"], r, "recording",
+                "Recording ended" if usual else "Recording stopped unusually",
+                f"{ended}; {minutes} min recorded" + (f", {paused} min paused" if paused else ""))
+    if ids:
+        for c in await conn.fetch("""
+            SELECT session_id, entry_type, payload, occurred_at FROM chain_entries
+             WHERE session_id = ANY($1::text[]) AND entry_type IN ('pause', 'resume')
+             ORDER BY session_id, entry_no
+        """, ids):
+            payload = c["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            payload = payload or {}
+            r = by_id[c["session_id"]]
+            if c["entry_type"] == "pause":
+                reason = payload.get("reason") or ""
+                if reason in api_v2.INTERNAL_PAUSES:
+                    continue
+                add(c["occurred_at"], r, "pause", "Paused by the doctor",
+                    payload.get("reason_detail") or reason.replace("_", " "))
+            else:
+                seconds = float(payload.get("paused_seconds") or 0)
+                if seconds and c["occurred_at"]:
+                    add(c["occurred_at"], r, "pause", "Resumed",
+                        f"after {int(seconds // 60)} min {int(seconds % 60):02d} s paused")
+        for a in await conn.fetch("""
+            SELECT session_id, alert_type, raised_at, detail FROM integrity_alerts
+             WHERE session_id = ANY($1::text[]) AND alert_type = ANY($2::text[])
+        """, ids, sorted(_PROBLEM_ALERTS)):
+            detail = a["detail"]
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except ValueError:
+                    detail = {}
+            detail = detail or {}
+            text = str(detail.get("detail") or detail.get("microphone") or "")[:200]
+            label = ("Microphone changed" if a["alert_type"] == "microphone_switched"
+                     else collectors.PROBLEMS.get(a["alert_type"], human_code(a["alert_type"])))
+            add(a["raised_at"], by_id[a["session_id"]], "microphone",
+                label[:1].upper() + label[1:], text)
+        times = await _cmed_message_times(sessions)
+        for sid, t in times.items():
+            r = by_id[sid]
+            if not t.get("cmed_matched") or r["refused_at"] is not None:
+                continue
+            for name, label in (("api2_at", "CMED API 2 (demographics) arrived"),
+                                ("api3_at", "CMED API 3 (prescription) arrived")):
+                if t.get(name):
+                    add(datetime.fromisoformat(t[name]), r, "cmed", label)
+            missing = [w for n, w in (("api2_at", "API 2"), ("api3_at", "API 3"))
+                       if not t.get(n)]
+            if missing and r["closed_at"] is not None:
+                add(r["closed_at"], r, "cmed", "Not received from CMED",
+                    " and ".join(missing) + " for this recording")
+        for n in await conn.fetch("""
+            SELECT DISTINCT ON (event_key) event_key, event, subject, created_at, session_id,
+                   (SELECT count(DISTINCT m.email) FROM collector_notifications m
+                     WHERE m.event_key = n.event_key) AS people,
+                   (SELECT min(m.seen_at) FROM collector_notifications m
+                     WHERE m.event_key = n.event_key AND m.audience = 'collector') AS seen_at
+              FROM collector_notifications n
+             WHERE session_id = ANY($1::text[])
+             ORDER BY event_key, created_at
+        """, ids):
+            r = by_id.get(n["session_id"])
+            if r is None:
+                continue
+            seen = (f"; Seen {n['seen_at'].astimezone(_zone()).strftime('%H:%M')}"
+                    if n["seen_at"] else "")
+            add(n["created_at"], r, "alert", "Alert sent",
+                f"{n['subject']} - to {n['people']} people{seen}")
+    out.sort(key=lambda e: e["at"], reverse=True)
+    return out
+
+
+def human_code(code: str) -> str:
+    return str(code or "").replace("_", " ")
+
+
+def _zone() -> ZoneInfo:
+    return collectors.zone()
+
+
+def _event_out(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {**e, "at": e["at"].isoformat(),
+            "time": e["at"].astimezone(_zone()).strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _csv(rows: List[Dict[str, Any]], columns: List[str]) -> bytes:
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in columns})
+    return buf.getvalue().encode("utf-8-sig")
+
+
+async def _no_collector_files(request: Request) -> None:
+    """A CSV is a download: researchers and admins, as for audio (036)."""
+    import portal
+    person = await portal.person_for(request)
+    if person is not None and person.role == "collector":
+        raise HTTPException(status_code=403, detail="A data collector can view the event "
+                                                    "log but not download it.")
+
+
+@router.get("/events")
+async def events(request: Request,
+                 from_date: Optional[str] = Query(None, alias="from"),
+                 to_date: Optional[str] = Query(None, alias="to"),
+                 hospital_id: Optional[str] = None, doctor_id: Optional[str] = None,
+                 kind: Optional[str] = None, format: Optional[str] = None,
+                 _: None = Depends(require_viewer),
+                 scope: Any = Depends(collectors.hospital_scope)):
+    """
+    18 Nov 2026: the event log - every recording's start and end, each pause
+    and resume with its reason, refusals, microphone changes, CMED's API 2 and
+    API 3 (and which never came), and each alert sent, newest first. With
+    format=csv, the same as a file.
+    """
+    today = clinic_today()
+    start = _day(from_date, today)
+    end = _day(to_date, today)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
+    doctor = _clinic(doctor_id) if doctor_id else None
+    if kind and kind not in EVENT_KINDS:
+        raise HTTPException(status_code=422, detail=f"kind is one of {', '.join(EVENT_KINDS)}")
+    if format == "csv":
+        await _no_collector_files(request)
+    async with _pool().acquire() as conn:
+        rows = await _event_rows(conn, start, end, clinics, doctor, kind)
+    if format == "csv":
+        name = f"aimscribe_events_{start.isoformat()}_{end.isoformat()}.csv"
+        return Response(_csv([_event_out(e) for e in rows], _EVENT_CSV),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    shown = rows[:3000]
+    return {"count": len(rows), "events": [_event_out(e) for e in shown]}
+
+
+_MISSING_CSV = ["cmed_hospital_id", "hospital", "doctor_id", "patient_id", "visit_id", "date",
+                "cmed_start_time", "recording_start", "recording_end", "api2_demographics",
+                "api3_prescription"]
+
+
+@router.get("/cmed-missing.csv")
+async def cmed_missing(request: Request,
+                       from_date: Optional[str] = Query(None, alias="from"),
+                       to_date: Optional[str] = Query(None, alias="to"),
+                       hospital_id: Optional[str] = None,
+                       _: None = Depends(require_viewer),
+                       scope: Any = Depends(collectors.hospital_scope)):
+    """
+    18 Nov 2026: the recordings CMED's API 2 or API 3 never reached us for -
+    with the five fields CMED matches a visit on, no names - to send to CMED.
+    Only recordings that ended over 10 minutes ago and were not refused.
+    """
+    await _no_collector_files(request)
+    today = clinic_today()
+    start = _day(from_date, today)
+    end = _day(to_date, today)
+    clinics = collectors.narrow(scope, _clinic(hospital_id))
+    where = ["s.session_date BETWEEN $1 AND $2", "s.closed_at < now() - interval '10 minutes'",
+             "s.confirmation IS DISTINCT FROM 'refused'", "g.cmed_hospital_id IS NOT NULL"]
+    args: List[Any] = [start, end]
+    if clinics is not None:
+        args.append(clinics)
+        where.append(f"s.hospital_id = ANY(${len(args)}::text[])")
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id, s.session_date,
+                   s.opened_at, s.closed_at,
+                   g.cmed_hospital_id AS cmed_code,
+                   COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
+                   g.start_time AS cmed_start_time
+              FROM sessions s
+              JOIN grant_authorisations g ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
+             WHERE {' AND '.join(where)}
+             ORDER BY s.opened_at
+             LIMIT 5000
+        """, *args)
+    times = await _cmed_message_times(rows)
+    tz = _zone()
+
+    def when(value) -> str:
+        if not value:
+            return "missing"
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+        return moment.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+
+    out = []
+    for r in rows:
+        t = times.get(r["session_id"], {})
+        if t.get("api2_at") and t.get("api3_at"):
+            continue
+        out.append({"cmed_hospital_id": r["cmed_code"], "hospital": r["hospital_id"],
+                    "doctor_id": r["doctor_id"], "patient_id": r["patient_id"],
+                    "visit_id": r["cmed_visit_id"] or "",
+                    "date": r["session_date"].isoformat() if r["session_date"] else "",
+                    "cmed_start_time": r["cmed_start_time"] or "",
+                    "recording_start": r["opened_at"].astimezone(tz).strftime("%H:%M:%S")
+                    if r["opened_at"] else "",
+                    "recording_end": r["closed_at"].astimezone(tz).strftime("%H:%M:%S")
+                    if r["closed_at"] else "",
+                    "api2_demographics": when(t.get("api2_at")),
+                    "api3_prescription": when(t.get("api3_at"))})
+    name = f"cmed_missing_{start.isoformat()}_{end.isoformat()}.csv"
+    return Response(_csv(out, _MISSING_CSV), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 __all__ = ["router"]

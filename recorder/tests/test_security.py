@@ -49,8 +49,16 @@ async def test_disallowed_origins_are_refused(make_security, fake_socket, origin
     manager = _manager(make_security())
     socket = fake_socket(origin=origin)
     assert not await manager.connect(socket)
-    assert not socket.accepted
     assert socket.close_code == 4403
+    assert manager.client_count == 0                 # never a connection that obeys
+    if origin is None:                               # not a browser: nothing to tell
+        assert not socket.accepted and not socket.sent
+    else:
+        # 16 Nov: a browser cannot read why a socket was refused before it opened,
+        # so the page is told in one message - its address, and what to do.
+        assert [m["code"] for m in socket.sent] == ["ORIGIN_NOT_ALLOWED"]
+        assert origin in socket.sent[0]["message"]
+        assert "Trusted EHR addresses" in socket.sent[0]["message"]
 
 
 @pytest.mark.asyncio

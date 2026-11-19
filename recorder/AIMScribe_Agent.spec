@@ -16,7 +16,7 @@
 #                         system tray instead.
 #   version resource      company, product and version, so Windows and IT can
 #                         see what the file is.
-# Every .exe/.dll/.pyd this produces is then signed by signing\sign.ps1.
+# signing\sign.ps1 then signs AIMScribe_Agent.exe (the one program file a clinic PC runs).
 from PyInstaller.utils.hooks import collect_all
 
 datas = []

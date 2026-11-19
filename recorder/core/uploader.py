@@ -210,6 +210,10 @@ class UploadManager:
         self._quiet_until = 0.0
         # This PC's id, named inside a signed refusal. Set with the token.
         self.device_id = ""
+        # The clinic this PC belongs to now, as the server last said (3.9.3).
+        # A recording made before an administrator moved the PC still names
+        # its old clinic; a grant for the new one is accepted for it.
+        self.hospital_id = ""
         # Checks the server's certificate before it is trusted (core.tls_check).
         self._tls: Optional[TlsGuard] = None
         self._tls_reported = ""
@@ -239,6 +243,11 @@ class UploadManager:
     def set_device_token(self, token: Optional[str]) -> None:
         """Set before start(); it becomes a default header on the HTTP session."""
         self._device_token = token
+
+    @property
+    def joined(self) -> bool:
+        """This PC has its device token: the server knows it (16 Nov)."""
+        return bool(self._device_token)
 
     async def start(self) -> None:
         if self._running:
@@ -912,6 +921,21 @@ class UploadManager:
             self.nudge()
             return AuthOutcome("granted", "GRANTED", "", grant, confirmation)
 
+    def clinic_changed(self, hospital_id: str) -> int:
+        """
+        The server moved this PC (3.9.3). Recordings held because their grant
+        named another clinic are asked for again at once, not in five minutes.
+        Returns how many were released.
+        """
+        self.hospital_id = hospital_id or ""
+        released = 0
+        for session in list(self._sessions):
+            if session.held_at is not None and session.hold_code == "AUTHORISATION_FAILED":
+                session.held_at = None
+                released += 1
+        self.nudge()
+        return released
+
     def _holding(self, session: SessionSpool) -> bool:
         """Asked recently and told no: wait before asking again."""
         wait = float(getattr(self.cfg.security, "authorise_hold_retry_seconds", 300.0))
@@ -946,8 +970,11 @@ class UploadManager:
             raise crypto.GrantError("grant is for another patient")
         if grant.doctor_id and grant.doctor_id != trigger.get("doctor_id"):
             raise crypto.GrantError("grant is for another doctor")
-        own = session.meta.get("hospital_id")
-        if grant.hospital_id and own and grant.hospital_id != own:
+        # The recording's own clinic, or the one the server has since moved
+        # this PC to: the server mints every grant for the PC's clinic now, so
+        # a recording held across a move is granted for the new one (3.9.3).
+        allowed = {c for c in (session.meta.get("hospital_id"), self.hospital_id) if c}
+        if grant.hospital_id and allowed and grant.hospital_id not in allowed:
             raise crypto.GrantError("grant is for another clinic")
         self._grant_guard.consume(grant)
         return grant

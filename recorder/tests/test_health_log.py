@@ -151,3 +151,41 @@ async def test_start_answers_at_once_when_the_server_is_known_unreachable(
     assert time.monotonic() - began < 0.3
     assert result["authorisation"] == "pending" and ctl.state == "recording"
     await ctl.close()
+
+
+async def test_a_pc_that_has_not_joined_sends_no_heartbeat_until_it_joins(
+        monkeypatch, spool, device_key):
+    """16 Nov: an unjoined PC's heartbeats were all refused (401); it now waits."""
+    import asyncio
+    import core.session_controller as sc
+
+    class Joining(ScriptedUploader):
+        joined = False
+        beats = 0
+
+        async def heartbeat(self, status):
+            self.beats += 1
+            return {"status": "ok"}
+
+        async def deliver_health(self):
+            return 0
+
+    up = Joining([])
+    ctl = make_controller(monkeypatch, spool, device_key, up)
+    ctl.cfg.app_version, ctl.cfg.protocol_version = "3.8.3", 2
+    ctl.device_id = ""
+    rounds = []
+    real_sleep = asyncio.sleep
+
+    async def quick(seconds):
+        rounds.append(seconds)
+        if len(rounds) == 3:
+            up.joined = True                     # it joins at its first CMED patient
+        if len(rounds) > 5:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(sc.asyncio, "sleep", quick)
+    with pytest.raises(asyncio.CancelledError):
+        await ctl._heartbeat_loop()
+    assert up.beats == 3                         # none before it joined, then every round

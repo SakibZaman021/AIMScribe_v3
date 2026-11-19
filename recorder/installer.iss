@@ -42,7 +42,7 @@
 #define AppName        "AIMScribe Agent"
 ; Set from the release tag by .github/workflows/recorder-release.yml, with
 ; config.py APP_VERSION and version_info.txt.
-#define AppVersion     "3.8.3"
+#define AppVersion     "3.9.4"
 
 ; The same mark as the agent, drawn by scripts/make_icon.py.
 #define AppIcon        "assets\aimscribe.ico"
@@ -201,8 +201,6 @@ var
   ConfigPage: TInputQueryWizardPage;
   KeptApiKey: String;
   InstallProblem: String;
-  { 9 when this PC has no TPM 2.0 chip to keep its identity key in. }
-  InstallExitCode: Integer;
 
 function OpenEvent(dwDesiredAccess: Longword; bInheritHandle: Boolean;
   lpName: String): Longword;
@@ -502,10 +500,18 @@ begin
       StopIfGoingOnBatteries      defaults True - Windows would kill the agent
                                   mid-consultation when someone unplugged it.
 
-    Started once at sign-in, and restarted by Windows if it fails - three
-    times, a minute apart. It used to be re-launched every minute all day and
-    could not be ended by Windows; that is how persistent malware behaves, and
-    antivirus products treat it accordingly. A normal app is started once. }
+    Started at sign-in, and looked at again every two minutes (16 Nov): a
+    recorder ended from Task Manager is back within two minutes on its own -
+    a doctor will not start a program by hand, and a clinic that loses its
+    recorder loses its consultations. While it runs, the look starts nothing
+    (MultipleInstancesPolicy IgnoreNew: the task is still running), and the
+    program is started with --from-task, so a copy started by hand is left
+    alone without an "Already running" box. Windows can still end it
+    (AllowHardTerminate); whoever ends it, it is back within two minutes. IT
+    keeps it off for maintenance by disabling the task. An earlier version
+    re-launched it every minute and could not be ended by Windows, which
+    antivirus treats as malware; this one is a plain repeating logon task, the
+    pattern updaters use, and the signed build is what keeps antivirus quiet. }
   Result := '';
   XmlPath := ExpandConstant('{tmp}\aimscribe_task.xml');
   SetArrayLength(Xml, 0);
@@ -515,9 +521,25 @@ begin
   Append(Xml, '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">');
   Append(Xml, '  <RegistrationInfo>');
   Append(Xml, '    <Author>AIMS LAB</Author>');
-  Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in.</Description>');
+  Append(Xml, '    <Description>Starts the AIMScribe consultation recording agent at sign-in, and again within two minutes if it was ended.</Description>');
   Append(Xml, '  </RegistrationInfo>');
-  Append(Xml, '  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>');
+    { Two triggers (16 Nov, found by ending it on a PC just installed):
+        at sign-in   - it starts at once when someone signs in;
+        a clock      - every two minutes from the moment Setup registers the
+                       task, for good. A repetition on the sign-in trigger alone
+                       only begins at the NEXT sign-in, so after an install or
+                       upgrade an ended recorder stayed off until then - days,
+                       on a PC that is only ever put to sleep.
+      In the order Windows itself exports them: Repetition, then the rest. No
+      Duration: repeated for ever. }
+  Append(Xml, '  <Triggers>');
+  Append(Xml, '    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>');
+  Append(Xml, '    <TimeTrigger>');
+  Append(Xml, '      <Repetition><Interval>PT2M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>');
+  Append(Xml, '      <StartBoundary>' + GetDateTimeString('yyyy-mm-dd"T"hh:nn:ss', '-', ':') + '</StartBoundary>');
+  Append(Xml, '      <Enabled>true</Enabled>');
+  Append(Xml, '    </TimeTrigger>');
+  Append(Xml, '  </Triggers>');
   Append(Xml, '  <Principals><Principal id="Author">');
   Append(Xml, '    <GroupId>S-1-5-32-545</GroupId>');
     { Least privilege: nothing the agent does needs administrator rights. }
@@ -541,6 +563,7 @@ begin
   Append(Xml, '  </Settings>');
   Append(Xml, '  <Actions Context="Author"><Exec>');
   Append(Xml, '    <Command>"' + ExpandConstant('{app}\{#AppExe}') + '"</Command>');
+  Append(Xml, '    <Arguments>--from-task</Arguments>');
   Append(Xml, '  </Exec></Actions>');
   Append(Xml, '</Task>');
   SaveStringsToUTF8FileWithoutBOM(XmlPath, Xml, False);
@@ -735,8 +758,8 @@ end;
 { This PC's identity key is created inside its TPM chip, as administrator -
   which only Setup is - so nothing on the PC can ever copy it. The agent, run
   as whoever signs in, may use the key to sign but never export it. A PC
-  enrolled before 3.6 keeps the software key it enrolled with, so a missing
-  TPM does not stop its update; a new PC without one cannot be set up. }
+  enrolled before 3.6 keeps the software key it enrolled with. A PC with no
+  usable TPM is still set up (below). }
 function ProvisionDeviceKey(): String;
 var
   ResultCode: Integer;
@@ -746,17 +769,12 @@ begin
               SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     ResultCode := 10;
   Log('Device key in the TPM: exit ' + IntToStr(ResultCode));
-  if (ResultCode = 0) or AlreadyEnrolled() then Exit;
-  if ResultCode = 9 then
-  begin
-    InstallExitCode := 9;
-    Result := 'This PC has no usable TPM 2.0 security chip, so AIMScribe cannot ' +
-              'keep its identity key safe here. Switch the TPM on in the PC''s ' +
-              'firmware (BIOS/UEFI) settings, or use another PC.';
-  end
-  else
-    Result := 'This PC''s identity key could not be created in its TPM chip ' +
-              '(code ' + IntToStr(ResultCode) + '). See the AIMScribe log.';
+  { No usable TPM (17 Nov): never a reason to stop. The agent signs with this
+    PC's software key instead, locked to the PC by Windows, as every PC did
+    before 3.6, and the dashboard shows which PCs have no chip. Nobody at a
+    clinic is sent into the BIOS. }
+  if ResultCode <> 0 then
+    Log('No TPM key (code ' + IntToStr(ResultCode) + '): the software key will be used');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -793,8 +811,6 @@ function GetCustomSetupExitCode(): Integer;
 begin
   if InstallProblem = '' then
     Result := 0
-  else if InstallExitCode <> 0 then
-    Result := InstallExitCode
   else
     Result := 8;
 end;

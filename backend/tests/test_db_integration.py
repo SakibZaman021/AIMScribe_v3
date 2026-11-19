@@ -38,6 +38,9 @@ from confirmation import Visit                 # noqa: E402
 from db_v2 import V2Repository                 # noqa: E402
 
 pytestmark = pytest.mark.asyncio
+# Quiet hours (no alerts at night) follow the clock; these tests check the
+# alerts themselves at any hour, and the quiet-hours test turns them on.
+os.environ.setdefault("AIMS_QUIET_HOURS", "off")
 
 # Every v2 and v3 migration, in order, as a deployment applies them.
 RECORDINGS_SCRIPTS = sorted((BACKEND / "scripts").glob("0[0-9][0-9]_*.sql"))
@@ -550,6 +553,50 @@ async def test_refusal_endpoint_on_postgres(dbs):
         _unserve()
 
 
+async def test_a_refused_recording_has_ended_and_no_alert_calls_it_running(dbs, monkeypatch):
+    """18 Nov: refused at 17:10, yet "still running (150 min)" in Telegram for hours."""
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append(subject)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    device = await enrolled_device(dbs.repo)
+    sid = await _linked_session(dbs, device, visit(patient_id="PREFUSE18"))
+    _server(dbs)
+    try:
+        await api_v2.refuse_session(api_v2.RefuseRequest(session_id=sid), device=device)
+        async with dbs.rec.acquire() as conn:
+            session = await conn.fetchrow("SELECT opened_at, closed_at, close_reason "
+                                          "FROM sessions WHERE session_id = $1", sid)
+            assert session["closed_at"] is not None
+            assert session["close_reason"] == "doctor_stopped:patient_did_not_consent"
+            # Even opened two hours ago, it is not "running 60 min".
+            await conn.execute("UPDATE sessions SET opened_at = now() - interval '2 hours' "
+                               "WHERE session_id = $1", sid)
+            await collectors.Notifier().recordings_too_long(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"long:{sid}")
+            # A "running too long" chain begun before the refusal ends, and says why.
+            state, how = await watchers._still_wrong(
+                conn, "long", {"session_id": sid, "device_id": device["device_id"],
+                               "created_at": session["opened_at"]},
+                datetime.now(timezone.utc))
+            assert state == "ended" and "did not consent" in how
+            # A refused one still open from before 18 Nov (migration 046 ends it).
+            await conn.execute("UPDATE sessions SET closed_at = NULL, close_reason = NULL "
+                               "WHERE session_id = $1", sid)
+            await collectors.Notifier().recordings_too_long(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"long:{sid}")
+    finally:
+        _unserve()
+    assert not any("PREFUSE18" in x for x in sent)
+
+
 async def test_closing_names_the_recording_and_links_the_visit(dbs):
     """SRS-SES-05, SRS-DBA-21, SRS-DBA-25."""
     device = await enrolled_device(dbs.repo)
@@ -1000,9 +1047,11 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
     device = await enrolled_device(dbs.repo)
     quarantined = await a_session(dbs.repo, device)
     stopped = await a_session(dbs.repo, device)
-    # The two normal ends - the next patient, two minutes after the
-    # prescription - are not "stopped early".
-    normal = [await a_session(dbs.repo, device), await a_session(dbs.repo, device)]
+    # The two ordinary ends - the next patient, the consultation finished
+    # (the doctor's Stop, or the counselling time after the prescription) -
+    # are not "stopped early"; the patient leaving the room is.
+    normal = [await a_session(dbs.repo, device), await a_session(dbs.repo, device),
+              await a_session(dbs.repo, device)]
     # Today, because an alert is stamped when it is raised: the dashboard
     # shows the alerts of the days it is asked about.
     day = datetime.now(timezone.utc).date()
@@ -1011,9 +1060,10 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
                            "quarantine_reason = 'chain_broken' WHERE session_id = $1",
                            quarantined, day)
         await conn.execute("UPDATE sessions SET session_date = $2, "
-                           "close_reason = 'doctor_stopped' WHERE session_id = $1",
+                           "close_reason = 'doctor_stopped:patient_left' WHERE session_id = $1",
                            stopped, day)
-        for sid, reason in zip(normal, ("superseded_by_new_patient", "counselling_limit")):
+        for sid, reason in zip(normal, ("superseded_by_new_patient", "counselling_limit",
+                                        "doctor_stopped")):
             await conn.execute("UPDATE sessions SET session_date = $2, close_reason = $3 "
                                "WHERE session_id = $1", sid, day, reason)
     await dbs.repo.raise_alert(alert_type="dashboard_test_alert", severity="warning",
@@ -1028,8 +1078,11 @@ async def test_the_dashboard_shows_what_went_wrong_and_where(dbs):
     integrity = result["integrity"]
     assert integrity["quarantined_total"] == 1
     assert integrity["quarantined"][0]["quarantine_reason"] == "chain_broken"
-    assert integrity["stopped_early_total"] == 1
-    assert integrity["stopped_early"][0]["close_reason"] == "doctor_stopped"
+    # Other tests' refusals the same day count too (a refusal is stopped early),
+    # so look for ours and for the absence of the ordinary ends.
+    reasons = {r["close_reason"] for r in integrity["stopped_early"]}
+    assert "doctor_stopped:patient_left" in reasons
+    assert not reasons & {"superseded_by_new_patient", "counselling_limit", "doctor_stopped"}
     assert any(a["alert_type"] == "dashboard_test_alert" for a in integrity["alerts"])
 
 
@@ -1049,6 +1102,7 @@ async def test_the_dashboard_shows_every_room(dbs):
     mine = next(r for r in rooms["rooms"] if r["device_id"] == str(device["device_id"]))
     assert (mine["pending_segments"], mine["spool_mb"]) == (4, 42.0)
     assert mine["silent"] is False
+    assert mine["key"] in ("tpm", "software")             # 3.9.2: shown per PC
 
 
 async def test_a_recorder_not_heard_from_is_called_silent(dbs):
@@ -1377,6 +1431,35 @@ async def test_a_pc_registers_itself_and_cmed_confirming_two_visits_approves_it(
                 "SELECT count(*) FROM audit_log WHERE device_id = $1 "
                 "AND event_type = 'device.approved'", pc["device_id"])
         assert audited == 1
+    finally:
+        _unserve()
+
+
+def _ed25519():
+    """A software key, as a PC without a usable TPM holds one (3.9.2)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = Ed25519PrivateKey.generate()
+    return (key.public_key().public_bytes(serialization.Encoding.Raw,
+                                          serialization.PublicFormat.Raw), key.sign)
+
+
+async def test_a_pc_without_a_tpm_chip_registers_with_its_software_key(dbs):
+    """17 Nov: no BIOS at a clinic. Pending like any PC; a forged proof still fails."""
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        key = _ed25519()
+        joined = await api_v2.register_device(_registration(key=key), _caller())
+        assert joined["approval"] == "pending" and "device_token" in joined
+        async with dbs.rec.acquire() as conn:
+            stored = await conn.fetchval("SELECT tpm_pubkey FROM devices WHERE device_id = $1",
+                                         joined["device_id"])
+        assert len(bytes(stored)) == 32
+
+        forged = _registration(key=_ed25519())
+        forged.device_pubkey = _ed25519()[0].hex()          # proof made with another key
+        assert _refusal(await api_v2.register_device(forged, _caller()))             == (401, "KEY_PROOF_INVALID")
     finally:
         _unserve()
 
@@ -1949,6 +2032,62 @@ async def test_a_researcher_downloads_the_archived_wav_and_it_is_logged(dbs, mon
         _unserve()
 
 
+async def test_an_admin_and_a_researcher_download_the_clinical_record(dbs, monkeypatch):
+    """17 Nov: the JSON CMED sent, decrypted like the audio, for the same people; logged."""
+    import httpx
+    record = json.dumps({"patient": "PDOWNJ", "rx": ["paracetamol"]}).encode()
+    sid, stem = await _copied_recording(dbs, "PDOWNJ")
+    await dbs.repo.record_cloud_copy(
+        session_id=sid, kind="json",
+        object_key=f"copies/HOSP003/DR0042/2026-09-13/{stem}.v1.json.enc",
+        version=1, byte_length=len(record) + 200, sha256=b"3" * 32,
+        plain_sha256=hashlib.sha256(record).digest())
+    asked = []
+
+    def worker(request):
+        asked.append(json.loads(request.content))
+        return httpx.Response(200, content=record,
+                              headers={"Content-Length": str(len(record))})
+
+    who = {"value": "owner@uiu.example"}
+    async with _download_app(dbs, monkeypatch, who, worker) as client:
+        await _sign_in(client)
+        got = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                               headers={"Sec-Fetch-Site": "same-origin"})
+        assert got.status_code == 200 and got.content == record
+        assert got.headers["content-type"].startswith("application/json")
+        disposition = got.headers["content-disposition"]
+        assert disposition.endswith('.json"') and "PDOWNJ" not in disposition
+
+        await _researcher(client, who, email="reader@uni.example")
+        theirs = await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                                  headers={"Sec-Fetch-Site": "same-origin"})
+        assert theirs.status_code == 200 and theirs.content == record
+        # Started from another site: nothing, as for the audio.
+        assert (await client.get(f"/api/v2/dashboard/recordings/{sid}/record",
+                                 headers={"Sec-Fetch-Site": "cross-site"})).status_code == 403
+    try:
+        assert len(asked) == 2
+        assert asked[1] == asked[0]
+        assert asked[0]["expect"] == {"session_id": sid, "kind": "json",
+                                      "stem_sha256": hashlib.sha256(stem.encode()).hexdigest()}
+        assert asked[0]["url"].endswith(".json.enc?expires=300")
+        assert asked[0]["plain_sha256"] == hashlib.sha256(record).hexdigest()
+        async with dbs.rec.acquire() as conn:
+            logged = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE event_type = 'recording.downloaded' "
+                "AND actor_id = 'owner@uiu.example' AND session_id = $1", sid)
+        assert logged == 1
+        async with dbs.rec.acquire() as conn:
+            theirs_logged = await conn.fetchval(
+                "SELECT count(*) FROM portal_downloads WHERE session_id = $1 "
+                "AND email = 'reader@uni.example' AND outcome = 'completed' "
+                "AND object_key LIKE '%.json.enc'", sid)
+        assert theirs_logged == 1
+    finally:
+        _unserve()
+
+
 async def test_a_download_the_worker_refuses_or_cuts_short_is_logged_as_failed(dbs, monkeypatch):
     import httpx
     refused_sid, _ = await _copied_recording(dbs, "PDOWN2")
@@ -2464,3 +2603,1999 @@ async def test_api3_brings_the_doctors_findings_and_api2_keeps_no_name(dbs):
         assert (json.loads(detail) if isinstance(detail, str) else detail) == {"duration": "3 days"}
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = None
+
+
+# ============================================================
+# 036: data collectors - their place's hospitals only, view only, shifts, mails
+# ============================================================
+
+def _with_collectors(client):
+    import bulk
+    import collectors
+    import downloads
+    app = client._transport.app
+    app.include_router(collectors.router)
+    app.include_router(collectors.admin_router)
+    app.include_router(downloads.router)
+    app.include_router(bulk.router)
+    return client
+
+
+async def _two_hospitals(dbs):
+    """A recording at HOSP003 on two microphones, and one at HOSP777 (another place)."""
+    device = await enrolled_device(dbs.repo)
+    await dbs.repo.upsert_hospital("HOSP777", "Korail", "Asia/Dhaka")
+    token = await dbs.repo.create_enrollment_token(hospital_id="HOSP777", doctor_id="",
+                                                   created_by="tests")
+    enrolled = await dbs.repo.enroll_device(token=token, tpm_pubkey=os.urandom(32),
+                                            machine_name="PC-K", os_version="",
+                                            app_version="3", protocol_version=2)
+    other = await dbs.repo.device_by_token(enrolled["device_token"])
+    mine = await a_session(dbs.repo, device)
+    theirs = await a_session(dbs.repo, other)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET hospital_id = 'HOSP777' WHERE session_id = $1",
+                           theirs)
+        await conn.execute("UPDATE sessions SET microphones = $2 WHERE session_id = $1", mine,
+                           ["Echo Cancelling Speakerphone (J", "Microphone Array (Realtek)"])
+    await dbs.repo.raise_alert(alert_type="microphone_switched", session_id=mine,
+                               device_id=device["device_id"],
+                               detail={"detail": "the microphone stopped"})
+    return device, mine, theirs
+
+
+async def _make_collector(client, who, email, hospitals=("HOSP003",)):
+    """As the owner: a new place with these hospitals and a collector in it; then sign in as them."""
+    import uuid as _uuid
+    h = {"X-AIMS-Portal": "1"}
+    client.cookies.clear()
+    who["value"] = "owner@uiu.example"
+    await _sign_in(client)
+    made = await client.post("/api/v2/admin/places",
+                             json={"name": f"Place {_uuid.uuid4().hex[:8]}"}, headers=h)
+    assert made.status_code == 200, made.text
+    place = made.json()["place_id"]
+    for hid in hospitals:
+        added = await client.post(f"/api/v2/admin/places/{place}/hospitals",
+                                  json={"hospital_id": hid}, headers=h)
+        assert added.status_code == 200, added.text
+    person = await client.post("/api/v2/admin/people",
+                               json={"email": email, "role": "collector", "place_id": place},
+                               headers=h)
+    assert person.status_code == 200, person.text
+    client.cookies.clear()
+    who["value"] = email
+    await _sign_in(client)
+    return place
+
+
+async def test_a_collector_sees_only_their_places_hospitals(dbs, monkeypatch):
+    who = {"value": "owner@uiu.example"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "seer@gmail.example")
+        me = (await client.get("/auth/me")).json()
+        assert me["role"] == "collector" and me["place_id"]
+
+        listed = (await client.get("/api/v2/dashboard/recordings")).json()["recordings"]
+        ids = {r["session_id"] for r in listed}
+        assert mine in ids and theirs not in ids
+        assert {r["hospital_id"] for r in listed} == {"HOSP003"}
+        row = next(r for r in listed if r["session_id"] == mine)
+        assert row["microphone"]["kind"] == "mixed"
+        assert row["microphone"]["label"] == "Jabra, then PC microphone (1 switch)"
+        not_jabra = (await client.get("/api/v2/dashboard/recordings",
+                                      params={"state": "not_jabra"})).json()["recordings"]
+        assert mine in {r["session_id"] for r in not_jabra}
+
+        # Asking for another place's hospital by name gives nothing.
+        asked = (await client.get("/api/v2/dashboard/recordings",
+                                  params={"hospital_id": "HOSP777"})).json()
+        assert asked["count"] == 0
+        clinics = (await client.get("/api/v2/dashboard/clinics")).json()
+        assert [c["hospital_id"] for c in clinics["clinics"]] == ["HOSP003"]
+        assert {d["hospital_id"] for d in clinics["doctors"]} <= {"HOSP003"}
+        summary = (await client.get("/api/v2/dashboard/summary")).json()
+        assert {c["hospital_id"] for c in summary["volume"]["by_clinic"]} <= {"HOSP003"}
+        assert {r["hospital_id"] for r in summary["recorders"]["rooms"]} == {"HOSP003"}
+
+        # The owner still sees both.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        everyone = (await client.get("/api/v2/dashboard/recordings")).json()["recordings"]
+        assert {mine, theirs} <= {r["session_id"] for r in everyone}
+    _unserve()
+
+
+async def test_a_collector_views_but_never_downloads_or_opens_the_database(dbs, monkeypatch):
+    who = {"value": "owner@uiu.example"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "viewer@gmail.example")
+        assert (await client.get("/auth/check", headers={"X-Forwarded-Uri": "/db/"})
+                ).status_code == 403
+        assert (await client.get("/auth/check",
+                                 headers={"X-Forwarded-Uri": "/api/v2/dashboard/bulk/preview"})
+                ).status_code == 403
+        assert (await client.get("/auth/check",
+                                 headers={"X-Forwarded-Uri": "/api/v2/dashboard/recordings"})
+                ).status_code == 200
+        assert (await client.get("/api/v2/admin/people")).status_code == 403
+        assert (await client.get("/api/v2/admin/shifts.csv")).status_code == 403
+        audio = await client.get(f"/api/v2/dashboard/recordings/{mine}/audio",
+                                 headers={"Accept": "application/json"})
+        assert audio.status_code == 403
+        record = await client.get(f"/api/v2/dashboard/recordings/{mine}/record",
+                                  headers={"Accept": "application/json"})
+        assert record.status_code == 403
+        assert (await client.get("/api/v2/dashboard/bulk/preview")).status_code == 403
+        batch = await client.post("/api/v2/dashboard/bulk/batches", json={},
+                                  headers={"X-AIMS-Portal": "1"})
+        assert batch.status_code in (403, 422)
+
+        # An admin cannot give a collector a database login either.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        login = await client.post("/api/v2/admin/people/db-login",
+                                  json={"email": "viewer@gmail.example"},
+                                  headers={"X-AIMS-Portal": "1"})
+        assert login.status_code == 409
+        # A collector without a place is refused.
+        bare = await client.post("/api/v2/admin/people",
+                                 json={"email": "noplace@gmail.example", "role": "collector"},
+                                 headers={"X-AIMS-Portal": "1"})
+        assert bare.status_code == 422
+    _unserve()
+
+
+async def test_shifts_are_logged_for_salaries_and_summarised(dbs, monkeypatch):
+    import collectors
+    sent = []
+
+    async def fake_send(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_send)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _two_hospitals(dbs)
+        await _make_collector(client, who, "shifter@gmail.example")
+        started = await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+        assert started.status_code == 200 and started.json()["status"] == "started"
+        again = await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+        assert again.json()["status"] == "already on shift"
+        mine = (await client.get("/api/v2/dashboard/collector/me")).json()
+        assert mine["shift"]["id"] == started.json()["shift"]["id"]
+        assert mine["hospitals"] == ["HOSP003"]
+        forged = await client.post("/api/v2/dashboard/collector/shift/end")
+        assert forged.status_code == 403                     # no X-AIMS-Portal: refused
+        ended = await client.post("/api/v2/dashboard/collector/shift/end", headers=h)
+        assert ended.status_code == 200 and ended.json()["shift"]["ended_by"] == "collector"
+        assert any(to == "shifter@gmail.example" and subject.startswith("Shift summary")
+                   for to, subject, _ in sent)
+
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        month = datetime.now(collectors.zone()).strftime("%Y-%m")
+        log = await client.get(f"/api/v2/admin/shifts.csv?month={month}")
+        assert log.status_code == 200
+        assert log.headers["content-type"].startswith("text/csv")
+        assert f"shift-log-{month}.csv" in log.headers["content-disposition"]
+        text = log.content.decode("utf-8-sig")
+        header, *rows = text.strip().splitlines()
+        assert header == ",".join(collectors.CSV_COLUMNS)
+        ours = [r for r in rows if "shifter@gmail.example" in r]
+        assert len(ours) == 1 and ",collector," in ours[0]
+        assert (await client.get("/api/v2/admin/shifts.csv?month=2026-13")).status_code == 400
+        # Nothing was deleted: the shift row is still there.
+        async with dbs.rec.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM collector_shifts "
+                                       "WHERE email = 'shifter@gmail.example'") == 1
+    _unserve()
+
+
+async def test_the_collector_on_shift_is_mailed_and_an_unseen_alert_escalates(
+        dbs, monkeypatch, caplog):
+    import logging
+    import collectors
+    sent = []
+
+    async def fake_send(to, subject, text):
+        sent.append((to, subject))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_send)
+    monkeypatch.setenv("AIMS_ALERT_EMAIL", "lab@uiu.example")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        place = await _make_collector(client, who, "onduty@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        # A second collector of the same place, off shift: the reserve.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        await client.post("/api/v2/admin/people", headers=h, json={
+            "email": "reserve@gmail.example", "role": "collector", "place_id": place})
+
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await notifier.alerts(conn)                  # sets where the mailer starts
+            await dbs.repo.raise_alert(
+                alert_type="microphone_switched", session_id=mine, device_id=device["device_id"],
+                detail={"detail": "the microphone stopped; recording continued on Microphone "
+                                  "Array after about 3s",
+                        "microphone": "Microphone Array (Realtek)"})
+            await notifier.alerts(conn)
+            unplugged = [s for s in sent if s[0] == "onduty@gmail.example"
+                         and s[1].startswith("Jabra unplugged")]
+            assert len(unplugged) == 1
+            assert not any(s[0] == "reserve@gmail.example" for s in sent)   # someone is on shift
+
+            # The same again within ten minutes: not mailed twice.
+            before = len(sent)
+            await dbs.repo.raise_alert(
+                alert_type="microphone_switched", session_id=mine, device_id=device["device_id"],
+                detail={"detail": "the microphone stopped", "microphone": "Microphone Array"})
+            await notifier.alerts(conn)
+            assert len(sent) == before
+
+            # Nobody marks it seen for 20 minutes: the reserve and the lab are told.
+            await conn.execute("""
+                UPDATE collector_notifications SET created_at = now() - interval '20 minutes'
+                 WHERE email = 'onduty@gmail.example' AND event = 'jabra_unplugged'
+            """)
+            await notifier.escalate(conn)
+            assert any(s[0] == "reserve@gmail.example" and s[1].startswith("Not yet seen")
+                       for s in sent)
+            assert any(s[0] == "lab@uiu.example" for s in sent)
+
+            # Every other round runs without an error on a real database.
+            with caplog.at_level(logging.WARNING, logger="collectors"):
+                await notifier.round(conn)
+            assert not [r for r in caplog.records if "failed" in r.getMessage()]
+
+        # The collector sees the mail and marks it seen.
+        client.cookies.clear()
+        who["value"] = "onduty@gmail.example"
+        await _sign_in(client)
+        notes = (await client.get("/api/v2/dashboard/collector/me")).json()["notifications"]
+        mail = next(n for n in notes if n["event"] == "jabra_unplugged")
+        assert mail["delivered"] is True and mail["urgent"] is True
+        seen = await client.post(f"/api/v2/dashboard/collector/notifications/{mail['id']}/seen",
+                                 headers=h)
+        assert seen.json()["status"] == "seen"
+    _unserve()
+
+
+async def test_a_forgotten_shift_closes_itself_and_is_marked_auto(dbs, monkeypatch):
+    import collectors
+
+    async def fake_send(to, subject, text):
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_send)
+    who = {"value": "owner@uiu.example"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _two_hospitals(dbs)
+        place = await _make_collector(client, who, "forgetful@gmail.example")
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO collector_shifts (email, place_id, shift, shift_date, started_at)
+                VALUES ('forgetful@gmail.example', $1, 'other', current_date,
+                        now() - interval '10 hours')
+            """, place)
+            await collectors.Notifier().close_forgotten_shifts(conn)
+            row = await conn.fetchrow("SELECT * FROM collector_shifts "
+                                      "WHERE email = 'forgetful@gmail.example'")
+        assert row["ended_by"] == "auto" and row["summary_sent_at"] is not None
+        assert (row["ended_at"] - row["started_at"]) == timedelta(hours=6)
+    _unserve()
+
+
+async def test_a_new_collector_is_invited_by_email_through_resend(dbs, monkeypatch):
+    import collectors
+    sent = []
+
+    async def fake_send(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_send)
+    monkeypatch.setenv("AIMS_RESEND_API_KEY", "re_test")
+    monkeypatch.setenv("AIMS_COLLECTOR_MAIL_FROM", "AIMScribe <alerts@aims.example>")
+    monkeypatch.delenv("AIMS_SMTP_HOST", raising=False)
+    who = {"value": "owner@uiu.example"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _two_hospitals(dbs)
+        await _make_collector(client, who, "invited@gmail.example")
+        invitation = [m for m in sent if m[0] == "invited@gmail.example"]
+        assert len(invitation) == 1
+        assert invitation[0][1] == "You are an AIMScribe data collector"
+        assert "Start my shift" in invitation[0][2] and "Place " in invitation[0][2]
+
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        people = (await client.get("/api/v2/admin/people")).json()
+        assert people["mail"] is True and people["mail_status"]["ready"] is True
+        test = (await client.post("/api/v2/admin/mail-test", json={},
+                                  headers={"X-AIMS-Portal": "1"})).json()
+        assert test["sent"] is True and test["to"] == "owner@uiu.example"
+
+        # When Resend refuses, the admin is told why instead of a silent nothing.
+        async def refused(to, subject, text):
+            return False, "Resend answered 403: You can only send testing emails to your own address"
+
+        monkeypatch.setattr(collectors, "send_mail", refused)
+        added = (await client.post("/api/v2/admin/people", headers={"X-AIMS-Portal": "1"},
+                                   json={"email": "late@uni.example", "role": "researcher"})
+                 ).json()
+        assert added["invited"] is False and "403" in added["invite_error"]
+    _unserve()
+
+
+class _FakeTelegram:
+    """Telegram's Bot API, as far as the collectors' alerts use it."""
+
+    def __init__(self):
+        self.calls = []
+        self.updates = []
+
+    async def __call__(self, method, payload, timeout=15):
+        self.calls.append((method, payload))
+        if method == "getMe":
+            return {"username": "AIMScribeTestBot"}, None
+        if method == "getUpdates":
+            return [u for u in self.updates if u["update_id"] >= payload["offset"]], None
+        if method == "sendMessage":
+            return {"message_id": len(self.calls)}, None
+        return True, None
+
+    def sent_to(self, chat):
+        return [p for m, p in self.calls if m == "sendMessage" and p["chat_id"] == chat]
+
+
+async def test_a_collector_connects_telegram_and_urgent_alerts_reach_it(dbs, monkeypatch):
+    import collectors
+    mails = []
+
+    async def fake_mail(to, subject, text):
+        mails.append((to, subject))
+        return True, None
+
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "phone@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        me = (await client.get("/api/v2/dashboard/collector/me")).json()
+        assert me["telegram"] == {"ready": True, "linked": False, "username": None,
+                                  "linked_at": None}
+        link = (await client.post("/api/v2/dashboard/collector/telegram/link", headers=h)).json()
+        assert link["url"].startswith("https://t.me/AIMScribeTestBot?start=")
+        code = link["url"].split("start=")[1]
+
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE collector_notifier_state SET last_id = 0 "
+                               "WHERE name = 'telegram'")
+            fake.updates = [
+                {"update_id": 900001, "message": {"chat": {"id": 555, "type": "private"},
+                                                  "from": {"username": "col_one"},
+                                                  "text": f"/start {code}"}},
+                # the same link pressed again: it is used up
+                {"update_id": 900002, "message": {"chat": {"id": 777, "type": "private"},
+                                                  "text": f"/start {code}"}}]
+            await notifier.telegram_updates(conn)
+            assert await conn.fetchval("SELECT chat_id FROM collector_telegram "
+                                       "WHERE email = 'phone@gmail.example'") == 555
+            assert fake.sent_to(555)[0]["text"].startswith("Connected: phone@gmail.example")
+            assert "expired" in fake.sent_to(777)[0]["text"]
+            assert await conn.fetchval("SELECT last_id FROM collector_notifier_state "
+                                       "WHERE name = 'telegram'") == 900002
+
+            # The Jabra is unplugged: the alert goes to Telegram, with a Seen button.
+            await notifier.alerts(conn)
+            await dbs.repo.raise_alert(
+                alert_type="microphone_switched", session_id=mine, device_id=device["device_id"],
+                detail={"detail": "the microphone stopped", "microphone": "Microphone Array"})
+            await notifier.alerts(conn)
+            alert = fake.sent_to(555)[-1]
+            # 18 Nov: the first alert of a lasting problem is its card.
+            assert alert["text"].startswith("\U0001F534 Jabra off")
+            button = alert["reply_markup"]["inline_keyboard"][0][0]
+            assert button["callback_data"].startswith("seen:")
+            note = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                       int(button["callback_data"][5:]))
+            assert (note["email"], note["event"]) == ("phone@gmail.example", "jabra_unplugged")
+            assert note["delivered"] and note["channel"] == "telegram"
+            assert not [m for m in mails if m[0] == "phone@gmail.example"]   # not mailed too
+
+            # Someone else's chat cannot mark it; the collector's Seen does.
+            fake.updates = [
+                {"update_id": 900003, "callback_query": {
+                    "id": "q1", "data": f"seen:{note['id']}",
+                    "message": {"message_id": 5, "chat": {"id": 777}}}},
+                {"update_id": 900004, "callback_query": {
+                    "id": "q2", "data": f"seen:{note['id']}",
+                    "message": {"message_id": 6, "chat": {"id": 555}}}}]
+            await notifier.telegram_updates(conn)
+            answers = [p["text"] for m, p in fake.calls if m == "answerCallbackQuery"]
+            assert answers[-2:] == ["Not found", "Marked seen"]
+            assert await conn.fetchval("SELECT seen_at FROM collector_notifications "
+                                       "WHERE id = $1", note["id"]) is not None
+
+        # The shift summary still comes by email.
+        ended = await client.post("/api/v2/dashboard/collector/shift/end", headers=h)
+        assert ended.status_code == 200
+        assert any(m[0] == "phone@gmail.example" and m[1].startswith("Shift summary")
+                   for m in mails)
+        test = (await client.post("/api/v2/dashboard/collector/telegram/test", headers=h)).json()
+        assert test["sent"] is True
+
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "phone@gmail.example")["telegram"] is True
+        places = (await client.get("/api/v2/admin/places")).json()
+        assert places["telegram"] == {"ready": True, "bot": "AIMScribeTestBot", "problem": None}
+    _unserve()
+
+
+async def test_a_patient_recorded_without_the_jabra_alerts_but_a_saved_one_does_not(
+        dbs, monkeypatch):
+    import collectors
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "watcher@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        # The doctor unplugged the Jabra for the last patient and left it out:
+        # the next patient's recording starts on the laptop's microphone.
+        nxt = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=2))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                UPDATE devices SET microphone = 'Microphone Array (Realtek)',
+                       microphone_is_clinic = FALSE, last_seen_at = now()
+                 WHERE device_id = $1
+            """, device["device_id"])
+            # The recording with the switch inside it has finished.
+            await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1",
+                               mine)
+            notifier = collectors.Notifier()
+            await notifier.recordings_without_jabra(conn)
+            alerts = [s for s in sent if s[0] == "watcher@gmail.example"
+                      and s[1].startswith("Patient recorded without the Jabra")]
+            assert len(alerts) == 1
+            row = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                      "WHERE event_key = $1 AND email = 'watcher@gmail.example'",
+                                      f"nojabra:{nxt}")
+            assert row["urgent"] and row["delivered"]
+            # Not again for the same recording, and the one with the switch is not named.
+            await notifier.recordings_without_jabra(conn)
+            assert len([s for s in sent if s[0] == "watcher@gmail.example"
+                        and s[1].startswith("Patient recorded")]) == len(alerts)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"nojabra:{mine}")
+            # A whole round: no "Recording saved" message for anything.
+            await notifier.round(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'recording_finished' "
+                                           "AND email = 'watcher@gmail.example'")
+    _unserve()
+
+
+async def test_an_alert_that_could_not_be_sent_is_tried_again_and_the_lab_is_told(
+        dbs, monkeypatch):
+    import collectors
+    answers = []
+    sent = []
+
+    async def flaky_mail(to, subject, text):
+        sent.append((to, subject))
+        return answers.pop(0) if answers else (True, None)
+
+    monkeypatch.setattr(collectors, "send_mail", flaky_mail)
+    monkeypatch.setenv("AIMS_ALERT_EMAIL", "lab@uiu.example")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "retry@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            # Straight to this collector, so no other test's collector takes the answer.
+            answers[:] = [(False, "Resend could not be reached: ConnectTimeout")]
+            first = await collectors._record(conn, email="retry@gmail.example",
+                                             event="jabra_unplugged", subject="Jabra unplugged: t",
+                                             body="b", event_key=f"t-{mine}-retry", urgent=True)
+            await collectors._deliver(conn, first)
+            note = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                       first)
+            assert note["delivered"] is False and note["attempts"] == 1
+            assert note["next_try_at"] is not None                  # a passing failure
+            await notifier.retry_failed(conn)                      # not yet due
+            assert (await conn.fetchval("SELECT attempts FROM collector_notifications "
+                                        "WHERE id = $1", note["id"])) == 1
+            await conn.execute("UPDATE collector_notifications SET next_try_at = now() "
+                               "- interval '1 second' WHERE id = $1", note["id"])
+            await notifier.retry_failed(conn)
+            again = await conn.fetchrow("SELECT * FROM collector_notifications WHERE id = $1",
+                                        note["id"])
+            assert again["delivered"] is True and again["attempts"] == 2
+            assert again["next_try_at"] is None and again["error"] is None
+
+            # A refusal that will not pass is not retried.
+            answers[:] = [(False, "Resend answered 403: domain not verified")]
+            nid = await collectors._record(conn, email="retry@gmail.example", event="pc_silent",
+                                           subject="PC not reporting", body="b",
+                                           event_key=f"t-{mine}-403", urgent=True)
+            await collectors._deliver(conn, nid)
+            assert await conn.fetchval("SELECT next_try_at FROM collector_notifications "
+                                       "WHERE id = $1", nid) is None
+
+            # Many failures in half an hour: AIMS LAB is told once.
+            for i in range(collectors.FAILURES_ALARM):
+                await conn.execute("""
+                    INSERT INTO collector_notifications (email, event, subject, body, event_key,
+                                                        delivered, error)
+                    VALUES ('retry@gmail.example', 'pc_silent', 's', 'b', $1, FALSE, 'down')
+                """, f"t-{mine}-fail-{i}")
+            await notifier.failure_alarm(conn)
+            await notifier.failure_alarm(conn)
+            told = [s for s in sent if s[0] == "lab@uiu.example" and "could not be sent" in s[1]]
+            assert len(told) == 1
+    _unserve()
+
+
+def _with_watchers(client):
+    import watchers
+    _with_collectors(client)
+    app = client._transport.app
+    app.include_router(watchers.router)
+    app.include_router(watchers.admin_router)
+    return client
+
+
+async def _watching_researcher(client, who, email, hospitals=("HOSP003",)):
+    """As the owner: a researcher who looks after these hospitals."""
+    h = {"X-AIMS-Portal": "1"}
+    client.cookies.clear()
+    who["value"] = "owner@uiu.example"
+    await _sign_in(client)
+    added = await client.post("/api/v2/admin/people", headers=h,
+                              json={"email": email, "role": "researcher"})
+    assert added.status_code == 200, added.text
+    for hid in hospitals:
+        given = await client.post("/api/v2/admin/people/watch", headers=h,
+                                  json={"email": email, "hospital_id": hid})
+        assert given.status_code == 200, given.text
+
+
+async def test_an_alert_for_someone_without_telegram_waits_and_arrives_when_they_connect(
+        dbs, monkeypatch):
+    """17 Nov: 27 alerts were lost - tried once by email, not set up, never again."""
+    import collectors
+    from datetime import datetime, timezone
+
+    async def no_mail(to, subject, text):
+        return False, "mail is not set up on this server (AIMS_RESEND_API_KEY)"
+
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "send_mail", no_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await dbs.repo.upsert_hospital("HOSP9W1", "Waiting clinic", "Asia/Dhaka")
+        await _make_collector(client, who, "late@gmail.example", hospitals=("HOSP9W1",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            await collectors.notify(conn, hospital_id="HOSP9W1", event="pc_silent",
+                                    subject="PC not reporting: HOSP9W1", body="Please check.",
+                                    event_key="waittest:1", urgent=True,
+                                    happened_at=datetime.now(timezone.utc))
+            note = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'late@gmail.example' "
+                                       "AND event_key = 'waittest:1'")
+            assert (note["delivered"], note["channel"]) == (False, "waiting")
+            assert "Telegram not connected" in note["error"] and note["next_try_at"] is None
+            # One lost before this change, the old way, is picked up too.
+            old = await collectors._record(conn, email="late@gmail.example", event="pc_silent",
+                                           subject="Older alert", body="b",
+                                           event_key="waittest:0", hospital_id="HOSP9W1")
+            await conn.execute("UPDATE collector_notifications SET channel = 'email', "
+                               "error = 'email: mail is not set up on this server "
+                               "(AIMS_RESEND_API_KEY)' WHERE id = $1", old)
+            # Waiting is not a failure to alarm AIMS LAB about.
+            assert await conn.fetchval("""
+                SELECT count(*) FROM collector_notifications
+                 WHERE email = 'late@gmail.example' AND delivered = FALSE
+                   AND channel IS DISTINCT FROM 'held' AND channel IS DISTINCT FROM 'waiting'
+            """) == 1
+
+        link = (await client.post("/api/v2/dashboard/collector/telegram/link", headers=h)).json()
+        code = link["url"].split("start=")[1]
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE collector_notifier_state SET last_id = 0 "
+                               "WHERE name = 'telegram'")
+            fake.updates = [{"update_id": 910001, "message": {
+                "chat": {"id": 4242, "type": "private"}, "text": f"/start {code}"}}]
+            await notifier.telegram_updates(conn)
+            texts = [m["text"] for m in fake.sent_to(4242)]
+            assert texts[0].startswith("Connected: late@gmail.example")
+            assert len(texts) == 3
+            assert all("Sent late (from " in t for t in texts[1:])
+            # 18 Nov: both are a PC problem's first alert, so both are its card.
+            assert sum("PC not reporting · HOSP9W1" in t for t in texts[1:]) == 2
+            rows = await conn.fetch("SELECT delivered, channel, subject FROM "
+                                    "collector_notifications WHERE email = 'late@gmail.example' "
+                                    "AND event_key LIKE 'waittest:%' ORDER BY id")
+            assert [(r["delivered"], r["channel"]) for r in rows] == [(True, "telegram")] * 2
+            assert await conn.fetchval("SELECT count(*) FROM collector_notifications "
+                                       "WHERE email = 'late@gmail.example' "
+                                       "AND event_key LIKE 'waittest:%' "
+                                       "AND delivered_at IS NOT NULL") == 2
+            # The stored alert is kept as it was; only the message says "late".
+            assert sorted(r["subject"] for r in rows) == ["Older alert",
+                                                          "PC not reporting: HOSP9W1"]
+
+
+async def test_the_first_consultation_without_the_jabra_is_alerted_at_once(dbs, monkeypatch):
+    """
+    17 Nov: the 10-minute wait per PC held the next patient's alert, or dropped
+    it - now the first goes at once. 18 Nov: the next ones, and the cable
+    coming out again, while that problem is open are its card's news, not new
+    alerts (38 messages for one Jabra in two hours).
+    """
+    import collectors
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append(subject)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_collectors(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await dbs.repo.upsert_hospital("HOSP9J1", "Jabra clinic", "Asia/Dhaka")
+        await _make_collector(client, who, "jabra@gmail.example", hospitals=("HOSP9J1",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            for n in (1, 2):
+                await collectors.notify(
+                    conn, hospital_id="HOSP9J1", event="recording_without_jabra",
+                    subject=f"Patient {n} recorded without the Jabra", body="b",
+                    event_key=f"nojabra:test{n}", urgent=True, device_id=device["device_id"])
+            # A flapping cable is still held to one alert per 10 minutes.
+            for n in (1, 2):
+                await collectors.notify(
+                    conn, hospital_id="HOSP9J1", event="jabra_unplugged",
+                    subject=f"Jabra unplugged {n}", body="b",
+                    event_key=f"unplug:test{n}", urgent=True, device_id=device["device_id"])
+    assert any("Patient 1 recorded without the Jabra" in x for x in sent)
+    assert not any("Patient 2 recorded without the Jabra" in x for x in sent)
+    assert not any("Jabra unplugged" in x for x in sent)
+
+
+async def test_an_alert_reaches_everyone_at_once_and_its_speed_is_kept(dbs, monkeypatch):
+    """18 Nov: delivered_at for every alert, sent to several people in parallel."""
+    import asyncio
+    import collectors
+    import watchers
+    from datetime import datetime, timedelta, timezone
+    starts = []
+
+    async def slow_mail(to, subject, text):
+        starts.append(asyncio.get_running_loop().time())
+        await asyncio.sleep(0.4)
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", slow_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await dbs.repo.upsert_hospital("HOSP9S1", "Speed clinic", "Asia/Dhaka")
+        for email in ("fast1@gmail.example", "fast2@gmail.example", "fast3@gmail.example"):
+            await _make_collector(client, who, email, hospitals=("HOSP9S1",))
+            assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                    ).status_code == 200
+        _server(dbs)
+        try:
+            happened = datetime.now(timezone.utc) - timedelta(seconds=5)
+            async with dbs.rec.acquire() as conn:
+                await collectors.notify(conn, hospital_id="HOSP9S1", event="jabra_unplugged",
+                                        subject="Jabra unplugged: HOSP9S1", body="b",
+                                        event_key="speed:1", urgent=True,
+                                        happened_at=happened)
+                rows = await conn.fetch("SELECT delivered, delivered_at FROM "
+                                        "collector_notifications WHERE event_key = 'speed:1' "
+                                        "AND audience = 'collector'")
+                assert len(rows) == 3 and all(r["delivered"] and r["delivered_at"] for r in rows)
+                # In parallel: all three began within the first send's 0.4 s.
+                assert max(starts) - min(starts) < 0.35
+                today = datetime.now(collectors.zone()).date()
+                start, end, _ = watchers.shift_window(today, "day")
+                line = await watchers.alert_speed(conn, "HOSP9S1", start, end)
+                assert line.startswith("Alert speed, from the event to the collector's "
+                                       "Telegram: typically ") and "(3 alerts" in line
+        finally:
+            _unserve()
+
+
+async def test_telegram_calls_share_one_kept_connection(monkeypatch):
+    """18 Nov: 0.49 s per message on a new connection, 0.16 s on a kept one."""
+    import asyncio
+    import httpx
+    import collectors
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    seen = []
+
+    def answer(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "result": {"username": "B"}})
+
+    kept = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    monkeypatch.setitem(collectors._KEPT, "loop", asyncio.get_running_loop())
+    monkeypatch.setitem(collectors._KEPT, "client", kept)
+    for _ in range(3):
+        result, error = await collectors._telegram("getMe", {})
+        assert result == {"username": "B"} and error is None
+    assert collectors._KEPT["client"] is kept and len(seen) == 3
+    assert collectors.TELEGRAM_TIMEOUT == 8.0
+    await kept.aclose()
+
+
+async def test_a_newly_assigned_researcher_gets_only_what_happens_afterwards(dbs, monkeypatch):
+    """17 Nov: assigned at 16:29, a researcher was sent a 10:09 refusal at once."""
+    import collectors
+    import watchers
+    from datetime import datetime, timedelta, timezone
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        # Its own hospital: the test database is shared, and HOSP003's researchers
+        # are counted by the tests after this one.
+        await dbs.repo.upsert_hospital("HOSP9N1", "Newcomer clinic", "Asia/Dhaka")
+        await _watching_researcher(client, who, "newcomer@uni.example",
+                                   hospitals=("HOSP9N1",))
+        now = datetime.now(timezone.utc)
+        async with dbs.rec.acquire() as conn:
+            await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP9N1", event="stopped_unusually", subject="Morning stop",
+                body="b", event_key="newcomer:old", urgent=True,
+                happened_at=now - timedelta(hours=6))
+            await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP9N1", event="stopped_unusually", subject="Fresh stop",
+                body="b", event_key="newcomer:new", urgent=True,
+                happened_at=now + timedelta(seconds=1))
+            # A follow-up about a problem that began before they were assigned: no.
+            await watchers._to_watchers(conn, ["HOSP9N1"], since=now - timedelta(hours=2),
+                                        event="still_not_fixed", subject="Old problem still",
+                                        body="b", event_key="newcomer:still", urgent=True)
+            await watchers._to_watchers(conn, ["HOSP9N1"], since=now + timedelta(seconds=1),
+                                        event="still_not_fixed", subject="New problem still",
+                                        body="b", event_key="newcomer:still2", urgent=True)
+    mine = [subject for to, subject in sent if to == "newcomer@uni.example"]
+    assert any("Fresh stop" in x for x in mine) and any("New problem still" in x for x in mine)
+    assert not any("Morning stop" in x or "Old problem still" in x for x in mine)
+
+
+async def test_a_researcher_looks_after_hospitals_and_hears_whether_alerts_were_handled(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "sentinel@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "res@uni.example")
+        # A collector's hospitals come from their place, never from here.
+        refused = await client.post("/api/v2/admin/people/watch", headers=h, json={
+            "email": "sentinel@gmail.example", "hospital_id": "HOSP003"})
+        assert refused.status_code == 409
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "res@uni.example")["watching"] == \
+            ["HOSP003"]
+
+        async with dbs.rec.acquire() as conn:
+            # The collector's alert, and the researcher's version: who is on shift.
+            key = f"t-watch-{mine}"
+            await collectors.notify(conn, hospital_id="HOSP003", event="jabra_unplugged",
+                                    subject="Jabra unplugged: HOSP003, PC", body="b"
+                                    + collectors._footer(), event_key=key, urgent=True,
+                                    everyone_if_nobody=True, device_id=None)
+            copy = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'res@uni.example' AND event_key = $1", key)
+            assert copy["audience"] == "watcher" and copy["urgent"] and copy["delivered"]
+            assert "Data collector on shift at " in copy["body"]
+            assert "no phone given, Telegram not connected" in copy["body"]
+            assert "Open " not in copy["body"]           # the collector's footer is left off
+            note = await conn.fetchval("SELECT id FROM collector_notifications "
+                                       "WHERE email = 'sentinel@gmail.example' AND event_key = $1",
+                                       key)
+
+        # The collector deals with it: the researcher hears who, and how fast.
+        client.cookies.clear()
+        who["value"] = "sentinel@gmail.example"
+        await _sign_in(client)
+        assert (await client.post(f"/api/v2/dashboard/collector/notifications/{note}/seen",
+                                  headers=h)).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            await watchers.handled_followups(conn)
+            await watchers.handled_followups(conn)            # once only
+            handled = await conn.fetch("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'res@uni.example' AND event = 'handled'")
+            assert len(handled) == 1 and "pressed Seen at" in handled[0]["body"]
+
+            # One nobody deals with: the researcher hears it was not handled.
+            key2 = f"t-watch2-{mine}"
+            await collectors.notify(conn, hospital_id="HOSP003", event="pc_silent",
+                                    subject="PC not reporting: HOSP003, PC", body="b",
+                                    event_key=key2, urgent=True)
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '20 minutes' WHERE event_key = $1", key2)
+            await collectors.Notifier().escalate(conn)
+            assert await conn.fetchval("""
+                SELECT subject FROM collector_notifications
+                 WHERE email = 'res@uni.example' AND event_key = $1
+            """, f"esc:{key2}") == "Not seen in 15 min: PC not reporting: HOSP003, PC"
+
+        # 'Only problems': no copy of the routine, still the problems.
+        client.cookies.clear()
+        who["value"] = "res@uni.example"
+        await _sign_in(client)
+        assert (await client.post("/api/v2/dashboard/watch/mode", headers=h,
+                                  json={"mode": "problems"})).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            assert await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP003", event="jabra_back", subject="s", body="b",
+                event_key=f"t-back-{mine}") == 0
+            assert await watchers.copy_to_watchers(
+                conn, hospital_id="HOSP003", event="pc_silent", subject="s", body="b",
+                event_key=f"t-down-{mine}") == 1
+
+        # "Only my hospitals" narrows what a researcher sees; without it, all.
+        me = (await client.get("/api/v2/dashboard/watch/me")).json()
+        assert [x["hospital_id"] for x in me["hospitals"]] == ["HOSP003"]
+        assert me["mode"] == "problems"
+        assert any(n["event"] == "handled" for n in me["notifications"])
+        everything = (await client.get("/api/v2/dashboard/recordings")).json()["recordings"]
+        assert {mine, theirs} <= {r["session_id"] for r in everything}
+        narrowed = (await client.get("/api/v2/dashboard/recordings",
+                                     params={"mine": "1"})).json()["recordings"]
+        assert {r["hospital_id"] for r in narrowed} == {"HOSP003"}
+
+        # Taking a hospital away is marked, never deleted.
+        client.cookies.clear()
+        who["value"] = "owner@uiu.example"
+        await _sign_in(client)
+        assert (await client.post("/api/v2/admin/people/watch", headers=h, json={
+            "email": "res@uni.example", "hospital_id": "HOSP003", "remove": True})
+        ).status_code == 200
+        async with dbs.rec.acquire() as conn:
+            assert await watchers.watched_hospitals("res@uni.example", conn) == []
+            assert await conn.fetchval("SELECT removed_at FROM researcher_hospitals "
+                                       "WHERE email = 'res@uni.example'") is not None
+    _unserve()
+
+
+async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        # A hospital of its own, so other tests' places do not crowd the report.
+        await dbs.repo.upsert_hospital("HOSP555", "Report Clinic", "Asia/Dhaka")
+        await dbs.repo.upsert_hospital("HOSP556", "Unplaced Clinic", "Asia/Dhaka")
+        token = await dbs.repo.create_enrollment_token(hospital_id="HOSP555", doctor_id="",
+                                                       created_by="tests")
+        enrolled = await dbs.repo.enroll_device(token=token, tpm_pubkey=os.urandom(32),
+                                                machine_name="PC-R", os_version="",
+                                                app_version="3", protocol_version=2)
+        device = await dbs.repo.device_by_token(enrolled["device_token"])
+        await _make_collector(client, who, "reporter@gmail.example", hospitals=("HOSP555",))
+        await _watching_researcher(client, who, "boss@uni.example", hospitals=("HOSP555", "HOSP556"))
+        # Both a few seconds apart, and the report for their day: a test run just
+        # after midnight in Dhaka would otherwise split them over two days.
+        quiet = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=30))
+        brief = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=30, seconds=-10))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE sessions SET hospital_id = 'HOSP555' "
+                               "WHERE session_id = ANY($1::text[])", [quiet, brief])
+            await conn.execute("UPDATE sessions SET closed_at = opened_at + interval '20 seconds', "
+                               "total_duration_seconds = 20, confirmation = 'unconfirmed' "
+                               "WHERE session_id = $1", brief)
+            await conn.execute("UPDATE devices SET pending_segments = 4 WHERE device_id = $1",
+                               device["device_id"])
+        await dbs.repo.raise_alert(alert_type="silent_session", session_id=quiet,
+                                   device_id=device["device_id"],
+                                   detail={"detail": "2 consecutive segments of digital silence"})
+
+        today = (datetime.now(collectors.zone()) - timedelta(minutes=30)).date()
+        async with dbs.rec.acquire() as conn:
+            text = await watchers.hospital_report(conn, "HOSP555", today)
+            other = await watchers.hospital_report(conn, "HOSP556", today)
+        assert text.startswith("\U0001F4CB Daily report: HOSP555")
+        assert "\U0001F534 Needs attention" in text and "with no sound" in text
+        for part in ("RECORDINGS", "MICROPHONE", "WHAT WILL BE KEPT", "DATA COLLECTORS",
+                     "PCs", "TO DO TOMORROW"):
+            assert part in text, part
+        assert "no sound at all: 1" in text
+        assert "not confirmed 1" in text
+        assert "4 clips still to upload" in text
+        assert "Telegram: 0 of 1 collectors connected" in text
+        assert len(text) <= 3900
+        assert "No place includes this hospital" in other
+
+        # The researcher sees it on the dashboard; a collector cannot.
+        client.cookies.clear()
+        who["value"] = "boss@uni.example"
+        await _sign_in(client)
+        shown = (await client.get("/api/v2/dashboard/watch/report",
+                                  params={"hospital_id": "HOSP555"})).json()
+        assert shown["text"].startswith("\U0001F4CB Daily report: HOSP555")
+        evening = (await client.get("/api/v2/dashboard/watch/report", params={
+            "hospital_id": "HOSP555", "shift": "evening"})).json()
+        assert evening["text"].startswith("\U0001F4CB Evening shift summary: HOSP555")
+        assert "(14:30 to 20:30)" in evening["text"].splitlines()[0]
+        assert (await client.get("/api/v2/dashboard/watch/report", params={
+            "hospital_id": "HOSP555", "shift": "night"})).status_code == 400
+        client.cookies.clear()
+        who["value"] = "reporter@gmail.example"
+        await _sign_in(client)
+        assert (await client.get("/api/v2/dashboard/watch/report",
+                                 params={"hospital_id": "HOSP555"})).status_code == 403
+
+        # Two summaries a day, each once, one per hospital, then one CSV.
+        from datetime import time as dtime
+        tz = collectors.zone()
+        at = {t: datetime.combine(today, dtime(*t), tzinfo=tz) for t in
+              ((14, 0), (14, 45), (20, 0), (20, 45))}
+        mine = lambda: [s[1] for s in sent if s[0] == "boss@uni.example"]   # noqa: E731
+        async with dbs.rec.acquire() as conn:
+            await watchers.shift_summaries(conn, now=at[(14, 0)])
+            assert not mine()
+            await watchers.shift_summaries(conn, now=at[(14, 45)])
+            await watchers.shift_summaries(conn, now=at[(20, 0)])
+            morning = mine()
+            assert sorted(x.split(",")[0] for x in morning) == [
+                "Morning shift summary CSV", "Morning shift summary: HOSP555",
+                "Morning shift summary: HOSP556"]
+            await watchers.shift_summaries(conn, now=at[(20, 45)])
+            await watchers.shift_summaries(conn, now=at[(20, 45)])
+        evening = [x for x in mine() if x not in morning]
+        assert sorted(x.split(",")[0] for x in evening) == [
+            "Evening shift summary CSV", "Evening shift summary: HOSP555",
+            "Evening shift summary: HOSP556"]
+    _unserve()
+
+
+async def test_an_unusual_stop_is_told_with_the_doctor_the_pc_and_the_consultation(
+        dbs, monkeypatch):
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device, mine, theirs = await _two_hospitals(dbs)
+        await _make_collector(client, who, "stops@gmail.example")
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "stopwatch@uni.example")
+        left = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=12))
+        broke = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=8))
+        done = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=6))
+        declined = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=3))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO doctors (doctor_id, hospital_id, full_name)
+                VALUES ('DR0042', 'HOSP003', 'Dr Nusrat Jahan')
+                ON CONFLICT (doctor_id, hospital_id) DO UPDATE SET full_name = EXCLUDED.full_name
+            """)
+            await conn.execute("UPDATE devices SET machine_name = 'ROOM-2' WHERE device_id = $1",
+                               device["device_id"])
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", left, "doctor_stopped:patient_left")
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", broke, "doctor_stopped:technical_problem")
+            await conn.execute("UPDATE sessions SET closed_at = now(), close_reason = $2 "
+                               "WHERE session_id = $1", done, "doctor_stopped")
+            notifier = collectors.Notifier()
+            await notifier.alerts(conn)
+        for sid, reason in ((left, "doctor_stopped:patient_left"),
+                            (broke, "doctor_stopped:technical_problem"),
+                            (done, "consultation_finished")):
+            await dbs.repo.raise_alert(alert_type="abnormal_close", session_id=sid,
+                                       device_id=device["device_id"],
+                                       detail={"reason": reason, "duration_seconds": 540})
+        async with dbs.rec.acquire() as conn:
+            await notifier.alerts(conn)
+            await conn.execute("""
+                INSERT INTO session_refusals (session_id, device_id, hospital_id, doctor_id)
+                VALUES ($1, $2, 'HOSP003', 'DR0042')
+            """, declined, device["device_id"])
+            await notifier.refusals(conn)
+            notes = {(r["session_id"], r["email"]): r for r in await conn.fetch(
+                "SELECT * FROM collector_notifications WHERE session_id = ANY($1::text[])",
+                [left, broke, done, declined])}
+
+        patient_left = notes[(left, "stops@gmail.example")]
+        assert patient_left["event"] == "stopped_unusually" and not patient_left["urgent"]
+        assert patient_left["subject"] == \
+            "Recording stopped: the patient left the room - Dr Nusrat Jahan"
+        body = patient_left["body"]
+        assert "Doctor: Dr Nusrat Jahan (DR0042)" in body and "PC: ROOM-2" in body
+        assert "Hospital: HOSP003" in body and "Consultation: " in body
+        technical = notes[(broke, "stops@gmail.example")]
+        assert technical["event"] == "stopped_technical" and technical["urgent"]
+        assert (done, "stops@gmail.example") not in notes            # an ordinary end
+        refused = notes[(declined, "stops@gmail.example")]
+        assert refused["subject"].startswith("Recording stopped: the patient did not consent")
+        # The researcher gets each one too - 18 Nov: as one line, without sound.
+        copy = notes[(left, "stopwatch@uni.example")]
+        assert copy["audience"] == "watcher" and "DR0042" in copy["subject"]
+        assert "ROOM-2" in copy["subject"] and "the patient left the room" in copy["subject"]
+        assert (declined, "stopwatch@uni.example") in notes
+
+        # The report of the clinic day the recording started on - not "today":
+        # run between 00:00 and 00:12 Dhaka time, a recording opened 12
+        # minutes ago belongs to yesterday's report (CI failed so at 00:09 on
+        # 19 Nov 2026).
+        async with dbs.rec.acquire() as conn:
+            opened = await conn.fetchval("SELECT opened_at FROM sessions WHERE session_id = $1",
+                                         left)
+            day = opened.astimezone(collectors.zone()).date()
+            text = await watchers.hospital_report(conn, "HOSP003", day)
+        assert "stopped unusually" in text and "Stopped because:" in text
+        assert "the patient left the room" in text
+    _unserve()
+
+
+async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs, monkeypatch):
+    """
+    039: the researcher gets the alert at once with the collector on shift and
+    their phone and Telegram; still wrong 30 minutes on, the collector is
+    reminded and the researcher told again; fixed, the researcher hears how.
+    """
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _make_collector(client, who, "caller@gmail.example")
+        # The collector gives their phone; nonsense is refused.
+        assert (await client.post("/api/v2/dashboard/collector/phone", headers=h,
+                                  json={"phone": "call me"})).status_code == 422
+        saved = await client.post("/api/v2/dashboard/collector/phone", headers=h,
+                                  json={"phone": "01711-000000"})
+        assert saved.status_code == 200 and saved.json()["phone"] == "01711-000000"
+        assert (await client.get("/api/v2/dashboard/collector/me")).json()["phone"] == \
+            "01711-000000"
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "lead@uni.example")
+        # An admin may correct it.
+        fixed = await client.post("/api/v2/admin/people/phone", headers=h,
+                                  json={"email": "caller@gmail.example",
+                                        "phone": "+880 1711 000000"})
+        assert fixed.status_code == 200, fixed.text
+        people = (await client.get("/api/v2/admin/people")).json()["people"]
+        assert next(p for p in people if p["email"] == "caller@gmail.example")["phone"] == \
+            "+880 1711 000000"
+
+        key = f"t-last-{device['device_id']}"
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO collector_telegram (email, chat_id, username) "
+                               "VALUES ('caller@gmail.example', 990011, 'caller_tg') "
+                               "ON CONFLICT (email) DO NOTHING")
+            await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE, "
+                               "microphone = 'Laptop mic', last_seen_at = now() "
+                               "WHERE device_id = $1", device["device_id"])
+            await collectors.notify(
+                conn, hospital_id="HOSP003", event="jabra_unplugged",
+                subject="Jabra unplugged: HOSP003, PC",
+                body=("At 10:05 the recording moved off the Jabra.\n\nPlease go to the room "
+                      "and plug the Jabra back in.") + collectors._footer(),
+                event_key=key, urgent=True, everyone_if_nobody=True,
+                device_id=device["device_id"])
+            copy = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'lead@uni.example' AND event_key = $1", key)
+            # At once: what happened, what the collector was asked, who to call.
+            assert copy["audience"] == "watcher" and copy["urgent"]
+            body = copy["body"]
+            assert "At 10:05 the recording moved off the Jabra." in body
+            assert "The collector was asked to: go to the room" in body
+            assert "phone +880 1711 000000, Telegram @caller_tg" in body
+            assert "Open " not in body
+
+            # Fixed within 30 minutes: nothing more yet.
+            await watchers.persisting(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event_key = $1", f"still:{key}:1")
+            # 31 minutes on and still on the laptop microphone.
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '31 minutes' WHERE event_key = $1", key)
+            await watchers.persisting(conn)
+            await watchers.persisting(conn)                        # once only
+            still = {r["email"]: r for r in await conn.fetch(
+                "SELECT * FROM collector_notifications WHERE event_key = $1", f"still:{key}:1")}
+            reminder = still["caller@gmail.example"]
+            assert reminder["audience"] == "collector" and reminder["urgent"]
+            assert reminder["subject"].startswith("Still not fixed after 31 min: Jabra unplugged")
+            # 18 Nov: the researcher's card says 30 minutes; the message comes at 60.
+            assert "lead@uni.example" not in still
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '61 minutes' WHERE event_key = $1", key)
+            await watchers.persisting(conn)
+            still = {r["email"]: r for r in await conn.fetch(
+                "SELECT * FROM collector_notifications WHERE event_key = $1", f"still:{key}:2")}
+            told = still["lead@uni.example"]
+            assert told["audience"] == "watcher"
+            assert "The PC is still on Laptop mic" in told["body"]
+            assert "Nobody has pressed Seen." in told["body"]
+            assert "Telegram @caller_tg" in told["body"]
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '31 minutes' WHERE event_key = $1", key)
+
+            # The Jabra is plugged back in: the researcher hears it is fixed, and how.
+            await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
+                               "WHERE device_id = $1", device["device_id"])
+            await watchers.persisting(conn)
+            done = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                       "WHERE email = 'lead@uni.example' AND event_key = $1",
+                                       f"fixed:{key}")
+            assert done["subject"].startswith("Fixed after 31 min: Jabra unplugged")
+            assert done["body"].startswith("The Jabra is back in use")
+            assert await conn.fetchval("SELECT resolution FROM collector_notifications "
+                                       "WHERE event_key = $1 AND audience = 'collector' "
+                                       "LIMIT 1", key) == \
+                "the Jabra is back in use"
+            today = (datetime.now(collectors.zone()) - timedelta(minutes=31)).date()
+            text = await watchers.hospital_report(conn, "HOSP003", today)
+            assert "Not fixed within 30 min:" in text and "the Jabra is back in use" in text
+
+            # Three unusual stops by one doctor in two hours: a pattern worth a call.
+            for _ in range(3):
+                sid = await a_session(dbs.repo, device, opened_ago=timedelta(minutes=10))
+                await conn.execute("UPDATE sessions SET closed_at = now(), "
+                                   "close_reason = 'doctor_stopped:patient_left' "
+                                   "WHERE session_id = $1", sid)
+            await watchers.repeated_stops(conn)
+            pattern = await conn.fetchrow("SELECT * FROM collector_notifications "
+                                          "WHERE email = 'lead@uni.example' "
+                                          "AND event = 'repeated_stops'")
+            assert "unusual stops in 2 hours" in pattern["subject"]
+            assert "the patient left the room" in pattern["body"]
+            assert "Telegram @caller_tg" in pattern["body"]
+
+        # The researcher's page: who to call now.
+        client.cookies.clear()
+        who["value"] = "lead@uni.example"
+        await _sign_in(client)
+        me = (await client.get("/api/v2/dashboard/watch/me")).json()
+        people = [p for g in me["contacts"] for p in g["people"]]
+        caller = next(p for p in people if p["email"] == "caller@gmail.example")
+        assert caller["phone"] == "+880 1711 000000" and caller["telegram"] == "caller_tg"
+        assert any(g["on_shift"] for g in me["contacts"])
+    _unserve()
+
+
+async def test_a_collector_saves_their_official_name_and_lab_id(dbs, monkeypatch):
+    """
+    040: the collector saves official name, lab ID and phone on My shift; no two
+    collectors hold one ID; an admin corrects them; researchers' alerts, the
+    evening report and the attendance CSV name them so.
+    """
+    import collectors
+    import watchers
+    sent = []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        await _make_collector(client, who, "first@gmail.example")
+        mine = await client.post("/api/v2/dashboard/collector/details", headers=h, json={
+            "official_name": "Md.  Sakib Zaman", "collector_code": "dc-907",
+            "phone": "01711-000000"})
+        assert mine.status_code == 200, mine.text
+        assert mine.json()["official_name"] == "Md. Sakib Zaman"
+        assert mine.json()["collector_code"] == "DC-907"
+        me = (await client.get("/api/v2/dashboard/collector/me")).json()
+        assert (me["official_name"], me["collector_code"], me["phone"]) == \
+            ("Md. Sakib Zaman", "DC-907", "01711-000000")
+        # Nonsense is refused, and leaves what was saved.
+        assert (await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                  json={"collector_code": "DC 907"})).status_code == 422
+        # Saving only the phone keeps the name and ID.
+        only = await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                 json={"phone": "01811-111111"})
+        assert only.json()["collector_code"] == "DC-907"
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+
+        # A second collector cannot take the same ID, in any case.
+        await _make_collector(client, who, "second@gmail.example")
+        taken = await client.post("/api/v2/dashboard/collector/details", headers=h,
+                                  json={"official_name": "Rahim Uddin",
+                                        "collector_code": "Dc-907"})
+        assert taken.status_code == 409 and "another data collector" in taken.json()["detail"]
+        assert (await client.get("/api/v2/dashboard/collector/me")).json()["official_name"] \
+            is None                                           # nothing half-saved
+
+        # An admin corrects them.
+        await _watching_researcher(client, who, "boss@uni.example")
+        fixed = await client.post("/api/v2/admin/people/details", headers=h, json={
+            "email": "second@gmail.example", "official_name": "Md. Rahim Uddin",
+            "collector_code": "DC-908"})
+        assert fixed.status_code == 200, fixed.text
+        assert (await client.post("/api/v2/admin/people/details", headers=h, json={
+            "email": "second@gmail.example", "collector_code": "DC-907"})).status_code == 409
+        people = {p["email"]: p for p in (await client.get("/api/v2/admin/people")).json()["people"]}
+        assert people["second@gmail.example"]["collector_code"] == "DC-908"
+        assert people["first@gmail.example"]["official_name"] == "Md. Sakib Zaman"
+
+        # The researcher's alert names them so.
+        key = f"t-identity-{len(sent)}"
+        async with dbs.rec.acquire() as conn:
+            await collectors.notify(conn, hospital_id="HOSP003", event="recording_problem",
+                                    subject="Recording problem: HOSP003, PC",
+                                    body="b" + collectors._footer(), event_key=key, urgent=True)
+            copy = await conn.fetchval("SELECT body FROM collector_notifications "
+                                       "WHERE email = 'boss@uni.example' AND event_key = $1",
+                                       key)
+            assert "- Md. Sakib Zaman (DC-907): phone 01811-111111" in copy
+            today = datetime.now(collectors.zone()).date()
+            text = await watchers.hospital_report(conn, "HOSP003", today)
+            assert "Md. Sakib Zaman (DC-907)" in text
+            # The second never started a shift and has no phone: the report says so.
+            assert "Details missing: Md. Rahim Uddin (DC-908) has not saved phone" in text
+
+        # The attendance sheet carries the ID and the official name.
+        log = await client.get(f"/api/v2/admin/shifts.csv?month={today:%Y-%m}")
+        lines = log.text.splitlines()
+        assert lines[0].lstrip("\ufeff").startswith("date,collector_id,official_name,")
+        assert any(",DC-907,Md. Sakib Zaman," in line for line in lines[1:])
+
+        # Who to call now, on the researcher's page.
+        client.cookies.clear()
+        who["value"] = "boss@uni.example"
+        await _sign_in(client)
+        page = (await client.get("/api/v2/dashboard/watch/me")).json()
+        found = [p for g in page["contacts"] for p in g["people"]
+                 if p["email"] == "first@gmail.example"]
+        assert found and found[0]["name"] == "Md. Sakib Zaman" and found[0]["code"] == "DC-907"
+        assert found[0]["missing"] == []
+    _unserve()
+
+
+async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
+        dbs, monkeypatch):
+    """
+    16 Nov: from the evening summary until the morning shift nobody is messaged
+    - it is kept, marked held, and is in the next summary; a PC switched off after
+    the shift is no alert; at 14:30 and 20:30 researchers get each hospital's
+    summary and one CSV of every recording and alert.
+    """
+    import csv
+    import io
+    import collectors
+    import watchers
+    from datetime import time as dtime
+    sent, files = [], []
+
+    async def fake_mail(to, subject, text):
+        sent.append((to, subject, text))
+        return True, None
+
+    async def fake_telegram(method, payload, timeout=15):
+        if method == "sendMessage":
+            sent.append((payload["chat_id"], payload["text"].split("\n")[0], payload["text"]))
+        return {"message_id": 1}, None
+
+    async def fake_upload(method, fields, filename, content, timeout=60):
+        files.append((fields["chat_id"], filename, content, fields["caption"]))
+        return {"message_id": 2}, None
+
+    monkeypatch.setattr(collectors, "send_mail", fake_mail)
+    monkeypatch.setattr(collectors, "_telegram", fake_telegram)
+    monkeypatch.setattr(collectors, "_telegram_upload", fake_upload)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    who = {"value": "owner@uiu.example"}
+    h = {"X-AIMS-Portal": "1"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO hospitals (hospital_id, name, timezone) VALUES "
+                               "('HOSP661', 'Night Clinic', 'Asia/Dhaka') ON CONFLICT DO NOTHING")
+            await conn.execute("UPDATE devices SET hospital_id = 'HOSP661', machine_name = 'PC-N', "
+                               "microphone_is_clinic = FALSE, last_seen_at = now() "
+                               "WHERE device_id = $1", device["device_id"])
+        place = await _make_collector(client, who, "night@gmail.example", hospitals=("HOSP661",))
+        assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+                ).status_code == 200
+        await _watching_researcher(client, who, "nightwatch@uni.example", hospitals=("HOSP661",))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("INSERT INTO collector_telegram (email, chat_id, username) VALUES "
+                               "('night@gmail.example', 661001, 'night_dc'), "
+                               "('nightwatch@uni.example', 661002, 'night_res')")
+            sid = f"N{device['device_id'].hex[:25]}"[:26]
+            await conn.execute("""
+                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                      protocol_version, status, session_date, opened_at)
+                VALUES ($1, 'P9', 'DR0661', 'HOSP661', $2, 2, 'active', now()::date, now())
+            """, sid, device["device_id"])
+
+            # ------------------------------------------------ the night: held, not sent
+            monkeypatch.setenv("AIMS_QUIET_HOURS", "on")
+            monkeypatch.setenv("AIMS_REPORT_AT", "00:00")          # quiet from midnight: now
+            assert await watchers.quiet_for(conn, "HOSP661")
+            before = len(sent)
+            await collectors.notify(conn, hospital_id="HOSP661", event="jabra_unplugged",
+                                    subject="Jabra unplugged: HOSP661, PC-N",
+                                    body="b" + collectors._footer(), event_key="night-1",
+                                    urgent=True, everyone_if_nobody=True,
+                                    device_id=device["device_id"], session_id=sid)
+            assert len(sent) == before                          # nobody messaged
+            held = await conn.fetch("SELECT email, channel, delivered FROM "
+                                    "collector_notifications WHERE event_key = 'night-1'")
+            assert {r["email"] for r in held} == {"night@gmail.example",
+                                                  "nightwatch@uni.example"}
+            assert all(r["channel"] == "held" and not r["delivered"] for r in held)
+            # Held is not a failure, is not escalated and is not chased all night.
+            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
+                               "interval '40 minutes' WHERE event_key = 'night-1'")
+            notifier = collectors.Notifier()
+            await notifier.escalate(conn)
+            await watchers.persisting(conn)
+            await notifier.failure_alarm(conn)
+            assert len(sent) == before
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications WHERE "
+                                           "event_key IN ('esc:night-1', 'still:night-1:1')")
+            # A new place starts on the lab's shifts: 08:00-14:00 and 14:30-20:30.
+            times = await conn.fetchrow("SELECT * FROM places WHERE place_id = $1", place)
+            assert (f"{times['morning_start']:%H:%M}", f"{times['morning_end']:%H:%M}",
+                    f"{times['evening_start']:%H:%M}", f"{times['evening_end']:%H:%M}") == \
+                ("08:00", "14:00", "14:30", "20:30")
+            tz = collectors.zone()
+            on_day = datetime.now(tz).date()
+            assert not await watchers.in_shift_hours(           # the break between shifts
+                conn, "HOSP661", now=datetime.combine(on_day, dtime(14, 15), tzinfo=tz))
+            assert await watchers.in_shift_hours(
+                conn, "HOSP661", now=datetime.combine(on_day, dtime(15, 0), tzinfo=tz))
+            # A PC switched off after the shift hours is no alert at all.
+            await conn.execute("UPDATE places SET morning_start = '00:00', morning_end = '00:00', "
+                               "evening_start = '00:00', evening_end = '00:00' "
+                               "WHERE place_id = $1", place)
+            await conn.execute("UPDATE devices SET last_seen_at = now() - interval '5 minutes' "
+                               "WHERE device_id = $1", device["device_id"])
+            assert not await watchers.in_shift_hours(conn, "HOSP661")
+            await notifier.silent_pcs(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'pc_silent' AND hospital_id = 'HOSP661'")
+            # A message that failed before the summary is not retried into the night.
+            retry = await collectors._record(conn, email="night@gmail.example", event="pc_silent",
+                                             subject="s", body="b", event_key="night-retry",
+                                             urgent=True, hospital_id="HOSP661")
+            await conn.execute("UPDATE collector_notifications SET delivered = FALSE, "
+                               "next_try_at = now() - interval '1 minute' WHERE id = $1", retry)
+            await notifier.retry_failed(conn)
+            assert len(sent) == before
+            # A shift the server closes at night: its summary is kept, not mailed then.
+            shift = await conn.fetchrow("UPDATE collector_shifts SET ended_at = now(), "
+                                        "ended_by = 'auto' WHERE email = 'night@gmail.example' "
+                                        "AND ended_at IS NULL RETURNING *")
+            await collectors.send_shift_summary(conn, dict(shift))
+            assert len(sent) == before
+            assert await conn.fetchval("SELECT channel FROM collector_notifications "
+                                       "WHERE event_key = $1", f"summary:{shift['id']}") == "held"
+
+            # ------------------------------------------------ the summaries
+            monkeypatch.setenv("AIMS_REPORT_AT", "20:30")
+            tz = collectors.zone()
+            day = datetime.now(tz).date()
+            # The rows of the last hours: both are in them, whatever the hour.
+            now = datetime.now(timezone.utc)
+            rows = await watchers.summary_rows(conn, ["HOSP661"], now - timedelta(hours=2),
+                                               now + timedelta(hours=1))
+            kinds = {r["type"] for r in rows}
+            assert kinds == {"recording", "alert"}
+            alert = next(r for r in rows if r["type"] == "alert")
+            assert alert["sent"] == "held (quiet hours)" and alert["pc"] == "PC-N"
+            rec = next(r for r in rows if r["type"] == "recording")
+            assert rec["how_it_ended"] == "still open" and rec["session_id"] == sid
+            assert rec["collector_on_shift"] not in ("", "nobody")    # who was on shift
+            text = watchers.csv_text(rows)
+            assert text.startswith(b"\xef\xbb\xbf")                   # Excel reads it right
+            header = next(csv.reader(io.StringIO(text.decode("utf-8-sig"))))
+            assert header == watchers.CSV_COLUMNS
+            assert b"P9" not in text                                 # no patient details
+
+            # Sent at the summary time: a message per hospital, then the CSV as a file.
+            evening = datetime.combine(day, dtime(20, 45), tzinfo=tz)
+            sent.clear()
+            await watchers.shift_summaries(conn, now=evening)
+            await watchers.shift_summaries(conn, now=evening)          # once only
+            subjects = [x[1] for x in sent if x[0] == 661002]
+            assert any(x.startswith("\U0001F4CB Evening shift summary: HOSP661") or
+                       "Evening shift summary: HOSP661" in x for x in subjects)
+            mine = [f for f in files if f[0] == 661002]
+            assert len(mine) == 2                                      # morning and evening
+            assert {f[1] for f in mine} == {f"aimscribe_{day.isoformat()}_morning.csv",
+                                            f"aimscribe_{day.isoformat()}_evening.csv"}
+            assert all(f[2].startswith(b"\xef\xbb\xbf") for f in mine)
+
+        # And on the dashboard, for any day and shift.
+        client.cookies.clear()
+        who["value"] = "nightwatch@uni.example"
+        await _sign_in(client)
+        got = await client.get("/api/v2/dashboard/watch/summary.csv",
+                               params={"day": day.isoformat(), "shift": "day"})
+        assert got.status_code == 200 and "text/csv" in got.headers["content-type"]
+        assert "attachment" in got.headers["content-disposition"]
+        assert got.content.decode("utf-8-sig").count("\n") >= 2      # header and the recording
+        assert (await client.get("/api/v2/dashboard/watch/summary.csv",
+                                 params={"shift": "night"})).status_code == 400
+        page = (await client.get("/api/v2/dashboard/watch/me")).json()
+        assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
+    _unserve()
+
+
+async def test_an_unknown_clinic_code_is_named_shown_and_fixed_on_the_dashboard(dbs):
+    """
+    16 Nov: CMED's developer saw only UNKNOWN_CLINIC. The refusal now names the
+    code and what to do; the dashboard lists the PC and its code; linking the code
+    to a clinic lets the same PC join at its next try; one code, one clinic.
+    """
+    await enrolled_device(dbs.repo)                       # HOSP003 <- CMED-DHOLPUR
+    _server(dbs)
+    try:
+        key = _p256()
+        refused = await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+        body = json.loads(refused.body)
+        assert (refused.status_code, body["code"]) == (403, "UNKNOWN_CLINIC")
+        assert "'CMED-ARMAN-01'" in body["message"] and "Clinic codes" in body["message"]
+        assert body["cmed_hospital_id"] == "CMED-ARMAN-01"
+        # Tried again: still one line on the dashboard, its detail the latest try.
+        await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+
+        codes = await api_v2.admin_clinic_codes()
+        mine = [r for r in codes["refused"] if r["cmed_hospital_id"] == "CMED-ARMAN-01"]
+        assert len(mine) == 1
+        assert mine[0]["code"] == "UNKNOWN_CLINIC" and mine[0]["machine_name"] == "ARMAN-PC"
+        assert mine[0]["address"] == "203.0.113.7" and not mine[0]["linked_now"]
+        clinic = next(c for c in codes["clinics"] if c["hospital_id"] == "HOSP003")
+        assert clinic["cmed_hospital_id"] == "CMED-DHOLPUR"
+
+        # Linked on the dashboard (to its own clinic): the same PC joins.
+        await dbs.repo.upsert_hospital("HOSP_ARMAN", "Arman test clinic", "Asia/Dhaka")
+        saved = await api_v2.admin_hospital(api_v2.HospitalRequest(
+            hospital_id="HOSP_ARMAN", name="Arman test clinic", timezone="Asia/Dhaka",
+            cmed_hospital_id="CMED-ARMAN-01"))
+        assert saved["cmed_hospital_id"] == "CMED-ARMAN-01"
+        joined = await api_v2.register_device(
+            _registration("CMED-ARMAN-01", key=key, machine="ARMAN-PC"), _caller())
+        assert joined["hospital_id"] == "HOSP_ARMAN" and joined["approval"] == "pending"
+        again = await api_v2.admin_clinic_codes()
+        assert next(r for r in again["refused"]
+                    if r["cmed_hospital_id"] == "CMED-ARMAN-01")["linked_now"]
+
+        # One CMED code belongs to one clinic: a second link is refused, by name.
+        with pytest.raises(api_v2.HTTPException) as clash:
+            await api_v2.admin_hospital(api_v2.HospitalRequest(
+                hospital_id="HOSP003", name="Dholpur", timezone="Asia/Dhaka",
+                cmed_hospital_id="CMED-ARMAN-01"))
+        assert clash.value.status_code == 409 and "HOSP_ARMAN" in clash.value.detail
+    finally:
+        _unserve()
+
+
+async def test_the_device_log_keeps_what_every_pc_was_told(dbs, monkeypatch):
+    """
+    042: through the real middleware, as a PC sees it. A refused join is kept
+    with the exact message; a join that works too; the same refusal repeated is
+    one line with a count; a malformed request keeps the field names, never the
+    values; only an admin can read it.
+    """
+    import asyncio
+    import httpx
+    from fastapi import FastAPI
+    import device_log
+    from api_v2 import router as v2_router
+
+    await enrolled_device(dbs.repo)                       # HOSP003 <- CMED-DHOLPUR
+    _server(dbs)
+    monkeypatch.setenv("AIMS_ADMIN_KEY", "admin-key-for-tests")
+    app = FastAPI()
+    device_log.install(app)
+    app.include_router(v2_router)
+    app.include_router(device_log.router)
+
+    async def settle():
+        await asyncio.gather(*list(device_log._PENDING), return_exceptions=True)
+
+    def as_json(req):
+        return json.loads(req.model_dump_json())
+
+    try:
+        transport = httpx.ASGITransport(app=app, client=("198.51.100.9", 40000))
+        async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
+            key = _p256()
+            refused = await http.post("/api/v2/device/register", json=as_json(
+                _registration("CMED-NOT-LINKED", key=key, machine="AMIR-MACBOOK")))
+            assert refused.status_code == 403
+            joined = await http.post("/api/v2/device/register", json=as_json(
+                _registration(key=_p256(), machine="CLINIC-PC-9")))
+            assert joined.status_code == 200
+            # A lost PC, heartbeating - three at the same moment: still one line
+            # (the line is found-or-made as one step, 16 Nov).
+            beats_sent = await asyncio.gather(*(
+                http.post("/api/v2/heartbeat", json={},
+                          headers={"X-Device-Token": "not-a-real-token"}) for _ in range(3)))
+            assert all(b.status_code == 401 for b in beats_sent)
+            unjoined = await http.post("/api/v2/heartbeat", json={})     # no token at all
+            assert unjoined.status_code == 401
+            assert "has not joined the AIMS LAB server yet" in unjoined.text
+            assert "Clinic codes" in unjoined.text
+            bad = await http.post("/api/v2/session/open", json={"patient_ref": "SECRET-P123"},
+                                  headers={"X-Device-Token": "not-a-real-token"})
+            assert bad.status_code in (401, 422)
+            await settle()
+
+            # Only an admin reads it.
+            assert (await http.get("/api/v2/admin/device-log")).status_code in (401, 403, 503)
+            rows = (await http.get("/api/v2/admin/device-log", params={"days": 1},
+                                   headers={"X-Admin-Key": "admin-key-for-tests"})).json()["rows"]
+            csv_text = (await http.get("/api/v2/admin/device-log.csv",
+                                       headers={"X-Admin-Key": "admin-key-for-tests"})).text
+
+        amir = next(r for r in rows if r["machine_name"] == "AMIR-MACBOOK")
+        assert amir["step"] == "join by itself (no token)" and amir["status"] == 403
+        assert amir["code"] == "UNKNOWN_CLINIC" and amir["cmed_hospital_id"] == "CMED-NOT-LINKED"
+        assert "'CMED-NOT-LINKED' is not set up" in amir["message"]
+        assert amir["address"] == "198.51.100.9" and amir["device_id"]
+        ok = next(r for r in rows if r["machine_name"] == "CLINIC-PC-9")
+        assert ok["status"] == 200 and ok["code"] == "JOINED_PENDING"
+        assert "joined clinic HOSP003" in ok["message"]
+        beats = [r for r in rows if r["step"] == "heartbeat" and r["address"] == "198.51.100.9"
+                 and r["message"] == "unknown device token"]
+        assert len(beats) == 1 and beats[0]["repeats"] == 3
+        never = [r for r in rows if r["step"] == "heartbeat"
+                 and "has not joined" in (r["message"] or "")]
+        assert len(never) == 1 and never[0]["repeats"] == 1     # its own line, not folded in
+        assert "SECRET-P123" not in json.dumps(rows)       # never a value the PC sent
+        assert "SECRET-P123" not in csv_text and "AMIR-MACBOOK" in csv_text
+
+        # 043: what the PC sent - its fields as sent, secrets only by fingerprint.
+        sent = amir["sent"]["fields"]
+        assert sent["machine_name"] == "AMIR-MACBOOK"
+        assert sent["cmed_hospital_id"] == "CMED-NOT-LINKED"
+        assert sent["device_pubkey"].startswith("TPM P-256 key, fingerprint ")
+        assert sent["key_proof"].startswith("sent (") and "fingerprint" in sent["key_proof"]
+        raw_proof = json.loads(_registration("CMED-NOT-LINKED", key=key,
+                                             machine="AMIR-MACBOOK").model_dump_json())["key_proof"]
+        assert raw_proof not in json.dumps(rows) and raw_proof not in csv_text
+        assert amir["sent"]["content_type"].startswith("application/json")
+        beat_sent = beats[0]["sent"]
+        assert beat_sent["device_token"].startswith("sent (16 chars, fingerprint ")
+        assert beat_sent["device_token"].endswith("no PC here has this token")
+        assert "not-a-real-token" not in json.dumps(rows) and "not-a-real-token" not in csv_text
+        opened = next(r for r in rows if r["path"] == "/api/v2/session/open")
+        assert opened["sent"]["fields"]["patient_ref"] == "sent (11 chars)"
+        assert "device_token:" in csv_text or "device_token: sent" in csv_text
+
+        # Researchers' database logins are refused the table (scripts/roles).
+        roles = (Path(__file__).resolve().parent.parent / "scripts" / "roles"
+                 / "researcher_logins_recordings.sql").read_text(encoding="utf-8")
+        assert "REVOKE ALL ON device_events FROM aims_researchers" in roles
+    finally:
+        _unserve()
+
+
+async def test_the_same_refusal_arriving_at_once_is_one_line(dbs, pg):
+    """
+    16 Nov (GitHub caught it once): identical refusals written at the same moment
+    each found no line and each made one. Found-or-made is now one step. Eight
+    connections opened beforehand, so the eight writes really meet.
+    """
+    import asyncio
+    import device_log
+    _server(dbs)
+    wide = await asyncpg.create_pool(pg.recordings, min_size=8, max_size=8)
+    own = dbs.repo._pool
+    dbs.repo._pool = wide
+    try:
+        row = {"step": "heartbeat", "method": "POST", "path": "/api/v2/heartbeat",
+               "status": 401, "code": "HTTP_401", "message": "race check",
+               "device_id": None, "address": "192.0.2.77", "machine_name": None,
+               "app_version": None, "hospital_id": None, "cmed_hospital_id": None,
+               "request_id": None, "sent": None}
+        await asyncio.gather(*(device_log._write(dict(row)) for _ in range(8)))
+        async with dbs.rec.acquire() as conn:
+            lines = await conn.fetch("SELECT repeats FROM device_events "
+                                     "WHERE address = '192.0.2.77' AND message = 'race check'")
+        assert [r["repeats"] for r in lines] == [8]
+    finally:
+        dbs.repo._pool = own
+        await wide.close()
+        _unserve()
+
+
+async def test_a_new_clinic_with_its_cmed_code_lets_the_pc_join(dbs):
+    """
+    16 Nov (Nabila's PC): a CMED connection for 'Susastho-Clinic-Test-1' was
+    registered, but no clinic answered to the code, so the PC was refused. A new
+    clinic made with the code (the dashboard's Add a clinic, or the connection
+    form's new clinic) lets the same PC join at its next try.
+    """
+    await enrolled_device(dbs.repo)
+    _server(dbs)
+    try:
+        key = _p256()
+        refused = await api_v2.register_device(
+            _registration("Susastho-Clinic-Test-1", key=key, machine="Nabila"), _caller())
+        assert json.loads(refused.body)["code"] == "UNKNOWN_CLINIC"
+        made = await api_v2.admin_hospital(api_v2.HospitalRequest(
+            hospital_id="HOSP_SUSASTHO_TEST", name="Susastho Clinic (test 1)",
+            timezone="Asia/Dhaka", cmed_hospital_id="Susastho-Clinic-Test-1"))
+        assert made["cmed_hospital_id"] == "Susastho-Clinic-Test-1"
+        joined = await api_v2.register_device(
+            _registration("Susastho-Clinic-Test-1", key=key, machine="Nabila"), _caller())
+        assert joined["hospital_id"] == "HOSP_SUSASTHO_TEST" and joined["approval"] == "pending"
+        codes = await api_v2.admin_clinic_codes()
+        clinic = next(c for c in codes["clinics"] if c["hospital_id"] == "HOSP_SUSASTHO_TEST")
+        assert clinic["active"] and clinic["pcs"] == 1
+    finally:
+        _unserve()
+
+
+# ============================================================
+# 18 Nov 2026: one card per problem, pauses seen, the live board
+# ============================================================
+
+async def _card_setup(dbs, monkeypatch, client, who, hospital, collector, lead,
+                      collector_chat, lead_chat, mode="problems"):
+    """A collector on shift and a researcher, both on Telegram, for one clinic of its own."""
+    h = {"X-AIMS-Portal": "1"}
+    await dbs.repo.upsert_hospital(hospital, f"Clinic {hospital}", "Asia/Dhaka")
+    await _make_collector(client, who, collector, hospitals=(hospital,))
+    assert (await client.post("/api/v2/dashboard/collector/shift/start", headers=h)
+            ).status_code == 200
+    await _watching_researcher(client, who, lead, hospitals=(hospital,))
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE portal_people SET alert_mode = $2 WHERE email = $1",
+                           lead, mode)
+        await conn.execute("UPDATE researcher_hospitals SET added_at = now() - interval '1 hour' "
+                           "WHERE email = $1", lead)
+        for email, chat in ((collector, collector_chat), (lead, lead_chat)):
+            await conn.execute("INSERT INTO collector_telegram (email, chat_id, username) "
+                               "VALUES ($1, $2, NULL) ON CONFLICT (email) DO UPDATE "
+                               "SET chat_id = EXCLUDED.chat_id", email, chat)
+
+
+async def _clinic_session(dbs, device, hospital, *, opened_ago=timedelta(seconds=5)):
+    from core.spool import new_ulid
+    sid = new_ulid()
+    opened = datetime.now(timezone.utc) - opened_ago
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                  protocol_version, status, session_date, opened_at)
+            VALUES ($1, 'P9', 'DR9CARD', $2, $3, 2, 'active', $4, $5)
+        """, sid, hospital, device["device_id"], opened.date(), opened)
+    return sid
+
+
+async def test_one_problem_is_one_card_edited_not_a_message_per_consultation(dbs, monkeypatch):
+    """
+    18 Nov: one unplugged Jabra made 38 messages for one researcher in two
+    hours - a new alert per consultation, each with its own reminders. Now the
+    first alert is a card; later consultations, Seen and the fix edit it.
+    """
+    import collectors
+    import watchers
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    monkeypatch.setenv("AIMS_QUIET_HOURS", "off")
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _card_setup(dbs, monkeypatch, client, who, "HOSP9C1", "card@gmail.example",
+                          "cardlead@uni.example", 9101, 9102)
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE, "
+                               "microphone = 'Laptop mic', last_seen_at = now() "
+                               "WHERE device_id = $1", device["device_id"])
+            sids = []
+            for n in range(3):
+                sid = await _clinic_session(dbs, device, "HOSP9C1")
+                sids.append(sid)
+                await collectors.notify(
+                    conn, hospital_id="HOSP9C1", event="recording_without_jabra",
+                    subject="Patient recorded without the Jabra: HOSP9C1, PC",
+                    body="A new recording started on the laptop mic.",
+                    event_key=f"nojabra:{sid}", urgent=True, everyone_if_nobody=True,
+                    device_id=device["device_id"], session_id=sid)
+            # One alert each, for the first consultation only.
+            assert len(fake.sent_to(9101)) == 1 and len(fake.sent_to(9102)) == 1
+            card = fake.sent_to(9102)[0]
+            assert card["text"].startswith("\U0001F534 Jabra off")
+            assert "Seen" in str(fake.sent_to(9101)[0].get("reply_markup"))
+            assert await conn.fetchval("SELECT count(DISTINCT event_key) FROM "
+                                       "collector_notifications WHERE hospital_id = 'HOSP9C1'"
+                                       " AND event = 'recording_without_jabra'") == 1
+            edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
+            assert edits and "Consultations since: 3" in edits[-1]["text"]
+
+            # The collector presses Seen in Telegram: the researcher's card says who.
+            note = await conn.fetchval("SELECT id FROM collector_notifications "
+                                       "WHERE email = 'card@gmail.example' "
+                                       "AND event = 'recording_without_jabra'")
+            await collectors.Notifier()._seen_pressed(conn, {
+                "id": "q1", "data": f"seen:{note}",
+                "message": {"chat": {"id": 9101}, "message_id": 1}})
+            edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
+            assert "pressed Seen" in edits[-1]["text"]
+
+            # Plugged back in: the card says fixed; the researcher's note is silent,
+            # under the card.
+            await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
+                               "WHERE device_id = $1", device["device_id"])
+            await watchers.persisting(conn)
+            edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
+            assert edits[-1]["text"].startswith("✅ Jabra off")
+            fixed = fake.sent_to(9102)[-1]
+            assert fixed.get("disable_notification") is True
+            assert fixed["reply_parameters"]["message_id"] == \
+                await conn.fetchval("SELECT tg_message_id FROM collector_notifications "
+                                    "WHERE email = 'cardlead@uni.example' "
+                                    "AND event = 'recording_without_jabra'")
+            # A new problem later is a new card again.
+            await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE "
+                               "WHERE device_id = $1", device["device_id"])
+            sid = await _clinic_session(dbs, device, "HOSP9C1")
+            await collectors.notify(
+                conn, hospital_id="HOSP9C1", event="recording_without_jabra",
+                subject="Patient recorded without the Jabra: HOSP9C1, PC", body="again",
+                event_key=f"nojabra:{sid}", urgent=True, everyone_if_nobody=True,
+                device_id=device["device_id"], session_id=sid)
+            assert fake.sent_to(9102)[-1]["text"].startswith("\U0001F534 Jabra off")
+
+
+async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urgent(
+        dbs, monkeypatch):
+    """
+    18 Nov: a doctor's pause reached the server but nobody saw it - the
+    dashboard said active and no message went. Now: the collector and the
+    researcher are told at once (the researcher in one silent line), the
+    dashboard says Paused, two minutes on it is urgent, and a researcher on
+    'problems' gets refusals too.
+    """
+    import collectors
+    import watchers
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    monkeypatch.setenv("AIMS_QUIET_HOURS", "off")
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _card_setup(dbs, monkeypatch, client, who, "HOSP9P1", "pause@gmail.example",
+                          "pauselead@uni.example", 9201, 9202)
+        sid = await _clinic_session(dbs, device, "HOSP9P1", opened_ago=timedelta(minutes=4))
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await notifier.pauses(conn)                       # starts reading from here
+            began = datetime.now(timezone.utc) - timedelta(minutes=3)
+            await dbs.repo.note_pause(sid, began.isoformat(), "sensitive_personal_matter")
+            await dbs.repo.audit(event_type="session.pause", actor_type="device",
+                                 actor_id="DR9CARD", device_id=device["device_id"],
+                                 session_id=sid,
+                                 detail={"reason": "sensitive_personal_matter",
+                                         "reason_detail": "", "authorised_by": "DR9CARD",
+                                         "supervisor_required": False})
+            # The Stop form's own hold is not a pause anyone is told about.
+            await dbs.repo.audit(event_type="session.pause", actor_type="device",
+                                 actor_id="DR9CARD", device_id=device["device_id"],
+                                 session_id=sid, detail={"reason": "stop_requested"})
+            await notifier.pauses(conn)
+            told = fake.sent_to(9201)
+            assert len(told) == 1 and "Recording paused: sensitive personal matter" in \
+                told[0]["text"] and not told[0].get("disable_notification")
+            line = fake.sent_to(9202)
+            assert len(line) == 1 and line[0].get("disable_notification") is True
+            assert "paused: sensitive personal matter" in line[0]["text"]
+
+        # The dashboard shows it paused.
+        listed = (await client.get("/api/v2/dashboard/recordings",
+                                   params={"hospital_id": "HOSP9P1"})).json()["recordings"]
+        row = next(r for r in listed if r["session_id"] == sid)
+        assert row["paused_since"] and row["pause_reason"] == "sensitive_personal_matter"
+
+        async with dbs.rec.acquire() as conn:
+            # Two minutes on: urgent, a card, with the Seen button for the collector.
+            await notifier.still_paused(conn)
+            await notifier.still_paused(conn)                 # once only
+            assert fake.sent_to(9201)[-1]["text"].startswith("\U0001F534 Recording paused")
+            assert fake.sent_to(9202)[-1]["text"].startswith("\U0001F534 Recording paused")
+            assert await conn.fetchval("SELECT count(*) FROM collector_notifications "
+                                       "WHERE event = 'still_paused' AND session_id = $1",
+                                       sid) == 2
+            # Resumed: a silent line, and the card says it is over.
+            await dbs.repo.note_pause(sid, None, None)
+            await dbs.repo.audit(event_type="session.resume", actor_type="device",
+                                 device_id=device["device_id"], session_id=sid, detail={})
+            await notifier.pauses(conn)
+            assert "resumed" in fake.sent_to(9202)[-1]["text"]
+            assert fake.sent_to(9202)[-1].get("disable_notification") is True
+            await watchers.persisting(conn)
+            edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9202]
+            assert edits and edits[-1]["text"].startswith("✅ Recording paused")
+
+            # A refusal reaches the researcher on 'problems' - as one silent line.
+            await collectors.notify(
+                conn, hospital_id="HOSP9P1", event="stopped_unusually",
+                subject="Recording stopped: the patient did not consent", body="b",
+                event_key=f"refused:{sid}", device_id=device["device_id"], session_id=sid,
+                line="12:21 · HOSP9P1 · PC · DR9CARD - patient did not consent")
+            got = fake.sent_to(9202)[-1]
+            assert got["text"].endswith("patient did not consent")
+            assert got.get("disable_notification") is True
+
+
+async def test_each_researcher_has_one_pinned_live_board_per_hospital(dbs, monkeypatch):
+    """18 Nov: what is recording or paused now, the open problems and the counts - one
+    pinned message, edited when it changes, not a stream of messages."""
+    import cards
+    import collectors
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _card_setup(dbs, monkeypatch, client, who, "HOSP9B1", "board@gmail.example",
+                          "boardlead@uni.example", 9301, 9302)
+        local = datetime.now(collectors.zone()).replace(hour=10, minute=0, second=0,
+                                                        microsecond=0)
+        at = local.astimezone(timezone.utc)
+        async with dbs.rec.acquire() as conn:
+            await cards.boards(conn, now=at, force=True)
+            sent = fake.sent_to(9302)
+            assert len(sent) == 1 and sent[0].get("disable_notification") is True
+            assert "HOSP9B1" in sent[0]["text"] and "nothing recording" in sent[0]["text"]
+            assert any(m == "pinChatMessage" and p["chat_id"] == 9302 for m, p in fake.calls)
+            calls = len(fake.calls)
+            await cards.boards(conn, now=at, force=True)          # nothing changed
+            assert not [c for c in fake.calls[calls:] if c[1].get("chat_id") == 9302]
+            sid = await _clinic_session(dbs, device, "HOSP9B1")
+            await dbs.repo.note_pause(sid, datetime.now(timezone.utc).isoformat(),
+                                      "non_clinical_interruption")
+            await cards.boards(conn, now=at, force=True)
+            edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9302]
+            assert edits and "PAUSED since" in edits[-1]["text"]
+            assert "non clinical interruption" in edits[-1]["text"]
+            assert len(fake.sent_to(9302)) == 1
+
+
+async def test_the_event_log_lists_pauses_and_what_cmed_never_sent(dbs, monkeypatch):
+    """18 Nov: one page with every start, end, pause and CMED message, and a CSV of the
+    recordings CMED's API 2 or API 3 never reached us for."""
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await dbs.repo.upsert_hospital("HOSP9E1", "Event clinic", "Asia/Dhaka")
+        await _sign_in(client)
+        sid = await _clinic_session(dbs, device, "HOSP9E1", opened_ago=timedelta(minutes=30))
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
+                    payload_sha256, prev_hash, entry_hash, device_signature, occurred_at)
+                VALUES ($1, 2, 'pause', $2::jsonb, $3, $3, $3, $3, now() - interval '20 minutes'),
+                       ($1, 3, 'resume', $4::jsonb, $5, $5, $5, $5, now() - interval '18 minutes'),
+                       ($1, 4, 'pause', $6::jsonb, $7, $7, $7, $7, now() - interval '15 minutes')
+            """, sid, json.dumps({"reason": "patient_declined"}), os.urandom(32),
+                json.dumps({"paused_seconds": 125.0}), os.urandom(32),
+                json.dumps({"reason": "stop_requested"}), os.urandom(32))
+            await conn.execute("UPDATE sessions SET closed_at = now() - interval '14 minutes', "
+                               "close_reason = 'superseded_by_new_patient', "
+                               "total_duration_seconds = 600, paused_seconds = 125 "
+                               "WHERE session_id = $1", sid)
+        got = await client.get("/api/v2/dashboard/events", params={"hospital_id": "HOSP9E1"})
+        assert got.status_code == 200, got.text
+        events = [(e["event"], e["detail"]) for e in got.json()["events"]
+                  if e["session_id"] == sid]
+        assert ("Paused by the doctor", "patient declined") in events
+        assert ("Resumed", "after 2 min 05 s paused") in events
+        assert not any("stop requested" in d for _, d in events)
+        assert any(e == "Recording ended" and "2.1 min paused" in d for e, d in events)
+        only = await client.get("/api/v2/dashboard/events",
+                                params={"hospital_id": "HOSP9E1", "kind": "pause"})
+        assert {e["kind"] for e in only.json()["events"]} == {"pause"}
+        csv_file = await client.get("/api/v2/dashboard/events",
+                                    params={"hospital_id": "HOSP9E1", "format": "csv"})
+        assert csv_file.status_code == 200 and b"Paused by the doctor" in csv_file.content
+        missing = await client.get("/api/v2/dashboard/cmed-missing.csv",
+                                   params={"hospital_id": "HOSP9E1"})
+        assert missing.status_code == 200
+        assert missing.content.decode("utf-8-sig").startswith("cmed_hospital_id,")

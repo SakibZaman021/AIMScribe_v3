@@ -42,7 +42,7 @@ import logging
 import os
 import platform
 import socket
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -65,13 +65,16 @@ DEVICE_TOKEN_FILE = "device.token"
 class EnrollmentError(RuntimeError):
     """Enrollment failed. The agent stays unenrolled and refuses to record."""
 
-    def __init__(self, message: str, *, rejected: bool = False, code: str = ""):
+    def __init__(self, message: str, *, rejected: bool = False, code: str = "",
+                 reason: str = ""):
         super().__init__(message)
         # The server said no - a mistyped, used or expired token. Trying the
         # same token again cannot succeed; an unreachable server can.
         self.rejected = rejected
         # The server's reason, when it gave one (UNKNOWN_CLINIC, ...).
         self.code = code
+        # And its words for it - which clinic code, and what to do (16 Nov).
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -267,9 +270,13 @@ async def enroll(cfg, device_key: DeviceKey, token: str, *, ssl_context=None) ->
 
 
 def can_self_register(cfg, device_key: DeviceKey) -> bool:
-    """Only a key the PC cannot give away - one in its TPM - may join without a token."""
-    return bool(getattr(cfg.security, "self_register", False)) and \
-        getattr(device_key, "kind", "") == "p256-tpm"
+    """
+    Any PC may join without a token, at the clinic CMED's trigger names: with
+    its TPM key, or (3.9.2) with its software key when it has no usable chip.
+    The gate is not the key: a PC stays pending, and nothing it records is
+    kept, until CMED's server confirms two of its visits.
+    """
+    return bool(getattr(cfg.security, "self_register", False))
 
 
 async def register(cfg, device_key: DeviceKey, cmed_hospital_id: str, *,
@@ -300,12 +307,15 @@ async def register(cfg, device_key: DeviceKey, cmed_hospital_id: str, *,
                 body = await response.text()
                 if response.status >= 300:
                     try:
-                        code = str(json.loads(body).get("code") or "")
+                        answer = json.loads(body)
+                        code = str(answer.get("code") or "")
+                        reason = str(answer.get("message") or "")[:400]
                     except Exception:
-                        code = ""
+                        code, reason = "", ""
                     raise EnrollmentError(
                         f"server refused registration ({response.status} {code}): "
-                        f"{body[:200]}", rejected=400 <= response.status < 500, code=code)
+                        f"{body[:400]}", rejected=400 <= response.status < 500, code=code,
+                        reason=reason)
                 data = json.loads(body)
     except EnrollmentError:
         raise
@@ -353,6 +363,21 @@ def _keep(cfg, device_key: DeviceKey, data: Dict[str, Any]) -> DeviceIdentity:
     tmp.write_text(identity.to_json(), encoding="utf-8")
     os.replace(tmp, path)
     return identity
+
+
+def save_clinic(cfg, identity: DeviceIdentity, hospital_id: str) -> DeviceIdentity:
+    """
+    The server moved this PC to another clinic (3.9.3). The identity file is
+    rewritten with the new clinic and nothing else, so the PC keeps its id,
+    key and token, and a restart starts at the new clinic.
+    """
+    moved = replace(identity, hospital_id=str(hospital_id))
+    path = identity_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(moved.to_json(), encoding="utf-8")
+    os.replace(tmp, path)
+    return moved
 
 
 async def ensure_enrolled(cfg, device_key: DeviceKey, *, ssl_context=None) -> Optional[DeviceIdentity]:

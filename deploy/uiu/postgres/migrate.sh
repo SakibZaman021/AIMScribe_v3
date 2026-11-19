@@ -130,6 +130,15 @@ apply aims_clinical aims_clinical_owner /aims/scripts/clinical/003_consultation_
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/004_patient_visit.sql
 # Every section of a visit as rows, and the research views (v_visit, ...).
 apply aims_clinical aims_clinical_owner /aims/scripts/clinical/005_visit_sections.sql
+# One row per visit, findable by patient: visit keys, the visit's files, v_visit_folder.
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/006_visit_folder.sql
+# The tables a person opens first: schema by_visit (overview, demographics,
+# prescription, medicines, files), newest visit first.
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/007_by_visit_tables.sql
+# One row per patient: by_visit.patient_list.
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/008_patient_list.sql
+# The two functions the visit tables use, with every table named in full (19 Nov).
+apply aims_clinical aims_clinical_owner /aims/scripts/clinical/009_qualified_functions.sql
 
 # The clinical database's read-only login, for the database viewer: its
 # password comes from .env (AIMS_CLINICAL_READER_PASSWORD), never a file.

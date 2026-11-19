@@ -6,10 +6,12 @@
     Two ways to call it:
 
       sign.ps1 -Folder dist\AIMScribe_Agent
-          Every .exe, .dll and .pyd in the folder that is not already validly
-          signed by its own maker is signed (Python's and OpenSSL's DLLs keep
-          their vendors' signatures). Then every file is verified, and the
-          script fails if any shipped file is left unsigned.
+          Only the program a clinic PC runs, AIMScribe_Agent.exe, is signed
+          and then verified (19 Nov 2026: three signatures a release - this,
+          the setup and its uninstaller - instead of about 27; the eSigner
+          plan is priced per signature). The updater checks the setup's
+          signature; Windows shows the program's. The Python modules and
+          DLLs beside it are left as their makers shipped them.
 
       sign.ps1 -File AIMScribeSetup.exe
           One file. Inno Setup calls this for the setup and its uninstaller
@@ -33,8 +35,9 @@
       thumbprint  A certificate in the Windows certificate store, found by its
                   SHA-1 thumbprint: an OV or EV certificate whose key is on a
                   hardware token, or in a cloud HSM through its vendor's
-                  Windows key storage provider (SSL.com eSigner, DigiCert
-                  KeyLocker, Sectigo). AIMS_SIGN_THUMBPRINT=<40 hex characters>.
+                  Windows key storage provider - SSL.com eSigner CKA (the
+                  chosen route, 19 Nov 2026), DigiCert KeyLocker, Sectigo.
+                  AIMS_SIGN_THUMBPRINT=<40 hex characters>.
 
       signpath    SignPath. The files are submitted to SignPath through its
                   PowerShell module (installed from the PowerShell Gallery if
@@ -72,6 +75,8 @@ $ErrorActionPreference = 'Stop'
 $Provider  = ($env:AIMS_SIGN_PROVIDER, 'thumbprint' | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
 $Publisher = ($env:AIMS_SIGN_PUBLISHER, 'AIMS LAB' | Where-Object { $_ } | Select-Object -First 1)
 $Shipped   = '*.exe', '*.dll', '*.pyd'
+# The program files AIMS LAB signs; everything else keeps its maker's state.
+$OurPrograms = @('AIMScribe_Agent.exe')
 
 function Write-Banner([string] $Text, [string] $Colour = 'Yellow') {
     $line = '*' * 68
@@ -237,20 +242,26 @@ if ($PSCmdlet.ParameterSetName -eq 'File') {
     exit 0
 }
 
-# ---------------------------------------------------------------- the whole folder
+# ---------------------------------------------------------------- the program folder
 $root = (Resolve-Path $Folder).Path
 $all = @(Get-ChildItem $root -Recurse -File -Include $Shipped | Select-Object -ExpandProperty FullName)
 if (-not $all) { throw "No program files under $root - build first." }
 
-$ours = @($all | Where-Object { -not (Test-VendorSigned $_) })
-Write-Host ("{0} program files: {1} already signed by their makers, {2} to sign" -f
-            $all.Count, ($all.Count - $ours.Count), $ours.Count) -ForegroundColor Cyan
+$ours = @(foreach ($name in $OurPrograms) {
+    $path = Join-Path $root $name
+    if (-not (Test-Path -LiteralPath $path)) { throw "$name is missing from $root - build first." }
+    $path
+})
+$vendor = @($all | Where-Object { $ours -notcontains $_ -and (Test-VendorSigned $_) }).Count
+Write-Host ("{0} program files: signing {1} ({2}); {3} carry their makers' signatures, the rest none" -f
+            $all.Count, $ours.Count, ($OurPrograms -join ', '), $vendor) -ForegroundColor Cyan
 
-if (-not $VerifyOnly -and $ours) { Invoke-Sign $ours $root }
+if (-not $VerifyOnly) { Invoke-Sign $ours $root }
 
-Assert-Verified $all
-$main = Join-Path $root 'AIMScribe_Agent.exe'
-if ((Test-Path $main) -and -not (Test-OurSignature $main)) {
-    throw "AIMScribe_Agent.exe is not signed by '$Publisher' with a timestamp."
+Assert-Verified $ours
+foreach ($path in $ours) {
+    if (-not (Test-OurSignature $path)) {
+        throw "$([IO.Path]::GetFileName($path)) is not signed by '$Publisher' with a timestamp."
+    }
 }
-Write-Host "All $($all.Count) program files are validly signed." -ForegroundColor Green
+Write-Host "Signed by $Publisher, timestamped: $($OurPrograms -join ', ')" -ForegroundColor Green

@@ -179,4 +179,25 @@ run
 [ "$(head_of "$AIMS_DEPLOY_DIR")" = "$good" ] || fail "deployed without its backup"
 grep -q "the backup before it failed" "$WORK/alerts.log" || fail "the reason is not in the alert"
 
+echo "9. the programs' logs are kept before an update replaces the containers"
+mkdir -p "$WORK/dev/deploy/uiu"
+cat > "$WORK/dev/deploy/uiu/keep-logs.sh" <<EOF
+echo "docker compose logs (kept)" >> "$WORK/docker.log"
+EOF
+commit "keep the logs" "" "BACKUP_FAILS"
+ci completed success
+: > "$WORK/docker.log"
+run
+[ "$status" = 0 ] || fail "exit $status: $(cat "$WORK/run.log")"
+kept=$(grep -n "(kept)" "$WORK/docker.log" | head -n 1 | cut -d: -f1)
+up=$(grep -n "compose up -d --remove-orphans" "$WORK/docker.log" | head -n 1 | cut -d: -f1)
+[ -n "$kept" ] && [ -n "$up" ] && [ "$kept" -lt "$up" ] \
+    || fail "the logs were not kept before the containers were replaced"
+: > "$WORK/docker.log"
+AIMS_KEEP_LOGS_EVERY=0 run
+[ "$status" = 0 ] && grep -q "(kept)" "$WORK/docker.log" || fail "not kept between updates"
+: > "$WORK/docker.log"
+AIMS_KEEP_LOGS=off AIMS_KEEP_LOGS_EVERY=0 run
+! grep -q "(kept)" "$WORK/docker.log" || fail "kept although turned off"
+
 echo "All autodeploy scenarios passed."

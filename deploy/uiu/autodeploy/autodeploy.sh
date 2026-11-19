@@ -81,6 +81,22 @@ notify() {
 
 compose() { (cd "$STACK" && docker compose "$@"); }
 
+# The programs' logs, copied into $STATE/logs (keep-logs.sh): every
+# AIMS_KEEP_LOGS_EVERY seconds, and - with "now" - just before an update
+# replaces the containers, whose logs would otherwise go with them. Never
+# the reason a deploy stops.
+KEEP_LOGS="${AIMS_KEEP_LOGS:-on}"
+KEEP_LOGS_EVERY="${AIMS_KEEP_LOGS_EVERY:-300}"
+keep_logs() {
+    [ "$KEEP_LOGS" != off ] && [ -f "$STACK/keep-logs.sh" ] || return 0
+    local last
+    last=$(stat -c %Y "$STATE/logs/.since" 2>/dev/null || echo 0)
+    if [ "${1:-}" = now ] || [ $(( $(date +%s) - last )) -ge "$KEEP_LOGS_EVERY" ]; then
+        bash "$STACK/keep-logs.sh" || log "could not keep the programs' logs this time"
+    fi
+    return 0
+}
+
 healthy() {
     local deadline=$((SECONDS + HEALTH_WAIT))
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -141,6 +157,7 @@ release() {
         compose run --rm -T backup --now "$2" < /dev/null || { BACKUP_FAILED=1; return 1; }
     fi
     compose exec -T postgres sh -s < "$STACK/postgres/migrate.sh" || return 1
+    keep_logs now                  # the outgoing containers' last lines
     compose up -d --remove-orphans || return 1
     healthy
 }
@@ -150,6 +167,7 @@ main() {
     exec 9>"$STATE/lock"
     flock -n 9 || exit 0
 
+    keep_logs
     git -C "$REPO" fetch --quiet origin "$BRANCH"
     local current target short subject
     current=$(git -C "$REPO" rev-parse HEAD)

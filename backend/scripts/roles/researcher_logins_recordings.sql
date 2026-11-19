@@ -49,6 +49,10 @@ BEGIN
     IF to_regclass('public.portal_sessions') IS NOT NULL THEN
         REVOKE ALL ON portal_sessions FROM aims_researchers;
     END IF;
+    -- 042: what each PC was told - admins only.
+    IF to_regclass('public.device_events') IS NOT NULL THEN
+        REVOKE ALL ON device_events FROM aims_researchers;
+    END IF;
 END $$;
 
 
@@ -87,6 +91,13 @@ BEGIN
     EXECUTE format('ALTER ROLE %I SET default_transaction_read_only = on', p_role);
     EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', p_role, '120s');
     EXECUTE format('ALTER ROLE %I SET log_statement = %L', p_role, 'all');
+    -- 18 Nov 2026: in the clinical database a new login starts in by_visit,
+    -- the readable tables (researcher_logins_clinical.sql does the same for
+    -- every login on each update).
+    IF EXISTS (SELECT 1 FROM pg_database WHERE datname = 'aims_clinical') THEN
+        EXECUTE format('ALTER ROLE %I IN DATABASE aims_clinical '
+                       'SET search_path = by_visit, public', p_role);
+    END IF;
 END $$;
 
 

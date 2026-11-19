@@ -105,3 +105,13 @@ async def test_a_refused_registration_says_why_and_the_next_patient_tries_again(
     assert await rt.register_from_trigger("CMED-NOWHERE") == "UNKNOWN_CLINIC"
     assert rt.identity is None and rt.controller.register is not None
     assert rt.warnings == [ts.AWAITING_REGISTRATION]
+
+
+async def test_a_refusal_passes_on_the_servers_reason(monkeypatch):
+    """16 Nov: CMED's page gets which clinic code, and what to do - not only the code."""
+    why = ("CMED's clinic code 'CMED-NOWHERE' is not set up on the AIMS LAB server. "
+           "AIMS LAB links it to one of its clinics.")
+    rt, asked = registering(monkeypatch, enrollment.EnrollmentError(
+        "server refused registration (403 UNKNOWN_CLINIC)", rejected=True,
+        code="UNKNOWN_CLINIC", reason=why))
+    assert await rt.register_from_trigger("CMED-NOWHERE") == f"UNKNOWN_CLINIC: {why}"

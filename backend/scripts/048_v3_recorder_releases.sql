@@ -1,5 +1,5 @@
 -- ================================================================
--- 036 - Recorder updates: which AIMScribeSetup.exe each PC should run
+-- 048 - Recorder updates: which AIMScribeSetup.exe each PC should run
 --
 --   recorder_releases   one row per release made available to recorders:
 --                       its version, where to download it and the file's

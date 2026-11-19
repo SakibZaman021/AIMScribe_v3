@@ -38,6 +38,8 @@ const clinicName = (id) => {
   const c = CLINICS.find((x) => x.hospital_id === id);
   return (c && c.name) || id || "";
 };
+// 18 Nov: this collector's Telegram, for the warning at Start shift.
+let myTelegram = {};
 const tag = (tone, text, tip) =>
   `<span class="tag ${tone}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(text)}</span>`;
 const empty = (title, line, ok) =>
@@ -89,10 +91,12 @@ $("keyForm").addEventListener("submit", (e) => {
 });
 $("keyDialog").addEventListener("cancel", (e) => e.preventDefault());  // the page needs it
 
+let MINE = false;   // 038: "Only my hospitals" - a researcher's own hospitals
 async function api(path, params, retried) {
   if (!PORTAL && !ADMIN_KEY) await askKey();
   const query = new URLSearchParams(
-    Object.entries(params || {}).filter(([, v]) => v !== "" && v != null));
+    Object.entries({ ...(params || {}), ...(MINE ? { mine: "1" } : {}) })
+      .filter(([, v]) => v !== "" && v != null));
   const response = await fetch(`/api/v2/dashboard${path}?${query}`,
     { headers: portalHeaders() });
   if (PORTAL && response.status === 401) {
@@ -233,6 +237,7 @@ const STATE_LABELS = {
   stopped_early: "Stopped early",
   unarchived: "Not archived",
   uncopied: "No cloud copy",
+  not_jabra: "Not on the Jabra",
   refused: "Refused",
   expired: "Expired",
   legacy: "Legacy",
@@ -327,7 +332,11 @@ function go(id) {
 const VIEWS = {
   overview: ["Overview", "How the clinics, the recordings and the server are doing", true],
   recordings: ["Recordings", "Every consultation, its confirmation, and where its audio is", true],
+  events: ["Event log", "Every start, end, pause, refusal, microphone change, CMED message and alert", true],
   pcs: ["PCs", "The recorders in the consulting rooms", true],
+  patient: ["Patients", "One patient's visits, newest first: demographics, prescriptions and recordings", false],
+  shift: ["My shift", "Your shift, and the alerts mailed to you", false],
+  watch: ["My alerts", "The hospitals you look after: alerts, and the evening report", false],
   downloads: ["Downloads", "Recordings in numbered batches, one ZIP each", false],
   cmed: ["CMED", "CMED's EHR addresses and the key each hospital signs with", false],
   people: ["People", "Who may sign in, and their database logins", false],
@@ -499,7 +508,7 @@ function drawProblems(d) {
   if (s.length) {
     html += `<div class="group-title">Stopped early</div><ul class="list">`
       + s.map((r) => `<li><span class="n">${num(r.n)}</span>`
-        + `<span>${tag("warn", human(r.close_reason))} ${who(r)}</span></li>`).join("")
+        + `<span>${tag("warn", (ENDED[r.close_reason] || [0, human(r.close_reason)])[1])} ${who(r)}</span></li>`).join("")
       + `</ul>`;
   }
   if (a.length) {
@@ -633,6 +642,9 @@ function drawRooms(d) {
       const disk = q.disk_encrypted === true ? tag("good", "Encrypted")
         : q.disk_encrypted === false ? tag("bad", "Not encrypted")
         : `<span class="hint">not reported</span>`;
+      const key = q.key === "tpm" ? tag("good", "TPM chip", "Its key is inside the PC's security chip: it cannot be copied off this PC")
+        : q.key === "software" ? tag("warn", "Software key", "No usable TPM chip (or joined before 3.6): its key is locked to this PC by Windows, but a person with full control of the PC could copy it. Revoke the PC here if it is ever lost or misused.")
+        : `<span class="hint">–</span>`;
       const mic = !q.microphone ? `<span class="hint">not reported</span>`
         : q.microphone_is_clinic ? tag("good", "Jabra", q.microphone)
         : tag("warn", "PC microphone", `${q.microphone} - the Jabra is not plugged in`);
@@ -661,13 +673,14 @@ function drawRooms(d) {
         + td("Held", held, "num")
         + td("Microphone", mic)
         + td("Disk", disk)
+        + td("Key", key)
         + td("Clock", clock, "num")
         + td("Offline (7 days)", offlineText(q.offline_periods))
         + `</tr>`;
     }).join("");
   });
   $("rooms").innerHTML = `<table><thead><tr><th>PC</th><th>State</th><th>Last seen</th>`
-    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th>`
+    + `<th>Version</th><th class="num">Audio waiting</th><th class="num">Held</th><th>Microphone</th><th>Disk</th><th>Key</th>`
     + `<th class="num">Clock</th><th>Offline (7 days)</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
@@ -786,16 +799,28 @@ const confirmTag = (v) => {
   const m = CONFIRM[v] || ["quiet", v || "–"];
   return tag(m[0], m[1]);
 };
-// How a recording ended. The first three are the normal ends (dashboard.py,
-// _ENDED_NORMALLY); the others are "stopped early".
+// How a recording ended. Green: the two ordinary ends - the next patient, or
+// the consultation finished (dashboard.py, _ENDED_NORMALLY). Everything else is
+// "stopped early", and alerts the collectors and researchers.
 const ENDED = {
   superseded_by_new_patient: ["good", "Next patient"],
   counselling_limit: ["good", "2 min after prescription"],
   prescription_built: ["good", "Prescription"],
-  doctor_stopped: ["warn", "Stopped by the doctor"],
+  doctor_stopped: ["good", "Consultation finished"],
+  consultation_finished: ["good", "Consultation finished"],
+  patient_did_not_consent: ["bad", "Patient did not consent"],
+  "doctor_stopped:patient_left": ["warn", "Patient left the room"],
+  "doctor_stopped:urgent_interruption": ["warn", "Emergency or urgent interruption"],
+  "doctor_stopped:technical_problem": ["bad", "Recorder or microphone problem"],
+  "doctor_stopped:other": ["warn", "Stopped: other reason"],
+  patient_left: ["warn", "Patient left the room"],
+  urgent_interruption: ["warn", "Emergency or urgent interruption"],
+  technical_problem: ["bad", "Recorder or microphone problem"],
+  recovered_after_unclean_shutdown: ["bad", "Recorder crashed, recovered"],
+  no_activity_limit: ["warn", "Nobody pressed Stop"],
   stopped_from_tray: ["warn", "Stopped by the doctor"],
-  pc_shutdown: ["warn", "PC shut down"],
-  agent_shutdown: ["warn", "Recorder closed"],
+  pc_shutdown: ["bad", "PC shut down"],
+  agent_shutdown: ["bad", "Recorder closed"],
   software_update: ["quiet", "Recorder updated"],
 };
 const timeOf = (v) => { const m = /(\d{2}:\d{2})/.exec(String(v || "")); return m ? m[1] : ""; };
@@ -821,17 +846,46 @@ function storedTag(r) {
    Only for someone signed in: each download is logged against their email.
    One link per patient file when a recording was cut into several. */
 function audioLinks(r) {
+  if (PORTAL && PORTAL.role === "collector") return `<span class="hint">view only</span>`;
   if (!r.copied || r.confirmation !== "confirmed") return `<span class="hint">–</span>`;
   if (!PORTAL) return `<span class="hint">sign in</span>`;
   const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/audio`;
   const files = r.files || [];
   const link = (href, label, title) =>
     `<a class="copy dl" href="${esc(href)}" title="${esc(title)}">${esc(label)}</a>`;
+  // 17 Nov: the clinical record CMED sent (JSON), decrypted the same way, for
+  // the same people: researchers and admins (a data collector stopped above).
+  const record = files.length > 1
+      ? "<br>" + files.map((f) => link(`${recordUrl(r)}?part=${f.part_no}`, `Record ${f.part_no}`,
+          `Download the clinical record of patient file ${f.part_no} (JSON)`)).join(" ")
+      : "<br>" + link(recordUrl(r), "Record (JSON)", "Download the clinical record CMED sent (JSON)");
   if (files.length > 1) {
     return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
-      `Download patient file ${f.part_no} (WAV)`)).join(" ");
+      `Download patient file ${f.part_no} (WAV)`)).join(" ") + record;
   }
-  return link(base, "Download", "Download the WAV");
+  return link(base, "Audio (WAV)", "Download the WAV") + record;
+}
+
+function recordUrl(r) {
+  return `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/record`;
+}
+
+/* 036: which microphone a recording used - the Jabra, the PC's own, or both. */
+function micTag(m) {
+  if (!m || m.kind === "unknown") return `<span class="hint">not reported</span>`;
+  const names = (m.names || []).join(", ");
+  return tag(m.kind === "jabra" ? "good" : "warn", m.label, names);
+}
+
+/* 18 Nov: when CMED's API 2 / API 3 for this recording's visit reached us. */
+function cmedArrival(r, iso, what) {
+  if (!r.cmed_matched) return `<span class="hint">–</span>`;
+  if (!iso) return tag("warn", "not received", `CMED's ${what} for this visit has not reached the server`);
+  const at = new Date(iso);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" });
+  const day = at.toLocaleDateString("en-CA", { timeZone: "Asia/Dhaka" });
+  const other = r.date && day !== String(r.date).slice(0, 10);
+  return tag("good", other ? `${day} ${time}` : time, `CMED's ${what} arrived ${at.toLocaleString([], { timeZone: "Asia/Dhaka" })}`);
 }
 
 function recordingsTable(list) {
@@ -841,9 +895,10 @@ function recordingsTable(list) {
       : empty("No recordings in this range", "Pick a wider range or another clinic.");
   }
   const showClinic = !$("clinic").value;
-  return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>Doctor</th>`
-    + `<th>Patient files and rule</th><th class="num">Length</th><th>CMED</th><th>Status</th>`
-    + `<th>Stored</th><th>Audio</th><th>Folder on server</th></tr></thead><tbody>`
+  return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>PC</th><th>Doctor</th>`
+    + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
+    + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th>`
+    + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
@@ -854,19 +909,38 @@ function recordingsTable(list) {
           const [tone, text] = ENDED[r.close_reason] || ["warn", "Stopped: " + human(r.close_reason)];
           status.push(tag(tone, text));
         }
+        // 18 Nov: open, but its PC has gone quiet - the audio waits on that PC.
+        if (r.on_pc_offline_since) {
+          status.push(tag("warn", "Waiting on the PC (offline since "
+            + esc(r.on_pc_offline_since.replace("T", " ").slice(0, 16)) + " UTC)",
+            "The PC went offline with this recording open. Its audio is on the PC and is sent, and the recording closed, when the PC is back online."));
+        }
+        // 18 Nov: the doctor has it paused now - nothing is being recorded.
+        if (r.paused_since) {
+          const at = new Date(r.paused_since).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" });
+          status.push(tag("warn", `Paused since ${at}` + (r.pause_reason ? ` (${human(r.pause_reason)})` : ""),
+            "The doctor paused this recording; nothing is recorded until they press Resume."));
+        }
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";
         return `<tr class="${tone}">`
           + td("Date", `${esc(r.date || "")}${t ? `<span class="sub2">${esc(t)}</span>` : ""}`)
           + (showClinic ? td("Clinic", esc(clinicName(r.hospital_id))) : "")
+          + td("PC", r.pc ? `<span title="${esc(r.pc_id || "")}">${esc(r.pc)}</span>` : `<span class="hint">–</span>`)
           + td("Doctor", esc(r.doctor_id))
           + td("Patient", filesText(r), "wrap")
-          + td("Length", `${num(r.minutes || 0)} min`, "num")
+          + td("Visit", r.visit_id ? esc(r.visit_id) : `<span class="hint">–</span>`)
+          + td("Length", `${num(r.minutes || 0)} min`
+            + (r.pauses ? `<span class="sub2" title="Paused by the doctor ${r.pauses} time(s): nothing was recorded then">`
+              + `paused ${num(r.paused_minutes || 0)} min (${r.pauses})</span>` : ""), "num")
+          + td("Microphone", micTag(r.microphone))
           + td("CMED", confirmTag(r.confirmation))
+          + td("Demographics", cmedArrival(r, r.api2_at, "demographics (API 2)"))
+          + td("Prescription", cmedArrival(r, r.api3_at, "prescription (API 3)"))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
-          + td("Audio", audioLinks(r))
+          + td("Download", audioLinks(r))
           + td("Folder", folder
             ? `<span title="${esc(folder)}">${esc(folder)}</span>`
               + ` <button type="button" class="copy" data-copy="${esc(folder)}">Copy</button>`
@@ -895,7 +969,7 @@ function drawStateFilters() {
     refused: c.refused, expired: c.expired, legacy: c.legacy,
   };
   const order = ["", "pending", "unconfirmed", "confirmed", "quarantined", "stopped_early",
-                 "unarchived", "uncopied", "refused", "expired", "legacy"];
+                 "not_jabra", "unarchived", "uncopied", "refused", "expired", "legacy"];
   $("stateFilters").innerHTML = order.map((s) => {
     const n = counts[s];
     if (["refused", "expired", "legacy"].includes(s) && !n && STATE !== s) return "";
@@ -935,6 +1009,64 @@ async function loadRecordings() {
     $("recTable").innerHTML = empty("Could not load recordings", err.message);
   }
 }
+
+/* 18 Nov: the event log - what happened to each recording, newest first. */
+let EVENT_KIND = "";
+let eventSeq = 0;
+const EVENT_TONES = { "Patient did not consent": "bad", "Recording stopped unusually": "warn",
+  "Paused by the doctor": "warn", "Resumed": "good", "Not received from CMED": "bad",
+  "Microphone changed": "warn", "Alert sent": "quiet", "Recording ended": "good" };
+
+function eventParams() {
+  return { from: $("from").value, to: $("to").value, hospital_id: $("clinic").value,
+           doctor_id: $("eventDoctor").value.trim(), kind: EVENT_KIND };
+}
+
+async function loadEvents() {
+  const seq = ++eventSeq;
+  if (!$("eventsTable").firstChild) $("eventsTable").innerHTML = empty("Loading");
+  try {
+    const d = await api("/events", eventParams());
+    if (seq !== eventSeq) return;
+    const list = d.events || [];
+    $("eventsHint").textContent = `${num(d.count)} events${d.count > list.length ? ` (newest ${num(list.length)} shown; the CSV has all)` : ""} · newest first`;
+    if (!list.length) { $("eventsTable").innerHTML = empty("Nothing in this range", "Pick a wider range or another clinic."); return; }
+    const showClinic = !$("clinic").value;
+    $("eventsTable").innerHTML = `<table><thead><tr><th>Time</th>${showClinic ? "<th>Clinic</th>" : ""}`
+      + `<th>PC</th><th>Doctor</th><th>Patient</th><th>Event</th><th>Detail</th></tr></thead><tbody>`
+      + list.map((e) => `<tr>`
+        + td("Time", esc(e.time))
+        + (showClinic ? td("Clinic", esc(clinicName(e.hospital))) : "")
+        + td("PC", esc(e.pc || "–"))
+        + td("Doctor", esc(e.doctor || "–"))
+        + td("Patient", esc(e.patient_id || "–") + (e.visit_id ? `<span class="sub2">visit ${esc(e.visit_id)}</span>` : ""))
+        + td("Event", tag(EVENT_TONES[e.event] || "quiet", e.event))
+        + td("Detail", esc(e.detail || ""), "wrap")
+        + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    if (seq !== eventSeq) return;
+    $("eventsTable").innerHTML = empty("Could not load the event log", err.message);
+  }
+}
+
+$("eventKinds").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-kind]");
+  if (!b) return;
+  EVENT_KIND = b.dataset.kind;
+  document.querySelectorAll("#eventKinds [data-kind]").forEach((x) =>
+    x.setAttribute("aria-pressed", String(x === b)));
+  loadEvents();
+});
+$("eventDoctor").addEventListener("change", loadEvents);
+
+function fileLink(path, params) {
+  const query = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
+  window.location.href = `/api/v2/dashboard${path}?${query}`;
+}
+$("eventsCsv").addEventListener("click", () => fileLink("/events", { ...eventParams(), format: "csv" }));
+$("cmedMissingCsv").addEventListener("click", () => fileLink("/cmed-missing.csv",
+  { from: $("from").value, to: $("to").value, hospital_id: $("clinic").value }));
+addEventListener("hashchange", () => { if (location.hash === "#events") loadEvents(); });
 
 /* ============================================================
    Refresh, auto-refresh and the "updated" pill.
@@ -984,6 +1116,8 @@ async function refresh() {
     LAST = d;
     drawAll(d);
     await loadRecordings();
+    if (!$("eventsTable").closest(".view").hidden) loadEvents();
+    if (PORTAL && PORTAL.role === "collector") loadShift();
     FAILED = false;
     UPDATED_AT = Date.now();
     if (!(d.volume.total_recordings)) {
@@ -1065,7 +1199,7 @@ async function whoAmI() {
   if (reply.status === 404) return;                 // the loopback door: the admin key
   const me = await reply.json().catch(() => ({}));
   if (reply.ok && me.signed_in) {
-    PORTAL = { email: me.email, role: me.role };
+    PORTAL = { email: me.email, role: me.role, place_id: me.place_id };
     $("who").textContent = `${me.email} \u00b7 ${me.role}`;
     $("who").hidden = false;
     $("signout").hidden = false;
@@ -1074,11 +1208,24 @@ async function whoAmI() {
       $("navPeople").hidden = false;
       loadPeople();
       $("originsPanel").hidden = false;
+      $("codesPanel").hidden = false;
+      $("deviceLogPanel").hidden = false;
       $("clientsPanel").hidden = false;
       $("navCmed").hidden = false;
       loadCmed();
       $("updatesPanel").hidden = false;
       loadUpdates();
+      $("placesPanel").hidden = false;
+      $("shiftLogPanel").hidden = false;
+      loadPlaces();
+    }
+    if (me.role === "collector") {
+      $("navShift").hidden = false;
+      loadShift();
+    }
+    if (me.role === "researcher" || me.role === "admin") {
+      $("navWatch").hidden = false;
+      loadWatch(true);
     }
   } else if (me.google) {
     window.location.href = "/auth/login?next=/dashboard";
@@ -1100,7 +1247,154 @@ async function adminCall(method, path, body) {
    ============================================================ */
 const dhaka = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
 
+/* 16 Nov: each clinic's CMED code, and PCs that could not join with the code they sent. */
+let CLINIC_CODES = [];
+async function loadCodes() {
+  let data;
+  try { data = await adminCall("GET", "/api/v2/admin/clinic-codes"); }
+  catch (err) {
+    $("codes").innerHTML = empty("Clinic codes could not be loaded", err.message, true);
+    return;
+  }
+  CLINIC_CODES = data.clinics || [];
+  // The connection form chooses among them, or a new one (16 Nov).
+  const keep = $("cClinic").value;
+  $("cClinic").innerHTML = `<option value="">Choose...</option>`
+    + CLINIC_CODES.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.hospital_id)} ${esc(c.name || "")}`
+      + `${c.cmed_hospital_id ? " (now " + esc(c.cmed_hospital_id) + ")" : ""}</option>`).join("")
+    + `<option value="__new">A new clinic...</option>`;
+  $("cClinic").value = keep;
+  $("codes").innerHTML = !CLINIC_CODES.length
+    ? empty("No clinic yet", "Clinics appear here once they are set up.", true)
+    : `<table><thead><tr><th>Our clinic</th><th>CMED's code for it</th><th>PCs</th>`
+      + `<th>Last from CMED</th></tr></thead><tbody>`
+      + CLINIC_CODES.map((c) => `<tr>`
+        + td("Our clinic", `<b><code>${esc(c.hospital_id)}</code></b><br><span class="hint">${esc(c.name || "")}</span>`
+          + (c.active ? "" : ` ${tag("quiet", "inactive")}`))
+        + td("CMED's code", `<input class="small" data-codefor="${esc(c.hospital_id)}" value="${esc(c.cmed_hospital_id || "")}" `
+          + `placeholder="${esc(c.hospital_id)} (our ID)" aria-label="CMED code for ${esc(c.hospital_id)}"> `
+          + `<button type="button" class="chip" data-savecode="${esc(c.hospital_id)}">Save</button>`)
+        + td("PCs", esc(String(c.pcs || 0)))
+        + td("Last from CMED", esc(c.cmed_last_message_at ? dhaka(c.cmed_last_message_at) : "never"))
+        + `</tr>`).join("") + `</tbody></table>`;
+  const refused = data.refused || [];
+  const options = CLINIC_CODES.map((c) =>
+    `<option value="${esc(c.hospital_id)}">${esc(c.hospital_id)} ${esc(c.name || "")}</option>`).join("");
+  $("refusedPcs").innerHTML = !refused.length
+    ? empty("None", "No PC was refused in the last 30 days.", true)
+    : `<table><thead><tr><th>Last tried</th><th>Code CMED sent</th><th>Why</th><th>PC</th>`
+      + `<th>Fix</th></tr></thead><tbody>`
+      + refused.map((r) => `<tr>`
+        + td("Last tried", esc(dhaka(r.last_at)))
+        + td("Code CMED sent", `<code>${esc(r.cmed_hospital_id || "")}</code>`)
+        + td("Why", tag(r.code === "UNKNOWN_CLINIC" ? "bad" : "warn", r.code || ""))
+        + td("PC", `${esc(r.machine_name || "")}<br><span class="hint">${esc(r.address || "")}`
+          + `${r.app_version ? " · recorder " + esc(r.app_version) : ""}</span>`)
+        + td("Fix", r.linked_now ? tag("good", "linked now: joins at the next patient")
+          : r.code !== "UNKNOWN_CLINIC" ? `<span class="hint">see the reason</span>`
+          : `<select class="small" data-linkcode="${esc(r.cmed_hospital_id || "")}" aria-label="Clinic for ${esc(r.cmed_hospital_id || "")}">`
+            + `<option value="">Link to clinic...</option>${options}</select>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+async function saveCode(hospitalId, code) {
+  const clinic = CLINIC_CODES.find((c) => c.hospital_id === hospitalId);
+  if (!clinic) return;
+  if (!code) { window.alert("Type CMED's code first."); return; }
+  if (clinic.cmed_hospital_id && clinic.cmed_hospital_id !== code
+      && !window.confirm(`${hospitalId} answers to '${clinic.cmed_hospital_id}' now. Replace it with '${code}'? PCs sent the old code would no longer join.`)) return;
+  try {
+    await adminCall("POST", "/api/v2/admin/hospital", {
+      hospital_id: hospitalId, name: clinic.name || hospitalId,
+      timezone: clinic.timezone || "Asia/Dhaka", cmed_hospital_id: code });
+  } catch (err) { window.alert(`Not saved: ${err.message}`); }
+  loadCodes();
+}
+
+$("codes").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-savecode]");
+  if (!b) return;
+  const input = document.querySelector(`[data-codefor="${CSS.escape(b.dataset.savecode)}"]`);
+  saveCode(b.dataset.savecode, (input ? input.value : "").trim());
+});
+$("refusedPcs").addEventListener("change", (e) => {
+  const sel = e.target.closest("[data-linkcode]");
+  if (!sel || !sel.value) return;
+  if (!window.confirm(`Link CMED's code '${sel.dataset.linkcode}' to clinic ${sel.value}?`)) { sel.value = ""; return; }
+  saveCode(sel.value, sel.dataset.linkcode);
+});
+
+/* 042: what every PC was told - admins only (the server refuses anyone else). */
+function deviceLogQuery() {
+  return `days=${encodeURIComponent($("dlDays").value)}`
+    + `&failed_only=${$("dlFailed").checked ? "true" : "false"}`
+    + `&q=${encodeURIComponent($("dlSearch").value.trim())}`;
+}
+async function loadDeviceLog() {
+  let rows;
+  try { rows = (await adminCall("GET", `/api/v2/admin/device-log?${deviceLogQuery()}`)).rows || []; }
+  catch (err) { $("deviceLog").innerHTML = empty("The device log could not be loaded", err.message, true); return; }
+  $("deviceLog").innerHTML = !rows.length
+    ? empty("Nothing in this period", "No PC tried to join, and no PC was refused anything.", true)
+    : `<table><thead><tr><th>When</th><th>PC</th><th>Trying to</th><th>Result</th>`
+      + `<th>What the server told it</th><th>What the PC sent</th></tr></thead><tbody>`
+      + rows.map((r) => {
+        const ok = r.status < 400;
+        const when = r.repeats > 1
+          ? `${esc(dhaka(r.last_at))}<br><span class="hint">${r.repeats} times since ${esc(dhaka(r.first_at))}</span>`
+          : esc(dhaka(r.last_at));
+        return `<tr class="${ok ? "" : "row-bad"}">`
+          + td("When", when)
+          + td("PC", `<b>${esc(r.machine_name || "unknown PC")}</b>`
+            + `<br><span class="hint">${esc(r.address || "")}`
+            + `${r.app_version ? " · recorder " + esc(r.app_version) : ""}`
+            + `${r.device_id ? " · " + esc(String(r.device_id).slice(0, 8)) : ""}</span>`)
+          + td("Trying to", esc(r.step || "")
+            + (r.cmed_hospital_id ? `<br><span class="hint">CMED code <code>${esc(r.cmed_hospital_id)}</code></span>` : "")
+            + (r.hospital_id ? `<br><span class="hint">clinic ${esc(r.hospital_id)}</span>` : ""))
+          + td("Result", tag(ok ? "good" : (r.status >= 500 ? "bad" : "warn"),
+                             `${r.status} ${r.code || ""}`))
+          + td("What the server told it", esc(r.message || ""), "wrap")
+          + td("What the PC sent", sentDetails(r.sent, r.repeats), "wrap")
+          + `</tr>`;
+      }).join("") + `</tbody></table>`;
+}
+/* 043: the headers and fields the PC sent (latest attempt); secrets and patient
+   values were never kept, only that they came, their length and a fingerprint. */
+function sentDetails(sent, repeats) {
+  if (!sent || typeof sent !== "object") return `<span class="hint">not recorded</span>`;
+  const lines = [];
+  for (const [key, value] of Object.entries(sent)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const [k, v] of Object.entries(value)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          for (const [k2, v2] of Object.entries(v)) lines.push([`${key}.${k}.${k2}`, v2]);
+        } else lines.push([`${key}.${k}`, v]);
+      }
+    } else lines.push([key, value]);
+  }
+  const show = (v) => esc(Array.isArray(v) ? v.join(", ") : String(v));
+  return `<details class="sent"><summary>${lines.length} item${lines.length === 1 ? "" : "s"}`
+    + `${repeats > 1 ? " (latest try)" : ""}</summary><dl>`
+    + lines.map(([k, v]) => `<dt>${esc(k.replace(/^fields\./, ""))}</dt><dd>${show(v)}</dd>`).join("")
+    + `</dl></details>`;
+}
+$("dlShow").addEventListener("click", loadDeviceLog);
+$("dlFailed").addEventListener("change", loadDeviceLog);
+$("dlDays").addEventListener("change", loadDeviceLog);
+$("dlSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") loadDeviceLog(); });
+$("dlCsv").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = `/api/v2/admin/device-log.csv?${deviceLogQuery()}`;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+});
+
 async function loadCmed() {
+  await loadCodes();
+  loadDeviceLog();
   try {
     const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
     $("origins").innerHTML = !origins.length
@@ -1127,7 +1421,12 @@ async function loadCmed() {
           const live = !c.revoked_at;
           return `<tr class="${live ? "" : ""}">`
             + td("Client id", `<b><code>${esc(c.client_id)}</code></b><br><span class="hint">${esc(c.label || "")}</span>`)
-            + td("Hospital", esc((c.cmed_hospital_ids || []).join(", ")))
+            + td("Hospital", (c.cmed_hospital_ids || []).map((code) => {
+              const clinic = CLINIC_CODES.find((k) => k.cmed_hospital_id === code || k.hospital_id === code);
+              return `<code>${esc(code)}</code> `
+                + (clinic ? tag("good", "clinic " + clinic.hospital_id)
+                          : tag("bad", "no clinic: PCs cannot join"));
+            }).join("<br>"))
             + td("Key", (c.kids || []).map((k) => `<code title="Confirm with CMED by phone">${esc(k)}</code>`).join("<br>") || `<span class="hint">none</span>`)
             + td("Last used", esc(dhaka(c.last_used_at)))
             + td("Valid until", esc(dhaka(c.expires_at)))
@@ -1286,6 +1585,47 @@ $("cHospital").addEventListener("input", () => {
   $("cClient").value = $("cHospital").value.trim().toLowerCase();
 });
 
+/* 16 Nov: a CMED connection lets CMED's server send API 2 and 3 for a code;
+   only a clinic linked to the code lets a PC join. Both are done here, the
+   clinic first - Nabila's PC was refused because only the first was done. */
+$("cClinic").addEventListener("change", () => {
+  const isNew = $("cClinic").value === "__new";
+  $("cNewWrap").hidden = !isNew;
+  $("cNewNameWrap").hidden = !isNew;
+});
+
+async function linkCodeToClinic(code, clinicId, newName) {
+  const clinic = CLINIC_CODES.find((c) => c.hospital_id === clinicId);
+  if (clinic && clinic.cmed_hospital_id && clinic.cmed_hospital_id !== code
+      && !window.confirm(`${clinicId} answers to '${clinic.cmed_hospital_id}' now. Replace it with '${code}'? `
+        + "PCs sent the old code would no longer join.")) {
+    throw new Error("not linked: the clinic keeps its code");
+  }
+  await adminCall("POST", "/api/v2/admin/hospital", {
+    hospital_id: clinicId, name: clinic ? (clinic.name || clinicId) : newName,
+    timezone: clinic ? (clinic.timezone || "Asia/Dhaka") : "Asia/Dhaka", cmed_hospital_id: code });
+}
+
+$("clinicForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = $("ncId").value.trim();
+  const name = $("ncName").value.trim();
+  const code = $("ncCode").value.trim();
+  if (CLINIC_CODES.some((c) => c.hospital_id === id)) {
+    $("clinicMsg").textContent = `${id} already exists: give it a code in the table below.`;
+    return;
+  }
+  try {
+    await adminCall("POST", "/api/v2/admin/hospital", {
+      hospital_id: id, name, timezone: "Asia/Dhaka", cmed_hospital_id: code });
+    $("clinicMsg").textContent = code
+      ? `Added ${id}, answering to '${code}': a PC CMED starts with that code joins at its next patient.`
+      : `Added ${id}. Give it CMED's code in the table below before its PCs can join.`;
+    $("ncId").value = ""; $("ncName").value = ""; $("ncCode").value = "";
+    loadCmed();
+  } catch (err) { $("clinicMsg").textContent = `Not added: ${err.message}`; }
+});
+
 $("clientForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   let jwk;
@@ -1296,11 +1636,27 @@ $("clientForm").addEventListener("submit", async (e) => {
   if (by.length < 2) return;
   const hospital = $("cHospital").value.trim();
   const alg = jwk.crv === "P-256" ? "ES256" : jwk.kty === "RSA" ? "RS384" : "ES384";
+  let clinicId = $("cClinic").value;
+  const isNew = clinicId === "__new";
+  if (isNew) clinicId = $("cNewId").value.trim();
+  if (!clinicId || (isNew && !$("cNewName").value.trim())) {
+    $("clientMsg").textContent = "Choose our clinic for this code (or give the new clinic's ID and name): "
+      + "without it, PCs CMED starts with this code cannot join.";
+    return;
+  }
+  if (isNew && CLINIC_CODES.some((c) => c.hospital_id === clinicId)) {
+    $("clientMsg").textContent = `${clinicId} already exists: choose it in the list instead.`;
+    return;
+  }
+  try {
+    await linkCodeToClinic(hospital, clinicId, $("cNewName").value.trim());
+  } catch (err) { $("clientMsg").textContent = `Not registered: ${err.message}`; return; }
   try {
     const r = await adminCall("POST", "/api/v2/admin/cmed-client", {
       client_id: $("cClient").value.trim(), label: `CMED - ${hospital}`,
       cmed_hospital_ids: [hospital], created_by: by, jwk, alg });
-    $("clientMsg").innerHTML = `Registered. Send CMED: client_id <code>${esc(r.client_id)}</code>, `
+    $("clientMsg").innerHTML = `Registered, and '${esc(hospital)}' linked to clinic ${esc(clinicId)}. `
+      + `Send CMED: client_id <code>${esc(r.client_id)}</code>, `
       + `kid <code>${esc(r.kid)}</code>. Before they use it, read the kid to them by phone: `
       + `their key tool printed the same value.`;
     $("cJwk").value = "";
@@ -1328,22 +1684,68 @@ $("clients").addEventListener("click", async (e) => {
   loadCmed();
 });
 
+let HOSPITAL_LIST = [];   // 038: for "Looks after"
 async function loadPeople() {
   try {
-    const { people, mail } = await adminCall("GET", "/api/v2/admin/people");
-    $("peopleHint").textContent = mail ? "An invitation email is sent when you give access"
-      : "No mail account is set, so send them the link yourself";
+    const { people, mail, mail_status } = await adminCall("GET", "/api/v2/admin/people");
+    if (!HOSPITAL_LIST.length) {
+      try { HOSPITAL_LIST = (await adminCall("GET", "/api/v2/admin/places")).hospitals || []; }
+      catch (err) { HOSPITAL_LIST = []; }
+    }
+    const watchCell = (p) => {
+      const mine = p.watching || [];
+      if (p.role === "collector") {
+        // 18 Nov: assigned as a researcher, then made a collector - the
+        // researcher alerts skip them, so they hear nothing for these hospitals.
+        if (!mine.length) return `<span class="hint">from their place</span>`;
+        return tag("bad", "Gets no researcher alerts",
+            "A data collector is sent only their place's alerts. Make them a researcher, or take these hospitals off.")
+          + " " + mine.map((h) => `<button type="button" class="chip" title="Take ${esc(h)} off"`
+          + ` data-unwatch="${esc(p.email)}" data-hospital="${esc(h)}">${esc(h)} ×</button>`).join(" ");
+      }
+      return mine.map((h) => `<button type="button" class="chip" title="Stop looking after ${esc(h)}" `
+          + `data-unwatch="${esc(p.email)}" data-hospital="${esc(h)}">${esc(h)} \u00d7</button>`).join(" ")
+        + ` <select class="small" data-watchsel="${esc(p.email)}" aria-label="Give ${esc(p.email)} a hospital">`
+        + `<option value="">+ hospital</option>`
+        + HOSPITAL_LIST.filter((h) => !mine.includes(h.hospital_id)).map((h) =>
+          `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("")
+        + `</select>`;
+    };
+    $("peopleHint").textContent = mail_status && mail_status.ready
+      ? "An invitation email is sent when you give access"
+      : "Invitation emails are not working yet, so send them the link yourself. "
+        + ((mail_status && mail_status.problem) || "");
     const when = (iso) => (iso ? new Date(iso).toLocaleString([], { timeZone: "Asia/Dhaka" }) : "never");
     $("people").innerHTML = `<table><thead><tr><th>Google account</th><th>Role</th>`
-      + `<th>Given by</th><th>Last signed in</th><th>Database login</th><th></th></tr></thead><tbody>`
+      + `<th>Looks after</th><th>Given by</th><th>Last signed in</th><th>Database login</th><th>Telegram</th><th></th></tr></thead><tbody>`
       + people.map((p) => `<tr>`
-        + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`)
-        + td("Role", p.role === "admin" ? tag("warn", "Admin") : tag("good", "Researcher"))
+        + td("Google account", `<b>${esc(p.email)}</b>${p.display_name ? `<br><span class="hint">${esc(p.display_name)}</span>` : ""}`
+          + (p.role === "collector"
+            ? `<br>${p.official_name ? esc(p.official_name) : tag("warn", "no official name")} `
+              + `${p.collector_code ? `<code>${esc(p.collector_code)}</code>` : tag("warn", "no ID")} `
+              + `<button type="button" class="chip" data-detail="official_name" data-who="${esc(p.email)}" `
+              + `data-current="${esc(p.official_name || "")}">Name</button> `
+              + `<button type="button" class="chip" data-detail="collector_code" data-who="${esc(p.email)}" `
+              + `data-current="${esc(p.collector_code || "")}">ID</button>`
+            : ""))
+        + td("Role", p.role === "admin" ? tag("warn", "Admin")
+          : p.role === "collector" ? tag("info", "Data collector")
+            + (p.place ? `<br><span class="hint">${esc(p.place)}</span>` : "")
+          : tag("good", "Researcher"))
+        + td("Looks after", watchCell(p))
         + td("Given by", esc(p.added_by || ""))
         + td("Last signed in", esc(when(p.last_signed_in)))
-        + td("Database login", (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
+        + td("Database login", p.role === "collector" ? `<span class="hint">none (view only)</span>`
+          : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
+        + td("Telegram", (p.telegram ? tag("good", "connected")
+          : tag(p.role === "collector" || (p.watching || []).length ? "warn" : "quiet", "not connected"))
+          + (p.role === "collector"
+            ? `<br>${p.phone ? esc(p.phone) : tag("warn", "no phone")} `
+              + `<button type="button" class="chip" data-phone="${esc(p.email)}" `
+              + `data-current="${esc(p.phone || "")}">Phone</button>`
+            : ""))
         + td("", p.owner ? `<span class="hint">owner</span>`
           : `<button type="button" class="chip" data-remove="${esc(p.email)}">Remove</button>`)
         + `</tr>`).join("") + `</tbody></table>`;
@@ -1357,9 +1759,16 @@ $("peopleForm").addEventListener("submit", async (e) => {
   const email = $("pEmail").value.trim();
   if (!email) return;
   try {
-    const r = await adminCall("POST", "/api/v2/admin/people", { email, role: $("pRole").value });
+    const role = $("pRole").value;
+    const body = { email, role };
+    if (role === "collector") {
+      if (!$("pPlace").value) { $("peopleMsg").textContent = "Pick the collector's place first (add places below)."; return; }
+      body.place_id = Number($("pPlace").value);
+    }
+    const r = await adminCall("POST", "/api/v2/admin/people", body);
     $("peopleMsg").textContent = r.invited ? `Invitation sent to ${r.email}.`
-      : `${r.email} can now sign in at ${r.link}`;
+      : `${r.email} can now sign in at ${r.link} - send them this link yourself; `
+        + `no invitation email was sent (${r.invite_error || "mail is not set up"}).`;
     if (r.db_login) showDbLogin(r.email, r.db_login);
     else if (r.db_login_error) $("peopleMsg").textContent += ` (No database login: ${r.db_login_error})`;
     $("pEmail").value = "";
@@ -1375,7 +1784,49 @@ function showDbLogin(email, login) {
     + `viewer (/db/) signed in with Google, then use this login.`;
 }
 
+$("people").addEventListener("change", async (e) => {
+  const sel = e.target.closest("[data-watchsel]");
+  if (!sel || !sel.value) return;
+  try {
+    await adminCall("POST", "/api/v2/admin/people/watch",
+                    { email: sel.dataset.watchsel, hospital_id: sel.value });
+  } catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadPeople();
+});
 $("people").addEventListener("click", async (e) => {
+  const w = e.target.closest("[data-unwatch]");
+  if (w) {
+    if (!window.confirm(`${w.dataset.unwatch} stops looking after ${w.dataset.hospital}?`)) return;
+    try {
+      await adminCall("POST", "/api/v2/admin/people/watch",
+                      { email: w.dataset.unwatch, hospital_id: w.dataset.hospital, remove: true });
+    } catch (err) { window.alert(`Not done: ${err.message}`); }
+    loadPeople();
+    return;
+  }
+  const dt = e.target.closest("[data-detail]");
+  if (dt) {
+    const what = dt.dataset.detail === "official_name" ? "Official name" : "ID (like DC-07)";
+    const value = window.prompt(`${what} for ${dt.dataset.who} (empty to clear):`,
+                                dt.dataset.current || "");
+    if (value === null) return;
+    try {
+      await adminCall("POST", "/api/v2/admin/people/details",
+                      { email: dt.dataset.who, [dt.dataset.detail]: value });
+    } catch (err) { window.alert(`Not saved: ${err.message}`); }
+    loadPeople();
+    return;
+  }
+  const ph = e.target.closest("[data-phone]");
+  if (ph) {
+    const phone = window.prompt(`Phone number for ${ph.dataset.phone} (empty to clear):`,
+                                ph.dataset.current || "");
+    if (phone === null) return;
+    try { await adminCall("POST", "/api/v2/admin/people/phone", { email: ph.dataset.phone, phone }); }
+    catch (err) { window.alert(`Not saved: ${err.message}`); }
+    loadPeople();
+    return;
+  }
   const k = e.target.closest("[data-dblogin]");
   if (k) {
     const who = k.dataset.dblogin;
@@ -1612,6 +2063,139 @@ $("bBatches").addEventListener("click", (e) => {
 });
 $("bEveryone").addEventListener("change", loadBatches);
 
+/* ============================================================
+   One patient's history (18 Nov 2026): type the ID, see every visit.
+   ============================================================ */
+function pText(label, value) {
+  return value ? `<div class="prow"><span class="pl">${esc(label)}</span><span class="pv">${esc(value)}</span></div>` : "";
+}
+function pArrived(iso, ok) {
+  if (!ok) return tag("warn", "not received");
+  if (!iso) return tag("good", "received");
+  return tag("good", String(iso).replace("T", " ").slice(0, 16));
+}
+function visitCard(v) {
+  const d = v.demographics || {}, p = v.prescription || {};
+  const vitals = [["BP", d.blood_pressure], ["Pulse", d.pulse], ["Temp", d.temperature],
+    ["Weight", d.weight], ["Height", d.height], ["SpO2", d.spo2]]
+    .filter(([, x]) => x).map(([n, x]) => `${n} ${x}`).join(" · ");
+  const meds = (v.medicines || []).length
+    ? `<table class="pmeds"><thead><tr><th>Medicine</th><th>Strength</th><th>Dose</th><th>How often</th><th>When</th><th>For</th></tr></thead><tbody>`
+      + v.medicines.map((m) => `<tr><td>${esc([m.form, m.medicine].filter(Boolean).join(" "))}</td>`
+        + `<td>${esc(m.strength || "")}</td><td>${esc(m.dose || "")}</td><td>${esc(m.frequency || "")}</td>`
+        + `<td>${esc(m.timing || "")}</td><td>${esc(m.duration || "")}</td></tr>`).join("")
+      + `</tbody></table>` : "";
+  const recs = (v.recordings_detail || []).map((r) => {
+    const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}`;
+    const links = r.copied && r.confirmation === "confirmed" && PORTAL
+      ? ` <a class="copy dl" href="${esc(base)}/audio">Audio (WAV)</a> <a class="copy dl" href="${esc(base)}/record">Record (JSON)</a>`
+      : "";
+    return `<div class="prec">${confirmTag(r.confirmation)} <span class="mono">${esc(r.session_id)}</span>`
+      + ` <span class="hint">${esc(String(r.local_start || "").slice(0, 5))} · ${num(r.minutes || 0)} min</span>${links}</div>`;
+  }).join("");
+  return `<section class="panel pvisit">
+    <div class="head wrap"><h3>${esc(v.visit_date || "")} <span class="hint">${esc(v.start_time || "")}</span></h3>
+      <span class="tags">${tag("quiet", v.visit_id || "no visit ID")} ${tag("quiet", v.doctor_id || "")}
+        ${tag("quiet", v.clinic ? clinicName(v.clinic) : v.cmed_clinic_code || "")}</span></div>
+    <div class="body pbody">
+      <div class="prow"><span class="pl">Demographics</span><span class="pv">${pArrived(v.api2_received_at, v.api2_received)}</span></div>
+      <div class="prow"><span class="pl">Prescription</span><span class="pv">${pArrived(v.api3_received_at, v.api3_received)}</span></div>
+      ${pText("Age", d.age)}
+      ${pText("Vitals", vitals)}
+      ${pText("Complaints", p.chief_complaints)}
+      ${pText("Examination", p.examination)}
+      ${pText("Diagnoses", p.diagnoses)}
+      ${meds ? `<div class="prow"><span class="pl">Medicines</span><span class="pv">${meds}</span></div>` : ""}
+      ${pText("Tests", p.investigations)}
+      ${pText("Advice", p.advice)}
+      ${pText("Follow-up", p.follow_up)}
+      <div class="prow"><span class="pl">Recordings</span><span class="pv">${recs || `<span class="hint">none</span>`}</span></div>
+      ${pText("Archive folder", v.archive_folder)}
+    </div>
+  </section>`;
+}
+async function loadPatient(ref, visit) {
+  $("patientMsg").textContent = "Looking up…";
+  $("patientOut").innerHTML = "";
+  try {
+    const d = await api(`/patient/${encodeURIComponent(ref)}`, visit ? { visit_id: visit } : {});
+    if (!d.found) {
+      $("patientMsg").textContent = `No patient or visit "${ref}" is held.`;
+      return;
+    }
+    const pt = d.patient || {};
+    if (d.visit_found === false) {
+      $("patientMsg").textContent = `${pt.patient_id || ref} has no visit "${visit}". Clear the visit ID to see every visit.`;
+      return;
+    }
+    $("patientMsg").textContent = visit
+      ? `Visit ${visit} of ${pt.patient_id || ref}.`
+      : `${d.visits.length} visit${d.visits.length === 1 ? "" : "s"}, newest first.`;
+    $("patientOut").innerHTML = `<section class="panel"><div class="head wrap"><h3>${esc(pt.patient_id || ref)}</h3>
+      <span class="tags">${tag("quiet", pt.cmed_clinic_code || "")}</span></div>
+      <div class="body pbody">
+        ${pText("Sex", pt.sex)}${pText("Date of birth", pt.date_of_birth)}${pText("Age", pt.age)}
+        ${pText("Blood group", pt.blood_group)}${pText("Visits", String(pt.visits || d.visits.length))}
+        ${pText("First visit", pt.first_visit)}${pText("Last visit", pt.last_visit)}
+      </div></section>` + d.visits.map(visitCard).join("");
+  } catch (err) {
+    $("patientMsg").textContent = `Not shown: ${err.message}`;
+  }
+}
+$("patientForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const ref = $("patientRef").value.trim();
+  if (ref) loadPatient(ref, $("visitRef").value.trim());
+});
+
+/* 19 Nov 2026: the demographics, prescriptions or medicines of every visit
+   in the dates chosen, as a CSV. The server checks the dates and the role. */
+function fillCsvClinics() {
+  const sel = $("csvClinic");
+  const chosen = sel.value;
+  sel.innerHTML = `<option value="">All clinics</option>`
+    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+  sel.value = chosen;
+}
+// Fetched rather than opened, so the admin key goes with it and a refusal
+// (too many rows, a bad date) is said here instead of replacing the page.
+document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click", async () => {
+  const from = $("csvFrom").value, to = $("csvTo").value;
+  const msg = $("csvMsg");
+  if (from && to && from > to) {
+    msg.textContent = "From is after To.";
+    return;
+  }
+  const query = new URLSearchParams(Object.entries(
+    { table: b.dataset.csv, from, to, hospital_id: $("csvClinic").value })
+    .filter(([, v]) => v !== "" && v != null));
+  msg.textContent = "Preparing...";
+  b.disabled = true;
+  try {
+    const response = await fetch(`/api/v2/dashboard/clinical.csv?${query}`,
+      { headers: portalHeaders() });
+    if (!response.ok) {
+      let detail = `Server error ${response.status}`;
+      try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    const named = /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = named ? named[1] : `${b.dataset.csv}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    msg.textContent = `Downloaded ${link.download}.`;
+  } catch (err) {
+    msg.textContent = `Not downloaded: ${err.message}`;
+  } finally {
+    b.disabled = false;
+  }
+}));
+
 function startBulk() {
   $("bulkPanel").hidden = false;
   $("batchesPanel").hidden = false;
@@ -1637,9 +2221,464 @@ async function start() {
       + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
-  if (PORTAL) startBulk();
+  if (PORTAL && PORTAL.role !== "collector") startBulk();
+  // 18 Nov: a patient's clinical record - researchers and admins only.
+  if (!PORTAL || PORTAL.role !== "collector") {
+    $("navPatient").hidden = false;
+    fillCsvClinics();
+  }
+  // A data collector views the event log but downloads nothing (036).
+  if (PORTAL && PORTAL.role === "collector") $("eventFiles").querySelectorAll("button").forEach((b) => { b.hidden = true; });
   showView(location.hash.slice(1));
   await refresh();
 }
 
 start();
+
+/* ============================================================
+   036: data collectors. Their own shift page, and the admin's
+   places and monthly shift log.
+   ============================================================ */
+async function collectorCall(method, path, body) {
+  const response = await fetch(`/api/v2/dashboard/collector${path}`, {
+    method, headers: { ...portalHeaders(), Accept: "application/json",
+                       ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+/* How an alert went out; 'held' = quiet hours, kept for the next summary (16 Nov). */
+// 18 Nov: alerts about something that just happened (watchers.REAL_TIME_EVENTS):
+// how long from the event to the message reaching them.
+const REAL_TIME = ["jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
+                   "recording_without_jabra", "stopped_unusually", "stopped_technical"];
+
+function tookWords(n) {
+  if (!n.delivered_at) return "";
+  const from = REAL_TIME.includes(n.event) && n.happened_at ? n.happened_at : n.created_at;
+  const s = Math.max(0, Math.round((Date.parse(n.delivered_at) - Date.parse(from)) / 1000));
+  return s < 90 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
+}
+
+function sentTag(n) {
+  if (n.delivered) {
+    const took = tookWords(n);
+    return tag(took && /min/.test(took) && REAL_TIME.includes(n.event) ? "warn" : "good",
+               (n.channel === "telegram" ? "Telegram" : "email") + (took ? ` · ${took}` : ""),
+               took ? (REAL_TIME.includes(n.event) ? "From the event to the message reaching them"
+                                                   : "From the alert to the message reaching them") : "");
+  }
+  if (n.channel === "held") return tag("quiet", "held (night)");
+  // 17 Nov: no Telegram yet - sent, marked late, the moment they connect it.
+  if (n.channel === "waiting") return tag("warn", "waiting for Telegram", n.error || "");
+  return tag("warn", "not sent", n.error || "");
+}
+
+const EVENT_LABELS = {
+  jabra_unplugged: "Jabra unplugged", jabra_back: "Jabra back", jabra_not_plugged: "Jabra not plugged in",
+  recording_problem: "Recording problem", pc_silent: "PC not reporting",
+  recording_finished: "Recording saved", shift_summary: "Shift summary",
+  no_shift_started: "Nobody on shift", escalation: "Not yet seen",
+  recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
+  recording_too_long: "Recording not stopped", handled: "Seen", daily_report: "Daily report",
+  still_not_fixed: "Still not fixed", problem_fixed: "Fixed", repeated_stops: "Repeated stops",
+  shift_report: "Shift summary", summary_csv: "Summary CSV",
+  stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
+};
+
+let tgWaiting = false;   // 037: Connect Telegram was pressed; watch for the link
+let tgTimer = null;
+let shiftSeq = 0;
+async function loadShift() {
+  const seq = ++shiftSeq;
+  let me;
+  try { me = await collectorCall("GET", "/me"); }
+  catch (err) {
+    $("shiftState").textContent = `Could not load your shift: ${err.message}`;
+    return;
+  }
+  if (seq !== shiftSeq) return;
+  const p = me.place || {};
+  $("shiftPlace").textContent = `${p.name || ""} · morning ${(p.morning || []).join("–")}`
+    + ` · evening ${(p.evening || []).join("–")} · ${(me.hospitals || []).map(clinicName).join(", ") || "no hospitals yet"}`;
+  const on = me.shift;
+  $("shiftState").textContent = on
+    ? `On shift (${on.shift}) since ${dhaka(on.started_at)}.`
+    : "You are not on shift.";
+  $("shiftStart").hidden = !!on;
+  $("shiftEnd").hidden = !on;
+  const tg = me.telegram || {};
+  myTelegram = tg;
+  $("shiftHint").textContent = tg.linked
+    ? "While you are on shift, Telegram alerts you at once when the Jabra is unplugged, a patient "
+      + "is recorded without the Jabra, a recording has a problem or a PC stops reporting. "
+      + "Recordings that finish normally are only shown on the dashboard."
+    : (me.mail_ready
+      ? "Connect Telegram below so alerts reach your phone at once. Until then they come by email."
+      : "Connect Telegram below so alerts reach your phone at once. Until then every alert is "
+        + "listed below as soon as it happens, so keep this page open during your shift.");
+  $("tgState").innerHTML = !tg.ready
+    ? tag("warn", "Telegram not set up yet") + ` <span class="hint">AIMS LAB is finishing it.</span>`
+    : tg.linked
+      ? tag("good", "Telegram connected")
+        + ` <span class="hint">${tg.username ? "@" + esc(tg.username) + " · " : ""}since ${esc(dhaka(tg.linked_at))}</span>`
+      : tag("bad", "Telegram not connected")
+        + ` <span class="hint">Press Connect Telegram, then Start in Telegram.</span>`;
+  $("tgLink").hidden = !tg.ready;
+  $("tgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
+  $("tgTest").hidden = !tg.linked;
+  if (tg.linked && tgWaiting) { tgWaiting = false; clearInterval(tgTimer); }
+  showDetails(me);
+  const mails = me.notifications || [];
+  const unseen = mails.filter((n) => n.urgent && !n.seen_at).length;
+  const badge = $("badge-shift");
+  badge.textContent = unseen ? String(unseen) : "";
+  badge.hidden = !unseen;
+  $("myMails").innerHTML = !mails.length
+    ? empty("No alerts yet", "They appear here, and on Telegram, while you are on shift.", true)
+    : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th>`
+      + `<th>Sent</th><th></th></tr></thead><tbody>`
+      + mails.map((n) => `<tr class="${n.urgent && !n.seen_at ? "row-bad" : ""}">`
+        + td("When", esc(dhaka(n.happened_at || n.created_at)))
+        + td("What", tag(n.urgent ? "bad" : "good", EVENT_LABELS[n.event] || human(n.event)))
+        + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
+        + td("Message", esc(n.subject), "wrap")
+        + td("Sent", sentTag(n))
+        + td("", n.seen_at ? `<span class="hint">seen</span>`
+          : `<button type="button" class="chip" data-seen="${esc(n.id)}">Mark seen</button>`)
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+$("shiftStart").addEventListener("click", async () => {
+  if (myTelegram.ready && !myTelegram.linked && !window.confirm(
+      "Your Telegram is not connected, so alerts will not reach your phone during this "
+      + "shift. Press Cancel, then Connect Telegram (it takes a minute). Or press OK to "
+      + "start anyway: alerts then wait and arrive, marked late, once you connect.")) return;
+  $("shiftStart").disabled = true;
+  try { await collectorCall("POST", "/shift/start"); }
+  catch (err) { window.alert(`Not started: ${err.message}`); }
+  $("shiftStart").disabled = false;
+  loadShift();
+});
+$("shiftEnd").addEventListener("click", async () => {
+  if (!window.confirm("End your shift now? A summary of the shift is emailed to you.")) return;
+  $("shiftEnd").disabled = true;
+  try { await collectorCall("POST", "/shift/end"); }
+  catch (err) { window.alert(`Not ended: ${err.message}`); }
+  $("shiftEnd").disabled = false;
+  loadShift();
+});
+$("myMails").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-seen]");
+  if (!b) return;
+  b.disabled = true;
+  try { await collectorCall("POST", `/notifications/${encodeURIComponent(b.dataset.seen)}/seen`); }
+  catch (err) { window.alert(`Not marked: ${err.message}`); }
+  loadShift();
+});
+
+/* Places (admins): which hospitals each place's collectors see. */
+let PLACES = [];
+async function loadPlaces() {
+  try {
+    const { places, hospitals, mail, telegram } = await adminCall("GET", "/api/v2/admin/places");
+    $("tgAdminState").innerHTML = telegram && telegram.ready
+      ? tag("good", "Telegram works") + ` <span class="hint">bot @${esc(telegram.bot)}</span>`
+      : tag("bad", "Telegram not working") + ` <span class="hint">${esc((telegram && telegram.problem) || "")}</span>`;
+    PLACES = places || [];
+    $("placesHint").textContent = "A place is a group of hospitals. Its data collectors see only these hospitals.";
+    $("mailState").innerHTML = mail && mail.ready
+      ? tag("good", "Email works") + ` <span class="hint">sent as ${esc(mail.sender)}</span>`
+      : tag("bad", "Email not working") + ` <span class="hint">${esc((mail && mail.problem) || "")}</span>`;
+    const options = (hospitals || []).map((h) =>
+      `<option value="${esc(h.hospital_id)}">${esc(h.name || h.hospital_id)}</option>`).join("");
+    $("pPlace").innerHTML = `<option value="">Pick a place</option>`
+      + PLACES.map((p) => `<option value="${esc(p.place_id)}">${esc(p.name)}</option>`).join("");
+    $("places").innerHTML = !PLACES.length
+      ? empty("No places yet", "Add one above, then put its hospitals in it.", true)
+      : `<table><thead><tr><th>Place</th><th>Shifts</th><th>Hospitals</th><th>Data collectors</th>`
+        + `<th>On shift now</th></tr></thead><tbody>`
+        + PLACES.map((p) => `<tr>`
+          + td("Place", `<b>${esc(p.name)}</b>`)
+          + td("Shifts", `morning ${esc(p.morning.join("–"))}<br>evening ${esc(p.evening.join("–"))}`)
+          + td("Hospitals", `<span class="placehosp">`
+            + p.hospitals.map((h) => `${tag("info", clinicName(h))}`
+              + `<button type="button" class="chip" data-unhosp="${esc(h)}" data-place="${esc(p.place_id)}" `
+              + `title="Take ${esc(h)} out of ${esc(p.name)}">×</button>`).join("")
+            + ` <select data-addfor="${esc(p.place_id)}" aria-label="Add a hospital to ${esc(p.name)}">`
+            + `<option value="">Add hospital…</option>${options}</select></span>`)
+          + td("Data collectors", p.collectors.length
+            ? p.collectors.map((c) => esc(c.name || c.email)).join("<br>") : `<span class="hint">none yet</span>`)
+          + td("On shift now", p.on_shift.length
+            ? p.on_shift.map((c) => `${esc(c.email)} (${esc(c.shift)})`).join("<br>") : `<span class="hint">nobody</span>`)
+          + `</tr>`).join("") + `</tbody></table>`;
+  } catch (err) {
+    $("places").innerHTML = empty("Places could not be loaded", err.message, true);
+  }
+}
+
+$("placeForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await adminCall("POST", "/api/v2/admin/places", {
+      name: $("plName").value.trim(), morning_start: $("plMs").value, morning_end: $("plMe").value,
+      evening_start: $("plEs").value, evening_end: $("plEe").value });
+    $("placeMsg").textContent = `Added ${$("plName").value.trim()}. Now add its hospitals.`;
+    $("plName").value = "";
+    loadPlaces();
+  } catch (err) { $("placeMsg").textContent = `Not added: ${err.message}`; }
+});
+
+$("places").addEventListener("change", async (e) => {
+  const sel = e.target.closest("select[data-addfor]");
+  if (!sel || !sel.value) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/places/${encodeURIComponent(sel.dataset.addfor)}/hospitals`,
+                    { hospital_id: sel.value });
+  } catch (err) { window.alert(`Not added: ${err.message}`); }
+  loadPlaces();
+});
+
+$("places").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-unhosp]");
+  if (!b) return;
+  if (!window.confirm(`Take ${b.dataset.unhosp} out of this place? Its collectors stop seeing it.`)) return;
+  try {
+    await adminCall("POST", `/api/v2/admin/places/${encodeURIComponent(b.dataset.place)}/hospitals`,
+                    { hospital_id: b.dataset.unhosp, remove: true });
+  } catch (err) { window.alert(`Not done: ${err.message}`); }
+  loadPlaces();
+});
+
+$("pRole").addEventListener("change", () => {
+  $("pPlaceLabel").hidden = $("pRole").value !== "collector";
+});
+
+/* The shift log: one month, as a CSV for salaries. */
+function setShiftLogLink() {
+  const month = $("slMonth").value;
+  $("slDownload").href = "/api/v2/admin/shifts.csv" + (month ? `?month=${encodeURIComponent(month)}` : "");
+}
+$("slMonth").value = today().slice(0, 7);
+setShiftLogLink();
+$("slMonth").addEventListener("change", setShiftLogLink);
+
+/* 036: one test mail, with Resend's exact answer, so mail problems are found at once. */
+$("mailTest").addEventListener("click", async () => {
+  $("mailTest").disabled = true;
+  $("mailState").innerHTML = `<span class="hint">Sending a test mail to you...</span>`;
+  try {
+    const r = await adminCall("POST", "/api/v2/admin/mail-test", {});
+    $("mailState").innerHTML = r.sent
+      ? tag("good", "Test mail sent") + ` <span class="hint">to ${esc(r.to)}: check the inbox and spam folder</span>`
+      : tag("bad", "Test mail not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("mailState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("mailTest").disabled = false;
+});
+
+/* 037: Telegram - a one-time link, then the page watches until it is connected. */
+$("tgLink").addEventListener("click", async () => {
+  $("tgLink").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/telegram/link");
+    window.open(r.url, "_blank", "noopener");
+    $("tgState").innerHTML = `<span class="hint">Telegram opened: press <b>Start</b> there. `
+      + `If it did not open, <a href="${esc(r.url)}" target="_blank" rel="noopener">tap here</a>. `
+      + `This page shows Connected within half a minute.</span>`;
+    tgWaiting = true;
+    clearInterval(tgTimer);
+    let polls = 0;
+    tgTimer = setInterval(() => {
+      if (++polls > 40 || !tgWaiting) { clearInterval(tgTimer); return; }
+      loadShift();
+    }, 5000);
+  } catch (err) {
+    $("tgState").innerHTML = tag("bad", "Could not connect") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("tgLink").disabled = false;
+});
+/* 040: official name, lab ID and phone - yellow until all three are saved. */
+function showDetails(d, saved) {
+  const fields = [["myName", "official_name"], ["myCode", "collector_code"], ["myPhone", "phone"]];
+  for (const [id, key] of fields) {
+    if (document.activeElement !== $(id)) $(id).value = d[key] || "";
+  }
+  const missing = [["official name", d.official_name], ["ID", d.collector_code],
+                   ["phone", d.phone]].filter((x) => !x[1]).map((x) => x[0]);
+  $("detailsPanel").classList.toggle("needs", missing.length > 0);
+  $("detailsState").innerHTML = missing.length
+    ? tag("warn", "Fill in your details") + ` <span class="hint">Missing: ${esc(missing.join(", "))}</span>`
+    : tag("good", saved ? "Saved" : "Complete");
+}
+$("myDetailsSave").addEventListener("click", async () => {
+  $("myDetailsSave").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/details", {
+      official_name: $("myName").value, collector_code: $("myCode").value,
+      phone: $("myPhone").value });
+    showDetails(r, true);
+  } catch (err) {
+    $("detailsState").innerHTML = tag("bad", "Not saved") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("myDetailsSave").disabled = false;
+});
+$("tgTest").addEventListener("click", async () => {
+  $("tgTest").disabled = true;
+  try {
+    const r = await collectorCall("POST", "/telegram/test");
+    $("tgState").innerHTML = r.sent
+      ? tag("good", "Test alert sent") + ` <span class="hint">Your phone should have made a sound. If not, turn on Telegram's notifications.</span>`
+      : tag("bad", "Test alert not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("tgState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("tgTest").disabled = false;
+});
+
+/* ============================================================
+   038: researchers. The hospitals they look after, Telegram, how
+   many alerts they want, the evening report, and their alerts.
+   ============================================================ */
+async function watchCall(method, path, body) {
+  const response = await fetch(`/api/v2/dashboard/watch${path}`, {
+    method, headers: { ...portalHeaders(), Accept: "application/json",
+                       ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `Server error ${response.status}`);
+  return data;
+}
+
+let watchWaiting = false;
+let watchTimer = null;
+async function loadWatch(first) {
+  let me;
+  try { me = await watchCall("GET", "/me"); }
+  catch (err) { $("wState").textContent = `Could not load: ${err.message}`; return; }
+  const hs = me.hospitals || [];
+  $("wHospitals").textContent = hs.length
+    ? hs.map((h) => `${h.hospital_id}${h.name ? " " + h.name : ""}`).join(", ")
+    : "None yet: an admin gives you hospitals in People.";
+  $("mineField").hidden = !hs.length;
+  if (first && hs.length) {          // start on their own hospitals; one click shows all
+    $("mine").checked = true;
+    MINE = true;
+    const again = () => (BUSY ? setTimeout(again, 800) : refresh());
+    again();
+  }
+  $("wMode").value = me.mode || "everything";
+  $("wReportAt").textContent = me.report_at || "20:30";
+  $("wMiddayAt").textContent = me.midday_at || "14:30";
+  if (first) {   // the summary most recently sent
+    const hm = new Date().toLocaleTimeString("en-GB", { timeZone: "Asia/Dhaka", hour12: false }).slice(0, 5);
+    $("wRepShift").value = hm >= (me.report_at || "20:30") ? "evening" : (hm >= (me.midday_at || "14:30") ? "morning" : "evening");
+  }
+  $("wRepHosp").innerHTML = hs.map((h) =>
+    `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("");
+  $("wRepShow").disabled = !hs.length;
+  const tg = me.telegram || {};
+  $("wTgState").innerHTML = !tg.ready
+    ? tag("warn", "Telegram not set up on the server yet")
+    : tg.linked
+      ? tag("good", "Telegram connected")
+        + ` <span class="hint">${tg.username ? "@" + esc(tg.username) + " \u00b7 " : ""}since ${esc(dhaka(tg.linked_at))}</span>`
+      : tag("bad", "Telegram not connected")
+        + ` <span class="hint">Press Connect Telegram, then Start in Telegram.</span>`;
+  $("wTgLink").hidden = !tg.ready;
+  $("wTgLink").textContent = tg.linked ? "Connect again" : "Connect Telegram";
+  $("wTgTest").hidden = !tg.linked;
+  if (tg.linked && watchWaiting) { watchWaiting = false; clearInterval(watchTimer); }
+  const groups = me.contacts || [];
+  $("wContacts").innerHTML = !groups.length
+    ? empty("Nobody to show", "No place holds your hospitals yet, so no collector is alerted for them.", true)
+    : `<table><thead><tr><th>Hospital</th><th>Place</th><th>Data collector</th><th>Phone</th>`
+      + `<th>Telegram</th><th>On shift</th></tr></thead><tbody>`
+      + groups.map((g) => (g.people.length ? g.people : [null]).map((c) => `<tr>`
+        + td("Hospital", esc(clinicName(g.hospital_id)))
+        + td("Place", esc(g.place))
+        + td("Data collector", c ? esc(c.name) + (c.code ? ` <code>${esc(c.code)}</code>` : "")
+          + ((c.missing || []).length ? ` ${tag("warn", "missing: " + c.missing.join(", "))}` : "")
+          : tag("bad", "No collector"))
+        + td("Phone", c && c.phone
+          ? `<a href="tel:${esc(c.phone.replace(/[^0-9+]/g, ""))}">${esc(c.phone)}</a>`
+          : (c ? tag("warn", "not given") : ""))
+        + td("Telegram", c && c.telegram
+          ? `<a href="https://t.me/${esc(c.telegram)}" target="_blank" rel="noopener">@${esc(c.telegram)}</a>`
+          : (c ? tag(c.telegram_linked ? "quiet" : "warn",
+                     c.telegram_linked ? "connected, no username" : "not connected") : ""))
+        + td("On shift", g.on_shift && c
+          ? tag("good", `${c.shift || ""} since ${dhaka(c.since)}`)
+          : tag("bad", "Nobody on shift"))
+        + `</tr>`).join("")).join("") + `</tbody></table>`;
+  const notes = me.notifications || [];
+  $("wAlerts").innerHTML = !notes.length
+    ? empty("No alerts yet", "Alerts for your hospitals appear here, and on Telegram.", true)
+    : `<table><thead><tr><th>When</th><th>What</th><th>Hospital</th><th>Message</th><th>Sent</th></tr></thead><tbody>`
+      + notes.map((n) => `<tr>`
+        + td("When", esc(dhaka(n.happened_at || n.created_at)))
+        + td("What", tag(n.urgent ? "bad" : (["handled", "problem_fixed"].includes(n.event) ? "good" : "info"),
+                         EVENT_LABELS[n.event] || human(n.event)))
+        + td("Hospital", esc(n.hospital_id ? clinicName(n.hospital_id) : ""))
+        + td("Message", esc(n.subject), "wrap")
+        + td("Sent", sentTag(n))
+        + `</tr>`).join("") + `</tbody></table>`;
+}
+
+$("mine").addEventListener("change", () => { MINE = $("mine").checked; refresh(); });
+$("wMode").addEventListener("change", async () => {
+  try { await watchCall("POST", "/mode", { mode: $("wMode").value }); }
+  catch (err) { window.alert(`Not saved: ${err.message}`); }
+  loadWatch();
+});
+$("wRepShow").addEventListener("click", async () => {
+  $("wReport").textContent = "Building the summary...";
+  try {
+    const r = await watchCall("GET", `/report?hospital_id=${encodeURIComponent($("wRepHosp").value)}`
+      + `&shift=${encodeURIComponent($("wRepShift").value)}`
+      + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : ""));
+    $("wReport").textContent = r.text;
+  } catch (err) { $("wReport").textContent = `Could not build it: ${err.message}`; }
+});
+$("wRepCsv").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.href = `/api/v2/dashboard/watch/summary.csv?shift=${encodeURIComponent($("wRepShift").value)}`
+    + ($("wRepDay").value ? `&day=${encodeURIComponent($("wRepDay").value)}` : "");
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+});
+$("wTgLink").addEventListener("click", async () => {
+  $("wTgLink").disabled = true;
+  try {
+    const r = await watchCall("POST", "/telegram/link");
+    window.open(r.url, "_blank", "noopener");
+    $("wTgState").innerHTML = `<span class="hint">Telegram opened: press <b>Start</b> there. `
+      + `If it did not open, <a href="${esc(r.url)}" target="_blank" rel="noopener">tap here</a>.</span>`;
+    watchWaiting = true;
+    clearInterval(watchTimer);
+    let polls = 0;
+    watchTimer = setInterval(() => {
+      if (++polls > 40 || !watchWaiting) { clearInterval(watchTimer); return; }
+      loadWatch();
+    }, 5000);
+  } catch (err) {
+    $("wTgState").innerHTML = tag("bad", "Could not connect") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("wTgLink").disabled = false;
+});
+$("wTgTest").addEventListener("click", async () => {
+  $("wTgTest").disabled = true;
+  try {
+    const r = await watchCall("POST", "/telegram/test");
+    $("wTgState").innerHTML = r.sent ? tag("good", "Test alert sent")
+      : tag("bad", "Test alert not sent") + ` <span class="hint">${esc(r.error || "")}</span>`;
+  } catch (err) {
+    $("wTgState").innerHTML = tag("bad", "Test failed") + ` <span class="hint">${esc(err.message)}</span>`;
+  }
+  $("wTgTest").disabled = false;
+});

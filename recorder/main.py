@@ -117,6 +117,17 @@ def load_log_salt() -> bytes:
 # Windows helpers
 # ============================================================
 
+# ---------------------------------------------------------------- kept running
+#
+# Windows' logon task starts AIMScribe at sign-in and looks again every two
+# minutes (installer.iss): whoever ended it - Task Manager, the tray, anyone -
+# it is back in the background within two minutes, waiting for CMED's start.
+# The task starts it with KEEPER_ARG, so a look that finds it already running
+# ends quietly instead of putting up "Already running". To keep it off for
+# maintenance, IT disables the task (INSTALL_FOR_IT.md).
+KEEPER_ARG = "--from-task"
+
+
 def tell_the_person(title: str, message: str) -> None:
     """
     Put a startup failure in front of whoever just launched the agent.
@@ -399,7 +410,8 @@ class AgentTray:
                         "Stopping AIMScribe requires an administrator.")
             logger.warning("Non-administrator attempted to exit the agent")
             return
-        logger.warning("Agent exit requested by an administrator from the tray menu")
+        logger.warning("Agent exit requested by an administrator from the tray menu; the "
+                       "logon task starts it again within two minutes")
         self._stop.set()
         self.server.should_exit = True
         icon.stop()
@@ -638,7 +650,11 @@ def main() -> int:
                 config.spool.directory, config.spool_seconds() / 3600)
     logger.info("=" * 68)
 
+    from_task = KEEPER_ARG in sys.argv[1:]
     mutex = acquire_single_instance()
+    if mutex is None and from_task:
+        # The two-minute look found AIMScribe running: nothing to do, no box.
+        return 0
     if mutex is None:
         tell_the_person(
             "Already running",

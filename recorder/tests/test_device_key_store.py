@@ -3,8 +3,10 @@ Which key a PC signs with (recorder 3.6).
 
 An installed recorder keeps its identity key inside the PC's TPM chip, where no
 program can copy it. A PC enrolled earlier with a software key keeps that key
-until it is re-enrolled, because the server holds that key's public half. A PC
-whose TPM cannot be used does not start recording with a weaker key instead.
+until it is re-enrolled, because the server holds that key's public half.
+A PC whose TPM cannot be used signs with the software key instead (3.9.2): no
+one at a clinic is sent into the BIOS. A PC that joined with its chip never
+swaps to a new key when the chip fails: to the server that is another PC.
 """
 from __future__ import annotations
 
@@ -91,16 +93,28 @@ def test_a_pc_enrolled_with_its_chip_keeps_the_chip(tmp_path, chip):
     assert crypto.load_device_key(c) is chip
 
 
-def test_no_usable_tpm_stops_rather_than_falling_back(tmp_path, monkeypatch):
+@pytest.fixture
+def no_chip(monkeypatch):
     def unavailable(cls, **kw):
         raise tpm_key.TpmUnavailable("this PC's TPM cannot be used")
     monkeypatch.setattr(tpm_key.TpmDeviceKey, "open", classmethod(unavailable))
-    with pytest.raises(crypto.DeviceKeyError, match="TPM"):
-        crypto.load_device_key(cfg(tmp_path, "tpm"))
-    assert not (tmp_path / "keys" / "device.key").exists()
 
 
-def test_a_missing_chip_key_points_at_the_installer(tmp_path, monkeypatch):
+def test_no_usable_tpm_falls_back_to_the_software_key(tmp_path, no_chip):
+    key = crypto.load_device_key(cfg(tmp_path, "tpm"))
+    assert isinstance(key, crypto.DeviceKey)
+    assert len(key.public_bytes_raw()) == 32           # Ed25519: the server tells by length
+    assert (tmp_path / "keys" / "device.key").exists()
+
+
+def test_a_pc_without_a_chip_keeps_the_same_key_every_start(tmp_path, no_chip):
+    c = cfg(tmp_path, "tpm")
+    first = crypto.load_device_key(c)
+    enrolled_as(c, first.fingerprint())
+    assert crypto.load_device_key(c).fingerprint() == first.fingerprint()
+
+
+def test_a_chip_key_that_cannot_be_made_falls_back_too(tmp_path, monkeypatch):
     def missing(cls, **kw):
         raise tpm_key.TpmKeyMissing("none")
 
@@ -108,8 +122,23 @@ def test_a_missing_chip_key_points_at_the_installer(tmp_path, monkeypatch):
         raise OSError("creating the TPM key failed: 0x80090010 (run as administrator)")
     monkeypatch.setattr(tpm_key.TpmDeviceKey, "open", classmethod(missing))
     monkeypatch.setattr(tpm_key.TpmDeviceKey, "create", classmethod(not_admin))
-    with pytest.raises(crypto.DeviceKeyError, match="installer"):
-        crypto.load_device_key(cfg(tmp_path, "tpm"))
+    assert isinstance(crypto.load_device_key(cfg(tmp_path, "tpm")), crypto.DeviceKey)
+
+
+def test_a_pc_that_joined_with_its_chip_never_swaps_keys(tmp_path, no_chip):
+    c = cfg(tmp_path, "tpm")
+    enrolled_as(c, FakeChip().fingerprint())
+    with pytest.raises(crypto.DeviceKeyError, match="joined with its TPM chip"):
+        crypto.load_device_key(c)
+    assert not (tmp_path / "keys" / "device.key").exists()
+
+
+def test_setup_never_stops_for_a_missing_chip():
+    from pathlib import Path
+    iss = (Path(__file__).resolve().parent.parent / "installer.iss").read_text(encoding="utf-8")
+    body = iss[iss.index("function ProvisionDeviceKey"):iss.index("procedure CurStepChanged")]
+    assert "Result :=" in body and body.count("Result :=") == 1      # only Result := ''
+    assert "InstallExitCode" not in iss
 
 
 @pytest.mark.parametrize("outcome,code", [(None, 0), (tpm_key.TpmUnavailable("no"), 9),

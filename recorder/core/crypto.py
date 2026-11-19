@@ -571,6 +571,7 @@ def load_device_key(cfg):
     This PC's identity key: the TPM key for an installed recorder, unless the PC
     enrolled earlier with a software key, which it keeps until re-enrolled
     (its server record holds that key, and changing it would orphan the PC).
+    A PC whose TPM cannot be used signs with the software key instead.
     """
     sec = cfg.security
     enrolled_with = _enrolled_fingerprint(cfg)
@@ -588,15 +589,30 @@ def load_device_key(cfg):
     from core import tpm_key
     try:
         return tpm_key.TpmDeviceKey.open()
-    except tpm_key.TpmUnavailable as exc:
-        raise DeviceKeyError(str(exc))
     except tpm_key.TpmKeyMissing:
         try:
             return tpm_key.TpmDeviceKey.create()       # works only as administrator
-        except Exception:
-            raise DeviceKeyError(
-                "This PC's security key has not been created. Run the AIMScribe "
-                "installer again (it creates the key inside the PC's TPM chip).")
+        except Exception as exc:
+            reason = f"the key could not be created in the TPM chip: {exc}"
+    except Exception as exc:                           # no chip, chip off, provider broken
+        reason = str(exc)
+    if enrolled_with:
+        # Enrolled with its chip, and the chip has failed: a new software key
+        # would be a different PC to the server. Say so; do not swap keys.
+        raise DeviceKeyError(f"This PC joined with its TPM chip, which cannot be "
+                             f"used now ({reason}). Restart the PC; if it persists, "
+                             f"contact AIMS LAB.")
+    # No usable TPM (17 Nov): the PC records with the software key, locked to
+    # this PC by Windows, as every PC did before 3.6 - rather than not at all.
+    # Nobody at a clinic is asked to open the BIOS. The server sees the kind
+    # from the key's length and the dashboard names it, so these PCs stay in
+    # view. Once enrolled with it, the PC keeps it (the first rule above).
+    logger.warning("No usable TPM key (%s); using this PC's software key", reason)
+    try:
+        return DeviceKey.load_or_create(software_file,
+                                        allow_plaintext=sec.allow_plaintext_keystore)
+    except Exception as exc:
+        raise DeviceKeyError(f"This PC has no usable identity key: {exc}")
 
 
 def _enrolled_fingerprint(cfg) -> Optional[str]:

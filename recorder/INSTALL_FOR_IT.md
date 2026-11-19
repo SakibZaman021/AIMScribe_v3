@@ -21,13 +21,20 @@ setting for you to change — tell AIMS LAB.
 | An installer built without settings pointed PCs at an old server | The installer cannot be built without the server and CMED addresses |
 | Every PC had to be clicked through by hand | One silent command (section 3) |
 
-**The PC needs a TPM 2.0 security chip, switched on** (every Windows 11 PC
-has one; most Windows 10 PCs since 2016 do). From 3.6 the PC's identity key is
+**A TPM 2.0 security chip is used when the PC has one** (every Windows 11 PC
+does; most Windows 10 PCs since 2016 do). The PC's identity key is then
 created inside that chip during setup: programs on the PC can ask the chip to
 sign, but nothing - not an administrator, not malware - can copy the key off
-the PC. Check with `tpmtool getdeviceinformation` ("TPM Present: True",
-"TPM Version: 2.0"). A PC enrolled before 3.6 keeps its existing key and
-updates normally.
+the PC. **A PC without a usable chip is still set up** (from 3.9.2): it signs
+with a software key that Windows locks to that PC, as every PC did before 3.6,
+and the dashboard's PC list shows it as "software key (no TPM chip)". Nobody
+needs to change BIOS settings. A PC keeps the key it joined with.
+
+**Moving a PC to another clinic is one click on the dashboard** (from 3.9.3).
+The PC learns its new clinic at its next check-in, within 30 seconds, and
+records the next patient there; recordings it held from before the move
+upload as well. Nothing is done on the PC. Before 3.9.3 a moved PC refused
+every recording until it was made to join again by hand.
 
 ---
 
@@ -85,7 +92,6 @@ Optional: `/PIN=<pin>[,<backup pin>]` (the server's TLS key pins, from AIMS LAB)
 | 0 | Installed, and the startup task exists |
 | 7 | Refused before copying anything — a value was missing or wrong (the log says which) |
 | 8 | Files installed but the startup task could not be registered — run again |
-| 9 | This PC has no usable TPM 2.0 chip — switch it on in the BIOS/UEFI settings, or use another PC (new PCs only; an enrolled PC still updates) |
 | other | Inno Setup's standard codes (e.g. 2 = cancelled, 5 = file in use) |
 
 An **upgrade** keeps the PC's own server, CMED address, local key and
@@ -116,8 +122,19 @@ delivered to the server are deliberately kept in `C:\ProgramData\AIMScribe`.
    (ordinary users may write here; the agent runs as the signed-in doctor
    because Windows only gives a signed-in user the microphone).
 4. Registers the task **AIMScribe Agent**: at sign-in, least privilege,
-   restarted up to 3 times if it fails.
-5. Registers the task **AIMScribe Updater** (3.8.4+): SYSTEM, at start-up and
+   restarted up to 3 times if it fails, and **looked at again every two
+   minutes** (from 3.9.0). If the agent was ended - from Task Manager, by
+   anyone - it is running again within two minutes, silently; a doctor never
+   has to start it. While it runs the look starts nothing.
+
+   It records nothing by itself: it waits in the background and records only
+   when CMED's page sends the start of a consultation.
+
+   **To keep it off on purpose** (IT, maintenance), as an administrator:
+   `schtasks /Change /TN "AIMScribe Agent" /DISABLE`, then end AIMScribe in
+   Task Manager. Bring it back with `/ENABLE` - it starts within two minutes.
+   Ending it any other way, it comes back within two minutes.
+5. Registers the task **AIMScribe Updater** (3.9.5+): SYSTEM, at start-up and
    every 30 minutes, installing only updates the AIMS LAB server offers that
    are signed by AIMS LAB, between consultations (section 7). Uninstalling
    removes both tasks.
@@ -160,13 +177,13 @@ The certificate must name the same publisher every time —
 **AIMS LAB, United International University** — because SmartScreen builds its
 trust per publisher.
 
-> **Decided 9 Nov 2026: an OV certificate from DigiCert, in KeyLocker**
-> (option 2). Azure Trusted Signing (option 1) is not open to organisations
-> in Bangladesh. Section 7.2 has the purchase, the GitHub settings and the
-> dry run. A local build uses the same certificate once DigiCert's KeyLocker
-> tools are installed on the build PC (`smctl windows ksp register`,
-> `smctl windows certsync`), with `AIMS_SIGN_PROVIDER=thumbprint` and the
-> thumbprint below.
+> **Decided 19 Nov 2026: an OV certificate from SSL.com, through eSigner**
+> (option 2; it replaced DigiCert KeyLocker, chosen 9 Nov, at about a third
+> of the price). Azure Trusted Signing (option 1) is not open to
+> organisations in Bangladesh. Section 7.2 has the purchase, the GitHub
+> settings and the dry run. A local build uses the same certificate once
+> SSL.com's eSigner CKA is installed and loaded on the build PC, with
+> `AIMS_SIGN_PROVIDER=thumbprint` and the thumbprint below.
 
 The options that were weighed:
 
@@ -205,9 +222,10 @@ BUILD.bat
 
 BUILD.bat installs the pinned, hash-checked dependencies
 (`requirements.lock`), audits them, runs the tests, builds from
-`AIMScribe_Agent.spec` (onedir, no UPX), **signs every file and fails if any
-shipped file is left unsigned**, builds the signed installer (Inno Setup signs
-the setup and its uninstaller through `signing\sign.ps1`), and writes
+`AIMScribe_Agent.spec` (onedir, no UPX), **signs the program
+(`AIMScribe_Agent.exe`) and fails if it is not signed by the publisher**,
+builds the signed installer (Inno Setup signs the setup and its uninstaller
+through `signing\sign.ps1`) - three signatures in all - and writes
 `AIMScribeSetup.exe.sha256`.
 
 `DEV_UNSIGNED=1` builds without a certificate for a developer's own PC. It
@@ -260,9 +278,9 @@ their settings and enrolment.
 
 ---
 
-## 7. Automatic updates (3.8.4 and later)
+## 7. Automatic updates (3.9.5 and later)
 
-From 3.8.4 a PC updates itself. Nobody visits it and nobody runs a setup: a
+From 3.9.5 a PC updates itself. Nobody visits it and nobody runs a setup: a
 version reaches the PCs an AIMS LAB admin chooses, and each PC installs it
 between consultations. IT installs by hand **once** (section 7.3); every
 version after that arrives by itself.
@@ -270,9 +288,9 @@ version after that arrives by itself.
 ### 7.1 How it works, and what it will not do
 
 ```
-git tag recorder-v3.8.5          GitHub Actions (recorder-release.yml)          AIMS LAB dashboard
-git push origin recorder-v3.8.5  -> build, test, sign (DigiCert KeyLocker, OV) -> PCs -> Recorder updates:
-                                 -> refuse anything unsigned                       add 3.8.5, pick a stage
+git tag recorder-v3.9.6          GitHub Actions (recorder-release.yml)          AIMS LAB dashboard
+git push origin recorder-v3.9.6  -> build, test, sign (SSL.com eSigner, OV)    -> PCs -> Recorder updates:
+                                 -> refuse anything unsigned                       add 3.9.6, pick a stage
                                  -> GitHub Release: AIMScribeSetup.exe + .sha256   (off / test PCs /
                                                                                     hospitals / all, pause)
 Each PC, inside the stage:
@@ -314,40 +332,49 @@ Each PC, inside the stage:
 
 ### 7.2 For AIMS LAB: the certificate and the cloud build (once)
 
-> **Status (9 Nov 2026): no code-signing certificate exists yet.** Every
-> AIMScribe build so far, 3.8.3 included, is unsigned, so the updater - which
+> **Status (19 Nov 2026): no code-signing certificate exists yet.** Every
+> AIMScribe build so far, 3.9.4 included, is unsigned, so the updater - which
 > requires an Authenticode signature by `AIMS_SIGN_PUBLISHER` - has nothing it
 > may install until the certificate below is in place. (Azure Trusted Signing
 > is not an option: it issues public-trust certificates only to organisations
 > in the USA, Canada, the EU and the UK.)
 
-**The chosen route: an OV code-signing certificate from DigiCert, kept in
-DigiCert KeyLocker.** The private key lives in DigiCert's HSM and never
-touches a PC or GitHub; the build signs through it. DigiCert, or a DigiCert
-reseller, sells it with *KeyLocker* as the delivery method (not a USB token).
+**The chosen route (19 Nov 2026): an OV code-signing certificate from SSL.com,
+signed through SSL.com eSigner.** The private key lives in SSL.com's cloud HSM
+and never touches a PC or GitHub; the build signs through it. About **$129 a
+year** for the certificate plus **$180 a year** for eSigner's 240 signatures
+(about $310 a year). DigiCert KeyLocker, the earlier choice, stays in the
+workflow as an alternative.
 
-**A. Buy it (AIMS LAB / UIU administration - a purchase only they can make)**
+**What is signed, and why only that.** Three files a release, so three
+signatures: the program `AIMScribe_Agent.exe`, the setup `AIMScribeSetup.exe`
+and the uninstaller Setup writes. The setup is the file each PC's updater
+checks before it installs anything; the program is what Windows shows when it
+runs. The 24 Python modules and the DLLs beside the program are left as their
+makers shipped them. 240 signatures a year cover about 80 releases, test
+builds (dry runs) included.
 
-1. Order an **OV Code Signing** certificate with **KeyLocker** delivery. The
-   organisation on the order must be a legal entity the CA can verify -
-   almost certainly *United International University* (AIMS LAB is part of
-   it). The certificate's name is that legal name, and that is the publisher
-   every PC will check. Have ready: the university's registration or charter
-   (UGC), its address and main phone number as listed in a public directory,
-   and an authorised signatory for the verification call.
-2. Ask, before paying: **how many signatures a year are included.** One
-   release uses about **27** (24 Python modules, the program, the setup and
-   its uninstaller; the other 29 files carry their makers' signatures), and
-   each dry run uses as many. 300 a year covers about ten releases.
-3. When it is issued, in **DigiCert ONE -> KeyLocker**:
-   - **Settings -> Users / Service users**: create a service user for GitHub;
-     create its **API key** (shown once).
-   - **Client authentication certificate**: create one for that user; download
-     the `.p12` and keep its **password**.
-   - **Certificates**: note the code-signing certificate's **SHA-1 thumbprint**
-     (40 hexadecimal characters) and its **subject** (`CN=...`, `O=...`).
-   - Note the **host** shown for the API (for example
-     `https://clientauth.one.digicert.com`).
+**A. Buy it (a purchase only UIU can authorise)**
+
+1. At **ssl.com**, order an **OV Code Signing** certificate, 1 year, with
+   **eSigner** (cloud) as the key storage - not a USB token. The
+   organisation is the legal entity SSL.com verifies - almost certainly
+   *United International University* (AIMS LAB is part of it). That name is
+   the publisher every PC will check. Have ready: the university's address
+   and main phone number as listed in a public directory, and someone at UIU
+   who can confirm, when SSL.com calls that number, that the requester may
+   order in UIU's name.
+2. Subscribe to the **eSigner Tier 1** plan for code signing: 240 signatures
+   a year ($180), extra signatures $1 each. New certificates get 30 days of
+   eSigner free.
+3. When the certificate is issued, in the **SSL.com account -> Orders -> the
+   certificate -> Signing credentials**:
+   - set the eSigner **PIN**, then **Show QR code**: below the code is the
+     **secret** (a base32/base64 string). This is the TOTP secret the build
+     uses instead of a phone. Keep it like a password.
+   - note the certificate's **subject** (`CN=...`, `O=...`) and, from the
+     certificate details, its **SHA-1 thumbprint** (40 hexadecimal
+     characters; optional, see B).
 
 **B. Give it to the build (GitHub -> Settings -> Environments -> `recorder-release`)**
 
@@ -358,37 +385,23 @@ so each build waits for a click before it can sign anything.
 
 | Kind | Name | Value |
 |---|---|---|
-| secret | `SM_API_KEY` | the service user's API key |
-| secret | `SM_CLIENT_CERT_FILE_B64` | the `.p12`, base64: PowerShell `[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\client.p12'))` |
-| secret | `SM_CLIENT_CERT_PASSWORD` | the `.p12` password |
-| variable | `SM_HOST` | the DigiCert ONE host from A3 |
-| variable | `SM_CODE_SIGNING_CERT_SHA1_HASH` | the certificate's SHA-1 thumbprint (public, not a secret) |
+| secret | `ES_USERNAME` | the SSL.com account's username |
+| secret | `ES_PASSWORD` | the SSL.com account's password |
+| secret | `ES_TOTP_SECRET` | the eSigner secret from A3 |
 | variable | `AIMS_SIGN_PUBLISHER` | the certificate's **exact** CN (or O), e.g. `United International University` |
-| variable (optional) | `AIMS_SIGN_PROVIDER` | `keylocker` (default); `azure` or `signpath` only if one of those ever becomes the route |
+| variable (optional) | `ES_CERT_SHA1_HASH` | the certificate's SHA-1 thumbprint, if the account holds more than one code-signing certificate |
+| variable (optional) | `ES_MODE` | `product` (default); `sandbox` only with an SSL.com sandbox account and its test certificate |
+| variable (optional) | `ES_CKA_URL` | a newer eSigner CKA installer; the default is SSL.com's v1.1.2 from github.com/SSLcom/eSignerCKA |
+| variable (optional) | `AIMS_SIGN_PROVIDER` | `esigner` (default); `keylocker`, `azure` or `signpath` only if one of those ever becomes the route |
 | variable (optional) | `ALLOW_VULNERABLE_BUILD` | `true` only to release past a pip-audit finding you have reviewed |
 
-**The easy way:** `signing\set-github-signing.ps1` asks for the API key and
-the `.p12` password without showing them, checks that the `.p12` opens, that
-the thumbprint is 40 characters and is the code-signing certificate's (not the
-`.p12`'s), then sets all six. Run it with `-Check` first to see what it would
-set; nothing is sent then.
+With `gh` signed in as the repository's owner, from any folder of the
+repository:
 
 ```powershell
-cd recorder
-.\signing\set-github-signing.ps1 -ClientCertificate C:\keys\github-signer.p12 `
-    -Thumbprint <code-signing certificate's SHA-1> `
-    -Publisher "<the certificate's exact CN>" -Check
-# then the same without -Check
-```
-
-Or by hand, if `gh` is signed in as the repository's owner:
-
-```powershell
-gh secret set SM_API_KEY --env recorder-release
-gh secret set SM_CLIENT_CERT_PASSWORD --env recorder-release
-[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\client.p12')) | gh secret set SM_CLIENT_CERT_FILE_B64 --env recorder-release
-gh variable set SM_HOST --env recorder-release --body "https://clientauth.one.digicert.com"
-gh variable set SM_CODE_SIGNING_CERT_SHA1_HASH --env recorder-release --body "<40 hex characters>"
+gh secret set ES_USERNAME --env recorder-release
+gh secret set ES_PASSWORD --env recorder-release
+gh secret set ES_TOTP_SECRET --env recorder-release
 gh variable set AIMS_SIGN_PUBLISHER --env recorder-release --body "<the certificate's exact CN>"
 ```
 
@@ -398,27 +411,33 @@ on a command line or kept in shell history.)
 **C. Prove it with a dry run, then release**
 
 ```powershell
-git tag recorder-v3.8.4-dryrun
-git push origin recorder-v3.8.4-dryrun
+git tag recorder-v3.9.5-dryrun
+git push origin recorder-v3.9.5-dryrun
 ```
 
-The *recorder-release* run installs DigiCert's tools (checked to be signed by
-DigiCert), syncs the certificate from KeyLocker, prints **Signing
-certificate: CN=...**, builds, runs the tests, signs, and checks every file -
-and publishes nothing; the signed setup is kept as a build artefact for a
+The *recorder-release* run installs SSL.com's eSigner CKA (checked to be
+signed by SSL.com), loads the certificate from eSigner, prints **Signing
+certificate: CN=...**, builds, runs the tests, signs the three files, and
+checks them - and publishes nothing (it uses three eSigner signatures); the signed setup is kept as a build artefact for a
 week. If it fails on the publisher, it prints the certificate's actual
 subject: set `AIMS_SIGN_PUBLISHER` to its CN exactly and push another dry-run
-tag. When a dry run is green, push the real tag `recorder-v3.8.4`.
+tag. When a dry run is green, push the real tag `recorder-v3.9.5`.
 
 **How the name is used.** The build refuses a setup whose signer's CN/O is
 not `AIMS_SIGN_PUBLISHER`, and the installer writes the same name into each
 PC's `.env` (`AIMS_UPDATE_PUBLISHER`), which its updater then requires. A PC
 keeps that value across updates. Changing the certificate's name later (a
 different legal entity) means one manual install of a release carrying the
-new name. A renewed certificate with the same name needs nothing: only the
-thumbprint variable changes.
+new name. A renewed certificate with the same name needs nothing (if
+`ES_CERT_SHA1_HASH` is set, change it to the new thumbprint). The certificate
+is renewed every year: since February 2026 no code-signing certificate lasts
+longer than 459 days.
 
 **Alternatives kept in the workflow** (not the route now):
+*DigiCert KeyLocker* (`AIMS_SIGN_PROVIDER=keylocker`) needs secrets
+`SM_API_KEY`, `SM_CLIENT_CERT_FILE_B64`, `SM_CLIENT_CERT_PASSWORD` and
+variables `SM_HOST`, `SM_CODE_SIGNING_CERT_SHA1_HASH`;
+`signing\set-github-signing.ps1` checks and sets them.
 *Azure Trusted Signing* (`AIMS_SIGN_PROVIDER=azure`) needs secrets
 `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` (an app
 registration with a federated credential for
@@ -431,9 +450,9 @@ and variables `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`,
 `SIGNPATH_ARTIFACT_CONFIG_PE`, and a policy that accepts API submissions.
 Neither has been run.
 
-### 7.3 For IT: the one manual install (3.8.4)
+### 7.3 For IT: the one manual install (3.9.5)
 
-3.8.3 and earlier have no updater, so each PC needs 3.8.4 installed once, the
+3.9.4 and earlier have no updater, so each PC needs 3.9.5 installed once, the
 way every release has been installed until now (section 3). Then:
 
 1. **Check the file** as in section 2: `Get-AuthenticodeSignature` says
@@ -457,7 +476,7 @@ way every release has been installed until now (section 3). Then:
 
    Expected: `AIMS_UPDATE_PUBLISHER=AIMS LAB` (the certificate's name), and
    `Update: idle` in the log (no release is offered yet).
-4. On the dashboard the PC shows version **3.8.4**.
+4. On the dashboard the PC shows version **3.9.5**.
 
 Nothing else changes for the doctor. A PC that misses this step keeps working
 on its old version and shows *recorder_outdated* once the server's minimum is
@@ -470,16 +489,16 @@ updates. Use two bench PCs first (A and B), then one clinic PC.
 
 | # | Do | Expect |
 |---|---|---|
-| 1 | Install 3.8.4 by hand on bench PCs A and B (7.3). | Both on the dashboard at 3.8.4; `updater.log` says idle. |
-| 2 | Push tag `recorder-v3.8.5-dryrun`, then `recorder-v3.8.5` (any harmless change). | The *recorder-release* run is green; the GitHub Release has `AIMScribeSetup.exe` and `.sha256`; the run's *Refuse anything unsigned* step lists `OK ... AIMS LAB` for the setup and the program. |
-| 3 | Dashboard -> PCs -> Recorder updates: **Add release** 3.8.5, leave SHA-256 and address empty. | The release appears at stage *off*, with the SHA-256 read from the GitHub Release - compare it with the Release page. No PC is offered it. |
+| 1 | Install 3.9.5 by hand on bench PCs A and B (7.3). | Both on the dashboard at 3.9.5; `updater.log` says idle. |
+| 2 | Push tag `recorder-v3.9.6-dryrun`, then `recorder-v3.9.6` (any harmless change). | The *recorder-release* run is green; the GitHub Release has `AIMScribeSetup.exe` and `.sha256`; the run's *Refuse anything unsigned* step lists `OK ... AIMS LAB` for the setup and the program. |
+| 3 | Dashboard -> PCs -> Recorder updates: **Add release** 3.9.6, leave SHA-256 and address empty. | The release appears at stage *off*, with the SHA-256 read from the GitHub Release - compare it with the Release page. No PC is offered it. |
 | 4 | **Set rollout**: stage *Test PCs only*, Test PCs = A's name. | Within a minute A shows *Will update* / *Notice received*; B shows nothing. `C:\ProgramData\AIMScribe\state\update_notice.json` exists on A only. |
 | 5 | On A, start a consultation from CMED's test page and keep it recording; run `schtasks /Run /TN "AIMScribe Updater"`. | A's updater reports **Waiting** ("a consultation is recording"); the recording is not interrupted; nothing is downloaded. |
-| 6 | End the consultation. Run the task again (or wait up to 30 min). | **Installing**, then about a minute later **Installed 3.8.5**; the agent is back in the tray; A shows 3.8.5. Records again normally. |
+| 6 | End the consultation. Run the task again (or wait up to 30 min). | **Installing**, then about a minute later **Installed 3.9.6**; the agent is back in the tray; A shows 3.9.6. Records again normally. |
 | 7 | **Tamper test** on B: quit AIMScribe from B's tray (its next heartbeat would remove the file), copy A's `update_notice.json` into B's state folder, run the task on B. | B reports **Refused**: "addressed to another PC". Edit one character of the version inside the copied file and run again: "signature does not check". B installs nothing. |
 | 8 | **Pause**, then set stage *Test PCs and named hospitals* with B's hospital. | While paused nothing is offered. Resume: B updates as A did (5-6). |
-| 9 | **Bad file test** (optional): add release 3.8.6 with a wrong SHA-256 (any 64 hex characters) for test PC A only. | A reports **Failed** ("SHA-256 ... not ... as the server said") three times, then **Gave up**; one *recorder_update_failed* alert; 3.8.5 still runs. |
-| 10 | **Rollback test**: add release 3.8.4 with *Rollback: yes*, stage Test PCs = A. | A installs 3.8.4 (it is signed as a rollback) and reports Installed 3.8.4. A rollback not marked as one is refused by the dashboard. |
+| 9 | **Bad file test** (optional): add release 3.9.7 with a wrong SHA-256 (any 64 hex characters) for test PC A only. | A reports **Failed** ("SHA-256 ... not ... as the server said") three times, then **Gave up**; one *recorder_update_failed* alert; 3.9.6 still runs. |
+| 10 | **Rollback test**: add release 3.9.5 with *Rollback: yes*, stage Test PCs = A. | A installs 3.9.5 (it is signed as a rollback) and reports Installed 3.9.5. A rollback not marked as one is refused by the dashboard. |
 | 11 | One clinic PC: add the current version, stage *Test PCs* with that PC, during clinic hours. | It waits through consultations and installs between them; the doctor sees at most the tray icon restart. |
 | 12 | All clinics: stage *Test PCs and named hospitals* one hospital at a time, then *Every PC*. | Each PC shows Installed; anything else shows its reason. |
 

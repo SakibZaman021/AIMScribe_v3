@@ -32,7 +32,11 @@
   <nav class="nav" id="nav">
     <a href="#overview" data-view="overview"><span class="ico ico-overview" aria-hidden="true"></span><span class="label">Overview</span><b class="badge" id="badge-overview" hidden></b></a>
     <a href="#recordings" data-view="recordings"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Recordings</span><b class="badge" id="badge-recordings" hidden></b></a>
+    <a href="#patient" data-view="patient" id="navPatient" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">Patients</span></a>
+    <a href="#events" data-view="events"><span class="ico ico-rec" aria-hidden="true"></span><span class="label">Event log</span></a>
     <a href="#pcs" data-view="pcs"><span class="ico ico-pc" aria-hidden="true"></span><span class="label">PCs</span><b class="badge" id="badge-pcs" hidden></b></a>
+    <a href="#shift" data-view="shift" id="navShift" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My shift</span><b class="badge" id="badge-shift" hidden></b></a>
+    <a href="#watch" data-view="watch" id="navWatch" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">My alerts</span></a>
     <a href="#downloads" data-view="downloads" id="navDownloads" hidden><span class="ico ico-dl" aria-hidden="true"></span><span class="label">Downloads</span></a>
     <a href="#cmed" data-view="cmed" id="navCmed" hidden><span class="ico ico-pc" aria-hidden="true"></span><span class="label">CMED</span></a>
     <a href="#people" data-view="people" id="navPeople" hidden><span class="ico ico-people" aria-hidden="true"></span><span class="label">People</span></a>
@@ -67,6 +71,8 @@
     <label class="field"><span>From</span> <input type="date" id="from"></label>
     <label class="field"><span>To</span> <input type="date" id="to"></label>
     <label class="field"><span>Clinic</span> <select id="clinic"><option value="">All clinics</option></select></label>
+    <label class="field" id="mineField" hidden><input type="checkbox" id="mine">
+      <span>Only my hospitals</span></label>
   </div>
 
   <main id="main">
@@ -138,7 +144,61 @@
       </div>
     </section>
 
+    <!-- ============================== Event log (18 Nov 2026) -->
+    <section class="view" data-view="events" aria-label="Event log" hidden>
+      <section class="panel" aria-labelledby="h-events">
+        <div class="head wrap"><h3 id="h-events">Event log</h3>
+          <span class="hint" id="eventsHint"></span></div>
+        <div class="chips small bar" id="eventKinds" role="group" aria-label="Show one kind of event">
+          <button type="button" class="chip" data-kind="" aria-pressed="true">All</button>
+          <button type="button" class="chip" data-kind="recording" aria-pressed="false">Recordings</button>
+          <button type="button" class="chip" data-kind="pause" aria-pressed="false">Pauses</button>
+          <button type="button" class="chip" data-kind="consent" aria-pressed="false">Consent</button>
+          <button type="button" class="chip" data-kind="microphone" aria-pressed="false">Microphone</button>
+          <button type="button" class="chip" data-kind="cmed" aria-pressed="false">CMED API 2 / 3</button>
+          <button type="button" class="chip" data-kind="alert" aria-pressed="false">Alerts sent</button>
+        </div>
+        <div class="bar" id="eventFiles">
+          <label class="field"><span>Doctor ID</span> <input type="text" id="eventDoctor" size="12" autocomplete="off"></label>
+          <button type="button" class="ghost small" id="eventsCsv">Download CSV</button>
+          <button type="button" class="ghost small" id="cmedMissingCsv" title="Recordings CMED's API 2 or API 3 never reached us for, with the fields CMED matches a visit on">Missing from CMED (CSV)</button>
+        </div>
+        <div class="scroll tall"><div id="eventsTable"></div></div>
+      </section>
+    </section>
+
     <!-- ============================== PCs -->
+    <!-- ============================== One patient's history (18 Nov 2026) -->
+    <section class="view" data-view="patient" aria-label="Patients" hidden>
+      <section class="panel" aria-labelledby="h-patient">
+        <div class="head wrap"><h3 id="h-patient">Find a patient</h3>
+          <button type="button" class="q" aria-label="About patients" data-tip="Patient ID alone: every visit of that patient, newest first. Patient ID and visit ID: that one consultation. Each shows the demographics and vitals, the prescription and the recordings. Each look-up is logged by your name.">?</button></div>
+        <form class="body pfind" id="patientForm" autocomplete="off">
+          <label class="field col"><span>Patient ID</span>
+            <input type="search" id="patientRef" placeholder="P4347353" required></label>
+          <label class="field col"><span>Visit ID (optional: one consultation)</span>
+            <input type="search" id="visitRef" placeholder="VIS-T-31492"></label>
+          <button type="submit" class="primary" id="patientGo">Show</button>
+          <span id="patientMsg" class="hint" role="status"></span>
+        </form>
+      </section>
+      <section class="panel" aria-labelledby="h-clinicalCsv">
+        <div class="head wrap"><h3 id="h-clinicalCsv">Download as CSV</h3>
+          <button type="button" class="q" aria-label="About the downloads" data-tip="Every visit in the dates and clinic chosen, one file each: Demographics is one row per visit with sex, age, blood group and vitals (API 2); Prescriptions is one row per visit with complaints, examination, diagnoses, medicines, tests and advice (API 3); Medicines is one row per medicine. No dates: every visit. Each download is logged by your name.">?</button></div>
+        <div class="body pfind">
+          <label class="field col"><span>From</span> <input type="date" id="csvFrom"></label>
+          <label class="field col"><span>To</span> <input type="date" id="csvTo"></label>
+          <label class="field col"><span>Clinic</span>
+            <select id="csvClinic"><option value="">All clinics</option></select></label>
+          <button type="button" class="primary" data-csv="demographics">Demographics (CSV)</button>
+          <button type="button" class="ghost" data-csv="prescriptions">Prescriptions (CSV)</button>
+          <button type="button" class="ghost" data-csv="medicines">Medicines (CSV)</button>
+          <span id="csvMsg" class="hint" role="status"></span>
+        </div>
+      </section>
+      <div id="patientOut"></div>
+    </section>
+
     <section class="view" data-view="pcs" aria-label="PCs" hidden>
       <section class="panel" aria-labelledby="h-pcs" id="pcsPanel">
         <div class="head wrap"><h3 id="h-pcs">PCs in the consulting rooms</h3>
@@ -179,7 +239,121 @@
       </section>
     </section>
 
+    <!-- ============================== My shift (data collectors, 036) -->
+    <section class="view" data-view="shift" aria-label="My shift" hidden>
+      <section class="panel" aria-labelledby="h-details" id="detailsPanel">
+        <div class="head wrap"><h3 id="h-details">Your details</h3>
+          <span id="detailsState" role="status"></span></div>
+        <div class="body shiftbody">
+          <div class="row">
+            <label class="field"><span>Official name</span>
+              <input type="text" id="myName" autocomplete="name" maxlength="80" placeholder="Md. Sakib Zaman"></label>
+            <label class="field"><span>Your ID</span>
+              <input type="text" id="myCode" autocomplete="off" maxlength="20" placeholder="DC-07"></label>
+            <label class="field"><span>Your phone</span>
+              <input type="tel" id="myPhone" autocomplete="tel" placeholder="01XXX-XXXXXX" maxlength="40"></label>
+            <button type="button" class="primary" id="myDetailsSave">Save</button>
+          </div>
+          <p class="hint">Your official name, the ID AIMS LAB gave you, and your phone. The
+            researchers who look after your hospitals see them with every alert, so they can
+            call you; the attendance sheet for salaries uses them too.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-shift">
+        <div class="head wrap"><h3 id="h-shift">My shift</h3>
+          <span class="hint" id="shiftPlace"></span></div>
+        <div class="body shiftbody">
+          <p id="shiftState" class="shiftstate" role="status">Loading</p>
+          <div class="row">
+            <button type="button" class="primary" id="shiftStart" hidden>Start my shift</button>
+            <button type="button" class="ghost" id="shiftEnd" hidden>End my shift</button>
+          </div>
+          <p class="hint" id="shiftHint">While you are on shift, Telegram alerts you at once
+            about anything unusual at your place.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-telegram">
+        <div class="head wrap"><h3 id="h-telegram">Alerts on your phone</h3>
+          <span class="hint">Telegram, free. Do this once, on your phone.</span></div>
+        <div class="body shiftbody">
+          <p id="tgState" role="status"></p>
+          <div class="row">
+            <button type="button" class="primary" id="tgLink" hidden>Connect Telegram</button>
+            <button type="button" class="ghost" id="tgTest" hidden>Send me a test alert</button>
+          </div>
+          <p class="hint">Install Telegram from the Play Store, press Connect Telegram, then
+            press Start in Telegram. Keep Telegram's notifications on. For an urgent alert,
+            press Seen in Telegram when you are dealing with it.</p>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-mails">
+        <div class="head wrap"><h3 id="h-mails">My alerts</h3>
+          <span class="hint">Urgent alerts not marked seen in 15 minutes (here, or with Seen
+            in Telegram) also go to the other collectors of your place and to AIMS LAB.</span></div>
+        <div class="scroll"><div id="myMails"></div></div>
+      </section>
+    </section>
+
     <!-- ============================== Downloads -->
+    <!-- ============================== My alerts (researchers, 038) -->
+    <section class="view" data-view="watch" aria-label="My alerts" hidden>
+      <section class="panel" aria-labelledby="h-watch">
+        <div class="head wrap"><h3 id="h-watch">The hospitals you look after</h3></div>
+        <div class="body shiftbody">
+          <p id="wHospitals" role="status">Loading</p>
+          <p class="hint" id="wState">You see and download every hospital as before. For these
+            you also get every alert the data collectors get, with the collector on shift and
+            their phone and Telegram; word when they press Seen; a reminder when a problem is
+            still not fixed after 30, 60 and 90 minutes; word when it is fixed; and a summary of
+            each shift at <b id="wMiddayAt">14:30</b> and <b id="wReportAt">20:30</b>, with a CSV.
+            Nothing is sent at night: what happens then is in the next summary.</p>
+          <label class="field"><span>Alerts</span>
+            <select id="wMode">
+              <option value="everything">Everything (every problem, and each normal recording)</option>
+              <option value="problems">Problems (everything unusual: Jabra, pauses, refusals, stops; not the normal recordings)</option>
+            </select></label>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-wcall">
+        <div class="head wrap"><h3 id="h-wcall">Who to call now</h3>
+          <span class="hint">The data collector on shift at each of your hospitals; with
+            nobody on shift, all of the place's collectors.</span></div>
+        <div class="scroll"><div id="wContacts"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-wtg">
+        <div class="head wrap"><h3 id="h-wtg">Alerts on your phone</h3>
+          <span class="hint">Telegram, free. Do this once, on your phone.</span></div>
+        <div class="body shiftbody">
+          <p id="wTgState" role="status"></p>
+          <div class="row">
+            <button type="button" class="primary" id="wTgLink" hidden>Connect Telegram</button>
+            <button type="button" class="ghost" id="wTgTest" hidden>Send me a test alert</button>
+          </div>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="h-wrep">
+        <div class="head wrap"><h3 id="h-wrep">Shift summaries</h3>
+          <span class="hint">Any day, exactly as Telegram sends it. The CSV has every recording
+            and alert at all your hospitals, one row each, to open in Excel.</span></div>
+        <div class="body row">
+          <label class="field"><span>Hospital</span> <select id="wRepHosp"></select></label>
+          <label class="field"><span>Day</span> <input type="date" id="wRepDay"></label>
+          <label class="field"><span>Shift</span> <select id="wRepShift">
+            <option value="morning">Morning (to 14:30)</option>
+            <option value="evening">Evening (to 20:30)</option>
+            <option value="day">Whole day</option>
+          </select></label>
+          <button type="button" class="ghost" id="wRepShow">Show summary</button>
+          <button type="button" class="ghost" id="wRepCsv">Download CSV</button>
+        </div>
+        <div class="body"><pre id="wReport" class="report"></pre></div>
+      </section>
+      <section class="panel" aria-labelledby="h-walerts">
+        <div class="head wrap"><h3 id="h-walerts">My alerts</h3></div>
+        <div class="scroll"><div id="wAlerts"></div></div>
+      </section>
+    </section>
+
     <section class="view" data-view="downloads" aria-label="Downloads" hidden>
       <section class="panel" aria-labelledby="h-bulk" id="bulkPanel" hidden>
         <div class="head wrap"><h3 id="h-bulk">Download in batches</h3>
@@ -224,6 +398,42 @@
         </form>
         <div class="scroll"><div id="origins"></div></div>
       </section>
+      <section class="panel" aria-labelledby="h-codes" id="codesPanel" hidden>
+        <div class="head wrap"><h3 id="h-codes">Clinic codes</h3>
+          <span class="hint">The hospital code CMED sends (hospital_id) for each of our clinics.
+            A new PC joins only if the code in CMED's start command is linked here - letter
+            for letter - or is our own clinic ID.</span></div>
+        <form id="clinicForm" class="peopleform">
+          <label>New clinic ID <input id="ncId" required autocomplete="off" placeholder="HOSP_SUSASTHO_TEST"></label>
+          <label>Name <input id="ncName" required autocomplete="off" placeholder="Susastho Clinic (test 1)"></label>
+          <label>CMED's code for it <input id="ncCode" autocomplete="off" placeholder="Susastho-Clinic-Test-1"></label>
+          <button type="submit" class="primary">Add a clinic</button>
+          <span id="clinicMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="codes"></div></div>
+        <div class="head wrap"><h3>PCs that could not join</h3>
+          <span class="hint">The last 30 days: the code each PC was given by CMED, and why it
+            was refused. Link the code to a clinic and the PC joins at its next patient.</span></div>
+        <div class="scroll"><div id="refusedPcs"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-devlog" id="deviceLogPanel" hidden>
+        <div class="head wrap"><h3 id="h-devlog">Device log</h3>
+          <span class="hint">Admins only. Every time a PC tried to join, and every time the
+            server refused a PC something - with the exact reason the PC was sent. The same
+            refusal repeated within ten minutes is one line, with a count.</span></div>
+        <div class="body row">
+          <label class="field"><span>Period</span> <select id="dlDays">
+            <option value="1">Last day</option><option value="7" selected>Last 7 days</option>
+            <option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+            <option value="3650">Everything</option></select></label>
+          <label class="field"><span>Find</span>
+            <input id="dlSearch" type="search" autocomplete="off" placeholder="PC name, address, code, CMED code..."></label>
+          <label class="field"><input id="dlFailed" type="checkbox"> <span>Refusals only</span></label>
+          <button type="button" class="ghost" id="dlShow">Show</button>
+          <button type="button" class="ghost" id="dlCsv">Download CSV</button>
+        </div>
+        <div class="scroll"><div id="deviceLog"></div></div>
+      </section>
       <section class="panel" aria-labelledby="h-clients" id="clientsPanel" hidden>
         <div class="head wrap"><h3 id="h-clients">CMED connections</h3>
           <span class="hint">One per hospital: CMED's public key, which every API 2 and API 3 is
@@ -232,6 +442,10 @@
         <form id="clientForm" class="peopleform clientform">
           <label>CMED hospital code <input id="cHospital" required autocomplete="off" placeholder="CMED-TEST"></label>
           <label>Client id <input id="cClient" required autocomplete="off" placeholder="cmed-test"></label>
+          <label>Our clinic for this code <select id="cClinic" required>
+            <option value="">Choose...</option></select></label>
+          <label id="cNewWrap" hidden>New clinic ID <input id="cNewId" autocomplete="off" placeholder="HOSP_SUSASTHO_TEST"></label>
+          <label id="cNewNameWrap" hidden>New clinic name <input id="cNewName" autocomplete="off" placeholder="Susastho Clinic"></label>
           <label class="wide">CMED's public key (JWK, the .public.json they sent)
             <textarea id="cJwk" rows="4" required spellcheck="false" placeholder='{"kty": "EC", "crv": "P-384", "x": "...", "y": "..."}'></textarea></label>
           <button type="submit" class="primary">Register</button>
@@ -251,11 +465,43 @@
           <label>Role <select id="pRole">
             <option value="researcher">Researcher - look, never change</option>
             <option value="admin">Admin - everything, and people</option>
+            <option value="collector">Data collector - view only, own place</option>
           </select></label>
+          <label id="pPlaceLabel" hidden>Place <select id="pPlace"></select></label>
           <button type="submit" class="primary">Give access</button>
           <span id="peopleMsg" class="hint" role="status"></span>
         </form>
         <div class="scroll"><div id="people"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-places" id="placesPanel" hidden>
+        <div class="head wrap"><h3 id="h-places">Places</h3>
+          <span class="hint" id="placesHint">A place is a group of hospitals. Its data
+            collectors see only these hospitals.</span></div>
+        <div class="body row">
+          <span id="mailState" role="status"></span>
+          <button type="button" class="ghost small" id="mailTest">Send me a test mail</button>
+        </div>
+        <div class="body row">
+          <span id="tgAdminState" role="status"></span>
+        </div>
+        <form id="placeForm" class="peopleform">
+          <label>Place <input id="plName" required autocomplete="off" placeholder="Mirpur"></label>
+          <label>Morning <input id="plMs" type="time" value="08:00" required> to
+            <input id="plMe" type="time" value="14:00" required></label>
+          <label>Evening <input id="plEs" type="time" value="14:30" required> to
+            <input id="plEe" type="time" value="20:30" required></label>
+          <button type="submit" class="primary">Add place</button>
+          <span id="placeMsg" class="hint" role="status"></span>
+        </form>
+        <div class="scroll"><div id="places"></div></div>
+      </section>
+      <section class="panel" aria-labelledby="h-shiftlog" id="shiftLogPanel" hidden>
+        <div class="head wrap"><h3 id="h-shiftlog">Shift log</h3>
+          <span class="hint">Every shift each data collector started and ended, for salaries.</span></div>
+        <div class="body row">
+          <label class="field"><span>Month</span> <input type="month" id="slMonth"></label>
+          <a class="button primary" id="slDownload" href="/api/v2/admin/shifts.csv">Download shift log (CSV)</a>
+        </div>
       </section>
     </section>
   </main>
