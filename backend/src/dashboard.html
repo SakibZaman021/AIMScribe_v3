@@ -128,6 +128,20 @@
         </div>
       </section>
 
+      <section class="panel" aria-labelledby="h-pieces" id="piecesPanel">
+        <div class="head wrap"><h3 id="h-pieces">Pieces log</h3>
+          <button type="button" class="q" aria-label="About the pieces log" data-tip="Every piece of audio that reached the server, kept after the piece itself is deleted. Every piece: one row per piece, with when it was recorded, when it arrived, its fingerprint and where it is now. One row per recording: pieces arrived, the numbers missing, whether the PC has finished sending, how many pieces the PC says it still holds, CMED and the archive. No dates: the last 7 days. A recording's own button is in its Pieces column.">?</button></div>
+        <div class="body pfind">
+          <label class="field col"><span>From</span> <input type="date" id="piecesFrom"></label>
+          <label class="field col"><span>To</span> <input type="date" id="piecesTo"></label>
+          <label class="field col"><span>Clinic</span>
+            <select id="piecesClinic"><option value="">All clinics</option></select></label>
+          <button type="button" class="primary" data-pieces-log="recordings">One row per recording (CSV)</button>
+          <button type="button" class="ghost" data-pieces-log="pieces">Every piece (CSV)</button>
+          <span id="piecesMsg" class="hint" role="status"></span>
+        </div>
+      </section>
+
       <div class="grid cols-b">
         <section class="panel" aria-labelledby="h-review">
           <div class="head"><h3 id="h-review">Needs review</h3>

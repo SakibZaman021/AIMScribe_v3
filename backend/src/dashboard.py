@@ -602,11 +602,16 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     async with _pool().acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT s.session_id, s.session_date, s.hospital_id, s.doctor_id,
-                   s.patient_id, s.visit_id, s.file_stem, s.local_start, s.local_end,
+                   s.patient_id,
+                   -- 20 Nov: the grant's visit_id while the recording is still
+                   -- going (recordings opened before it was saved at the start).
+                   COALESCE(s.visit_id, CASE WHEN g.patient_id = s.patient_id
+                                             THEN g.visit_id END) AS visit_id,
+                   s.file_stem, s.local_start, s.local_end,
                    s.confirmation, s.status, s.total_duration_seconds,
                    s.segment_count, s.opened_at, s.closed_at, s.archived_at,
                    s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
-                   s.microphones,
+                   s.microphones, s.object_prefix,
                    (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
                       AND a.alert_type = 'microphone_switched') AS mic_switches,
                    -- 18 Nov: paused now, and how much of it was paused.
@@ -883,6 +888,9 @@ def _recording_row(row) -> Dict[str, Any]:
         if "paused_seconds" in row.keys() else 0,
         "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
         "pause_list": _pause_list(row),
+        # 20 Nov: its folder in the segment store, for the pieces log.
+        "pieces_folder": (f"audio/{row['object_prefix'] or row['session_id']}/"
+                          if "object_prefix" in row.keys() else None),
     }
 
 
@@ -1021,6 +1029,226 @@ async def clinical_csv(request: Request, table: str = "demographics",
     dates = [d.isoformat() for d in (start, end) if d]
     named = [x for x in (clinic, patient, visit) if x]
     name = "_".join([table, *named, *(dates or ([] if named else ["all"]))]) + ".csv"
+    return Response(_csv(out, columns), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# ============================================================
+# The pieces log (20 Nov 2026)
+# ============================================================
+#
+# Every piece of audio that ever reached the segment store has a row in
+# `segments`, kept after the piece itself is deleted: its number, length,
+# fingerprint, when it was recorded and when it arrived, and where it went.
+# This turns those rows into the log the team asked for: one row per piece,
+# or one per recording with what arrived, what is missing and where it is.
+
+_PIECE_WHERE = """
+    CASE WHEN p.state = 'quarantined' THEN 'rejected: did not match what the PC signed'
+         WHEN p.object_deleted_at IS NOT NULL AND s.confirmation = 'refused'
+              THEN 'erased: the patient refused'
+         WHEN p.object_deleted_at IS NOT NULL AND s.confirmation = 'expired'
+              THEN 'erased: CMED did not confirm it in time'
+         WHEN p.object_deleted_at IS NOT NULL AND s.copied_at IS NOT NULL
+              THEN 'in the archive; piece removed after the archive copy was checked'
+         WHEN p.object_deleted_at IS NOT NULL OR p.state = 'purged'
+              THEN 'removed from the segment store'
+         WHEN p.state = 'archived'
+              THEN 'joined into the archive WAV; piece still in the segment store'
+         WHEN s.closed_at IS NULL THEN 'in the segment store; recording still sending'
+         WHEN s.confirmation = 'confirmed'
+              THEN 'in the segment store; confirmed, waiting to be joined'
+         ELSE 'in the segment store; waiting for CMED' END"""
+
+# The visit the recording belongs to: saved on it, or its grant's while that
+# grant is still this recording's patient.
+_PIECE_VISIT = ("COALESCE(s.visit_id, CASE WHEN g.patient_id = s.patient_id "
+                "THEN g.visit_id END)")
+
+_PIECES_SQL = f"""
+    SELECT s.hospital_id AS clinic, s.doctor_id AS doctor, s.session_date AS day,
+           s.patient_id, {_PIECE_VISIT} AS visit_id,
+           s.session_id AS recording, d.machine_name AS pc,
+           p.seq_no AS piece,
+           p.captured_start_at AS recorded_from,
+           p.captured_end_at AS recorded_to,
+           p.duration_seconds AS seconds, p.bytes,
+           encode(p.sha256, 'hex') AS fingerprint_sha256,
+           p.committed_at AS arrived_at,
+           round(extract(epoch FROM p.committed_at - p.captured_end_at))::int
+               AS arrived_seconds_after_recorded,
+           {_PIECE_WHERE} AS where_now,
+           p.object_deleted_at
+               AS removed_from_store_at,
+           p.object_key AS address_in_segment_store,
+           COALESCE(h.timezone, 'Asia/Dhaka') AS _clock
+      FROM segments p
+      JOIN sessions s ON s.session_id = p.session_id
+      LEFT JOIN hospitals h ON h.hospital_id = s.hospital_id
+      LEFT JOIN devices d ON d.device_id = s.device_id
+      LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti
+     WHERE {{where}}
+     ORDER BY s.session_date, s.hospital_id, s.doctor_id, s.opened_at, p.seq_no
+     LIMIT {{most}}"""
+
+_PIECE_RECORDINGS_SQL = f"""
+    SELECT s.hospital_id AS clinic, s.doctor_id AS doctor, s.session_date AS day,
+           s.patient_id, {_PIECE_VISIT} AS visit_id,
+           s.session_id AS recording, d.machine_name AS pc,
+           s.opened_at AS started,
+           s.closed_at AS pc_finished_sending_at,
+           CASE WHEN s.closed_at IS NOT NULL THEN s.segment_count END AS pieces_in_recording,
+           a.arrived AS pieces_arrived,
+           a.last_piece,
+           -- An erased recording's pieces are gone by design, not missing.
+           CASE WHEN s.confirmation NOT IN ('refused', 'expired') THEN m.missing END
+               AS missing_piece_numbers,
+           CASE WHEN s.closed_at IS NULL THEN d.pending_segments END
+               AS pieces_this_pc_reports_waiting,
+           d.last_seen_at AS pc_last_seen,
+           a.last_arrived AS last_piece_arrived_at,
+           a.sent_late AS pieces_arrived_over_2_min_late,
+           a.longest_wait AS longest_wait_seconds,
+           a.in_store AS pieces_in_segment_store,
+           s.confirmation AS cmed,
+           s.archived_at AS archived_at,
+           s.copied_at AS archive_copy_at,
+           CASE WHEN s.status = 'quarantined' OR s.quarantine_reason IS NOT NULL
+                     THEN 'held for review: ' || COALESCE(s.quarantine_reason, '')
+                WHEN s.confirmation IN ('refused', 'expired') THEN 'erased'
+                WHEN s.closed_at IS NULL AND a.arrived = 0
+                     THEN 'started; no piece has arrived yet'
+                WHEN s.closed_at IS NULL
+                     THEN 'recording, or the PC still has pieces to send'
+                WHEN m.missing IS NOT NULL THEN 'finished, but pieces are missing'
+                WHEN s.copied_at IS NOT NULL THEN 'archived, and its archive copy made'
+                WHEN s.archived_at IS NOT NULL THEN 'archived; archive copy pending'
+                WHEN s.confirmation = 'confirmed'
+                     THEN 'every piece in; confirmed; waiting to be joined'
+                ELSE 'every piece in; waiting for CMED' END AS status,
+           'audio/' || COALESCE(s.object_prefix, s.session_id) || '/'
+               AS folder_in_segment_store,
+           COALESCE(h.timezone, 'Asia/Dhaka') AS _clock
+      FROM sessions s
+      LEFT JOIN hospitals h ON h.hospital_id = s.hospital_id
+      LEFT JOIN devices d ON d.device_id = s.device_id
+      LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti
+      CROSS JOIN LATERAL (
+          SELECT count(*) AS arrived, max(p.seq_no) AS last_piece,
+                 max(p.committed_at) AS last_arrived,
+                 count(*) FILTER (WHERE p.committed_at - p.captured_end_at
+                                        > interval '2 minutes') AS sent_late,
+                 max(round(extract(epoch FROM p.committed_at - p.captured_end_at)))::int
+                     AS longest_wait,
+                 count(*) FILTER (WHERE p.object_deleted_at IS NULL
+                                    AND p.state <> 'purged') AS in_store
+            FROM segments p WHERE p.session_id = s.session_id) a
+      CROSS JOIN LATERAL (
+          SELECT string_agg(n::text, ' ' ORDER BY n) AS missing
+            FROM generate_series(1, GREATEST(COALESCE(a.last_piece, 0),
+                                             CASE WHEN s.closed_at IS NOT NULL
+                                                  THEN COALESCE(s.segment_count, 0)
+                                                  ELSE 0 END)) n
+           WHERE NOT EXISTS (SELECT 1 FROM segments q
+                              WHERE q.session_id = s.session_id AND q.seq_no = n)) m
+     WHERE s.protocol_version >= 2 AND {{where}}
+     ORDER BY s.session_date, s.hospital_id, s.doctor_id, s.opened_at
+     LIMIT {{most}}"""
+
+
+def _clinic_clock(value: Any, zone: str) -> Any:
+    """A moment as the clinic's wall clock reads it, to the second; else as _cell."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        try:
+            value = value.astimezone(ZoneInfo(zone))
+        except Exception:
+            value = value.astimezone(timezone.utc)
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return _cell(value)
+
+
+@router.get("/pieces.csv")
+async def pieces_csv(request: Request, table: str = "pieces",
+                     from_date: Optional[str] = Query(None, alias="from"),
+                     to_date: Optional[str] = Query(None, alias="to"),
+                     hospital_id: Optional[str] = None,
+                     patient_id: Optional[str] = None,
+                     visit_id: Optional[str] = None,
+                     session_id: Optional[str] = None,
+                     _: None = Depends(require_viewer),
+                     scope: Any = Depends(collectors.hospital_scope)):
+    """
+    20 Nov 2026: the pieces log. table=pieces is one row per piece that
+    reached the segment store - when it was recorded, when it arrived, its
+    fingerprint and where it is now; table=recordings is one row per
+    recording - pieces arrived, the numbers missing, whether the PC has
+    finished sending and how many pieces it says it still holds, CMED, the
+    archive. One recording (session_id), a patient, a visit, or the dates and
+    clinic chosen (the last 7 days when nothing narrows it). Not clinical: no
+    value from CMED's messages is in it. Researchers and admins (036).
+    """
+    await _no_collector_files(request, "the recordings")
+    if table not in ("pieces", "recordings"):
+        raise HTTPException(status_code=400, detail="table is pieces or recordings.")
+    where: List[str] = []
+    args: List[Any] = []
+
+    def add(clause: str, value: Any) -> None:
+        args.append(value)
+        where.append(clause.replace("$N", f"${len(args)}"))
+
+    recording = None
+    if isinstance(session_id, str) and session_id.strip():
+        try:
+            recording = api_v2.safe_session_id(session_id.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="session_id is not a recording ID")
+        add("s.session_id = $N", recording)
+    patient = None
+    if isinstance(patient_id, str) and patient_id.strip():
+        try:
+            patient = safe_identifier(patient_id.strip(), field="patient_id")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="patient_id is not an identifier")
+        add("s.patient_id = $N", patient)
+    visit = None
+    if isinstance(visit_id, str) and visit_id.strip():
+        visit = visit_id.strip()
+        if not api_v2.VISIT_ID.match(visit):
+            raise HTTPException(status_code=400,
+                                detail="A visit ID has letters, digits and '-' only.")
+        add(f"{_PIECE_VISIT} = $N", visit)
+    # One recording, patient or visit: every day of it unless dates are given.
+    # Otherwise the last 7 days, as on the Recordings page.
+    narrowed = bool(recording or patient or visit)
+    today = clinic_today()
+    start = _day(from_date, None if narrowed else today - timedelta(days=7))
+    end = _day(to_date, None if narrowed else today)
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=400, detail="From is after To.")
+    if start is not None:
+        add("s.session_date >= $N", start)
+    if end is not None:
+        add("s.session_date <= $N", end)
+    clinic = _clinic(hospital_id)
+    clinics = collectors.narrow(scope, clinic)
+    if clinics is not None:
+        add("s.hospital_id = ANY($N::text[])", clinics)
+    sql = (_PIECES_SQL if table == "pieces" else _PIECE_RECORDINGS_SQL).format(
+        where=" AND ".join(where) or "true", most=_CSV_MOST + 1)
+    async with _pool().acquire() as conn:
+        statement = await conn.prepare(sql)
+        columns = [a.name for a in statement.get_attributes() if a.name != "_clock"]
+        rows = await statement.fetch(*args)
+    if len(rows) > _CSV_MOST:
+        raise HTTPException(status_code=413, detail=f"Over {_CSV_MOST:,} rows: choose fewer "
+                                                    "days or one clinic.")
+    out = [{k: _clinic_clock(r[k], r["_clock"]) for k in columns} for r in rows]
+    # e.g. pieces_01M7SPZC8F929V47JCX96JWRS5.csv,
+    # recordings_AALO_KARAIL_2026-11-13_2026-11-20.csv
+    dates = [d.isoformat() for d in (start, end) if d]
+    named = [x for x in (recording, clinic, patient, visit) if x]
+    name = "_".join([table, *named, *dates]) + ".csv"
     return Response(_csv(out, columns), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
@@ -1279,13 +1507,13 @@ def _csv(rows: List[Dict[str, Any]], columns: List[str]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
-async def _no_collector_files(request: Request) -> None:
+async def _no_collector_files(request: Request, what: str = "the event log") -> None:
     """A CSV is a download: researchers and admins, as for audio (036)."""
     import portal
     person = await portal.person_for(request)
     if person is not None and person.role == "collector":
-        raise HTTPException(status_code=403, detail="A data collector can view the event "
-                                                    "log but not download it.")
+        raise HTTPException(status_code=403, detail=f"A data collector can view {what} "
+                                                    "but not download it.")
 
 
 @router.get("/events")

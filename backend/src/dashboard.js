@@ -908,7 +908,7 @@ function recordingsTable(list) {
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>PC</th><th>Doctor</th>`
     + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
     + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th>`
-    + `<th>Stored</th><th>Download</th><th>Folder on server</th></tr></thead><tbody>`
+    + `<th>Stored</th><th>Download</th><th>Pieces</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
@@ -949,6 +949,7 @@ function recordingsTable(list) {
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Stored", storedTag(r))
           + td("Download", audioLinks(r))
+          + td("Pieces", piecesButton(r))
           + td("Folder", folder
             ? `<span title="${esc(folder)}">${esc(folder)}</span>`
               + ` <button type="button" class="copy" data-copy="${esc(folder)}">Copy</button>`
@@ -956,6 +957,28 @@ function recordingsTable(list) {
           + `</tr>`;
       }).join("") + `</tbody></table>`;
 }
+
+/* 20 Nov 2026: the pieces log - every piece of a recording, when it was
+   recorded, when it arrived, and where it is now. */
+function piecesButton(r) {
+  if (PORTAL && PORTAL.role === "collector") return `<span class="hint">view only</span>`;
+  return `<button type="button" class="copy" data-pieces="${esc(r.session_id)}"`
+    + ` title="${esc(r.pieces_folder || "")}">Pieces (CSV)</button>`;
+}
+$("recTable").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-pieces]");
+  if (b) downloadCsv({ table: "pieces", session_id: b.dataset.pieces }, b, $("piecesMsg"),
+    "/api/v2/dashboard/pieces.csv");
+});
+document.querySelectorAll("[data-pieces-log]").forEach((b) => b.addEventListener("click", () => {
+  const from = $("piecesFrom").value, to = $("piecesTo").value;
+  if (from && to && from > to) {
+    $("piecesMsg").textContent = "From is after To.";
+    return;
+  }
+  downloadCsv({ table: b.dataset.piecesLog, from, to, hospital_id: $("piecesClinic").value },
+    b, $("piecesMsg"), "/api/v2/dashboard/pieces.csv");
+}));
 
 $("recTable").addEventListener("click", async (e) => {
   const b = e.target.closest("button[data-copy]");
@@ -1228,6 +1251,7 @@ async function whoAmI() {
     }
     if (me.role === "collector") {
       $("navShift").hidden = false;
+      $("piecesPanel").hidden = true;      // a download: researchers and admins
       loadShift();
     }
     if (me.role === "researcher" || me.role === "admin") {
@@ -2050,13 +2074,13 @@ function visitCard(v) {
 
 // One CSV download, fetched so the admin key goes with it and a refusal is
 // said on the page instead of replacing it.
-async function downloadCsv(params, button, msg) {
+async function downloadCsv(params, button, msg, path = "/api/v2/dashboard/clinical.csv") {
   const query = new URLSearchParams(Object.entries(params)
     .filter(([, v]) => v !== "" && v != null));
   msg.textContent = "Preparing...";
   button.disabled = true;
   try {
-    const response = await fetch(`/api/v2/dashboard/clinical.csv?${query}`,
+    const response = await fetch(`${path}?${query}`,
       { headers: portalHeaders() });
     if (!response.ok) {
       let detail = `Server error ${response.status}`;
@@ -2147,11 +2171,13 @@ $("patientForm").addEventListener("submit", (e) => {
 /* 19 Nov 2026: the demographics, prescriptions or medicines of every visit
    in the dates chosen, as a CSV. The server checks the dates and the role. */
 function fillCsvClinics() {
-  const sel = $("csvClinic");
-  const chosen = sel.value;
-  sel.innerHTML = `<option value="">All clinics</option>`
-    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
-  sel.value = chosen;
+  for (const id of ["csvClinic", "piecesClinic"]) {
+    const sel = $(id);
+    const chosen = sel.value;
+    sel.innerHTML = `<option value="">All clinics</option>`
+      + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+    sel.value = chosen;
+  }
 }
 document.querySelectorAll("[data-csv]").forEach((b) => b.addEventListener("click", () => {
   const from = $("csvFrom").value, to = $("csvTo").value;
