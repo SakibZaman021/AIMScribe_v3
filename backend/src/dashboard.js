@@ -931,6 +931,11 @@ function recordingsTable(list) {
           status.push(tag("warn", `Paused since ${at}` + (r.pause_reason ? ` (${human(r.pause_reason)})` : ""),
             "The doctor paused this recording; nothing is recorded until they press Resume."));
         }
+        // 20 Nov (recorder 3.9.6+): pieces its PC still holds, by number.
+        if (r.pc_waiting && r.pc_waiting.length) {
+          status.push(tag("warn", `On the PC: ${r.pc_waiting.length} piece${r.pc_waiting.length === 1 ? "" : "s"} not sent (${esc(pieceRanges(r.pc_waiting))})`,
+            "The PC has recorded these pieces but not sent them yet. It keeps trying every 10 seconds; they arrive when it is back online."));
+        }
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";
@@ -956,6 +961,19 @@ function recordingsTable(list) {
             : `<span class="hint">–</span>`, "path")
           + `</tr>`;
       }).join("") + `</tbody></table>`;
+}
+
+// 1 2 3 5 7 8 -> "1-3, 5, 7-8"
+function pieceRanges(numbers) {
+  const out = [];
+  let start = null, prev = null;
+  for (const n of [...numbers].sort((a, b) => a - b)) {
+    if (start !== null && n === prev + 1) { prev = n; continue; }
+    if (start !== null) out.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = prev = n;
+  }
+  if (start !== null) out.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return out.join(", ");
 }
 
 /* 20 Nov 2026: the pieces log - every piece of a recording, when it was

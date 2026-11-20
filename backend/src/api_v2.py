@@ -415,6 +415,11 @@ class HeartbeatRequest(BaseModel):
     microphone_is_clinic: Optional[bool] = None
     # The version of CMED's address list it holds (recorder 3.8+).
     trusted_origins_version: Optional[int] = None
+    # Recorder 3.9.6+: each recording the PC still holds something of - pieces
+    # sealed, accepted, and the numbers still waiting - and whether every such
+    # recording is listed (False when there were more than it sends).
+    recordings: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
+    recordings_complete: Optional[bool] = None
 
 
 class ArchivedPart(BaseModel):
@@ -1966,6 +1971,12 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         except Exception as exc:
             logger.warning("Could not note the recording's microphone: %s", exc)
     await _check_recorder(device, body)
+    if body.recordings is not None:
+        try:
+            await _repo().note_piece_reports(device["device_id"], _piece_reports(body.recordings),
+                                             complete=body.recordings_complete is not False)
+        except Exception as exc:          # a heartbeat never fails for its report
+            logger.warning("Could not keep the PC's piece report: %s", exc)
     if body.spool_pressure == "critical":
         await _repo().raise_alert(
             alert_type="spool_critical", severity="critical",
@@ -1999,6 +2010,36 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         except Exception as exc:
             logger.warning("Could not send the trusted origins: %s", exc)
     return reply
+
+
+def _piece_reports(items: List[Any]) -> List[Dict[str, Any]]:
+    """
+    A 3.9.6 PC's report, made safe to store: a recording ID, counts that are
+    counts, piece numbers that are piece numbers. Anything else is dropped.
+    """
+    def count(value: Any) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool)             and 0 <= value <= 100_000 else None
+
+    def numbers(value: Any) -> List[int]:
+        if not isinstance(value, list):
+            return []
+        return sorted({n for n in value[:500]
+                       if isinstance(n, int) and not isinstance(n, bool) and 0 < n <= 100_000})
+
+    out = []
+    for item in items[:50]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            sid = safe_session_id(str(item.get("session_id", "")))
+        except ValueError:
+            continue
+        out.append({"session_id": sid, "recorded": count(item.get("recorded")),
+                    "sent": count(item.get("sent")), "waiting": count(item.get("waiting")),
+                    "waiting_numbers": numbers(item.get("waiting_numbers")),
+                    "rejected_numbers": numbers(item.get("rejected_numbers")),
+                    "finished": bool(item.get("finished"))})
+    return out
 
 
 _ORIGINS_CACHE: Dict[str, Any] = {"version": -1, "bundle": None}

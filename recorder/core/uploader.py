@@ -1357,6 +1357,46 @@ class UploadManager:
         held.sort(key=lambda h: h["since"] or "")
         return held
 
+    # 3.9.6: each recording's own account of its pieces, sent with every
+    # heartbeat, so the server's pieces log can say "pieces 16-20 are still on
+    # this PC" instead of only "this PC has 5 pieces waiting".
+    REPORT_MOST = 20          # recordings per heartbeat, those waiting longest first
+    NUMBERS_MOST = 500        # piece numbers listed per recording
+
+    def delivery_report(self) -> Dict[str, Any]:
+        """
+        For every recording this PC still holds something of: how many pieces
+        it has sealed, how many the server has accepted, and the numbers still
+        waiting to be sent or refused by the server. A recording whose pieces
+        are all accepted and whose end the server has is left out. `complete`
+        is False when more recordings were waiting than are listed, so the
+        server does not take an unlisted one as fully sent.
+        """
+        sent_states = (COMMITTED, RECEIPTED, spool_mod.PURGED)
+        rows = []
+        for session in list(self._sessions):
+            pieces = session.segment_list()
+            waiting = [p.seq_no for p in pieces if p.state == PENDING]
+            rejected = [p.seq_no for p in pieces if p.state == spool_mod.QUARANTINED]
+            finished = session.closed_at is not None
+            if finished and session.close_reported and not waiting and not rejected:
+                continue
+            oldest = session.oldest_pending_at()
+            rows.append({
+                "session_id": session.session_id,
+                "recorded": len(pieces),
+                "last_recorded": max((p.seq_no for p in pieces), default=0),
+                "sent": sum(1 for p in pieces if p.state in sent_states),
+                "waiting": len(waiting),
+                "waiting_numbers": waiting[:self.NUMBERS_MOST],
+                "rejected_numbers": rejected[:self.NUMBERS_MOST],
+                "finished": finished,
+                "oldest_waiting_at": crypto.iso_utc(oldest) if oldest else None,
+            })
+        rows.sort(key=lambda r: (r["oldest_waiting_at"] is None, r["oldest_waiting_at"] or ""))
+        return {"recordings": rows[:self.REPORT_MOST],
+                "complete": len(rows) <= self.REPORT_MOST}
+
     def status(self) -> Dict[str, Any]:
         pending = sum(len(s.pending_segments()) for s in self._sessions)
         return {

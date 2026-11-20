@@ -612,6 +612,12 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    s.segment_count, s.opened_at, s.closed_at, s.archived_at,
                    s.copied_at, s.archive_relpath, s.quarantine_reason, s.close_reason,
                    s.microphones, s.object_prefix,
+                   -- 20 Nov (recorder 3.9.6+): pieces the PC says it still holds,
+                   -- less any that have arrived since.
+                   (SELECT array_agg(n ORDER BY n) FROM unnest(s.pc_waiting_numbers) n
+                     WHERE NOT EXISTS (SELECT 1 FROM segments q WHERE
+                                       q.session_id = s.session_id AND q.seq_no = n))
+                       AS pc_still_waiting, s.pc_reported_at,
                    (SELECT count(*) FROM integrity_alerts a WHERE a.session_id = s.session_id
                       AND a.alert_type = 'microphone_switched') AS mic_switches,
                    -- 18 Nov: paused now, and how much of it was paused.
@@ -888,6 +894,10 @@ def _recording_row(row) -> Dict[str, Any]:
         if "paused_seconds" in row.keys() else 0,
         "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
         "pause_list": _pause_list(row),
+        # 20 Nov (recorder 3.9.6+): piece numbers still on its PC, and when said.
+        "pc_waiting": list(row["pc_still_waiting"] or [])
+        if "pc_still_waiting" in row.keys() else [],
+        "pc_reported_at": moment(row["pc_reported_at"]) if "pc_reported_at" in row.keys() else None,
         # 20 Nov: its folder in the segment store, for the pieces log.
         "pieces_folder": (f"audio/{row['object_prefix'] or row['session_id']}/"
                           if "object_prefix" in row.keys() else None),
@@ -1066,6 +1076,7 @@ _PIECE_VISIT = ("COALESCE(s.visit_id, CASE WHEN g.patient_id = s.patient_id "
                 "THEN g.visit_id END)")
 
 _PIECES_SQL = f"""
+    SELECT * FROM (
     SELECT s.hospital_id AS clinic, s.doctor_id AS doctor, s.session_date AS day,
            s.patient_id, {_PIECE_VISIT} AS visit_id,
            s.session_id AS recording, d.machine_name AS pc,
@@ -1081,14 +1092,36 @@ _PIECES_SQL = f"""
            p.object_deleted_at
                AS removed_from_store_at,
            p.object_key AS address_in_segment_store,
-           COALESCE(h.timezone, 'Asia/Dhaka') AS _clock
+           COALESCE(h.timezone, 'Asia/Dhaka') AS _clock, s.opened_at AS _opened
       FROM segments p
       JOIN sessions s ON s.session_id = p.session_id
       LEFT JOIN hospitals h ON h.hospital_id = s.hospital_id
       LEFT JOIN devices d ON d.device_id = s.device_id
       LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti
      WHERE {{where}}
-     ORDER BY s.session_date, s.hospital_id, s.doctor_id, s.opened_at, p.seq_no
+    UNION ALL
+    -- Recorder 3.9.6+: the pieces the PC says it still holds, not yet here.
+    SELECT s.hospital_id, s.doctor_id, s.session_date, s.patient_id, {_PIECE_VISIT},
+           s.session_id, d.machine_name, n.piece,
+           NULL::timestamptz, NULL::timestamptz, NULL::numeric, NULL::bigint, NULL::text,
+           NULL::timestamptz, NULL::int,
+           CASE WHEN n.piece = ANY(COALESCE(s.pc_rejected_numbers, '{{{{}}}}'))
+                THEN 'on the PC: refused by the server, kept there for review'
+                ELSE 'on the PC: not sent yet' END,
+           NULL::timestamptz, NULL::text,
+           COALESCE(h.timezone, 'Asia/Dhaka'), s.opened_at
+      FROM sessions s
+      CROSS JOIN LATERAL unnest(COALESCE(s.pc_waiting_numbers, '{{{{}}}}')
+                                || COALESCE(s.pc_rejected_numbers, '{{{{}}}}')) AS n(piece)
+      LEFT JOIN hospitals h ON h.hospital_id = s.hospital_id
+      LEFT JOIN devices d ON d.device_id = s.device_id
+      LEFT JOIN grant_authorisations g ON g.jti = s.grant_jti
+     WHERE s.confirmation NOT IN ('refused', 'expired')
+       AND NOT EXISTS (SELECT 1 FROM segments q
+                        WHERE q.session_id = s.session_id AND q.seq_no = n.piece)
+       AND {{where}}
+    ) pieces
+     ORDER BY day, clinic, doctor, _opened, recording, piece
      LIMIT {{most}}"""
 
 _PIECE_RECORDINGS_SQL = f"""
@@ -1103,8 +1136,16 @@ _PIECE_RECORDINGS_SQL = f"""
            -- An erased recording's pieces are gone by design, not missing.
            CASE WHEN s.confirmation NOT IN ('refused', 'expired') THEN m.missing END
                AS missing_piece_numbers,
-           CASE WHEN s.closed_at IS NULL THEN d.pending_segments END
-               AS pieces_this_pc_reports_waiting,
+           -- Recorder 3.9.6+: what the PC itself says it still holds, less what
+           -- has arrived since it said so. Empty for older recorders.
+           s.pc_pieces_recorded AS pieces_recorded_on_pc,
+           cardinality(w.still) AS pieces_waiting_on_pc,
+           array_to_string(w.still, ' ') AS piece_numbers_waiting_on_pc,
+           array_to_string(s.pc_rejected_numbers, ' ') AS piece_numbers_refused_kept_on_pc,
+           s.pc_reported_at AS pc_reported_at,
+           -- Every recorder: the PC's one count for all its recordings.
+           CASE WHEN s.closed_at IS NULL OR cardinality(w.still) > 0
+                THEN d.pending_segments END AS pieces_waiting_on_this_pc_all_recordings,
            d.last_seen_at AS pc_last_seen,
            a.last_arrived AS last_piece_arrived_at,
            a.sent_late AS pieces_arrived_over_2_min_late,
@@ -1116,6 +1157,13 @@ _PIECE_RECORDINGS_SQL = f"""
            CASE WHEN s.status = 'quarantined' OR s.quarantine_reason IS NOT NULL
                      THEN 'held for review: ' || COALESCE(s.quarantine_reason, '')
                 WHEN s.confirmation IN ('refused', 'expired') THEN 'erased'
+                WHEN cardinality(w.still) > 0
+                     THEN 'the PC still has ' || cardinality(w.still) || ' piece(s) to send: '
+                          || array_to_string(w.still, ' ')
+                WHEN cardinality(COALESCE(s.pc_rejected_numbers, '{{{{}}}}')) > 0
+                     THEN 'the server refused piece(s) '
+                          || array_to_string(s.pc_rejected_numbers, ' ')
+                          || '; the PC keeps them for review'
                 WHEN s.closed_at IS NULL AND a.arrived = 0
                      THEN 'started; no piece has arrived yet'
                 WHEN s.closed_at IS NULL
@@ -1144,8 +1192,14 @@ _PIECE_RECORDINGS_SQL = f"""
                                     AND p.state <> 'purged') AS in_store
             FROM segments p WHERE p.session_id = s.session_id) a
       CROSS JOIN LATERAL (
+          SELECT array_agg(n ORDER BY n) FILTER (WHERE n IS NOT NULL) AS still
+            FROM unnest(COALESCE(s.pc_waiting_numbers, '{{{{}}}}')) n
+           WHERE NOT EXISTS (SELECT 1 FROM segments q
+                              WHERE q.session_id = s.session_id AND q.seq_no = n)) w
+      CROSS JOIN LATERAL (
           SELECT string_agg(n::text, ' ' ORDER BY n) AS missing
             FROM generate_series(1, GREATEST(COALESCE(a.last_piece, 0),
+                                             COALESCE(s.pc_pieces_recorded, 0),
                                              CASE WHEN s.closed_at IS NOT NULL
                                                   THEN COALESCE(s.segment_count, 0)
                                                   ELSE 0 END)) n
@@ -1238,7 +1292,8 @@ async def pieces_csv(request: Request, table: str = "pieces",
         where=" AND ".join(where) or "true", most=_CSV_MOST + 1)
     async with _pool().acquire() as conn:
         statement = await conn.prepare(sql)
-        columns = [a.name for a in statement.get_attributes() if a.name != "_clock"]
+        columns = [a.name for a in statement.get_attributes()
+                   if a.name not in ("_clock", "_opened")]
         rows = await statement.fetch(*args)
     if len(rows) > _CSV_MOST:
         raise HTTPException(status_code=413, detail=f"Over {_CSV_MOST:,} rows: choose fewer "

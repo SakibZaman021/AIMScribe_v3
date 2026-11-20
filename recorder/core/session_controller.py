@@ -1763,8 +1763,23 @@ class SessionController:
             **self._microphone_report(active),
             # The list of CMED addresses held: the server sends a newer one.
             "trusted_origins_version": _origins_version(),
+            # 3.9.6: each recording's pieces - sealed, accepted, still waiting.
+            **self._delivery_report(),
             "sent_at": crypto.iso_utc(datetime.now(timezone.utc)),
         }
+
+    def _delivery_report(self) -> Dict[str, Any]:
+        """The uploader's per-recording report; nothing when it cannot give one."""
+        report = getattr(self._uploader, "delivery_report", None)
+        if not callable(report):
+            return {}
+        try:
+            found = report()
+        except Exception as exc:                  # never worth a missed heartbeat
+            logger.debug("No delivery report: %s", exc)
+            return {}
+        return {"recordings": found["recordings"],
+                "recordings_complete": found["complete"]}
 
     # ---- status ----
 
