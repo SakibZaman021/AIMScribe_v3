@@ -1620,7 +1620,7 @@ class Notifier:
             line = await cards.line(conn, happened, f"stopped after {minutes} min: "
                                     f"{stop_label(detail.get('reason'))}",
                                     session_id=row["session_id"], device_id=row["device_id"],
-                                    hospital_id=row["hospital_id"])
+                                    hospital_id=row["hospital_id"], icon=cards.UNUSUAL)
         await notify(conn, hospital_id=row["hospital_id"], event=event, subject=subject,
                      body=body + _footer(), event_key=f"alert:{row['id']}", urgent=urgent,
                      everyone_if_nobody=urgent, device_id=row["device_id"],
@@ -1744,7 +1744,8 @@ class Notifier:
                                                "patient did not consent (recording deleted)",
                                                session_id=r["session_id"],
                                                device_id=r["device_id"],
-                                               hospital_id=r["hospital_id"]))
+                                               hospital_id=r["hospital_id"],
+                                               icon=cards.UNUSUAL))
 
     # -- 18 Nov: the doctor paused a recording, or resumed it
     async def pauses(self, conn) -> None:
@@ -1800,7 +1801,8 @@ class Notifier:
                              happened_at=r["occurred_at"],
                              line=await cards.line(conn, r["occurred_at"], f"paused: {words}",
                                                    session_id=sid, device_id=r["device_id"],
-                                                   hospital_id=r["hospital_id"]))
+                                                   hospital_id=r["hospital_id"],
+                                                   icon=cards.UNUSUAL))
             else:
                 # Only a resume after a pause the doctor chose (not the Stop form's).
                 paused = await conn.fetchval("""
@@ -1826,7 +1828,8 @@ class Notifier:
                              line=await cards.line(conn, r["occurred_at"],
                                                    f"resumed after {took} paused",
                                                    session_id=sid, device_id=r["device_id"],
-                                                   hospital_id=r["hospital_id"]))
+                                                   hospital_id=r["hospital_id"],
+                                                   icon=cards.BACK))
         await conn.execute("UPDATE collector_notifier_state SET last_id = $1, "
                            "updated_at = now() WHERE name = 'pauses'", top)
 

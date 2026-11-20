@@ -83,13 +83,21 @@ async def where_words(conn, *, session_id=None, device_id=None, hospital_id=None
     return " · ".join(str(p) for p in parts if p)
 
 
+# 20 Nov: a silent line still catches the eye. Orange: something unusual (a
+# refusal, an unusual stop, a pause); green: back to normal (resumed). A red
+# circle stays for the problems that ring (the cards).
+UNUSUAL = "\U0001F7E0"
+BACK = "\U0001F7E2"
+
+
 async def line(conn, at: Optional[datetime], what: str, *, session_id=None, device_id=None,
-               hospital_id=None) -> str:
-    """One silent line for a researcher: '12:21 · TEST · PC · DRTEST01 - what happened'."""
+               hospital_id=None, icon: str = "") -> str:
+    """One silent line for a researcher: '🟠 12:21 · TEST · PC · DRTEST01 - what happened'."""
     import collectors
     where = await where_words(conn, session_id=session_id, device_id=device_id,
                               hospital_id=hospital_id)
-    return f"{collectors._hhmm(at or datetime.now(timezone.utc))} · {where} - {what}"
+    text = f"{collectors._hhmm(at or datetime.now(timezone.utc))} · {where} - {what}"
+    return f"{icon} {text}" if icon else text
 
 
 # ============================================================ the card

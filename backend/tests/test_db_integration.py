@@ -4495,6 +4495,7 @@ async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urg
             line = fake.sent_to(9202)
             assert len(line) == 1 and line[0].get("disable_notification") is True
             assert "paused: sensitive personal matter" in line[0]["text"]
+            assert line[0]["text"].startswith("🟠 ")         # orange: unusual
 
         # The dashboard shows it paused.
         listed = (await client.get("/api/v2/dashboard/recordings",
@@ -4517,6 +4518,7 @@ async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urg
                                  device_id=device["device_id"], session_id=sid, detail={})
             await notifier.pauses(conn)
             assert "resumed" in fake.sent_to(9202)[-1]["text"]
+            assert fake.sent_to(9202)[-1]["text"].startswith("🟢 ")  # green: normal again
             assert fake.sent_to(9202)[-1].get("disable_notification") is True
             await watchers.persisting(conn)
             edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9202]
