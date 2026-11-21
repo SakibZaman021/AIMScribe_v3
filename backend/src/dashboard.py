@@ -643,25 +643,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    -- 18 Nov: the visit CMED's API 2 and API 3 are matched on.
                    g.cmed_hospital_id AS cmed_code,
                    COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
-                   g.start_time AS cmed_start_time,
-                   -- 21 Nov: a waiting recording whose visit another PC also
-                   -- asked for. Never confirmed by itself (the two-PC rule);
-                   -- an admin decides, seeing both PCs and their times.
-                   CASE WHEN s.confirmation IN ('pending', 'unconfirmed') THEN (
-                       SELECT json_agg(json_build_object(
-                                  'pc', od.machine_name, 'session_id', os.session_id,
-                                  'opened_at', COALESCE(os.opened_at, o.issued_at),
-                                  'closed_at', os.closed_at,
-                                  'confirmation', os.confirmation)
-                              ORDER BY COALESCE(os.opened_at, o.issued_at))
-                         FROM grant_authorisations o
-                         LEFT JOIN sessions os ON os.grant_jti = o.jti
-                         LEFT JOIN devices od ON od.device_id = o.device_id
-                        WHERE o.device_id <> g.device_id
-                          AND o.patient_id = g.patient_id AND o.doctor_id = g.doctor_id
-                          AND o.cmed_hospital_id = g.cmed_hospital_id
-                          AND o.start_time = g.start_time AND o.visit_date = g.visit_date)
-                   END AS other_pcs
+                   g.start_time AS cmed_start_time
               FROM sessions s
               LEFT JOIN grant_authorisations g
                      ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
@@ -886,8 +868,6 @@ def _recording_row(row) -> Dict[str, Any]:
         "local_end": moment(row["local_end"]),
         "confirmation": row["confirmation"],
         "status": row["status"],
-        "opened_at": moment(row["opened_at"]) if "opened_at" in row.keys() else None,
-        "closed_at": moment(row["closed_at"]) if "closed_at" in row.keys() else None,
         "minutes": round(float(row["total_duration_seconds"] or 0) / 60, 1),
         "segments": row["segment_count"],
         "archived": row["archived_at"] is not None,
@@ -918,46 +898,10 @@ def _recording_row(row) -> Dict[str, Any]:
         "pc_waiting": list(row["pc_still_waiting"] or [])
         if "pc_still_waiting" in row.keys() else [],
         "pc_reported_at": moment(row["pc_reported_at"]) if "pc_reported_at" in row.keys() else None,
-        # 21 Nov: other PCs that asked for this waiting recording's visit.
-        "other_pcs": _other_pcs(row),
         # 20 Nov: its folder in the segment store, for the pieces log.
         "pieces_folder": (f"audio/{row['object_prefix'] or row['session_id']}/"
                           if "object_prefix" in row.keys() else None),
     }
-
-
-def _other_pcs(row) -> List[Dict[str, Any]]:
-    """
-    21 Nov 2026: the other PCs that asked for this waiting recording's visit -
-    each with its recording (if it opened one), its times, and whether the two
-    recordings ran at the same time. Two at once is two PCs recording one
-    consultation; one after the other is more likely the doctor moving PC
-    (visit-e2984763). The admin who confirms by hand sees which.
-    """
-    if "other_pcs" not in row.keys() or not row["other_pcs"]:
-        return []
-    found = row["other_pcs"]
-    if isinstance(found, str):
-        found = json.loads(found)
-    now = datetime.now(timezone.utc)
-    start, end = row["opened_at"], row["closed_at"] or now
-
-    def when(value):
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
-        except ValueError:
-            return None
-
-    out = []
-    for other in found:
-        o_start, o_end = when(other.get("opened_at")), when(other.get("closed_at"))
-        overlapped = None
-        if start is not None and o_start is not None and other.get("session_id"):
-            overlapped = o_start < end and (o_end or now) > start
-        out.append({"pc": other.get("pc"), "session_id": other.get("session_id"),
-                    "opened_at": other.get("opened_at"), "closed_at": other.get("closed_at"),
-                    "confirmation": other.get("confirmation"), "overlapped": overlapped})
-    return out
 
 
 def _pause_list(row) -> List[Dict[str, Any]]:
