@@ -936,6 +936,8 @@ function recordingsTable(list) {
           status.push(tag("warn", `On the PC: ${r.pc_waiting.length} piece${r.pc_waiting.length === 1 ? "" : "s"} not sent (${esc(pieceRanges(r.pc_waiting))})`,
             "The PC has recorded these pieces but not sent them yet. It keeps trying every 10 seconds; they arrive when it is back online."));
         }
+        // 21 Nov: another PC also asked for this visit - an admin decides.
+        if (waitingTwoPcs(r)) status.push(twoPcsTag(r) + confirmByHandButton(r));
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";
@@ -962,6 +964,65 @@ function recordingsTable(list) {
           + `</tr>`;
       }).join("") + `</tbody></table>`;
 }
+
+/* 21 Nov 2026: one visit, two PCs. The server never confirms such a recording
+   by itself (a copied PC and a doctor who moved PC look the same from there);
+   an admin can, by name and with a reason, after seeing both PCs' times. */
+const waitingTwoPcs = (r) => (r.other_pcs || []).length > 0
+  && (r.confirmation === "pending" || r.confirmation === "unconfirmed");
+const dhakaTime = (iso) => (iso ? new Date(iso).toLocaleTimeString([], {
+  hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dhaka" }) : "");
+
+function otherPcLine(o) {
+  const span = o.session_id
+    ? `${dhakaTime(o.opened_at)}–${o.closed_at ? dhakaTime(o.closed_at) : "still open"}`
+    : `asked at ${dhakaTime(o.opened_at)}, recorded nothing`;
+  const state = o.session_id ? `, ${(CONFIRM[o.confirmation] || ["", o.confirmation || "?"])[1]}` : "";
+  const when = o.overlapped === true ? ", AT THE SAME TIME as this one"
+    : o.overlapped === false ? ", not at the same time" : "";
+  return `${o.pc || "another PC"}: ${span}${state}${when}`;
+}
+
+function twoPcsTag(r) {
+  const others = r.other_pcs || [];
+  const together = others.some((o) => o.overlapped === true);
+  const names = [...new Set(others.map((o) => o.pc || "another PC"))].join(", ");
+  return tag(together ? "bad" : "warn", `Also recorded on ${names}`,
+    "CMED's visit was asked for by more than one PC, so it is never confirmed automatically.\n"
+    + others.map(otherPcLine).join("\n"));
+}
+
+function confirmByHandButton(r) {
+  if (!PORTAL || PORTAL.role !== "admin") return "";
+  return ` <button type="button" class="copy" data-confirm-hand="${esc(r.session_id)}">Confirm by hand</button>`;
+}
+
+$("recTable").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-confirm-hand]");
+  if (!b) return;
+  const r = (window.LAST_RECORDINGS || []).find((x) => x.session_id === b.dataset.confirmHand);
+  if (!r) return;
+  const together = (r.other_pcs || []).some((o) => o.overlapped === true);
+  const facts = `This recording: ${r.pc || "this PC"}, ${dhakaTime(r.opened_at)}–`
+    + `${r.closed_at ? dhakaTime(r.closed_at) : "still open"}, patient ${r.patient_id}, visit ${r.visit_id || "–"}.\n`
+    + (r.other_pcs || []).map(otherPcLine).join("\n");
+  if (!window.confirm(`Confirm this recording by hand?\n\n${facts}\n\n`
+    + (together ? "WARNING: the two PCs recorded AT THE SAME TIME. Only one of them can be "
+      + "the real consultation room.\n\n" : "")
+    + "It then joins the dataset, is archived, and is not erased. This is written in the audit log under your name.")) return;
+  const reason = (window.prompt("Why is it the real consultation? (at least 10 letters, e.g. "
+    + "\"the doctor moved to this PC after the first recording\")") || "").trim();
+  if (reason.length < 10) { if (reason) window.alert("Give a longer reason (at least 10 letters)."); return; }
+  b.disabled = true;
+  try {
+    await adminCall("POST", `/api/v2/admin/session/${encodeURIComponent(r.session_id)}/confirm`,
+      { confirmed_by: PORTAL.email, reason });
+    await loadRecordings();
+  } catch (err) {
+    b.disabled = false;
+    window.alert(`Not confirmed: ${err.message}`);
+  }
+});
 
 // 1 2 3 5 7 8 -> "1-3, 5, 7-8"
 function pieceRanges(numbers) {
@@ -1052,6 +1113,7 @@ async function loadRecordings() {
     const d = await api("/recordings", params);
     if (seq !== recSeq) return;
     const list = d.recordings || [];
+    window.LAST_RECORDINGS = list;          // for "Confirm by hand"
     $("recTable").innerHTML = recordingsTable(list);
     $("recHint").textContent = `${label} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
   } catch (err) {
