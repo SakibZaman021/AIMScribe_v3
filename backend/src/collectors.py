@@ -1537,7 +1537,10 @@ class Notifier:
                      self.no_shift_started, self.pauses, self.still_paused,
                      self.normal_ends,
                      self.escalate, watchers.handled_followups, watchers.persisting,
-                     watchers.repeated_stops, watchers.shift_summaries,
+                     # 22 Nov: the same unusual event 3 times in a day -> the
+                     # collector contacts the hospital manager (replaces the
+                     # researchers' "3 unusual stops in 2 hours").
+                     watchers.repeated_unusual, watchers.shift_summaries,
                      self.retry_failed, self.failure_alarm, self.boards, self.legend):
             try:
                 await self.keep_lease(conn)

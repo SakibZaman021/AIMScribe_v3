@@ -92,6 +92,9 @@ OVER = "\u26AA"             # white: over, not fixed (the PC was switched off fi
 BOARD = "\U0001F4CB"        # the live board
 SUMMARY = "\U0001F4CA"      # the shift summary
 ICONS = (ACT, UNUSUAL, BACK, OVER, BOARD, SUMMARY)
+# 22 Nov, the lab: an unusual event is not "nothing to do" - the collector
+# takes it to the hospital manager when it repeats; the third time it is red.
+AGAIN = "If it happens again, consult the hospital manager."
 LEGEND = (f"How to read AIMScribe messages\n"
           f"{ACT} Act now: someone must go and fix it. Press Seen when you start.\n"
           f"{UNUSUAL} Unusual, nothing to do now: kept for the log (patient did not consent, "
@@ -274,13 +277,13 @@ async def message_text(conn, note: Dict[str, Any]) -> Optional[str]:
         cause = subject.split(" - ")[0]
         cause = cause[len("Recording stopped: "):] if cause.startswith("Recording stopped: ") \
             else cause
-        return f"{UNUSUAL} {_cap(cause)[:-1]} · {await where()} · {at}\nNothing to do now."
+        return f"{UNUSUAL} {_cap(cause)[:-1]} · {await where()} · {at}\n{AGAIN}"
     if event == "recording_paused":
         words = subject[len("Recording paused: "):] if subject.startswith("Recording paused: ") \
             else subject
         words = words.split(" - ")[0]                    # without the doctor added at the end
         return (f"{UNUSUAL} Paused: {words} · {await where()} · {at}\n"
-                "Nothing is recorded until the doctor presses Resume.")
+                f"Nothing is recorded until the doctor presses Resume. {AGAIN}")
     if event == "recording_resumed":
         m = re.search(r"after (.+?) paused", body)
         return (f"{BACK} Recording resumed{' after ' + m.group(1) if m else ''} · "
@@ -308,6 +311,10 @@ async def message_text(conn, note: Dict[str, Any]) -> Optional[str]:
         if note.get("audience") == "watcher":
             return f"{ACT} {subject}" + ("\n\n" + PARAGRAPH.join(rest) if rest else "")
         return f"{ACT} {subject}\nIf you are at the clinic, open the dashboard and press Start my shift."
+    if event == "repeated_unusual":
+        what = subject.split(" - ")[0]
+        return (f"{ACT} {what} · {await where()}\n" + (f"{first}\n" if first else "")
+                + "Contact the hospital manager as soon as possible.")
     if event in ("repeated_stops", "send_failures"):
         return f"{ACT} {subject}" + (f"\n{first}" if first else "")
     return None

@@ -62,7 +62,7 @@ EVERYTHING_ONLY = {"recording_finished", "jabra_back", "handled"}
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
                  "recording_too_long", "stopped_technical", "daily_report", "shift_report",
                  "summary_csv", "summary_xlsx", "still_not_fixed", "problem_fixed",
-                 "repeated_stops",
+                 "repeated_stops", "repeated_unusual",
                  "stopped_unusually", "jabra_unplugged", "jabra_not_plugged",
                  "recording_without_jabra", "recording_paused", "recording_resumed",
                  "still_paused"}
@@ -723,6 +723,76 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                            first_key=first["event_key"])
 
 
+# 22 Nov, the lab's rule: the same unusual event three times in a day for one
+# doctor - in a row or not - and the collector contacts the hospital manager at
+# once. Again at 6, 9 ... The unusual events: a refusal, the patient left, an
+# emergency or interruption, another reason, a pause. (A technical stop is red
+# already, with its own reminders.)
+REPEAT_TIMES = 3
+UNUSUAL_WORDS = {"patient_did_not_consent": "Patient did not consent",
+                 "patient_left": "Patient left the room",
+                 "urgent_interruption": "Emergency or urgent interruption",
+                 "other": "Stopped for another reason",
+                 "pause": "Recording paused"}
+
+
+async def repeated_unusual(conn, now: Optional[datetime] = None) -> None:
+    """The third (sixth, ...) time today one doctor has the same unusual event: red."""
+    import api_v2
+    now = now or datetime.now(timezone.utc)
+    tz = collectors.zone()
+    local = now.astimezone(tz)
+    day_start = datetime.combine(local.date(), dtime(0), tzinfo=tz).astimezone(timezone.utc)
+    rows = await conn.fetch("""
+        SELECT r.hospital_id, r.doctor_id, 'patient_did_not_consent' AS kind,
+               r.refused_at AS at, r.session_id, r.device_id
+          FROM session_refusals r
+         WHERE r.refused_at >= $1
+        UNION ALL
+        SELECT s.hospital_id, s.doctor_id, s.close_reason, s.closed_at, s.session_id, s.device_id
+          FROM sessions s
+         WHERE s.closed_at >= $1 AND s.close_reason LIKE 'doctor_stopped:%'
+           AND s.confirmation IS DISTINCT FROM 'refused'
+           AND NOT EXISTS (SELECT 1 FROM session_refusals x WHERE x.session_id = s.session_id)
+        UNION ALL
+        SELECT s.hospital_id, s.doctor_id, 'pause', c.occurred_at, s.session_id, s.device_id
+          FROM sessions s JOIN chain_entries c ON c.session_id = s.session_id
+         WHERE s.opened_at >= $1::timestamptz - interval '12 hours'
+           AND c.entry_type = 'pause' AND c.occurred_at >= $1
+           AND COALESCE(c.payload->>'reason', '') <> ALL($2::text[])
+    """, day_start, sorted(api_v2.INTERNAL_PAUSES))
+    groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        if not r["doctor_id"] or not r["hospital_id"]:
+            continue
+        kind = r["kind"] if r["kind"] in ("patient_did_not_consent", "pause") \
+            else collectors.stop_kind(r["kind"])
+        if kind is None or kind in collectors.TECHNICAL_ENDS:
+            continue
+        kind = kind if kind in UNUSUAL_WORDS else "other"
+        groups.setdefault((r["hospital_id"], r["doctor_id"], kind), []).append(dict(r))
+    day = local.date().isoformat()
+    for (hid, doctor_id, kind), items in groups.items():
+        if len(items) < REPEAT_TIMES:
+            continue
+        times = len(items) // REPEAT_TIMES * REPEAT_TIMES
+        key = f"manager:{hid}:{doctor_id}:{kind}:{day}:{times}"
+        if await conn.fetchval("SELECT 1 FROM collector_notifications WHERE event_key = $1 "
+                               "LIMIT 1", key):
+            continue
+        items.sort(key=lambda r: r["at"])
+        last = items[-1]
+        when = ", ".join(collectors._hhmm(r["at"]) for r in items)
+        label = UNUSUAL_WORDS[kind]
+        await collectors.notify(
+            conn, hospital_id=hid, event="repeated_unusual",
+            subject=f"{label}: {len(items)} times today",
+            body=(f"At {when}.\n\nPlease contact the hospital manager as soon as possible."
+                  + collectors._footer()),
+            event_key=key, urgent=True, everyone_if_nobody=True, device_id=last["device_id"],
+            session_id=last["session_id"], happened_at=last["at"])
+
+
 async def repeated_stops(conn, now: Optional[datetime] = None) -> None:
     """Three unusual stops by one doctor in two hours: a pattern worth a call."""
     now = now or datetime.now(timezone.utc)
@@ -912,7 +982,7 @@ MIC_WORDS = {"jabra": "Jabra all through", "mixed": "switched off the Jabra",
 ALERT_EVENTS = ("jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
                 "pc_silent", "recording_without_jabra", "recording_too_long",
                 "stopped_unusually", "stopped_technical", "no_shift_started",
-                "repeated_stops", "recording_paused", "still_paused")
+                "repeated_stops", "recording_paused", "still_paused", "repeated_unusual")
 
 
 def _ended_words(close_reason: Optional[str], refused: bool, closed: bool) -> str:
@@ -1458,6 +1528,7 @@ async def hospital_report(conn, hospital_id: str, day: date, shift: str = "day")
 
 ALERT_NAMES = {
     "no_shift_started": "nobody started the shift", "repeated_stops": "repeated unusual stops",
+    "repeated_unusual": "same unusual event 3 times: contact the manager",
     "jabra_unplugged": "Jabra unplugged", "jabra_back": "Jabra back",
     "jabra_not_plugged": "Jabra not plugged in", "recording_problem": "recording problem",
     "pc_silent": "PC not reporting", "recording_without_jabra": "recorded without the Jabra",

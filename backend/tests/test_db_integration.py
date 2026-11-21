@@ -4631,10 +4631,11 @@ async def test_the_shift_workbook_has_four_sheets_built_around_the_audio_file(db
     from openpyxl import load_workbook
     device = await enrolled_device(dbs.repo)
     await dbs.repo.upsert_hospital("HOSP9X1", "Workbook clinic", "Asia/Dhaka")
-    sid = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(minutes=30))
-    other = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(minutes=10))
+    # Within the last ten minutes, so both fall on today whatever the hour.
+    sid = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(minutes=9))
+    other = await _clinic_session(dbs, device, "HOSP9X1", opened_ago=timedelta(seconds=30))
     async with dbs.rec.acquire() as conn:
-        began = datetime.now(timezone.utc) - timedelta(minutes=25)
+        began = datetime.now(timezone.utc) - timedelta(minutes=8)
         await conn.execute("""
             INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
                 payload_sha256, prev_hash, entry_hash, device_signature, occurred_at)
@@ -4810,3 +4811,59 @@ def test_a_microphone_name_windows_garbled_is_mended():
     assert collectors.unmangle("Microphone Array (2- IntelÂ® Sma") == \
         "Microphone Array (2- Intel\u00ae Sma"
     assert collectors.unmangle("Jabra Speak2 55") == "Jabra Speak2 55"
+
+
+async def test_the_same_unusual_event_three_times_asks_for_the_hospital_manager(dbs,
+                                                                               monkeypatch):
+    """
+    22 Nov, the lab's rule: an unusual event says "if it happens again, consult
+    the hospital manager"; the third time in a day for one doctor - in a row or
+    not - the collector gets a red "contact the hospital manager as soon as
+    possible". Again at the sixth.
+    """
+    import collectors
+    import watchers
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    monkeypatch.setenv("AIMS_QUIET_HOURS", "off")
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _card_setup(dbs, monkeypatch, client, who, "HOSP9R1", "manager@gmail.example",
+                          "managerlead@uni.example", 9501, 9502)
+        async with dbs.rec.acquire() as conn:
+            sids = []
+            for n in range(3):
+                sid = await _clinic_session(dbs, device, "HOSP9R1",
+                                            opened_ago=timedelta(seconds=40 - n * 10))
+                sids.append(sid)
+                # Seconds ago: "today" holds whatever the hour the test runs at.
+                await conn.execute("UPDATE sessions SET closed_at = now() - $2::interval, "
+                                   "close_reason = 'doctor_stopped:patient_left' "
+                                   "WHERE session_id = $1", sid, timedelta(seconds=30 - n * 10))
+                if n == 1:
+                    await watchers.repeated_unusual(conn)
+                    assert not fake.sent_to(9501)                  # twice: not yet
+            # A different unusual event in between does not count towards this one.
+            other = await _clinic_session(dbs, device, "HOSP9R1")
+            await conn.execute("UPDATE sessions SET closed_at = now(), "
+                               "close_reason = 'doctor_stopped:other' WHERE session_id = $1", other)
+            await watchers.repeated_unusual(conn)
+            await watchers.repeated_unusual(conn)                  # once only
+            told = fake.sent_to(9501)
+            assert len(told) == 1
+            text = told[0]["text"]
+            assert text.startswith("\U0001F534 Patient left the room: 3 times today")
+            assert text.endswith("Contact the hospital manager as soon as possible.")
+            assert "Seen" in str(told[0].get("reply_markup"))   # the collector presses Seen
+            assert fake.sent_to(9502)[-1]["text"].startswith("\U0001F534 Patient left")
+
+            # The single unusual message says what to do if it repeats.
+            await collectors.notify(
+                conn, hospital_id="HOSP9R1", event="stopped_unusually",
+                subject="Recording stopped: the patient left the room", body="b",
+                event_key=f"alert:left:{sids[0]}", device_id=device["device_id"],
+                session_id=sids[0])
+            assert fake.sent_to(9501)[-1]["text"].endswith(
+                "If it happens again, consult the hospital manager.")
