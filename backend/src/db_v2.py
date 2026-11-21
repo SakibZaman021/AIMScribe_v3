@@ -2051,13 +2051,23 @@ class V2Repository:
         Same PC and the same five fields as a confirmed recording, and no other
         PC ever asked for that visit (a contested visit waits for a person).
         `clinic` is where the confirmed one is filed.
+
+        Or (21 Nov 2026) the same PC's grant that took CMED's message never
+        became a recording at all, and has expired: VIS-T-31509, a new PC that
+        joined the server 11 s into its first recording - the grant issued at
+        that moment claimed the API 2, the PC opened the recording later under
+        a new grant, and every recording of the visit waited to be erased.
+        Then `confirmed_by` is empty, `notice_grant` names that grant, and
+        `clinic` is the grant's. A confirmed recording is preferred as proof.
         """
         async with self._acquire() as conn:
             rows = await conn.fetch("""
                 SELECT DISTINCT ON (s.session_id)
                        s.session_id, s.hospital_id, s.closed_at, g.jti,
                        g.patient_id, g.doctor_id, g.cmed_hospital_id, g.start_time,
-                       g.visit_date, c.session_id AS confirmed_by, c.hospital_id AS clinic
+                       g.visit_date, c.session_id AS confirmed_by,
+                       COALESCE(c.hospital_id, g2.hospital_id) AS clinic,
+                       g2.jti AS notice_grant
                   FROM sessions s
                   JOIN grant_authorisations g ON g.jti = s.grant_jti
                   JOIN grant_authorisations g2
@@ -2066,8 +2076,12 @@ class V2Repository:
                    AND g2.patient_id = g.patient_id AND g2.doctor_id = g.doctor_id
                    AND g2.cmed_hospital_id = g.cmed_hospital_id
                    AND g2.start_time = g.start_time AND g2.visit_date = g.visit_date
-                  JOIN sessions c ON c.grant_jti = g2.jti AND c.confirmation = 'confirmed'
+                  LEFT JOIN sessions c ON c.grant_jti = g2.jti AND c.confirmation = 'confirmed'
                  WHERE s.confirmation IN ('pending', 'unconfirmed')
+                   AND (c.session_id IS NOT NULL
+                        OR (g2.session_id IS NULL AND g2.expires_at < now()
+                            AND NOT EXISTS (SELECT 1 FROM sessions u
+                                             WHERE u.grant_jti = g2.jti)))
                    AND g.notice_id IS NULL AND g.patient_id <> 'REDACTED'
                    AND NOT EXISTS (
                        SELECT 1 FROM grant_authorisations o
@@ -2075,7 +2089,7 @@ class V2Repository:
                           AND o.patient_id = g.patient_id AND o.doctor_id = g.doctor_id
                           AND o.cmed_hospital_id = g.cmed_hospital_id
                           AND o.start_time = g.start_time AND o.visit_date = g.visit_date)
-                 ORDER BY s.session_id, c.opened_at DESC
+                 ORDER BY s.session_id, (c.session_id IS NULL), c.opened_at DESC
                  LIMIT $1
             """, limit)
         return [dict(r) for r in rows]

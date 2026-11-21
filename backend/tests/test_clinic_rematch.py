@@ -369,3 +369,121 @@ async def test_a_visits_other_recordings_on_postgres(dbs):
         assert await clinical.confirm_same_visit() == []
     finally:
         api_v2.ctx.repo = api_v2.ctx.clinical = None
+
+
+# ------------------------------------------- CMED's message taken by a grant never used
+#
+# VIS-T-31509, 21 Nov 2026: a new PC joined the server 11 s into its first
+# recording. The grant issued at that moment claimed CMED's one API 2; the PC
+# opened the recording only at 09:30, under a new grant, and recorded the
+# visit again at 11:53. Both waited to be erased: no confirmed recording
+# existed to vouch for them.
+
+def unused_grant_expires(server, jti, *, ago=timedelta(seconds=1)):
+    server.repo.auths[jti]["expires_at"] = NOW_() - ago
+
+
+def NOW_():
+    from test_v3_server import NOW
+    return NOW()
+
+
+async def the_31509_case(server, *, device=DEVICE):
+    await send("patient_information", api2())               # 00:02:39
+    _, taken = await mint()                                   # 00:02:47: claims it, never used
+    assert taken["confirmation"] == "confirmed"
+    _, later = await mint(device=device)                      # 09:30
+    sid = open_session(server, device=device)
+    assert await api_v2._link_grant(sid, later["jti"], "P0012345", device) == "pending"
+    return sid, taken
+
+
+async def test_a_message_taken_by_a_grant_never_used_confirms_the_pcs_recordings(server):
+    sid, taken = await the_31509_case(server)
+    unused_grant_expires(server, taken["jti"])
+    _, again = await mint()                                   # 11:53, the same visit again
+    sid2 = open_session(server)
+    await api_v2._link_grant(sid2, again["jti"], "P0012345", DEVICE)
+
+    assert sorted(await confirm_same_visit()) == sorted([sid, sid2])
+    for s in (sid, sid2):
+        assert server.repo.sessions[s]["confirmation"] == "confirmed"
+    why = [a["detail"] for a in server.repo.audits if a["event_type"] == "session.confirmed"]
+    assert why == [{"notice_used_by_unused_grant": taken["jti"], "clinic": "HOSP003"}] * 2
+    assert await confirm_same_visit() == []                   # once
+
+
+async def test_a_grant_still_valid_may_yet_become_its_recording(server):
+    sid, taken = await the_31509_case(server)
+    unused_grant_expires(server, taken["jti"], ago=-timedelta(seconds=30))   # not expired
+    assert await confirm_same_visit() == []
+    assert server.repo.sessions[sid]["confirmation"] == "pending"
+
+
+async def test_an_unused_grant_on_another_pc_vouches_for_nothing(server):
+    other = dict(DEVICE, device_id="dev-2")
+    sid, taken = await the_31509_case(server, device=other)
+    unused_grant_expires(server, taken["jti"])
+    assert await confirm_same_visit() == []
+    assert server.repo.sessions[sid]["confirmation"] == "pending"
+
+
+async def test_a_refusal_still_keeps_the_visit_out(server, monkeypatch):
+    sid, taken = await the_31509_case(server)
+    unused_grant_expires(server, taken["jti"])
+
+    async def refused(digest):
+        return True
+    monkeypatch.setattr(server.repo, "refused_visit", refused)
+    assert await confirm_same_visit() == []
+
+
+async def test_a_grant_that_did_become_a_recording_is_not_unused(server):
+    """Its recording waits too (not confirmed): nothing vouches for the visit."""
+    sid, taken = await the_31509_case(server)
+    unused_grant_expires(server, taken["jti"])
+    other = open_session(server)
+    server.repo.sessions[other]["confirmation"] = "refused"
+    server.repo.sessions[other]["grant_jti"] = taken["jti"]
+    server.repo.auths[taken["jti"]]["session_id"] = other
+    assert await confirm_same_visit() == []
+
+
+@postgres
+async def test_a_message_taken_by_a_grant_never_used_on_postgres(dbs):
+    import uuid
+    import clinical
+    from datetime import datetime, timezone
+    from test_db_integration import visit as a_visit
+
+    repo = dbs.repo
+    device, elsewhere = await enrolled_device(repo), await enrolled_device(repo)
+    api_v2.ctx.repo, api_v2.ctx.clinical = repo, dbs.clinical
+    now = datetime.now(timezone.utc)
+    try:
+        async def case(*, expires, later_device=device):
+            v = a_visit(patient_id=f"P{uuid.uuid4().hex[:7]}")
+            notice = await repo.record_notice(v, hospital_id="HOSP003", clinical_record_id=1)
+            taken = uuid.uuid4().hex
+            await repo.create_authorisation(jti=taken, device_id=device["device_id"],
+                                            hospital_id="HOSP003", visit=v, expires_at=expires)
+            assert await repo.claim_notice(notice, taken)
+            jti = uuid.uuid4().hex
+            await repo.create_authorisation(jti=jti, device_id=later_device["device_id"],
+                                            hospital_id="HOSP003", visit=v, expires_at=now)
+            sid = await a_session(repo, later_device)
+            await repo.link_authorisation(jti, sid)
+            await repo.set_session_confirmation(sid, "unconfirmed", grant_jti=jti)
+            return sid, taken
+
+        waits_valid, _ = await case(expires=now + timedelta(minutes=5))
+        waits_other, _ = await case(expires=now - timedelta(minutes=1), later_device=elsewhere)
+        kept, taken = await case(expires=now - timedelta(minutes=1))
+
+        assert await clinical.confirm_same_visit() == [kept]
+        assert (await repo.get_session(kept))["confirmation"] == "confirmed"
+        for sid in (waits_valid, waits_other):
+            assert (await repo.get_session(sid))["confirmation"] == "unconfirmed"
+        assert await clinical.confirm_same_visit() == []
+    finally:
+        api_v2.ctx.repo = api_v2.ctx.clinical = None

@@ -538,6 +538,9 @@ async def confirm_same_visit(limit: int = 500) -> List[str]:
     fields is that consultation. Not when the patient refused it, and not
     when another PC also asked for it (an administrator decides those).
     Filed where the confirmed recording is.
+
+    The proof may also be the PC's own grant that took CMED's message and
+    never became a recording (21 Nov 2026, db_v2.waiting_same_visit).
     """
     repo = api_v2._repo()
     confirmed: List[str] = []
@@ -549,16 +552,22 @@ async def confirm_same_visit(limit: int = 500) -> List[str]:
             if row["clinic"] and row["clinic"] != row["hospital_id"]:
                 await repo.refile_session(row["session_id"], row["jti"], row["clinic"])
             await repo.set_session_confirmation(row["session_id"], "confirmed")
+            if row.get("confirmed_by"):
+                why = {"same_visit_as": row["confirmed_by"], "clinic": row["clinic"]}
+            else:
+                # CMED's message went to this PC's grant that never became a
+                # recording (VIS-T-31509, 21 Nov 2026).
+                why = {"notice_used_by_unused_grant": row.get("notice_grant"),
+                       "clinic": row["clinic"]}
             await repo.audit(event_type="session.confirmed", actor_type="service",
                              actor_id="channel-b", session_id=row["session_id"],
-                             detail={"same_visit_as": row["confirmed_by"],
-                                     "clinic": row["clinic"]})
+                             detail=why)
             await api_v2.confirm_continuations(row["session_id"])
             if row["clinic"] != row["hospital_id"] and row.get("closed_at") is not None:
                 await api_v2._record_file_name(row["session_id"])   # the name carries the clinic
             confirmed.append(row["session_id"])
             logger.info("Session %s confirmed: the same visit as %s", row["session_id"],
-                        row["confirmed_by"])
+                        row.get("confirmed_by") or f"grant {row.get('notice_grant')}")
         except Exception as exc:                    # one row never stops the others
             logger.warning("Could not confirm %s with its visit: %s", row.get("session_id"), exc)
     return confirmed

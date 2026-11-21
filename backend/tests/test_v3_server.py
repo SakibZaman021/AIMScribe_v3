@@ -87,7 +87,7 @@ class FakeRepo:
             cmed_hospital_id=visit.cmed_hospital_id, patient_id=visit.patient_id,
             doctor_id=visit.doctor_id, start_time=visit.start_time,
             visit_date=visit.day, notice_id=None, session_id=None, issued_at=NOW(),
-            visit_id=visit_id)
+            expires_at=expires_at, visit_id=visit_id)
 
     # interface 4: the recording's visit_id, and when its API 3 arrived
     async def set_session_visit(self, session_id, visit_id):
@@ -225,13 +225,24 @@ class FakeRepo:
                     if c.get("confirmation") == "confirmed" and any(
                         a["jti"] == c.get("grant_jti") and a["jti"] != g["jti"]
                         and a["notice_id"] is not None for a in same)]
-            if not done:
+            unused = [a for a in same
+                      if a["jti"] != g["jti"] and a["notice_id"] is not None
+                      and a["session_id"] is None and a.get("expires_at") is not None
+                      and a["expires_at"] < NOW()
+                      and not any(x.get("grant_jti") == a["jti"]
+                                  for x in self.sessions.values())]
+            if done:
+                c = max(done, key=lambda c: c["opened_at"])
+                proof = dict(confirmed_by=c["session_id"], clinic=c["hospital_id"],
+                             notice_grant=c["grant_jti"])
+            elif unused:
+                proof = dict(confirmed_by=None, clinic=unused[0]["hospital_id"],
+                             notice_grant=unused[0]["jti"])
+            else:
                 continue
-            c = max(done, key=lambda c: c["opened_at"])
             rows.append(dict(session_id=s["session_id"], hospital_id=s["hospital_id"],
                              closed_at=s.get("closed_at"), jti=g["jti"],
-                             **{k: g[k] for k in five},
-                             confirmed_by=c["session_id"], clinic=c["hospital_id"]))
+                             **{k: g[k] for k in five}, **proof))
         return rows[:limit]
 
     async def refile_session(self, session_id, jti, hospital_id):
