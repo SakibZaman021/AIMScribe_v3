@@ -641,9 +641,11 @@ async def persisting(conn, now: Optional[datetime] = None) -> None:
                                [n["id"] for n in notes], now, how[:200])
             # 18 Nov: every card of it now says how it ended.
             await collectors._refresh_card(conn, chain, (state, how, minutes))
-            if quiet or family == "paused":
-                # At night: in the next summary. A resumed pause: its card says
-                # so, and the researchers had the "resumed" line already.
+            import cards
+            if quiet or family in cards.CARD_FAMILIES:
+                # At night: in the next summary. 21 Nov: a problem with a card -
+                # the card turning green or white is the notice; a separate
+                # "fixed" message said the same thing twice.
                 continue
             heard = await conn.fetch("""
                 SELECT DISTINCT ON (email) email, hospital_id FROM collector_notifications

@@ -393,6 +393,12 @@ class CloseRequest(BaseModel):
     manifest: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _unmangle(text: Optional[str]) -> str:
+    """A microphone name Windows garbled ("IntelÂ® Sma"), mended (collectors.unmangle)."""
+    import collectors
+    return collectors.unmangle(text)
+
+
 class HeartbeatRequest(BaseModel):
     device_id: str = ""
     app_version: str = ""
@@ -1961,7 +1967,7 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
         else (len(held) if held is not None else None),
         disk_encrypted=body.disk_encrypted,
         clock_offset_seconds=body.clock_offset_seconds,
-        microphone=body.microphone or None,
+        microphone=_unmangle(body.microphone) or None,
         microphone_is_clinic=body.microphone_is_clinic,
     )
     if body.session_id and body.microphone:

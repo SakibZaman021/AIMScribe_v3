@@ -68,6 +68,8 @@ SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
 AUTO_CLOSE_AFTER = timedelta(hours=1)     # a shift nobody ended
 TOO_LONG = timedelta(minutes=60)          # a recording nobody stopped (038)
 PAUSE_ALERT = timedelta(minutes=2)        # 18 Nov: a recording paused this long
+JABRA_SETTLE = timedelta(minutes=2)       # 21 Nov: off the Jabra this long before an alert
+LEGEND_KEY = "legend:v1"                  # 21 Nov: what the circles mean, sent once each
 OTHER_SHIFT = timedelta(hours=6)          # a shift started outside both windows
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -1020,19 +1022,43 @@ async def _send_to(conn, note: Dict[str, Any]) -> Tuple[bool, Optional[str], Opt
 
 
 async def _telegram_body(conn, note: Dict[str, Any]) -> str:
-    """The message's text: for the first alert of a lasting problem, its card."""
+    """
+    The message's text. 21 Nov: every message short and with its circle
+    (cards.LEGEND) - a lasting problem's card, or one or two lines for the
+    rest. The full text stays on the dashboard.
+    """
+    text = None
     try:
         import cards
         if cards.is_card(note) and note.get("created_at") is not None:
             text = await cards.text_for(conn, note)
-            if note.get("late"):
-                text = (f"Sent late (from {_hhmm(note['created_at'])}, before Telegram was "
-                        f"connected)\n{text}")
-            return text[:4000]
+        else:
+            text = await cards.message_text(conn, note)
     except Exception as exc:
-        logger.warning("Card text for alert %s failed; sending it plain: %s", note.get("id"),
+        logger.warning("Short text for alert %s failed; sending it plain: %s", note.get("id"),
                        _hide(str(exc)))
-    return _telegram_text(note["subject"], note["body"], note["urgent"])
+    if text is None:
+        text = _telegram_text(note["subject"], note["body"], note["urgent"])
+    if note.get("late"):
+        text = f"Sent late (from {_hhmm(note['created_at'])}, before Telegram was connected)\n{text}"
+    return unmangle(text)[:4000]
+
+
+# Windows names a microphone in one code page, read as another: "IntelÂ® Smart".
+_MANGLED = {"Â®": "®", "Â©": "©", "Â°": "°", "Â·": "·", "â„¢": "™", "Â ": " "}
+
+
+def unmangle(text: Optional[str]) -> str:
+    """'IntelÂ® Sma' -> 'Intel® Sma' (21 Nov: seen in Aalo Karail's alerts)."""
+    text = text or ""
+    if "Â" not in text and "â" not in text:
+        return text
+    try:
+        return text.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        for bad, good in _MANGLED.items():
+            text = text.replace(bad, good)
+        return text
 
 
 WAITING = "waiting"
@@ -1472,6 +1498,8 @@ class Notifier:
     def __init__(self) -> None:
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.mic_state: Dict[Any, bool] = {}
+        # 21 Nov: when each PC moved off the Jabra, until it has stayed off JABRA_SETTLE.
+        self.mic_pending: Dict[Any, float] = {}
         self.task: Optional[asyncio.Task] = None
 
     async def lease(self, conn) -> bool:
@@ -1510,7 +1538,7 @@ class Notifier:
                      self.normal_ends,
                      self.escalate, watchers.handled_followups, watchers.persisting,
                      watchers.repeated_stops, watchers.shift_summaries,
-                     self.retry_failed, self.failure_alarm, self.boards):
+                     self.retry_failed, self.failure_alarm, self.boards, self.legend):
             try:
                 await self.keep_lease(conn)
                 await step(conn)
@@ -1639,11 +1667,26 @@ class Notifier:
                AND d.last_seen_at > now() - $1::interval
         """, SILENT_AFTER)
         for row in rows:
+            device = row["device_id"]
             now_clinic = bool(row["microphone_is_clinic"])
-            before = self.mic_state.get(row["device_id"])
-            self.mic_state[row["device_id"]] = now_clinic
-            if before is None or before == now_clinic or row["recording"]:
-                continue                     # first sight, no change, or the alert covers it
+            before = self.mic_state.get(device)
+            if before is None or before == now_clinic:
+                self.mic_state[device] = now_clinic
+                self.mic_pending.pop(device, None)
+                continue                     # first sight, or no change
+            # 21 Nov: 4 of 9 "Jabra not plugged in" alerts were fixed within two
+            # minutes - the Jabra reconnecting by itself. Off the Jabra counts
+            # once it has stayed so JABRA_SETTLE; back on it counts at once.
+            if not now_clinic:
+                since = self.mic_pending.setdefault(device, time.monotonic())
+                if time.monotonic() - since < JABRA_SETTLE.total_seconds():
+                    continue
+            self.mic_pending.pop(device, None)
+            self.mic_state[device] = now_clinic
+            if row["recording"]:
+                continue                     # the recording's own alert covers it
+            if now_clinic and await open_problem(conn, "jabra_not_plugged", device) is None:
+                continue                     # nobody was told it was off: nothing to say
             where = f"{row['hospital_id']}, {row['machine_name'] or 'a PC'}"
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
             if now_clinic:
@@ -1655,17 +1698,29 @@ class Notifier:
                         f"{row['microphone'] or 'its own microphone'}, not the Jabra.\n\n"
                         "Please plug the Jabra in before the next consultation.")
             await notify(conn, hospital_id=row["hospital_id"], event=event, subject=subject,
-                         body=body + _footer(), event_key=f"idle:{row['device_id']}:{stamp}",
+                         # 21 Nov: the event in the key - off and back within one minute
+                         # shared a key, so "plugged in" was dropped as already sent.
+                         body=body + _footer(),
+                         event_key=f"idle:{event}:{row['device_id']}:{stamp}",
                          urgent=not now_clinic, everyone_if_nobody=False,
                          device_id=row["device_id"])
 
     # -- a PC that stopped reporting during a shift
     async def silent_pcs(self, conn) -> None:
+        # 21 Nov: 72 "PC not reporting" alerts in one day, none with a recording
+        # open - PCs asleep between patients, where nothing is lost. Now only a
+        # PC that goes quiet while recording, or with pieces still to send; the
+        # rest show on the researchers' board.
         rows = await conn.fetch("""
-            SELECT device_id, hospital_id, machine_name, last_seen_at FROM devices
-             WHERE revoked_at IS NULL
-               AND last_seen_at < now() - $1::interval
-               AND last_seen_at > now() - interval '30 minutes'
+            SELECT d.device_id, d.hospital_id, d.machine_name, d.last_seen_at FROM devices d
+             WHERE d.revoked_at IS NULL
+               AND d.last_seen_at < now() - $1::interval
+               AND d.last_seen_at > now() - interval '30 minutes'
+               AND (COALESCE(d.pending_segments, 0) > 0
+                    OR EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.device_id
+                                 AND s.closed_at IS NULL
+                                 AND s.opened_at > now() - interval '12 hours'
+                                 AND s.confirmation IS DISTINCT FROM 'refused'))
         """, SILENT_AFTER)
         import watchers
         for row in rows:
@@ -1891,6 +1946,33 @@ class Notifier:
                 body="", event_key=f"done:{r['session_id']}", device_id=r["device_id"],
                 session_id=r["session_id"], happened_at=r["closed_at"],
                 hold=await watchers.quiet_for(conn, r["hospital_id"]))
+
+    # -- 21 Nov: the legend, once to everyone on Telegram, pinned
+    async def legend(self, conn) -> None:
+        import cards
+        import watchers
+        if await watchers.quiet_for(conn):
+            return                            # not at night; the morning is soon enough
+        rows = await conn.fetch("""
+            SELECT t.email, t.chat_id, p.role FROM collector_telegram t
+              JOIN portal_people p ON p.email = t.email AND p.removed_at IS NULL
+             WHERE NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.email = t.email AND n.event_key = $1)
+        """, LEGEND_KEY)
+        for r in rows:
+            note_id = await _record(conn, email=r["email"], event="legend",
+                                    subject="How to read AIMScribe messages",
+                                    body=cards.LEGEND, event_key=LEGEND_KEY,
+                                    audience="collector" if r["role"] == "collector"
+                                    else "watcher")
+            if note_id is None or not await _deliver(conn, note_id):
+                continue
+            message_id = await conn.fetchval("SELECT tg_message_id FROM collector_notifications "
+                                             "WHERE id = $1", note_id)
+            if message_id:
+                await _telegram("pinChatMessage", {"chat_id": r["chat_id"],
+                                                   "message_id": message_id,
+                                                   "disable_notification": True})
 
     # -- 18 Nov: each researcher's pinned live board
     async def boards(self, conn) -> None:
@@ -2150,6 +2232,7 @@ class Notifier:
             await send_waiting(conn, row["email"])
 
     async def _greet(self, conn, chat, row, person, place) -> None:
+        import cards
         if person is not None and person["role"] != "collector":
             import watchers
             mine = await watchers.watched_hospitals(row["email"], conn)
@@ -2167,12 +2250,12 @@ class Notifier:
                                 f"at {watchers.midday_time():%H:%M} and "
                                 f"{watchers.report_time():%H:%M}, with an Excel workbook "
                                 "for each of your hospitals. Nothing comes "
-                                "at night: it waits for the next summary.")
+                                "at night: it waits for the next summary.\n\n" + cards.LEGEND)
             return
         await send_telegram(chat["id"], f"Connected: {row['email']}.\n\nWhile you are on "
                             f"shift{' at ' + place if place else ''}, AIMScribe alerts come here. "
                             "Keep notifications on for Telegram. For an urgent alert, press "
-                            "Seen when you are dealing with it.")
+                            "Seen when you are dealing with it.\n\n" + cards.LEGEND)
 
     async def _seen_pressed(self, conn, query: Dict[str, Any]) -> None:
         data = str(query.get("data") or "")

@@ -3803,7 +3803,8 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
                 "SELECT * FROM collector_notifications WHERE event_key = $1", f"still:{key}:1")}
             reminder = still["caller@gmail.example"]
             assert reminder["audience"] == "collector" and reminder["urgent"]
-            assert reminder["subject"].startswith("Still not fixed after 31 min: Jabra unplugged")
+            assert reminder["subject"].startswith("Still not fixed after 3")     # 30 or 31 min
+            assert "Jabra unplugged" in reminder["subject"]
             # 18 Nov: the researcher's card says 30 minutes; the message comes at 60.
             assert "lead@uni.example" not in still
             await conn.execute("UPDATE collector_notifications SET created_at = $2 "
@@ -3819,15 +3820,14 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             await conn.execute("UPDATE collector_notifications SET created_at = $2 "
                                "WHERE event_key = $1", key, _ago(31))
 
-            # The Jabra is plugged back in: the researcher hears it is fixed, and how.
+            # The Jabra is plugged back in. 21 Nov: the card turning green is the
+            # notice - no second "fixed" message.
             await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
                                "WHERE device_id = $1", device["device_id"])
             await watchers.persisting(conn)
-            done = await conn.fetchrow("SELECT * FROM collector_notifications "
-                                       "WHERE email = 'lead@uni.example' AND event_key = $1",
-                                       f"fixed:{key}")
-            assert done["subject"].startswith("Fixed after 31 min: Jabra unplugged")
-            assert done["body"].startswith("The Jabra is back in use")
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE email = 'lead@uni.example' "
+                                           "AND event_key = $1", f"fixed:{key}")
             assert await conn.fetchval("SELECT resolution FROM collector_notifications "
                                        "WHERE event_key = $1 AND audience = 'collector' "
                                        "LIMIT 1", key) == \
@@ -4422,7 +4422,7 @@ async def test_one_problem_is_one_card_edited_not_a_message_per_consultation(dbs
                                        "collector_notifications WHERE hospital_id = 'HOSP9C1'"
                                        " AND event = 'recording_without_jabra'") == 1
             edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
-            assert edits and "Consultations since: 3" in edits[-1]["text"]
+            assert edits and "3 consultations so far" in edits[-1]["text"]
 
             # The collector presses Seen in Telegram: the researcher's card says who.
             note = await conn.fetchval("SELECT id FROM collector_notifications "
@@ -4432,7 +4432,7 @@ async def test_one_problem_is_one_card_edited_not_a_message_per_consultation(dbs
                 "id": "q1", "data": f"seen:{note}",
                 "message": {"chat": {"id": 9101}, "message_id": 1}})
             edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
-            assert "pressed Seen" in edits[-1]["text"]
+            assert "Seen: " in edits[-1]["text"] and "Seen: nobody" not in edits[-1]["text"]
 
             # Plugged back in: the card says fixed; the researcher's note is silent,
             # under the card.
@@ -4440,13 +4440,10 @@ async def test_one_problem_is_one_card_edited_not_a_message_per_consultation(dbs
                                "WHERE device_id = $1", device["device_id"])
             await watchers.persisting(conn)
             edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9102]
-            assert edits[-1]["text"].startswith("✅ Jabra off")
-            fixed = fake.sent_to(9102)[-1]
-            assert fixed.get("disable_notification") is True
-            assert fixed["reply_parameters"]["message_id"] == \
-                await conn.fetchval("SELECT tg_message_id FROM collector_notifications "
-                                    "WHERE email = 'cardlead@uni.example' "
-                                    "AND event = 'recording_without_jabra'")
+            # 21 Nov: the card turns green; no second "fixed" message.
+            assert edits[-1]["text"].startswith("\U0001F7E2 Fixed after")
+            assert "Jabra off" in edits[-1]["text"]
+            assert len(fake.sent_to(9102)) == 1
             # A new problem later is a new card again.
             await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE "
                                "WHERE device_id = $1", device["device_id"])
@@ -4497,8 +4494,10 @@ async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urg
                                  session_id=sid, detail={"reason": "stop_requested"})
             await notifier.pauses(conn)
             told = fake.sent_to(9201)
-            assert len(told) == 1 and "Recording paused: sensitive personal matter" in \
-                told[0]["text"] and not told[0].get("disable_notification")
+            # 21 Nov: short, with its orange circle.
+            assert len(told) == 1 and told[0]["text"].startswith(
+                "\U0001F7E0 Paused: sensitive personal matter \u00b7 HOSP9P1") \
+                and not told[0].get("disable_notification")
             line = fake.sent_to(9202)
             assert len(line) == 1 and line[0].get("disable_notification") is True
             assert "paused: sensitive personal matter" in line[0]["text"]
@@ -4514,8 +4513,8 @@ async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urg
             # Two minutes on: urgent, a card, with the Seen button for the collector.
             await notifier.still_paused(conn)
             await notifier.still_paused(conn)                 # once only
-            assert fake.sent_to(9201)[-1]["text"].startswith("\U0001F534 Recording paused")
-            assert fake.sent_to(9202)[-1]["text"].startswith("\U0001F534 Recording paused")
+            assert fake.sent_to(9201)[-1]["text"].startswith("\U0001F534 Still paused")
+            assert fake.sent_to(9202)[-1]["text"].startswith("\U0001F534 Still paused")
             assert await conn.fetchval("SELECT count(*) FROM collector_notifications "
                                        "WHERE event = 'still_paused' AND session_id = $1",
                                        sid) == 2
@@ -4529,7 +4528,7 @@ async def test_a_pause_is_seen_at_once_and_still_paused_after_two_minutes_is_urg
             assert fake.sent_to(9202)[-1].get("disable_notification") is True
             await watchers.persisting(conn)
             edits = [p for m, p in fake.calls if m == "editMessageText" and p["chat_id"] == 9202]
-            assert edits and edits[-1]["text"].startswith("✅ Recording paused")
+            assert edits and edits[-1]["text"].startswith("\U0001F7E2 Fixed after")
 
             # A refusal reaches the researcher on 'problems' - as one silent line.
             await collectors.notify(
@@ -4713,3 +4712,101 @@ def test_pauses_pair_with_their_resumes_and_skip_the_recorders_own_holds():
     assert [(p["reason"], p["seconds"]) for p in got] == [("other", 120.0),
                                                          ("patient_declined", 60.0)]
     assert workbook.pause_words(got[0]) == "Other: call"
+
+
+async def test_messages_are_short_with_their_circle_and_quiet_pcs_send_nothing(dbs, monkeypatch):
+    """
+    21 Nov, the lab's legend: every message starts with its circle and is one or
+    two lines; a PC asleep between patients sends nothing (72 such alerts in a
+    day, none with a recording open); the Jabra off while waiting is alerted
+    only once it has stayed off two minutes; the legend reaches everyone once.
+    """
+    import collectors
+    import watchers
+    fake = _FakeTelegram()
+    monkeypatch.setattr(collectors, "_telegram", fake)
+    monkeypatch.setenv("AIMS_TELEGRAM_BOT_TOKEN", "1:fake")
+    monkeypatch.setenv("AIMS_QUIET_HOURS", "off")
+
+    async def in_shift(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(watchers, "in_shift_hours", in_shift)     # whatever the hour now
+    who = {"value": "owner@uiu.example"}
+    async with _with_watchers(_portal_app(dbs, monkeypatch, google_email=who)) as client:
+        device = await enrolled_device(dbs.repo)
+        await _card_setup(dbs, monkeypatch, client, who, "HOSP9M1", "short@gmail.example",
+                          "shortlead@uni.example", 9401, 9402)
+        notifier = collectors.Notifier()
+        async with dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE devices SET hospital_id = 'HOSP9M1' WHERE device_id = $1",
+                               device["device_id"])
+            # A refusal: one orange line for the collector too, nothing about the dashboard.
+            sid = await _clinic_session(dbs, device, "HOSP9M1")
+            await collectors.notify(
+                conn, hospital_id="HOSP9M1", event="stopped_unusually",
+                subject="Recording stopped: the patient did not consent (the recording was "
+                        "deleted)", body="At 12:19 the doctor stopped ...\n\nNothing to do now."
+                + collectors._footer(), event_key=f"refused:{sid}", device_id=device["device_id"],
+                session_id=sid)
+            text = fake.sent_to(9401)[-1]["text"]
+            assert text.startswith("\U0001F7E0 The patient did not consent (the recording was "
+                                   "deleted) \u00b7 HOSP9M1")
+            assert text.count("\n") == 1 and "dashboard" not in text
+
+            # A PC asleep with no recording open: no alert at all.
+            await conn.execute("UPDATE sessions SET closed_at = now() WHERE device_id = $1",
+                               device["device_id"])
+            await conn.execute("UPDATE devices SET last_seen_at = now() - interval '5 minutes', "
+                               "pending_segments = 0 WHERE device_id = $1", device["device_id"])
+            await notifier.silent_pcs(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'pc_silent' AND hospital_id = 'HOSP9M1'")
+            # ...but one that goes quiet while recording: alerted.
+            await _clinic_session(dbs, device, "HOSP9M1", opened_ago=timedelta(minutes=8))
+            await notifier.silent_pcs(conn)
+            assert await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                       "WHERE event = 'pc_silent' AND hospital_id = 'HOSP9M1'")
+            await conn.execute("UPDATE sessions SET closed_at = now() WHERE device_id = $1",
+                               device["device_id"])
+
+            # The Jabra off while waiting: nothing until it has stayed off two minutes.
+            await conn.execute("UPDATE devices SET last_seen_at = now(), microphone_is_clinic = "
+                               "TRUE, microphone = 'Jabra' WHERE device_id = $1",
+                               device["device_id"])
+            await notifier.idle_microphones(conn)                     # first sight
+            await conn.execute("UPDATE devices SET microphone_is_clinic = FALSE, "
+                               "microphone = 'IntelÂ® Smart Sound' WHERE device_id = $1",
+                               device["device_id"])
+            await notifier.idle_microphones(conn)
+            assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                           "WHERE event = 'jabra_not_plugged' "
+                                           "AND hospital_id = 'HOSP9M1'")
+            notifier.mic_pending[device["device_id"]] -= 121
+            await notifier.idle_microphones(conn)
+            assert await conn.fetchval("SELECT 1 FROM collector_notifications "
+                                       "WHERE event = 'jabra_not_plugged' "
+                                       "AND hospital_id = 'HOSP9M1'")
+            card = fake.sent_to(9401)[-1]["text"]
+            assert card.startswith("\U0001F534 Jabra off") and "Intel\u00ae Smart" in card
+            # Back on the Jabra: one green line.
+            await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
+                               "WHERE device_id = $1", device["device_id"])
+            await notifier.idle_microphones(conn)
+            assert fake.sent_to(9401)[-1]["text"].startswith("\U0001F7E2 Jabra plugged in")
+
+            # The legend: once to everyone on Telegram, pinned.
+            await notifier.legend(conn)
+            await notifier.legend(conn)
+            for chat in (9401, 9402):
+                legends = [m for m in fake.sent_to(chat)
+                           if m["text"].startswith("How to read AIMScribe messages")]
+                assert len(legends) == 1
+            assert any(m == "pinChatMessage" and p["chat_id"] == 9402 for m, p in fake.calls)
+
+
+def test_a_microphone_name_windows_garbled_is_mended():
+    import collectors
+    assert collectors.unmangle("Microphone Array (2- IntelÂ® Sma") == \
+        "Microphone Array (2- Intel\u00ae Sma"
+    assert collectors.unmangle("Jabra Speak2 55") == "Jabra Speak2 55"

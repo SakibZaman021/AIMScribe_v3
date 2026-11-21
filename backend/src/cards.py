@@ -83,11 +83,22 @@ async def where_words(conn, *, session_id=None, device_id=None, hospital_id=None
     return " · ".join(str(p) for p in parts if p)
 
 
-# 20 Nov: a silent line still catches the eye. Orange: something unusual (a
-# refusal, an unusual stop, a pause); green: back to normal (resumed). A red
-# circle stays for the problems that ring (the cards).
-UNUSUAL = "\U0001F7E0"
-BACK = "\U0001F7E2"
+# 21 Nov, the lab's legend: every message starts with one of these, and is one
+# or two lines. The details stay on the dashboard and in the shift workbook.
+ACT = "\U0001F534"          # red: act now - someone must go and fix it
+UNUSUAL = "\U0001F7E0"      # orange: unusual, nothing to do now - for the log
+BACK = "\U0001F7E2"         # green: back to normal
+OVER = "\u26AA"             # white: over, not fixed (the PC was switched off first)
+BOARD = "\U0001F4CB"        # the live board
+SUMMARY = "\U0001F4CA"      # the shift summary
+ICONS = (ACT, UNUSUAL, BACK, OVER, BOARD, SUMMARY)
+LEGEND = (f"How to read AIMScribe messages\n"
+          f"{ACT} Act now: someone must go and fix it. Press Seen when you start.\n"
+          f"{UNUSUAL} Unusual, nothing to do now: kept for the log (patient did not consent, "
+          f"patient left, emergency, pause).\n"
+          f"{BACK} Back to normal: Jabra plugged in, recording resumed, problem fixed.\n"
+          f"{OVER} Over, not fixed: the PC was switched off before it was fixed.\n"
+          f"{BOARD} Live board of a hospital · {SUMMARY} Shift summary and workbook")
 
 
 async def line(conn, at: Optional[datetime], what: str, *, session_id=None, device_id=None,
@@ -103,8 +114,7 @@ async def line(conn, at: Optional[datetime], what: str, *, session_id=None, devi
 # ============================================================ the card
 
 async def _consultations(conn, first: Dict[str, Any]) -> Optional[str]:
-    """How many consultations began on this PC since the problem did, and the latest."""
-    import collectors
+    """How many consultations began on this PC since the problem did."""
     if first.get("device_id") is None:
         return None
     since = None
@@ -120,8 +130,7 @@ async def _consultations(conn, first: Dict[str, Any]) -> Optional[str]:
     """, first["device_id"], since - timedelta(seconds=1))
     if not row or not row["n"]:
         return None
-    return (f"Consultations since: {row['n']} (latest started "
-            f"{collectors._hhmm(row['latest'])}{', recording now' if row['running'] else ''})")
+    return f"{row['n']} consultation{'s' if row['n'] != 1 else ''} so far"
 
 
 async def view(conn, first: Dict[str, Any],
@@ -157,41 +166,151 @@ async def view(conn, first: Dict[str, Any],
                                    device_id=first.get("device_id"),
                                    hospital_id=first.get("hospital_id")),
         "consultations": await _consultations(conn, first) if family in COUNTED else None,
-        "seen": await watchers._seen_text(conn, [key, f"esc:{key}"], started, key),
+        "seen": _seen_short(await watchers._seen_text(conn, [key, f"esc:{key}"], started,
+                                                      key)),
         "hhmm": collectors._hhmm,
         "event": first.get("event"),
-        # What happened, as the first alert said it (its first paragraph).
-        "what": (first.get("body") or "").split(PARAGRAPH)[0].strip()[:300],
+        "title": _title(family, first),
     }
 
 
+def _seen_short(text: str) -> str:
+    """'nobody', or 'Name 12:20', from watchers._seen_text."""
+    import re
+    m = re.match(r"(.+?) pressed Seen at (\d\d:\d\d)", text or "")
+    return f"{m.group(1)} {m.group(2)}" if m else "nobody"
+
+
+def _title(family: str, first: Dict[str, Any]) -> str:
+    """The card's name; for a recording problem, which problem."""
+    import re
+    title = TITLES[family]
+    if family == "paused":
+        return "Still paused"
+    if family == "recording":
+        body = (first.get("body") or "").split(PARAGRAPH)[0]
+        m = (re.search(r"because (.+?)\.", body)
+             or re.search(r"At \d\d:\d\d(?: \(.*?\))?, (.+?) at ", body))
+        if m:
+            title = f"{title}: {m.group(1)}"
+    return title
+
+
+# The words _still_wrong uses when a problem ended without being fixed.
+_ENDED = ("switched off", "no longer in use", "is gone", "ended at", "did not consent",
+          "no longer watched")
+
+
+def _ended(how: str) -> bool:
+    return any(word in (how or "") for word in _ENDED)
+
+
+def _cap(text: str) -> str:
+    return (text[:1].upper() + text[1:]).rstrip(".") + "." if text else ""
+
+
 def render(v: Dict[str, Any], audience: str) -> str:
+    """
+    21 Nov, short: a circle, what and where, then at most three short lines.
+        🔴 Jabra off · TEST · PC-1 · DR01
+        Since 15:26 · 3 consultations so far · Seen: nobody
+        The PC is still on Microphone Array.
+        Ask the doctor, between patients, to plug the Jabra in.   (collector)
+    Fixed: 🟢 Fixed after 7 min: Jabra off · ...; over unfixed: ⚪ Over after ...
+    """
     hhmm = v["hhmm"]
-    open_now = v["state"] == "still"
-    icon = "\U0001F534" if open_now else ("✅" if v["state"] in ("fixed", "over")
-                                         else "⏹")
-    lines = [f"{icon} {TITLES[v['family']]} · {v['where']}"]
-    if v.get("what"):
-        lines.append(v["what"])
-    if v["how"]:
-        lines.append(v["how"][:1].upper() + v["how"][1:] + ".")
-    lines.append(f"Started {hhmm(v['started'])}"
-                 + (f", {v['minutes']} min ago." if open_now and v["minutes"] else "."))
-    if v["consultations"]:
-        lines.append(v["consultations"])
-    lines.append(v["seen"])
-    if open_now:
-        if v["minutes"] >= 30:
-            lines.append(f"Still not fixed after {v['minutes']} min.")
+    title, where = v["title"], v["where"]
+    if v["state"] == "still":
+        lines = [f"{ACT} {title} · {where}"]
+        facts = [f"Since {hhmm(v['started'])}"]
+        if v["consultations"]:
+            facts.append(v["consultations"])
+        facts.append(f"Seen: {v['seen']}")
+        lines.append(" · ".join(facts))
+        if v["how"]:
+            lines.append(_cap(v["how"]))
         if audience == "collector":
             lines.append(DO_NOW if v.get("event") == "jabra_unplugged" else DO[v["family"]])
-    elif v["state"] == "fixed":
-        lines.append(f"Fixed by {hhmm(v['now'])}, after {v['minutes']} min.")
-    elif v["state"] == "over":
-        lines.append(f"Over after {v['minutes']} min.")
+    elif v["state"] == "fixed" or (v["state"] == "over" and not _ended(v["how"])):
+        lines = [f"{BACK} Fixed after {v['minutes']} min: {title} · {where}"]
+        if v["how"]:
+            lines.append(_cap(v["how"]))
     else:
-        lines.append(f"Ended by {hhmm(v['now'])} after {v['minutes']} min, not fixed.")
+        lines = [f"{OVER} Over after {v['minutes']} min, not fixed: {title} · {where}"]
+        if v["how"]:
+            lines.append(_cap(v["how"]))
     return "\n".join(lines)[:4000]
+
+
+async def message_text(conn, note: Dict[str, Any]) -> Optional[str]:
+    """
+    21 Nov: every message that is not a problem's card, short and with its
+    circle (LEGEND). None: send it as written (_telegram_text).
+    """
+    import re
+    import collectors
+    event = note.get("event") or ""
+    subject = (note.get("subject") or "").strip()
+    body = note.get("body") or ""
+    parts = [p.strip() for p in body.split(PARAGRAPH)
+             if p.strip() and not p.startswith("Open ") and "You get this because" not in p]
+    first = parts[0] if parts else ""
+    rest = parts[1:]
+    if subject[:1] in "".join(ICONS) or subject[:2] in ICONS:
+        return subject                                   # already a line with its circle
+    if re.match(r"^\d\d:\d\d · ", subject):           # a researcher's line without one
+        icon = BACK if event in ("recording_resumed", "recording_finished", "jabra_back")             else UNUSUAL
+        return f"{icon} {subject}"
+    at = collectors._hhmm(note.get("happened_at") or note.get("created_at"))
+
+    async def where() -> str:
+        return await where_words(conn, session_id=note.get("session_id"),
+                                 device_id=note.get("device_id"),
+                                 hospital_id=note.get("hospital_id"))
+
+    if event == "legend":
+        return body
+    if event == "stopped_unusually":
+        cause = subject.split(" - ")[0]
+        cause = cause[len("Recording stopped: "):] if cause.startswith("Recording stopped: ") \
+            else cause
+        return f"{UNUSUAL} {_cap(cause)[:-1]} · {await where()} · {at}\nNothing to do now."
+    if event == "recording_paused":
+        words = subject[len("Recording paused: "):] if subject.startswith("Recording paused: ") \
+            else subject
+        words = words.split(" - ")[0]                    # without the doctor added at the end
+        return (f"{UNUSUAL} Paused: {words} · {await where()} · {at}\n"
+                "Nothing is recorded until the doctor presses Resume.")
+    if event == "recording_resumed":
+        m = re.search(r"after (.+?) paused", body)
+        return (f"{BACK} Recording resumed{' after ' + m.group(1) if m else ''} · "
+                f"{await where()} · {at}")
+    if event == "jabra_back":
+        return f"{BACK} Jabra plugged in · {await where()} · {at}"
+    if event == "recording_finished":
+        return f"{BACK} {subject}"
+    if event == "problem_fixed":
+        icon = BACK if subject.startswith("Fixed") else OVER
+        return f"{icon} {subject}" + (f"\n{first}" if first else "")
+    if event == "handled":
+        return f"{BACK} {subject}"
+    if event in ("shift_report", "shift_summary", "daily_report", "summary_csv",
+                 "summary_xlsx"):
+        return f"{SUMMARY} {subject}" + (f"\n\n{PARAGRAPH.join(parts)}" if parts else "")
+    if event == "escalation":
+        text = f"{ACT} {subject}"
+        if note.get("audience") == "watcher" and rest:
+            text += "\n\n" + PARAGRAPH.join(rest)          # who to call
+        return text
+    if event == "still_not_fixed":
+        return f"{ACT} {subject}" + (f"\n{first}" if first else "")
+    if event == "no_shift_started":
+        if note.get("audience") == "watcher":
+            return f"{ACT} {subject}" + ("\n\n" + PARAGRAPH.join(rest) if rest else "")
+        return f"{ACT} {subject}\nIf you are at the clinic, open the dashboard and press Start my shift."
+    if event in ("repeated_stops", "send_failures"):
+        return f"{ACT} {subject}" + (f"\n{first}" if first else "")
+    return None
 
 
 async def text_for(conn, note: Dict[str, Any]) -> str:
@@ -300,7 +419,7 @@ async def board_text(conn, hospital_id: str, day: str, shift: str,
     start, _, _ = watchers.shift_window(_date.fromisoformat(day), shift)
     name = await conn.fetchval("SELECT name FROM hospitals WHERE hospital_id = $1",
                                hospital_id) or ""
-    out = [f"\U0001F4CB {hospital_id} {name} · {shift} shift · live".replace("  ", " ")]
+    out = [f"{BOARD} {hospital_id} {name} · {shift} shift · live".replace("  ", " ")]
 
     live = await conn.fetch("""
         SELECT s.doctor_id, s.opened_at, s.paused_since, s.pause_reason, d.machine_name,
@@ -327,6 +446,18 @@ async def board_text(conn, hospital_id: str, day: str, shift: str,
                    (r["microphone"] or "PC microphone") if r["microphone_is_clinic"] is False
                    else "microphone not reported")
             out.append(f"- {who}: recording since {hhmm(r['opened_at'])}, {mic}")
+
+    # 21 Nov: a PC asleep or off between patients is no alert any more; it is here.
+    quiet = await conn.fetch("""
+        SELECT machine_name, last_seen_at FROM devices
+         WHERE hospital_id = $1 AND revoked_at IS NULL
+           AND last_seen_at < $2::timestamptz - $3::interval
+           AND last_seen_at > $2::timestamptz - interval '12 hours'
+         ORDER BY last_seen_at
+    """, hospital_id, now, collectors.SILENT_AFTER)
+    if quiet:
+        out.append("Off or asleep: " + ", ".join(
+            f"{q['machine_name'] or 'a PC'} since {hhmm(q['last_seen_at'])}" for q in quiet))
 
     problems = await conn.fetch("""
         SELECT DISTINCT ON (n.event_key) n.event_key, n.event, n.subject, n.created_at
