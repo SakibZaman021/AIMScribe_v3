@@ -3718,6 +3718,13 @@ async def test_an_unusual_stop_is_told_with_the_doctor_the_pc_and_the_consultati
     _unserve()
 
 
+def _ago(minutes: int) -> datetime:
+    # The Notifier counts minutes on the app's clock (datetime.now), so the test
+    # sets "N minutes ago" on that clock too. Postgres's now() can run a few ms
+    # ahead of it on Windows, which turned 31 minutes into "30 min" (21 Nov 2026).
+    return datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+
 async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs, monkeypatch):
     """
     039: the researcher gets the alert at once with the collector on shift and
@@ -3788,8 +3795,8 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             assert not await conn.fetchval("SELECT 1 FROM collector_notifications "
                                            "WHERE event_key = $1", f"still:{key}:1")
             # 31 minutes on and still on the laptop microphone.
-            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
-                               "interval '31 minutes' WHERE event_key = $1", key)
+            await conn.execute("UPDATE collector_notifications SET created_at = $2 "
+                               "WHERE event_key = $1", key, _ago(31))
             await watchers.persisting(conn)
             await watchers.persisting(conn)                        # once only
             still = {r["email"]: r for r in await conn.fetch(
@@ -3799,8 +3806,8 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             assert reminder["subject"].startswith("Still not fixed after 31 min: Jabra unplugged")
             # 18 Nov: the researcher's card says 30 minutes; the message comes at 60.
             assert "lead@uni.example" not in still
-            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
-                               "interval '61 minutes' WHERE event_key = $1", key)
+            await conn.execute("UPDATE collector_notifications SET created_at = $2 "
+                               "WHERE event_key = $1", key, _ago(61))
             await watchers.persisting(conn)
             still = {r["email"]: r for r in await conn.fetch(
                 "SELECT * FROM collector_notifications WHERE event_key = $1", f"still:{key}:2")}
@@ -3809,8 +3816,8 @@ async def test_a_problem_that_lasts_reaches_the_researcher_with_who_to_call(dbs,
             assert "The PC is still on Laptop mic" in told["body"]
             assert "Nobody has pressed Seen." in told["body"]
             assert "Telegram @caller_tg" in told["body"]
-            await conn.execute("UPDATE collector_notifications SET created_at = now() - "
-                               "interval '31 minutes' WHERE event_key = $1", key)
+            await conn.execute("UPDATE collector_notifications SET created_at = $2 "
+                               "WHERE event_key = $1", key, _ago(31))
 
             # The Jabra is plugged back in: the researcher hears it is fixed, and how.
             await conn.execute("UPDATE devices SET microphone_is_clinic = TRUE "
