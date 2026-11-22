@@ -2071,6 +2071,12 @@ class Notifier:
                AND NOT EXISTS (SELECT 1 FROM collector_notifications m
                                 WHERE m.event_key = n.event_key AND m.audience = 'collector'
                                   AND m.seen_at IS NOT NULL)
+               -- 22 Nov: a problem already over (its card green or white) is
+               -- not "not seen": a Jabra back after 22 s was still escalated
+               -- to the researchers 15 min later, red, with phone numbers.
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications m
+                                WHERE m.event_key = n.event_key AND m.audience = 'collector'
+                                  AND m.resolved_at IS NOT NULL)
              ORDER BY n.event_key, n.id
         """, ESCALATE_AFTER)
         import watchers

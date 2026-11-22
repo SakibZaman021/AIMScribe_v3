@@ -2847,9 +2847,24 @@ async def test_the_collector_on_shift_is_mailed_and_an_unseen_alert_escalates(
             await notifier.alerts(conn)
             assert len(sent) == before
 
-            # Nobody marks it seen for 20 minutes: the reserve and the lab are told.
+            # 22 Nov: the Jabra came back seconds later - the problem is over,
+            # so 20 minutes on nobody is told it was "not seen".
             await conn.execute("""
-                UPDATE collector_notifications SET created_at = now() - interval '20 minutes'
+                UPDATE collector_notifications SET created_at = now() - interval '20 minutes',
+                       resolved_at = now() - interval '19 minutes',
+                       resolution = 'the Jabra is back in use'
+                 WHERE email = 'onduty@gmail.example' AND event = 'jabra_unplugged'
+            """)
+            before = len(sent)
+            await notifier.escalate(conn)
+            assert len(sent) == before
+            assert not await conn.fetchval("SELECT count(*) FROM collector_notifications "
+                                           "WHERE event = 'escalation'")
+
+            # Still unplugged and nobody marks it seen for 20 minutes: the
+            # reserve and the lab are told.
+            await conn.execute("""
+                UPDATE collector_notifications SET resolved_at = NULL, resolution = NULL
                  WHERE email = 'onduty@gmail.example' AND event = 'jabra_unplugged'
             """)
             await notifier.escalate(conn)
