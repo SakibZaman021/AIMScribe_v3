@@ -1480,12 +1480,10 @@ async def send_shift_summary(conn, shift: Dict[str, Any]) -> None:
                             body=body, event_key=f"summary:{shift['id']}",
                             place_id=shift["place_id"])
     if note_id is not None:
-        import watchers
-        if shift.get("ended_by") == "auto" and await watchers.quiet_for(
-                conn, place_id=shift["place_id"]):
-            await _hold(conn, note_id)            # night: on My shift, not in the inbox
-        else:
-            await _deliver(conn, note_id, shift["email"], subject, body)
+        # 22 Nov: always sent. An evening shift nobody ended closes itself an
+        # hour after its end - in quiet hours - so holding it meant collectors
+        # never got their evening summary at all.
+        await _deliver(conn, note_id, shift["email"], subject, body)
     await conn.execute("UPDATE collector_shifts SET summary_sent_at = now() WHERE id = $1",
                        shift["id"])
 

@@ -4082,14 +4082,16 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
                                "next_try_at = now() - interval '1 minute' WHERE id = $1", retry)
             await notifier.retry_failed(conn)
             assert len(sent) == before
-            # A shift the server closes at night: its summary is kept, not mailed then.
+            # A shift the server closes at night: 22 Nov, its summary is still sent -
+            # an evening shift closes itself in quiet hours, and holding it meant the
+            # collector never had their evening summary.
             shift = await conn.fetchrow("UPDATE collector_shifts SET ended_at = now(), "
                                         "ended_by = 'auto' WHERE email = 'night@gmail.example' "
                                         "AND ended_at IS NULL RETURNING *")
             await collectors.send_shift_summary(conn, dict(shift))
-            assert len(sent) == before
+            assert len(sent) == before + 1
             assert await conn.fetchval("SELECT channel FROM collector_notifications "
-                                       "WHERE event_key = $1", f"summary:{shift['id']}") == "held"
+                                       "WHERE event_key = $1", f"summary:{shift['id']}") != "held"
 
             # ------------------------------------------------ the summaries
             monkeypatch.setenv("AIMS_REPORT_AT", "20:30")
@@ -4114,6 +4116,11 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
 
             # Sent at the summary time: a message per hospital, then the CSV as a file.
             evening = datetime.combine(day, dtime(20, 45), tzinfo=tz)
+            # 22 Nov: the collector worked this afternoon, in the evening shift.
+            await conn.execute("UPDATE collector_shifts SET started_at = $2, ended_at = $3 "
+                               "WHERE id = $1", shift["id"],
+                               datetime.combine(day, dtime(15, 0), tzinfo=tz),
+                               datetime.combine(day, dtime(16, 0), tzinfo=tz))
             sent.clear()
             await watchers.shift_summaries(conn, now=evening)
             await watchers.shift_summaries(conn, now=evening)          # once only
@@ -4127,6 +4134,11 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
                 f"aimscribe_HOSP661_{day.isoformat()}_morning.xlsx",
                 f"aimscribe_HOSP661_{day.isoformat()}_evening.xlsx"}
             assert all(f[2].startswith(b"PK") for f in mine)           # an .xlsx is a zip
+            # 22 Nov: the collector who worked the evening shift gets its workbook
+            # too - only that shift's, once.
+            theirs = [f for f in files if f[0] == 661001]
+            assert [f[1] for f in theirs] == [
+                f"aimscribe_HOSP661_{day.isoformat()}_evening.xlsx"]
 
         # And on the dashboard, for any day and shift.
         client.cookies.clear()

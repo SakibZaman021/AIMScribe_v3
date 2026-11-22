@@ -966,6 +966,33 @@ async def shift_summaries(conn, now: Optional[datetime] = None) -> None:
                 audience="watcher")
             if note_id is not None:
                 await collectors._deliver(conn, note_id)
+        # 22 Nov, the lab: the data collector who worked the shift gets the same
+        # workbook, for each hospital of the place they were on shift at.
+        start, end, words = shift_window(day, shift)
+        rows = await conn.fetch("""
+            SELECT DISTINCT s.email, h.hospital_id
+              FROM collector_shifts s
+              JOIN portal_people p ON p.email = s.email AND p.removed_at IS NULL
+              JOIN place_hospitals h ON h.place_id = s.place_id AND h.removed_at IS NULL
+             WHERE s.started_at < $3 AND COALESCE(s.ended_at, $3) > $2
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications n
+                                WHERE n.email = s.email
+                                  AND n.event_key = 'summary-xlsx:' || $1::text || ':'
+                                                    || h.hospital_id)
+             ORDER BY h.hospital_id, s.email
+        """, f"{day.isoformat()}:{shift}", start, end)
+        for r in rows:
+            hid = r["hospital_id"]
+            note_id = await collectors._record(
+                conn, email=r["email"], event="summary_xlsx",
+                subject=f"{SHIFT_NAMES[shift]} workbook: {hid}, {day:%d %b}",
+                body=(f"{hid}, {words} on {day:%d %b}: Summary by doctor; every audio file "
+                      "with its pauses and stops; what CMED did not send; the alerts of "
+                      "each file."),
+                event_key=f"summary-xlsx:{day.isoformat()}:{shift}:{hid}", hospital_id=hid,
+                audience="collector")
+            if note_id is not None:
+                await collectors._deliver(conn, note_id)
 
 
 # Kept for anything that still calls it: the summaries replaced the one evening report.
