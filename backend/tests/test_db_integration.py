@@ -1977,11 +1977,22 @@ async def _copied_recording(dbs, patient, *, plain=_DL_WAV):
     return sid, stem
 
 
-async def _researcher(client, who, email="researcher@uni.example"):
+async def _researcher(client, who, email="researcher@uni.example", hospitals=("HOSP003",)):
+    """049: a researcher downloads only the hospitals assigned to them - HOSP003,
+    the test recordings' clinic, unless the test says otherwise."""
     who["value"] = "owner@uiu.example"
     await _sign_in(client)
     await client.post("/api/v2/admin/people", json={"email": email, "role": "researcher"},
                       headers={"X-AIMS-Portal": "1"})
+    import portal
+    async with portal._pool().acquire() as conn:          # the People page's "Looks after"
+        for hid in hospitals:
+            await conn.execute("""
+                INSERT INTO researcher_hospitals (email, hospital_id, added_by)
+                VALUES ($1, $2, 'download-test')
+                ON CONFLICT (email, hospital_id) DO UPDATE SET removed_at = NULL,
+                    added_by = 'download-test'
+            """, email.lower(), hid)
     client.cookies.clear()
     who["value"] = email
     await _sign_in(client)
@@ -3201,6 +3212,11 @@ def _with_watchers(client):
 async def _watching_researcher(client, who, email, hospitals=("HOSP003",)):
     """As the owner: a researcher who looks after these hospitals."""
     h = {"X-AIMS-Portal": "1"}
+    import portal
+    async with portal._pool().acquire() as conn:
+        # The download tests' researchers (049) are not the alert tests' watchers.
+        await conn.execute("UPDATE researcher_hospitals SET removed_at = now() "
+                           "WHERE added_by = 'download-test' AND removed_at IS NULL")
     client.cookies.clear()
     who["value"] = "owner@uiu.example"
     await _sign_in(client)

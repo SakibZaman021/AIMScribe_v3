@@ -216,6 +216,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it a 3.9.6 PC's report of the pieces it still holds is not kept.
     ("048_v3_pc_piece_report.sql", "recordings", "column sessions.pc_waiting_numbers",
      _column("sessions", "pc_waiting_numbers")),
+    # Without it CMED staff cannot be given their own role (no audio).
+    ("049_v3_cmed_role.sql", "recordings", "role 'cmed' allowed",
+     _check_allows("portal_people", "role", "cmed")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

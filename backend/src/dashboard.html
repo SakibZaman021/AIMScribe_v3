@@ -196,7 +196,7 @@
           <span id="patientMsg" class="hint" role="status"></span>
         </form>
       </section>
-      <section class="panel" aria-labelledby="h-clinicalCsv">
+      <section class="panel" aria-labelledby="h-clinicalCsv" id="clinicalCsvPanel">
         <div class="head wrap"><h3 id="h-clinicalCsv">Download as CSV</h3>
           <button type="button" class="q" aria-label="About the downloads" data-tip="Every visit in the dates and clinic chosen, one file each: Demographics is one row per visit with sex, age, blood group and vitals (API 2); Prescriptions is one row per visit with complaints, examination, diagnoses, medicines, tests and advice (API 3); Medicines is one row per medicine. No dates: every visit. Each download is logged by your name.">?</button></div>
         <div class="body pfind">
@@ -449,6 +449,7 @@
           <label>Role <select id="pRole">
             <option value="researcher">Researcher - look, never change</option>
             <option value="admin">Admin - everything, and people</option>
+            <option value="cmed">CMED - clinical records (JSON) only, no audio</option>
             <option value="collector">Data collector - view only, own place</option>
           </select></label>
           <label id="pPlaceLabel" hidden>Place <select id="pPlace"></select></label>
