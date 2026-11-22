@@ -691,9 +691,10 @@ async def _clinical_reader(request: Request) -> str:
     import portal
     person = await portal.person_for(request)
     if person is not None:
-        if person.role not in ("admin", "researcher"):
+        if person.role not in ("admin", "researcher", "cmed"):
             raise HTTPException(status_code=403,
-                                detail="A patient's clinical record is for researchers and admins.")
+                                detail="A patient's clinical record is for researchers, "
+                                       "CMED staff and admins.")
         return person.email
     if request.headers.get("x-admin-key"):
         return "admin key"
@@ -783,11 +784,12 @@ async def patient_history(patient_ref: str, request: Request,
         async with _pool().acquire() as conn:
             for r in await conn.fetch("""
                 SELECT session_id, confirmation, copied_at IS NOT NULL AS copied,
-                       total_duration_seconds, parts_count, local_start
+                       total_duration_seconds, parts_count, local_start, hospital_id
                   FROM sessions WHERE session_id = ANY($1::text[])
             """, sessions):
                 recorded[r["session_id"]] = {
                     "session_id": r["session_id"], "confirmation": r["confirmation"],
+                    "hospital_id": r["hospital_id"],
                     "copied": r["copied"], "parts": r["parts_count"],
                     "minutes": round(float(r["total_duration_seconds"] or 0) / 60, 1),
                     "local_start": _plain(r["local_start"])}
@@ -977,6 +979,7 @@ async def clinical_csv(request: Request, table: str = "demographics",
     patient ID, a visit ID, or both narrow it to one patient or consultation.
     """
     actor = await _clinical_reader(request)
+    await _no_collector_files(request, "the clinical tables")      # 049: not CMED either
     view = _CLINICAL_CSV.get(table if isinstance(table, str) else "")
     if view is None:
         raise HTTPException(status_code=400,
@@ -1563,12 +1566,16 @@ def _csv(rows: List[Dict[str, Any]], columns: List[str]) -> bytes:
 
 
 async def _no_collector_files(request: Request, what: str = "the event log") -> None:
-    """A CSV is a download: researchers and admins, as for audio (036)."""
+    """A CSV is a download: researchers and admins, as for audio (036). CMED
+    staff download the clinical record (JSON) and nothing else (049)."""
     import portal
     person = await portal.person_for(request)
     if person is not None and person.role == "collector":
         raise HTTPException(status_code=403, detail=f"A data collector can view {what} "
                                                     "but not download it.")
+    if person is not None and person.role == "cmed":
+        raise HTTPException(status_code=403, detail=f"CMED staff can view {what} but "
+                                                    "download only the clinical record (JSON).")
 
 
 @router.get("/events")

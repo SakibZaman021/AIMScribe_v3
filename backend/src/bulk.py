@@ -317,12 +317,23 @@ async def _person(request: Request, *, write: bool = False) -> portal.Person:
     person = await portal.person_for(request)
     if person is None:
         raise HTTPException(status_code=401, detail="Sign in with Google to download recordings.")
-    if person.role == "collector":
-        raise HTTPException(status_code=403, detail="A data collector can view recordings but "
-                                                    "not download them.")
+    if person.role in ("collector", "cmed"):
+        # 036: a collector downloads nothing. 049: a batch is audio, which CMED
+        # staff never download.
+        raise HTTPException(status_code=403, detail=(
+            downloads.CMED_NO_AUDIO if person.role == "cmed" else
+            "A data collector can view recordings but not download them."))
     if write:
         portal.check_csrf(request)
     return person
+
+
+async def _may_select(person: portal.Person, sel: "Selection") -> None:
+    """049: a researcher's batch must name one of the hospitals assigned to them."""
+    try:
+        await downloads.may_download(person, "audio", sel.hospital_id)
+    except downloads._Refused as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.message)
 
 
 # ------------------------------------------------------------------ what is left
@@ -341,6 +352,7 @@ async def preview(request: Request,
     """
     person = await _person(request)
     sel = selection_of(hospital_id, from_date, to_date, doctor)
+    await _may_select(person, sel)
     lim = limits_for(person.role)
     async with portal._pool().acquire() as conn:
         await _tidy(conn)
@@ -433,6 +445,7 @@ async def create_batch(body: BatchRequest, request: Request):
     """
     person = await _person(request, write=True)
     sel = selection_of(body.hospital_id, body.from_date, body.to_date, body.doctors)
+    await _may_select(person, sel)
     lim = limits_for(person.role)
     state = window_state(lim.window)
     if not state["open"]:
@@ -668,6 +681,9 @@ async def _may_start(conn, person: portal.Person, batch_id: int, lim: Limits):
     batch, files = await _load_batch(conn, batch_id)
     if batch is None or batch["email"] != person.email:
         raise downloads._Refused(404, "No such batch of yours.")
+    # 049: asked again at every start - a batch made before the rule, or a
+    # hospital no longer assigned, is refused here.
+    await downloads.may_download(person, "audio", batch["hospital_id"])
     if batch["outcome"] == "started":
         raise downloads._Refused(409, "This batch is downloading now.")
     if batch["outcome"] == "abandoned":
@@ -708,9 +724,10 @@ async def download_batch(batch_id: int, request: Request):
     person = await portal.person_for(request)
     if person is None:
         return downloads._refusal(request, 401, "Sign in with Google to download recordings.")
-    if person.role == "collector":
-        return downloads._refusal(request, 403, "A data collector can view recordings but "
-                                                "not download them.")
+    if person.role in ("collector", "cmed"):
+        return downloads._refusal(request, 403, (
+            downloads.CMED_NO_AUDIO if person.role == "cmed" else
+            "A data collector can view recordings but not download them."))
     if (request.headers.get("sec-fetch-site") or "same-origin") not in ("same-origin", "none"):
         return downloads._refusal(request, 403, "Downloads start from the dashboard only.")
     if not downloads._decrypt_url():

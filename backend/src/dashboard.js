@@ -849,6 +849,11 @@ function audioLinks(r) {
   if (PORTAL && PORTAL.role === "collector") return `<span class="hint">view only</span>`;
   if (!r.copied || r.confirmation !== "confirmed") return `<span class="hint">–</span>`;
   if (!PORTAL) return `<span class="hint">sign in</span>`;
+  // 049: a researcher downloads only the hospitals assigned to them.
+  if (PORTAL.role === "researcher" && !(PORTAL.download_hospitals || []).includes(r.hospital_id)) {
+    return `<span class="hint" title="You can download only the hospitals assigned to you`
+      + ` (People page)">Not your hospital</span>`;
+  }
   const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}/audio`;
   const files = r.files || [];
   const link = (href, label, title) =>
@@ -859,6 +864,8 @@ function audioLinks(r) {
       ? "<br>" + files.map((f) => link(`${recordUrl(r)}?part=${f.part_no}`, `Record ${f.part_no}`,
           `Download the clinical record of patient file ${f.part_no} (JSON)`)).join(" ")
       : "<br>" + link(recordUrl(r), "Record (JSON)", "Download the clinical record CMED sent (JSON)");
+  // 049: CMED staff take the clinical record only, never the audio.
+  if (PORTAL.role === "cmed") return record.slice("<br>".length);
   if (files.length > 1) {
     return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
       `Download patient file ${f.part_no} (WAV)`)).join(" ") + record;
@@ -979,7 +986,9 @@ function pieceRanges(numbers) {
 /* 20 Nov 2026: the pieces log - every piece of a recording, when it was
    recorded, when it arrived, and where it is now. */
 function piecesButton(r) {
-  if (PORTAL && PORTAL.role === "collector") return `<span class="hint">view only</span>`;
+  if (PORTAL && (PORTAL.role === "collector" || PORTAL.role === "cmed")) {
+    return `<span class="hint">view only</span>`;
+  }
   return `<button type="button" class="copy" data-pieces="${esc(r.session_id)}"`
     + ` title="${esc(r.pieces_folder || "")}">Pieces (CSV)</button>`;
 }
@@ -1249,7 +1258,8 @@ async function whoAmI() {
   if (reply.status === 404) return;                 // the loopback door: the admin key
   const me = await reply.json().catch(() => ({}));
   if (reply.ok && me.signed_in) {
-    PORTAL = { email: me.email, role: me.role, place_id: me.place_id };
+    PORTAL = { email: me.email, role: me.role, place_id: me.place_id,
+               download_hospitals: me.download_hospitals || [] };
     $("who").textContent = `${me.email} \u00b7 ${me.role}`;
     $("who").hidden = false;
     $("signout").hidden = false;
@@ -1271,6 +1281,11 @@ async function whoAmI() {
       $("navShift").hidden = false;
       $("piecesPanel").hidden = true;      // a download: researchers and admins
       loadShift();
+    }
+    if (me.role === "cmed") {
+      // 049: CMED staff download the clinical record (JSON) and nothing else.
+      $("piecesPanel").hidden = true;
+      $("clinicalCsvPanel").hidden = true;
     }
     if (me.role === "researcher" || me.role === "admin") {
       $("navWatch").hidden = false;
@@ -1666,13 +1681,15 @@ async function loadPeople() {
               + `data-current="${esc(p.collector_code || "")}">ID</button>`
             : ""))
         + td("Role", p.role === "admin" ? tag("warn", "Admin")
+          : p.role === "cmed" ? tag("info", "CMED") + `<br><span class="hint">JSON only, no audio</span>`
           : p.role === "collector" ? tag("info", "Data collector")
             + (p.place ? `<br><span class="hint">${esc(p.place)}</span>` : "")
           : tag("good", "Researcher"))
         + td("Looks after", watchCell(p))
         + td("Given by", esc(p.added_by || ""))
         + td("Last signed in", esc(when(p.last_signed_in)))
-        + td("Database login", p.role === "collector" ? `<span class="hint">none (view only)</span>`
+        + td("Database login", p.role === "collector" || p.role === "cmed"
+          ? `<span class="hint">none</span>`
           : (p.db_user ? `<code>${esc(p.db_user)}</code><br>` : "")
           + `<button type="button" class="chip" data-dblogin="${esc(p.email)}">`
           + `${p.db_user ? "New password" : "Create login"}</button>`)
@@ -2065,13 +2082,17 @@ function prescriptionBlock(v) {
 function visitCard(v) {
   const recs = (v.recordings_detail || []).map((r) => {
     const base = `/api/v2/dashboard/recordings/${encodeURIComponent(r.session_id)}`;
-    const links = r.copied && r.confirmation === "confirmed" && PORTAL
-      ? ` <a class="copy dl" href="${esc(base)}/audio">Audio (WAV)</a> <a class="copy dl" href="${esc(base)}/record">Record (JSON)</a>`
-      : "";
+    const record = ` <a class="copy dl" href="${esc(base)}/record">Record (JSON)</a>`;
+    // 049: CMED staff the record only; a researcher their own hospitals only.
+    const links = !(r.copied && r.confirmation === "confirmed" && PORTAL) ? ""
+      : PORTAL.role === "cmed" ? record
+      : PORTAL.role === "researcher" && !(PORTAL.download_hospitals || []).includes(r.hospital_id)
+        ? ` <span class="hint">Not your hospital</span>`
+      : ` <a class="copy dl" href="${esc(base)}/audio">Audio (WAV)</a>` + record;
     return `<div class="prec">${confirmTag(r.confirmation)} <span class="mono">${esc(r.session_id)}</span>`
       + ` <span class="hint">${esc(String(r.local_start || "").slice(0, 5))} · ${num(r.minutes || 0)} min</span>${links}</div>`;
   }).join("");
-  const visitDl = v.visit_id
+  const visitDl = v.visit_id && !(PORTAL && PORTAL.role === "cmed")       // 049: no CSV
     ? `<button type="button" class="ghost small" data-pcsv="visits" data-visit="${esc(v.visit_id)}">This visit (CSV)</button>`
     : "";
   return `<section class="panel pvisit">
@@ -2211,9 +2232,14 @@ function startBulk() {
   $("batchesPanel").hidden = false;
   $("navDownloads").hidden = false;
   $("bEveryoneLabel").hidden = PORTAL.role !== "admin";
-  $("bClinic").innerHTML = `<option value="">All clinics</option>`
-    + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
-  $("bClinic").value = $("clinic").value;
+  // 049: a researcher's batch is one of the hospitals assigned to them.
+  const mine = PORTAL.role === "researcher" ? (PORTAL.download_hospitals || []) : null;
+  const offered = mine ? CLINICS.filter((c) => mine.includes(c.hospital_id)) : CLINICS;
+  $("bClinic").innerHTML = (mine ? (offered.length ? ""
+      : `<option value="">No hospital assigned to you</option>`)
+    : `<option value="">All clinics</option>`)
+    + offered.map((c) => `<option value="${esc(c.hospital_id)}">${esc(c.name || c.hospital_id)}</option>`).join("");
+  if (!mine || mine.includes($("clinic").value)) $("bClinic").value = $("clinic").value;
   $("bFrom").value = $("from").value;
   $("bTo").value = $("to").value;
   loadBulk();
@@ -2231,14 +2257,18 @@ async function start() {
       + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
   } catch { /* refresh reports it */ }
-  if (PORTAL && PORTAL.role !== "collector") startBulk();
+  // A batch is audio: never for a data collector (036) or CMED staff (049).
+  if (PORTAL && PORTAL.role !== "collector" && PORTAL.role !== "cmed") startBulk();
   // 18 Nov: a patient's clinical record - researchers and admins only.
   if (!PORTAL || PORTAL.role !== "collector") {
     $("navPatient").hidden = false;
     fillCsvClinics();
   }
   // A data collector views the event log but downloads nothing (036).
-  if (PORTAL && PORTAL.role === "collector") $("eventFiles").querySelectorAll("button").forEach((b) => { b.hidden = true; });
+  // 049: nor CMED staff, who download the clinical record (JSON) only.
+  if (PORTAL && (PORTAL.role === "collector" || PORTAL.role === "cmed")) {
+    $("eventFiles").querySelectorAll("button").forEach((b) => { b.hidden = true; });
+  }
   showView(location.hash.slice(1));
   await refresh();
 }

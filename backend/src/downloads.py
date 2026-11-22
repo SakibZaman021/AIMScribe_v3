@@ -25,6 +25,16 @@ The clinical record (17 Nov) - the JSON CMED sent, kept as its own sealed
 copy - comes the same way, to the same people (researchers and admins; a data
 collector neither), under the same daily limit, logged the same way. Before
 this, reading one meant the copy key and restore.py.
+
+Who may take what (049, 23 Nov 2026) - may_download() below, used by the
+single downloads here and by the batches in bulk.py:
+
+    admin (and the owner)   audio and clinical record, every hospital
+    cmed (CMED staff)       the clinical record of every hospital; never audio
+    researcher              audio and clinical record of the hospitals assigned
+                            to them (researcher_hospitals) only; they still SEE
+                            every hospital
+    collector               nothing
 """
 from __future__ import annotations
 
@@ -85,6 +95,40 @@ def _refusal(request: Request, status: int, message: str):
                             "<p><a href='/dashboard'>Back to the dashboard</a></p>",
                             status)
     raise HTTPException(status_code=status, detail=message)
+
+
+COLLECTOR_NO_FILES = "A data collector can view recordings but not download or play them."
+CMED_NO_AUDIO = ("CMED staff can download the clinical record (JSON), not the audio.")
+
+
+async def may_download(person: "portal.Person", kind: str,
+                       hospital_id: Optional[str]) -> None:
+    """
+    Raise _Refused unless this person may download this kind of file - "audio"
+    or "json" - of a recording from this hospital. hospital_id None means a
+    selection of every hospital (a batch of "All clinics").
+    """
+    if person.role == "collector":
+        raise _Refused(403, COLLECTOR_NO_FILES)
+    if person.role == "cmed":
+        if kind != "json":
+            raise _Refused(403, CMED_NO_AUDIO)
+        return
+    if person.role == "researcher":
+        import watchers
+        mine = await watchers.watched_hospitals(person.email)
+        if not mine:
+            raise _Refused(403, "Not your hospital: no hospital is assigned to you, so you "
+                                "can view recordings but not download them. An admin "
+                                "assigns hospitals on the People page.")
+        if hospital_id is None:
+            raise _Refused(403, "Choose one of your hospitals: " + ", ".join(mine) + ".")
+        if hospital_id not in mine:
+            raise _Refused(403, f"Not your hospital: {hospital_id}. You can download the "
+                                f"recordings of " + ", ".join(mine) + " only.")
+        return
+    if person.role != "admin":
+        raise _Refused(403, "This account cannot download recordings.")
 
 
 def _stem_of(object_key: str) -> Optional[str]:
@@ -194,10 +238,13 @@ async def _download(session_id: str, request: Request, part: Optional[int], kind
     person = await portal.person_for(request)
     if person is None:
         return _refusal(request, 401, "Sign in with Google to download recordings.")
-    if person.role == "collector":
+    if person.role in ("collector", "cmed"):
         # 036: data collectors view only - no file, no batch, no playback.
-        return _refusal(request, 403, "A data collector can view recordings but not "
-                                      "download or play them.")
+        # 049: CMED staff the clinical record only. Refused before any lookup.
+        try:
+            await may_download(person, kind, None)
+        except _Refused as refused:
+            return _refusal(request, refused.status, refused.message)
     # A link on another site may not start a download in this browser's name.
     if (request.headers.get("sec-fetch-site") or "same-origin") not in ("same-origin", "none"):
         return _refusal(request, 403, "Downloads start from the dashboard only.")
@@ -206,6 +253,13 @@ async def _download(session_id: str, request: Request, part: Optional[int], kind
                                       "(AIMS_DECRYPT_URL).")
     sid = api_v2._sid(session_id)
     try:
+        if person.role == "researcher":
+            # 049: only the hospitals assigned to them - asked before anything
+            # about the recording's copies is told.
+            session = await api_v2._repo().get_session(sid)
+            if session is None:
+                raise _Refused(404, "No such recording.")
+            await may_download(person, kind, session.get("hospital_id"))
         copy = await _the_copy(sid, part, kind)
         async with portal._pool().acquire() as conn:
             await _within_limits(conn, person.email, person.role)

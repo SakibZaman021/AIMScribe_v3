@@ -63,12 +63,17 @@ GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 COOKIE = "aims_portal"
 SESSION_SECONDS = 8 * 3600
 LOGIN_MINUTES = 10
-ROLES = ("admin", "researcher", "collector")
+ROLES = ("admin", "cmed", "researcher", "collector")
 CSRF_HEADER = "x-aims-portal"
 ADMIN_PATHS = ("/api/v2/admin",)
 # 036: what a data collector may never open - the database viewer and the
 # admin routes. Downloads refuse them in downloads.py and bulk.py.
 COLLECTOR_REFUSED = ("/db", "/api/v2/admin", "/api/v2/dashboard/bulk")
+# 049 (23 Nov 2026): CMED staff see every hospital and download the clinical
+# record (JSON), nothing else - no audio one at a time or in batches (a batch
+# is audio only), no admin tools, no database viewer. downloads.py refuses
+# them the audio and dashboard.py the CSV files as well.
+CMED_REFUSED = ("/db", "/api/v2/admin", "/api/v2/dashboard/bulk")
 
 
 @dataclass(frozen=True)
@@ -314,8 +319,13 @@ async def me(request: Request):
     if person is None:
         return JSONResponse(status_code=401, content={"signed_in": False,
                                                       "google": configured()})
-    return {"signed_in": True, "email": person.email, "role": person.role,
-            "place_id": person.place_id}
+    answer = {"signed_in": True, "email": person.email, "role": person.role,
+              "place_id": person.place_id}
+    if person.role == "researcher":
+        # 049: a researcher downloads only the hospitals assigned to them.
+        import watchers
+        answer["download_hospitals"] = await watchers.watched_hospitals(person.email)
+    return answer
 
 
 @router.get("/auth/check")
@@ -336,6 +346,9 @@ async def check(request: Request):
         return JSONResponse(status_code=403, content={"detail": "this needs an administrator"})
     if person.role == "collector" and uri.startswith(COLLECTOR_REFUSED):
         return JSONResponse(status_code=403, content={"detail": "a data collector views only"})
+    if person.role == "cmed" and uri.startswith(CMED_REFUSED):
+        return JSONResponse(status_code=403,
+                            content={"detail": "CMED staff download the clinical record only"})
     headers = {"X-Portal-Email": person.email, "X-Portal-Role": person.role}
     if person.db_user:
         headers["X-Portal-Db-User"] = person.db_user
@@ -347,7 +360,7 @@ async def check(request: Request):
 class PersonRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=254,
                        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    role: str = Field("researcher", pattern=r"^(admin|researcher|collector)$")
+    role: str = Field("researcher", pattern=r"^(admin|cmed|researcher|collector)$")
     # 036: required for a data collector, ignored for the other roles.
     place_id: Optional[int] = None
 
@@ -524,8 +537,9 @@ async def set_db_login(body: RemoveRequest, request: Request, _: None = _admin()
         raise HTTPException(status_code=404, detail="no such person")
     async with _pool().acquire() as conn:
         role = await conn.fetchval("SELECT role FROM portal_people WHERE email = $1", email)
-    if role == "collector":
-        raise HTTPException(status_code=409, detail="a data collector has no database login")
+    if role in ("collector", "cmed"):
+        raise HTTPException(status_code=409, detail="a data collector or a CMED staff member "
+                                                    "has no database login")
     return {"email": email, **await _set_db_login(email, await _actor(request))}
 
 
@@ -560,6 +574,13 @@ def _invitation_text(email: str, role: str, by: str, place: Optional[str]) -> st
                 "and the shift's summary is emailed to you.\n\n"
                 "You can see the recordings of your place's hospitals, but not download "
                 "or play them.\n\n"
+                "If you did not expect this, you can ignore this email.\n")
+    if role == "cmed":
+        return (f"{by} has given you CMED access to the AIMScribe portal.\n\n"
+                f"Open {link} and sign in with this Google account ({email}).\n\n"
+                "You can see every hospital's recordings and download the clinical record "
+                "(JSON) of any of them. Audio is not downloaded or played from this "
+                "account.\n\n"
                 "If you did not expect this, you can ignore this email.\n")
     return (f"{by} has given you {role} access to the AIMScribe research portal.\n\n"
             f"Open {link} and sign in with this Google account ({email}).\n\n"
