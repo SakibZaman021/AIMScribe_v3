@@ -4116,11 +4116,6 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
 
             # Sent at the summary time: a message per hospital, then the CSV as a file.
             evening = datetime.combine(day, dtime(20, 45), tzinfo=tz)
-            # 22 Nov: the collector worked this afternoon, in the evening shift.
-            await conn.execute("UPDATE collector_shifts SET started_at = $2, ended_at = $3 "
-                               "WHERE id = $1", shift["id"],
-                               datetime.combine(day, dtime(15, 0), tzinfo=tz),
-                               datetime.combine(day, dtime(16, 0), tzinfo=tz))
             sent.clear()
             await watchers.shift_summaries(conn, now=evening)
             await watchers.shift_summaries(conn, now=evening)          # once only
@@ -4134,11 +4129,8 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
                 f"aimscribe_HOSP661_{day.isoformat()}_morning.xlsx",
                 f"aimscribe_HOSP661_{day.isoformat()}_evening.xlsx"}
             assert all(f[2].startswith(b"PK") for f in mine)           # an .xlsx is a zip
-            # 22 Nov: the collector who worked the evening shift gets its workbook
-            # too - only that shift's, once.
-            theirs = [f for f in files if f[0] == 661001]
-            assert [f[1] for f in theirs] == [
-                f"aimscribe_HOSP661_{day.isoformat()}_evening.xlsx"]
+            # 22 Nov, the lab: data collectors get no workbook or CSV.
+            assert not [f for f in files if f[0] == 661001]
 
         # And on the dashboard, for any day and shift.
         client.cookies.clear()
