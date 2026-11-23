@@ -53,6 +53,8 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp"          # HTTP/3
+      # The beta server (BETA_SERVER.md), the same name on its own port.
+      - "9443:9443"
       # The lab's door: admin routes and the dashboard, on this machine's
       # loopback only - reached from the server itself or an SSH tunnel.
       - "127.0.0.1:6001:6001"
@@ -76,6 +78,9 @@ services:
         # A fixed address, so the API can trust X-Forwarded-For from this
         # one sender and from nobody else (AIMS_TRUSTED_PROXIES).
         ipv4_address: ${AIMS_GATEWAY_IP:-172.30.10.2}
+      # To the beta stack's API only (docker-compose.beta.yml).
+      beta_gw:
+        ipv4_address: ${AIMS_BETA_GATEWAY_IP:-172.30.20.2}
 
   # ------------------------------------------------------------
   # PostgreSQL 16: both databases, on the database disks
@@ -626,3 +631,12 @@ networks:
           # address (.2) is never taken first by whichever container started
           # before it - which stopped the gateway on the first droplet start.
           ip_range: ${AIMS_INTERNAL_DYNAMIC_RANGE:-172.30.10.128/25}
+  # `beta_gw`: the gateway and the beta API (BETA_SERVER.md), nothing else.
+  # Made here, so the real gateway starts whether or not beta is up.
+  beta_gw:
+    name: aimsbeta-gw
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+          ip_range: 172.30.20.128/25
