@@ -209,6 +209,9 @@ networks:
   gw:
     name: aimsbeta-gw
     external: true
+  # Beta's own way out to R2 - never the real stack's aims-egress. Sharing it
+  # (24 Nov 2026, 03:13-03:44) gave two containers each named "api" and
+  # "archive-worker" on one network: the real API sent downloads to beta's
+  # worker ("the worker key is required") and the real worker polled beta's API.
   egress:
-    name: aims-egress
-    external: true
+    name: aimsbeta-egress
