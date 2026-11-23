@@ -256,7 +256,13 @@ async def _integrity(conn, start: date, end: date,
                count(*) FILTER (WHERE EXISTS (SELECT 1 FROM unnest(microphones) m
                                                WHERE m NOT ILIKE '%jabra%'
                                                  AND m NOT ILIKE 'echo cancelling speakerphone (j%'))
-                   AS not_jabra
+                   AS not_jabra,
+               -- 24 Nov 2026: every part on the Jabra, shown before "Not on the Jabra".
+               count(*) FILTER (WHERE cardinality(microphones) > 0
+                                  AND NOT EXISTS (SELECT 1 FROM unnest(microphones) m
+                                                   WHERE m NOT ILIKE '%jabra%'
+                                                     AND m NOT ILIKE 'echo cancelling speakerphone (j%'))
+                   AS on_jabra
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
@@ -264,6 +270,7 @@ async def _integrity(conn, start: date, end: date,
 
     return {
         "not_jabra_total": int(more["not_jabra"] or 0) if more else 0,
+        "on_jabra_total": int(more["on_jabra"] or 0) if more else 0,
         "unarchived_total": int(more["unarchived"] or 0) if more else 0,
         "quarantined": [dict(r) for r in quarantined],
         "quarantined_total": sum(r["n"] for r in quarantined),
@@ -553,7 +560,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     level (`SRS-DSH-02`). `state` opens one of the summary's counts:
 
         confirmed | pending | unconfirmed | refused | expired | legacy
-        quarantined | stopped_early | unarchived | uncopied | not_jabra
+        quarantined | stopped_early | unarchived | uncopied | on_jabra | not_jabra
     """
     today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
@@ -586,6 +593,10 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
         "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
                     "AND s.confirmation = 'confirmed'",
+        # 24 Nov 2026: every part recorded on the Jabra.
+        "on_jabra": "cardinality(s.microphones) > 0 AND NOT EXISTS (SELECT 1 FROM "
+                    "unnest(s.microphones) m WHERE m NOT ILIKE '%jabra%' "
+                    "AND m NOT ILIKE 'echo cancelling speakerphone (j%')",
         # 036: any part recorded on something other than the Jabra.
         "not_jabra": "EXISTS (SELECT 1 FROM unnest(s.microphones) m "
                      "WHERE m NOT ILIKE '%jabra%' "

@@ -8,6 +8,7 @@ let ADMIN_KEY = "";
 let PORTAL = null;          // {email, role} when signed in
 const portalHeaders = () => (PORTAL ? { "X-AIMS-Portal": "1" } : { "X-Admin-Key": ADMIN_KEY });
 let CLINICS = [];
+let DOCTORS = [];     // 24 Nov 2026: {hospital_id, doctor_id}, for the Recordings doctor filter
 let LAST = null;            // last /summary answer, for redraws without a fetch
 let STATE = "";             // recordings table filter (the API's `state`)
 let PC_FILTER = "all";      // PCs table filter
@@ -237,6 +238,7 @@ const STATE_LABELS = {
   stopped_early: "Stopped early",
   unarchived: "Not archived",
   uncopied: "No cloud copy",
+  on_jabra: "On the Jabra",
   not_jabra: "Not on the Jabra",
   refused: "Refused",
   expired: "Expired",
@@ -1025,12 +1027,12 @@ function drawStateFilters() {
   const counts = {
     pending: c.pending, unconfirmed: c.unconfirmed, confirmed: c.confirmed,
     quarantined: i.quarantined_total, stopped_early: i.stopped_early_total,
-    not_jabra: i.not_jabra_total, unarchived: i.unarchived_total,
+    on_jabra: i.on_jabra_total, not_jabra: i.not_jabra_total, unarchived: i.unarchived_total,
     uncopied: LAST && LAST.copies.recordings_without_a_cloud_copy,
     refused: c.refused, expired: c.expired, legacy: c.legacy,
   };
   const order = ["", "pending", "unconfirmed", "confirmed", "quarantined", "stopped_early",
-                 "not_jabra", "unarchived", "uncopied", "refused", "expired", "legacy"];
+                 "on_jabra", "not_jabra", "unarchived", "uncopied", "refused", "expired", "legacy"];
   $("stateFilters").innerHTML = order.map((s) => {
     const n = counts[s];
     if (["refused", "expired", "legacy"].includes(s) && !n && STATE !== s) return "";
@@ -1051,20 +1053,35 @@ function setState(s) {
 }
 
 let recSeq = 0;
+/* 24 Nov 2026: the chosen clinic's doctors (every clinic's, with none chosen). */
+function fillRecDoctors(clinic) {
+  const sel = $("recDoctor");
+  const chosen = sel.value;
+  const ids = [...new Set(DOCTORS.filter((d) => !clinic || d.hospital_id === clinic)
+    .map((d) => d.doctor_id).filter(Boolean))].sort();
+  sel.innerHTML = `<option value="">All doctors</option>`
+    + ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  sel.value = ids.includes(chosen) ? chosen : "";
+}
+$("recDoctor").addEventListener("change", () => loadRecordings());
+
 async function loadRecordings() {
   const clinic = $("clinic").value;
+  fillRecDoctors(clinic);
+  const doctor = $("recDoctor").value;
   const label = clinic ? $("clinic").selectedOptions[0].textContent : "All clinics";
   $("recTitle").textContent = STATE ? `Recordings · ${STATE_LABELS[STATE] || human(STATE)}` : "Recordings";
   const seq = ++recSeq;
   if (!$("recTable").firstChild) $("recTable").innerHTML = empty("Loading");
   try {
     const params = { from: $("from").value, to: $("to").value, hospital_id: clinic, limit: 200 };
+    if (doctor) params.doctor_id = doctor;
     if (STATE) params.state = STATE;
     const d = await api("/recordings", params);
     if (seq !== recSeq) return;
     const list = d.recordings || [];
     $("recTable").innerHTML = recordingsTable(list);
-    $("recHint").textContent = `${label} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
+    $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
   } catch (err) {
     if (seq !== recSeq) return;
     $("recTable").innerHTML = empty("Could not load recordings", err.message);
@@ -2275,8 +2292,9 @@ async function start() {
   $("to").value = today();
   markRanges();
   try {
-    const { clinics } = await api("/clinics", {});
+    const { clinics, doctors } = await api("/clinics", {});
     CLINICS = clinics || [];
+    DOCTORS = doctors || [];
     // The summary's hospital list was filled before the clinics arrived.
     if (PORTAL && PORTAL.role === "admin") loadWatch();
     $("clinic").innerHTML = `<option value="">All clinics</option>`
