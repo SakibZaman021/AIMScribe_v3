@@ -493,7 +493,8 @@ async def list_places(_: None = Depends(api_v2.require_admin)):
         """)
         on_shift = await conn.fetch("SELECT place_id, email, shift, started_at "
                                     "FROM collector_shifts WHERE ended_at IS NULL")
-        hospitals = await conn.fetch("SELECT hospital_id, name FROM hospitals ORDER BY hospital_id")
+        hospitals = await conn.fetch("SELECT hospital_id, name FROM hospitals WHERE active "
+                                     "ORDER BY hospital_id")
     out = []
     for p in places:
         pid = p["place_id"]
