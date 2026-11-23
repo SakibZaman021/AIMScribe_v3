@@ -60,7 +60,10 @@ GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_KEYS = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"]
 
-COOKIE = "aims_portal"
+# The beta server (deploy/uiu/BETA_SERVER.md) is the same name on port 9443.
+# A cookie ignores the port, so beta's must have a name of its own, or signing
+# in to one would sign the browser out of the other.
+COOKIE = os.getenv("AIMS_PORTAL_COOKIE", "").strip() or "aims_portal"
 SESSION_SECONDS = 8 * 3600
 LOGIN_MINUTES = 10
 ROLES = ("admin", "cmed", "researcher", "collector")

@@ -44,11 +44,12 @@ def test_the_database_viewer_is_reached_only_through_the_portal():
     assert "handle_path /db/*" in CADDYFILE and "reverse_proxy dbviewer:8080" in CADDYFILE
 
 
-def test_the_gateway_opens_only_80_and_443():
-    """To the world: 80 and 443. Anything else is bound to the machine's loopback."""
+def test_the_gateway_opens_only_80_443_and_the_beta_port():
+    """To the world: 80, 443 and 9443 (the beta server, BETA_SERVER.md). Anything
+    else is bound to the machine's loopback."""
     public = {p.split(":")[0] for p in SERVICES["gateway"]["ports"]
               if not p.startswith("127.0.0.1:")}
-    assert public == {"80", "443"}
+    assert public == {"80", "443", "9443"}
     assert [p for p in SERVICES["gateway"]["ports"] if p.startswith("127.0.0.1:")] \
         == ["127.0.0.1:6001:6001"]
 

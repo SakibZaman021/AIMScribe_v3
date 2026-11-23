@@ -163,6 +163,79 @@
 }
 
 # ----------------------------------------------------------------
+# The beta server (BETA_SERVER.md): the same name on port 9443, proxied to
+# the separate beta stack (docker-compose.beta.yml) over aimsbeta-gw. Every
+# test - test PCs, CMED's test pages, Postman - goes here, never to the real
+# server above. While beta is stopped this answers 502 and nothing else
+# changes. Beta has no database viewer.
+# ----------------------------------------------------------------
+{$AIMS_PUBLIC_HOST}:9443 {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	@api not path /api/v2/dashboard /api/v2/dashboard/*
+	header @api Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+	@dashboard path /api/v2/dashboard /api/v2/dashboard/*
+	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+	request_body {
+		max_size 2MB
+	}
+
+	handle /health {
+		reverse_proxy aimsbeta-api:6000
+	}
+
+	@never path /api/v1 /api/v1/* /docs /docs/* /redoc /redoc/* /openapi.json /api/v2/archive /api/v2/archive/* /api/v2/maintenance /api/v2/maintenance/* /db /db/*
+	handle @never {
+		respond 404
+	}
+
+	@portal path /dashboard /dashboard/* /api/v2/admin /api/v2/admin/* /api/v2/dashboard /api/v2/dashboard/*
+	forward_auth @portal aimsbeta-api:6000 {
+		uri /auth/check
+		copy_headers X-Portal-Email X-Portal-Role X-Portal-Db-User
+	}
+
+	redir /dashboard /api/v2/dashboard 302
+	redir /dashboard/ /api/v2/dashboard 302
+
+	handle {
+		reverse_proxy aimsbeta-api:6000 {
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Request-ID {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap console
+			fields {
+				request>uri regexp "\?.*$" ""
+				request>headers>X-Device-Token delete
+				request>headers>X-Cmed-Key delete
+				request>headers>X-Worker-Key delete
+				request>headers>X-Admin-Key delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
+
+# ----------------------------------------------------------------
 # The lab's door: plain HTTP on the machine's own loopback only
 # (published as 127.0.0.1:6001 in docker-compose.yml). Reached from the
 # droplet itself, or from a laptop through

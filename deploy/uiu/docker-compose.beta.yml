@@ -1,0 +1,214 @@
+# ================================================================
+# The beta server: every test, never the real field (BETA_SERVER.md)
+#
+#   docker compose -p aimsbeta -f docker-compose.beta.yml --env-file .env.beta up -d
+#   docker compose -p aimsbeta -f docker-compose.beta.yml --env-file .env.beta ps
+#
+# The same images as the real server, beside it on the same machine, with:
+#   - its own database server, data folder, archive folder and Redis;
+#   - no port of its own: the real gateway serves it on 9443
+#     (Caddyfile, "The beta server"), over the network aimsbeta-gw;
+#   - no Telegram, no email, no erasing, and no transcription worker.
+# Stopping it (down) leaves the real server exactly as it is.
+#
+# .env.beta is made from .env by beta/make-env.sh and holds the beta values.
+# ================================================================
+
+name: aimsbeta
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging: *logging
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aimsbeta-postgres
+    mem_limit: 1g
+    <<: *hardening
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-aims_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set in .env.beta}
+      POSTGRES_DB: postgres
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    volumes:
+      # A copy of the real database cluster, made by `pitr recover beta`
+      # (BETA_SERVER.md, step 2): the same roles and passwords as the real one.
+      - ${AIMS_BETA_ROOT:?set in .env.beta}/db:/var/lib/postgresql/data
+      - ./postgres/postgresql.4gb.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/hba:/etc/postgresql/hba:ro
+      # Its WAL archive stays with beta, never in the real backups.
+      - ${AIMS_BETA_ROOT}/wal:/wal
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-aims_admin} -d aims_recordings"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: aimsbeta-redis
+    mem_limit: 128m
+    <<: *hardening
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env.beta}",
+              "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+
+  api:
+    image: aimscribe/api:3.5.0
+    container_name: aimsbeta-api
+    mem_limit: 768m
+    <<: *hardening
+    environment:
+      AIMS_ENVIRONMENT: beta
+      SERVER_WORKERS: 1
+      # Straight to its own database server: beta has no pooler.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: aims_recordings
+      POSTGRES_USER: aims_api
+      POSTGRES_PASSWORD: ${AIMS_API_DB_PASSWORD:?set in .env.beta}
+      POSTGRES_SSLMODE: disable
+      POSTGRES_POOL_MIN: 1
+      POSTGRES_POOL_MAX: 8
+      AIMS_CLINICAL_DATABASE_URL: postgresql://aims_clinical_writer:${AIMS_CLINICAL_PASSWORD}@postgres:5432/aims_clinical
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 6000
+      PROMPTS_DIR: /app/src/prompts
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: Asia/Dhaka
+      # The same name as the real server, on its own port.
+      AIMS_PUBLIC_HOST: ${AIMS_BETA_PUBLIC_HOST:?set in .env.beta}
+      AIMS_PUBLIC_BASE_URL: https://${AIMS_BETA_PUBLIC_HOST}
+      AIMS_TRUSTED_PROXIES: ${AIMS_BETA_GATEWAY_IP:-172.30.20.2}
+      AIMS_PORTAL_COOKIE: aims_beta_portal
+      # The same signing keys: a test PC moves here by its .env alone.
+      AIMS_GRANT_PRIVATE_KEY: ${AIMS_GRANT_PRIVATE_KEY:?set in .env.beta}
+      AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:?set in .env.beta}
+      AIMS_ADMIN_KEY: ${AIMS_BETA_ADMIN_KEY:?set in .env.beta}
+      AIMS_GOOGLE_CLIENT_ID: ${AIMS_GOOGLE_CLIENT_ID:-}
+      AIMS_GOOGLE_CLIENT_SECRET: ${AIMS_GOOGLE_CLIENT_SECRET:-}
+      AIMS_PORTAL_OWNER_EMAIL: ${AIMS_PORTAL_OWNER_EMAIL:-}
+      # No email and no Telegram from beta: a test must never page anyone.
+      AIMS_RESEND_API_KEY: ""
+      AIMS_SMTP_HOST: ""
+      AIMS_TELEGRAM_BOT_TOKEN: ""
+      AIMS_COLLECTOR_MAILER: "off"
+      AIMS_DECRYPT_URL: http://archive-worker:7070
+      AIMS_DOWNLOAD_DAILY_LIMIT: 500
+      AIMS_BULK_HOURS: ""
+      # Test data is kept: nothing is erased by itself here.
+      AIMS_ERASE_PAUSED: "true"
+      AIMS_WORKER_KEY: ${AIMS_BETA_WORKER_KEY:?set in .env.beta}
+      AIMS_ALLOWED_ORIGINS: ""
+      AIMS_DEFAULT_TIMEZONE: Asia/Dhaka
+      AIMS_MIN_RECORDER_VERSION: ${AIMS_MIN_RECORDER_VERSION:-3.4.0}
+      AIMS_LIMITS: "off"
+      AIMS_SELF_REGISTRATION: "on"
+      # Beta's own upload bucket (beta/set-r2-beta.sh).
+      MINIO_ENDPOINT: ${AIMS_BETA_MINIO_ENDPOINT:?set in .env.beta}
+      MINIO_EXTERNAL_ENDPOINT: ""
+      MINIO_ACCESS_KEY: ${AIMS_BETA_MINIO_ACCESS_KEY:?set in .env.beta}
+      MINIO_SECRET_KEY: ${AIMS_BETA_MINIO_SECRET_KEY:?set in .env.beta}
+      MINIO_BUCKET: ${AIMS_BETA_MINIO_BUCKET:?set in .env.beta}
+      MINIO_SECURE: "true"
+      MINIO_REGION: auto
+      # The copy store, so the recordings moved here still open and download.
+      AIMS_COPY_BUCKET: ${AIMS_COPY_BUCKET:-}
+      AIMS_COPY_ENDPOINT: ${AIMS_COPY_ENDPOINT:-}
+      AIMS_COPY_ACCESS_KEY: ${AIMS_COPY_ACCESS_KEY:-}
+      AIMS_COPY_SECRET_KEY: ${AIMS_COPY_SECRET_KEY:-}
+      AIMS_COPY_REGION: ${AIMS_COPY_REGION:-auto}
+      AIMS_COPY_SECURE: ${AIMS_COPY_SECURE:-true}
+      AIMS_JSON_BUCKET: ${AIMS_JSON_BUCKET:-}
+      AIMS_JSON_ENDPOINT: ${AIMS_JSON_ENDPOINT:-}
+      AIMS_JSON_ACCESS_KEY: ${AIMS_JSON_ACCESS_KEY:-}
+      AIMS_JSON_SECRET_KEY: ${AIMS_JSON_SECRET_KEY:-}
+      AIMS_JSON_REGION: ${AIMS_JSON_REGION:-auto}
+      AIMS_JSON_SECURE: ${AIMS_JSON_SECURE:-true}
+      AIMS_CMED_LEGACY_KEYS: "off"
+      AIMS_REQUIRE_DEVICE_SIGNATURES: "off"
+      AIMS_REQUIRE_SIGNED_REFUSAL: "off"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    networks:
+      internal: {}
+      gw: {}
+      egress: {}
+
+  archive-worker:
+    image: aimscribe/archive-worker:3.5.0
+    container_name: aimsbeta-archive-worker
+    mem_limit: 768m
+    cpus: 1
+    <<: *hardening
+    environment:
+      AIMS_BACKEND_URL: http://api:6000
+      AIMS_WORKER_KEY: ${AIMS_BETA_WORKER_KEY}
+      AIMS_ARCHIVE_ROOT: /archive
+      AIMS_COPY_KEY: ${AIMS_COPY_KEY:-}
+      AIMS_COPY_BATCH: 1
+      AIMS_DECRYPT_PORT: 7070
+      AIMS_DECRYPT_CONCURRENCY: 2
+      AIMS_POLL_SECONDS: 60
+      AIMS_BATCH_SIZE: 2
+      AIMS_DISK_HEADROOM_BYTES: 21474836480
+      AIMS_ARCHIVE_LOCAL_RETENTION_DAYS: -1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: Asia/Dhaka
+    volumes:
+      - ${AIMS_BETA_ROOT}/archive:/archive
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=2g
+    networks: [internal, egress]
+
+networks:
+  internal:
+    name: aimsbeta-internal
+    internal: true
+  # Made by the real stack (docker-compose.yml), so the real gateway never
+  # depends on beta being up: here it is only joined.
+  gw:
+    name: aimsbeta-gw
+    external: true
+  egress:
+    name: aims-egress
+    external: true
