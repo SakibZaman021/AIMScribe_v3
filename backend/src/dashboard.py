@@ -1323,7 +1323,10 @@ async def clinics(_: None = Depends(require_viewer),
                      WHERE d.hospital_id = h.hospital_id AND d.revoked_at IS NULL)
                    AS recorders
               FROM hospitals h
-             WHERE ($1::text[] IS NULL OR h.hospital_id = ANY($1::text[]))
+             -- 24 Nov 2026: a clinic switched off (hospitals.active) is not
+             -- offered: the test clinics, once moved to the beta server.
+             WHERE h.active
+               AND ($1::text[] IS NULL OR h.hospital_id = ANY($1::text[]))
              ORDER BY h.hospital_id
         """, allowed)
         doctors = await conn.fetch("""

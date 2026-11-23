@@ -1678,6 +1678,8 @@ async def summary_workbook(request: Request, hospital_id: str, day: Optional[str
     from fastapi.responses import Response
     import workbook
     person = await _watcher(request)
+    if not (hospital_id or "").strip():
+        raise HTTPException(status_code=400, detail="Choose a hospital for the workbook.")
     when, shift = _day_and_shift(day, shift)
     async with _pool().acquire() as conn:
         if not await conn.fetchval("SELECT 1 FROM hospitals WHERE hospital_id = $1",

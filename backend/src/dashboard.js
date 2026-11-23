@@ -553,7 +553,9 @@ function drawCopies(d) {
    PCs (recorders), grouped by clinic.
    ============================================================ */
 const PC_FILTERS = [
-  ["all", "All", () => true],
+  // 24 Nov 2026: revoked PCs are hidden unless "Revoked" is chosen - since
+  // the beta split every test PC is revoked here and lives on beta.
+  ["all", "All", (q) => !q.revoked],
   ["approval", "Waiting for approval", (q) => q.approval === "pending" && !q.revoked],
   ["offline", "Offline", (q) => q.silent && !q.revoked],
   ["outdated", "Needs update", (q) => q.outdated && !q.revoked],
@@ -1456,11 +1458,30 @@ $("dlCsv").addEventListener("click", () => {
   link.remove();
 });
 
+/* 24 Nov 2026: a list's removed or revoked entries, behind one switch each. */
+const SHOW_REMOVED = { origins: false, clients: false };
+function removedSwitch(list, n) {
+  if (!n) return "";
+  return `<button type="button" class="chip" data-removed-switch="${list}">`
+    + (SHOW_REMOVED[list] ? `Hide removed (${n})` : `Show removed (${n})`) + `</button>`;
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-removed-switch]");
+  if (!b) return;
+  SHOW_REMOVED[b.dataset.removedSwitch] = !SHOW_REMOVED[b.dataset.removedSwitch];
+  loadCmed();
+});
+
 async function loadCmed() {
   await loadCodes();
   loadDeviceLog();
   try {
-    const { origins } = await adminCall("GET", "/api/v2/admin/trusted-origins");
+    const { origins: everyOrigin } = await adminCall("GET", "/api/v2/admin/trusted-origins");
+    // 24 Nov 2026: removed addresses are kept (history, audit) but hidden
+    // unless asked for, so the list shows what recorders obey now.
+    const goneOrigins = everyOrigin.filter((o) => o.removed_at).length;
+    const origins = SHOW_REMOVED.origins ? everyOrigin : everyOrigin.filter((o) => !o.removed_at);
+    $("originsRemoved").innerHTML = removedSwitch("origins", goneOrigins);
     $("origins").innerHTML = !origins.length
       ? empty("No address trusted yet", "Add CMED's EHR address: until then no recorder obeys any page.", true)
       : `<table><thead><tr><th>Address</th><th>Note</th><th>Added</th><th>State</th><th></th></tr></thead><tbody>`
@@ -1476,7 +1497,10 @@ async function loadCmed() {
     $("origins").innerHTML = empty("Addresses could not be loaded", err.message, true);
   }
   try {
-    const { clients } = await adminCall("GET", "/api/v2/admin/cmed-clients");
+    const { clients: everyClient } = await adminCall("GET", "/api/v2/admin/cmed-clients");
+    const goneClients = everyClient.filter((c) => c.revoked_at).length;
+    const clients = SHOW_REMOVED.clients ? everyClient : everyClient.filter((c) => !c.revoked_at);
+    $("clientsRemoved").innerHTML = removedSwitch("clients", goneClients);
     $("clients").innerHTML = !clients.length
       ? empty("No hospital connected", "Register CMED's public key for a hospital.", true)
       : `<table><thead><tr><th>Client id</th><th>Hospital</th><th>Key (kid)</th><th>Last used</th>`
@@ -2253,6 +2277,8 @@ async function start() {
   try {
     const { clinics } = await api("/clinics", {});
     CLINICS = clinics || [];
+    // The summary's hospital list was filled before the clinics arrived.
+    if (PORTAL && PORTAL.role === "admin") loadWatch();
     $("clinic").innerHTML = `<option value="">All clinics</option>`
       + CLINICS.map((c) => `<option value="${esc(c.hospital_id)}">`
         + `${esc(c.name || c.hospital_id)}</option>`).join("");
@@ -2617,9 +2643,14 @@ async function loadWatch(first) {
     const hm = new Date().toLocaleTimeString("en-GB", { timeZone: "Asia/Dhaka", hour12: false }).slice(0, 5);
     $("wRepShift").value = hm >= (me.report_at || "20:30") ? "evening" : (hm >= (me.midday_at || "14:30") ? "morning" : "evening");
   }
-  $("wRepHosp").innerHTML = hs.map((h) =>
+  // 24 Nov 2026: an admin may take any clinic's summary and workbook; a
+  // researcher, the hospitals they look after. Before, an admin who looks
+  // after none had an empty list, and the workbook asked for "no hospital".
+  const choices = PORTAL && PORTAL.role === "admin" && CLINICS.length ? CLINICS : hs;
+  $("wRepHosp").innerHTML = choices.map((h) =>
     `<option value="${esc(h.hospital_id)}">${esc(h.hospital_id)} ${esc(h.name || "")}</option>`).join("");
-  $("wRepShow").disabled = !hs.length;
+  $("wRepShow").disabled = !choices.length;
+  $("wRepCsv").disabled = !choices.length;
   const tg = me.telegram || {};
   $("wTgState").innerHTML = !tg.ready
     ? tag("warn", "Telegram not set up on the server yet")
