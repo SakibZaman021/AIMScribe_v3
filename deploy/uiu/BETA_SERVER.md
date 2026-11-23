@@ -58,7 +58,7 @@ Counted on the live server on 24 Nov 05:55 Dhaka.
 | AALO_KARAIL | GP-Female | 35, from 23 Nov 16:29 |
 | AMADER_SUSASTHO | Lenovo | 33, from 22 Nov 15:00 |
 
-**Moves to beta: 245 recordings.** This is everything else:
+**Moves to beta: 238 recordings.** This is everything else:
 
 | Clinic | PCs | Recordings |
 |---|---|---|
@@ -89,7 +89,7 @@ The test clinics, test PCs and test CMED logins move as well.
 6. Give CMED the beta address for their test logins.
 7. Lock the real server's trusted list to the three production pages.
 8. Block on the real server every PC except GP-Males, GP-Female and Lenovo. Blocking is reversible.
-9. **With the owner's written yes only:** remove the 245 moved recordings and the test clinics, PCs and logins from the real server. Remove the 107 real ones from the beta copy. A full encrypted backup of both databases is taken first and kept.
+9. **With the owner's written yes only:** remove the 238 moved recordings and the test clinics, PCs and logins from the real server. Remove the 107 real ones from the beta copy. A full encrypted backup of both databases is taken first and kept.
 
 After that, a new hospital (Aalo Dholpur, Shampur, Narayanganj, Ershadnagar, Mirpur) is added to the real server exactly as Aalo Karail and Amader Susastho were.
 
