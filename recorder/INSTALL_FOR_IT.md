@@ -94,8 +94,15 @@ Optional: `/PIN=<pin>[,<backup pin>]` (the server's TLS key pins, from AIMS LAB)
 | 8 | Files installed but the startup task could not be registered — run again |
 | other | Inno Setup's standard codes (e.g. 2 = cancelled, 5 = file in use) |
 
-An **upgrade** keeps the PC's own server, CMED address, local key and
-enrolment: run the new installer the same way, no token needed.
+An **upgrade** keeps the PC's CMED address, local key and enrolment: run the
+new installer the same way, no token needed.
+
+**The server address is always the real one** (25 Nov 2026): the installer
+shows and sets `https://aimscribe.iriic.uiu.ac.bd` on a new PC and on an
+upgrade alike, never the beta / testing server (`:9443`). A test PC is put
+on beta only on purpose: `/BACKEND=https://aimscribe.iriic.uiu.ac.bd:9443`
+on the command line, or by typing it and confirming the BETA warning. An
+installer cannot be built with the beta address as its default.
 
 **Uninstall** removes the program and the startup task. Recordings not yet
 delivered to the server are deliberately kept in `C:\ProgramData\AIMScribe`.
