@@ -45,6 +45,7 @@ from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
+import environment
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -179,8 +180,8 @@ def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(status_code=status, content=(
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>{html.escape(title)} - AIMScribe</title></head>"
-        f"<body><h1>{html.escape(title)}</h1>{body}</body></html>"))
+        f"<title>{html.escape(environment.title(title))} - AIMScribe</title></head>"
+        f"<body>{environment.banner_html()}<h1>{html.escape(title)}</h1>{body}</body></html>"))
 
 
 # ------------------------------------------------------------------ sign-in
