@@ -1,32 +1,25 @@
 """
-The on-screen Stop and Pause control, drawn with tkinter (SRS 3.2 §7.8).
+The on-screen control, drawn with tkinter (3.9.8).
 
-A small card, at the top right of the screen until the doctor drags it
-elsewhere, shown only while a consultation is recording or paused. Two controls, the shapes the SRS names (SRS-UIX-03):
+A slim, see-through strip at the top right of the screen until the doctor drags
+it elsewhere, shown only while a consultation is recording. One small dot says
+a recording is on; below it two icons, one above the other:
 
-    Stop   - a red circle.       Thick ring, white inside. The microphone cuts
-                                 on the press (SRS-UIX-08); the reason form
-                                 then closes the session, or Cancel resumes it.
-    Pause  - a blue rectangle.   Thick border, white inside. Takes effect only
-                                 after a reason (SRS-UIX-05); while paused the
-                                 same control resumes.
+    Stop   - a square in a circle.
+    Mark   - two bars in a circle (a sensitive part).
 
-Outlined rather than filled: a solid block of red beside a doctor's screen all
-afternoon is tiring, and a ring reads as a control while a filled shape reads
-as a warning. Beside them, only what has to be there - the state, the elapsed
-time, and a line of words when something needs saying.
+There is no clock. Hovering over an icon, or tapping it, opens its menu beside
+the strip; one more click chooses. A tap alone does nothing. What each choice
+does, and what the menus say, is decided in overlay_model.py, which has no
+tkinter in it and is tested on its own; this file only draws.
 
-It needs nothing from CMED to work (SRS-UIX-12). It has no title bar, so no
-minimise or close, but it can be dragged by its background so it does not sit
-over what the doctor is reading. It can never be dragged off the screen - a
-Stop nobody can reach is the reason it used to be fixed (SRS-UIX-02) - and it
-stays where it was left for the next consultation.
+The strip is half see-through until the pointer comes near, so it does not sit
+heavily over what the doctor is reading, and it can be dragged by its dot but
+never off the screen. It stays where it was left for the next consultation.
 
-tkinter runs on its own thread, which owns every widget. Button presses are
-handed to the agent's event loop, as the tray menu's are; events from the
-controller arrive through a queue this thread drains several times a second.
-What to show is decided in overlay_model.py, which has no tkinter in it and is
-tested on its own; this file only draws.
+tkinter runs on its own thread, which owns every widget. Choices are handed to
+the agent's event loop, as the tray menu's are; events from the controller
+arrive through a queue this thread drains several times a second.
 """
 from __future__ import annotations
 
@@ -38,8 +31,8 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from ui.overlay_model import (DELETE_QUESTION, NEEDS_DELETE_CONFIRMATION, OverlayActions,
-                              OverlayState, format_duration, pause_reasons)
+from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, STOP,
+                              OverlayActions, OverlayState, menu)
 
 logger = logging.getLogger(__name__)
 
@@ -50,18 +43,23 @@ MUTED = "#6b7178"
 RED = "#d92d3a"
 RED_DEEP = "#a8202b"
 BLUE = "#1f5fbf"
-BLUE_DEEP = "#17478f"
 AMBER = "#b5791a"
 TEAL = "#17836f"
-OFF = "#b8bec4"                # a control that cannot be pressed
+OFF = "#b8bec4"
+HOVER = "#eef3fb"
 FONT = "Segoe UI"
 
-WIDTH, HEIGHT = 258, 84        # grows by one line when there is something to say
-NOTE_HEIGHT = 20
-MARGIN = 20                    # from the screen's edge, where the card starts
-STOP_SIZE = 50
-PAUSE_W, PAUSE_H = 74, 40
-
+KEY = "#010203"                # the strip's background: drawn see-through
+WIDTH, HEIGHT = 56, 132        # the strip
+NOTE_HEIGHT = 0                # kept for older callers: notes now sit beside it
+MARGIN = 20                    # from the screen's right edge, where the strip starts
+TOP = 120                      # from the top: below a browser's own close button
+ICON = 44                      # each icon's diameter
+DOT = 10
+IDLE_ALPHA = 0.55              # see-through until the pointer comes near
+NEAR_ALPHA = 1.0
+MENU_WIDTH = 300
+CLOSE_DELAY_MS = 450           # the pointer may cross the gap to the menu
 
 SCALE = 1.0                    # display scale, set once by _enable_dpi_awareness()
 
@@ -69,21 +67,12 @@ SCALE = 1.0                    # display scale, set once by _enable_dpi_awarenes
 def _enable_dpi_awareness() -> float:
     """
     Tell Windows this process draws its own pixels, and return the display scale.
-
-    Without this, Windows bitmap-stretches the entire window at any scaling above
-    100%: every glyph and every curve is resampled by the compositor, which is
-    exactly the soft, smeared card seen at 125%. Nothing in the drawing code can
-    fix it, because the blurring happens after the drawing is finished.
-
-    Per-monitor v2 is asked for first, so the card stays sharp if it is moved to
-    a second screen at a different scaling. Each call is tried in turn because
-    the newer entry points do not exist on older Windows, and a recorder must
-    start on whatever the clinic has.
+    Without it Windows stretches the window at any scaling above 100% and every
+    edge is smeared.
     """
     global SCALE
     if sys.platform != "win32":
         return 1.0
-
     import ctypes
 
     user32 = ctypes.windll.user32
@@ -98,40 +87,24 @@ def _enable_dpi_awareness() -> float:
                 break
         except Exception:
             continue
-
     dpi = 96
     try:
         dpi = user32.GetDpiForSystem() or 96
     except Exception:
-        try:
-            dc = user32.GetDC(0)
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88) or 96   # LOGPIXELSX
-            user32.ReleaseDC(0, dc)
-        except Exception:
-            pass
-
+        pass
     SCALE = max(1.0, min(3.0, dpi / 96.0))
     return SCALE
 
 
 def _apply_scale() -> None:
-    """
-    Grow the card to match the display scale.
-
-    Once the process is DPI-aware Windows stops scaling it, so the same pixel
-    figures that looked right at 100% would draw a card a fifth smaller at 125%.
-    These are the only place sizes are written down, so scaling them here is
-    enough; fonts are given in points and follow `tk scaling` instead.
-    """
-    global WIDTH, HEIGHT, NOTE_HEIGHT, STOP_SIZE, PAUSE_W, PAUSE_H
+    """Grow the strip to match the display scale (fonts follow `tk scaling`)."""
+    global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP
     if SCALE == 1.0:
         return
-    WIDTH = round(WIDTH * SCALE)
-    HEIGHT = round(HEIGHT * SCALE)
-    NOTE_HEIGHT = round(NOTE_HEIGHT * SCALE)
-    STOP_SIZE = round(STOP_SIZE * SCALE)
-    PAUSE_W = round(PAUSE_W * SCALE)
-    PAUSE_H = round(PAUSE_H * SCALE)
+    WIDTH, HEIGHT = round(WIDTH * SCALE), round(HEIGHT * SCALE)
+    TOP = round(TOP * SCALE)
+    ICON, DOT = round(ICON * SCALE), round(DOT * SCALE)
+    MENU_WIDTH = round(MENU_WIDTH * SCALE)
 
 
 class Overlay:
@@ -141,18 +114,24 @@ class Overlay:
     def __init__(self, runtime, *, visible: bool = True):
         self.runtime = runtime
         self.state = OverlayState()
-        self.actions = OverlayActions(self._submit, pause_reasons(runtime.cfg.pause.reasons))
+        self.actions = OverlayActions(self._submit)
         self._events: "queue.Queue[tuple]" = queue.Queue()
         self._visible = visible
         self._thread: Optional[threading.Thread] = None
         self.root = None
         self.window = None
-        self.form = None
         self.canvas = None
-        self._pause_text = "Pause"
+        self.menu_window = None
+        self.menu_kind: Optional[str] = None
+        self.toast = None
+        self._toast_text = ""
+        self._view = None
         self._height = HEIGHT
-        self._spot: Optional[tuple] = None      # where the doctor left the card
+        self._spot: Optional[tuple] = None      # where the doctor left the strip
         self._grab: Optional[tuple] = None      # the pointer's offset while dragging
+        self._close_job = None
+        self._reminded: Optional[str] = None    # the marked part already asked about
+        self._near = False
 
     # ---- lifecycle ----
 
@@ -206,93 +185,175 @@ class Overlay:
 
         _enable_dpi_awareness()
         _apply_scale()
+        self._height = HEIGHT                       # the scaled height, not the 100% one
 
         self.root = tk.Tk()
         self.root.withdraw()
-        # Font sizes are in points; this is what turns a point into the right
-        # number of physical pixels on a scaled display.
         try:
             self.root.tk.call("tk", "scaling", (96.0 * SCALE) / 72.0)
         except Exception:
             pass
 
-        win = tk.Toplevel(self.root, bg=PAPER)
+        win = tk.Toplevel(self.root, bg=KEY)
         win.overrideredirect(True)                  # no title bar: no minimise, no close
         win.attributes("-topmost", True)
         win.withdraw()
         try:
-            # So the rounded corners have nothing behind them. Where the window
-            # manager cannot do this the card is simply square, which is a
-            # matter of looks and nothing else.
-            win.attributes("-transparentcolor", "#010203")
-            self._backdrop = "#010203"
+            win.attributes("-transparentcolor", KEY)
+            self._backdrop = KEY
         except Exception:
             self._backdrop = PAPER
+        self._set_alpha(win, IDLE_ALPHA)
         self.window = win
 
-        self.canvas = tk.Canvas(win, width=WIDTH, height=HEIGHT + NOTE_HEIGHT,
-                                bg=self._backdrop, highlightthickness=0, bd=0,
-                                cursor="fleur")
+        self.canvas = tk.Canvas(win, width=WIDTH, height=HEIGHT, bg=self._backdrop,
+                                highlightthickness=0, bd=0, cursor="fleur")
         self.canvas.pack()
-        # Dragged by the card itself; the two controls are their own widgets,
-        # so a press on Stop or Pause is a press, never the start of a drag.
+        # Dragged by the strip itself; the icons are their own widgets, so a
+        # press on one opens its menu and never starts a drag.
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
+        win.bind("<Enter>", lambda _e: self._come_near(True))
+        win.bind("<Leave>", lambda _e: self._come_near(False))
 
-        self.stop_button = self._button(win, "Stop", RED, RED_DEEP, shape="circle",
-                                        action=self._on_stop)
-        self.stop_button.place(x=WIDTH - STOP_SIZE - 18, y=17,
-                               width=STOP_SIZE, height=STOP_SIZE)
-        self.pause_button = self._button(win, "Pause", BLUE, BLUE_DEEP, shape="rect",
-                                         action=self._on_pause)
-        self.pause_button.place(x=WIDTH - STOP_SIZE - PAUSE_W - 34, y=22,
-                                width=PAUSE_W, height=PAUSE_H)
-
+        left = (WIDTH - ICON) // 2
+        self.stop_button = self._icon(win, STOP)
+        self.stop_button.place(x=left, y=round(26 * SCALE), width=ICON, height=ICON)
+        self.mark_button = self._icon(win, MARK)
+        self.mark_button.place(x=left, y=round(26 * SCALE) + ICON + round(14 * SCALE),
+                               width=ICON, height=ICON)
         self._place()
 
-    def _button(self, parent, label, colour, deep, *, shape, action):
-        """
-        A shaped control that works by mouse and by keyboard (SRS-UIX-11).
+    @staticmethod
+    def _set_alpha(window, alpha: float) -> None:
+        try:
+            window.attributes("-alpha", alpha)
+        except Exception:
+            pass
 
-        Drawn rather than themed: tk's own buttons take whatever look the PC
-        happens to be set to, and these two have shapes the SRS specifies.
-        """
+    def _come_near(self, near: bool) -> None:
+        self._near = near
+        self._set_alpha(self.window, NEAR_ALPHA if near or self.menu_window else IDLE_ALPHA)
+
+    def _icon(self, parent, kind: str):
+        """An icon that opens its menu on hover or tap, and does nothing else."""
         import tkinter as tk
 
         canvas = tk.Canvas(parent, bg=PAPER, highlightthickness=0, bd=0,
                            takefocus=1, cursor="hand2")
-        canvas.enabled = True
-        canvas.label = label
-        canvas.colour = colour
-        canvas.deep = deep
-        canvas.shape = shape
+        canvas.kind = kind
         canvas.hover = False
-        canvas.pressed = False
-        canvas.focused = False
-        canvas.draw = lambda: self._draw_button(canvas)
+        canvas.draw = lambda: self._draw_icon(canvas)
 
-        def press(_event=None):
-            if not canvas.enabled:
-                return
-            canvas.pressed = True
+        def opened(_event=None):
+            canvas.hover = True
             canvas.draw()
-            canvas.after(110, lambda: (setattr(canvas, "pressed", False), canvas.draw()))
-            action()
+            self._come_near(True)
+            self._open_menu(kind)
 
+        canvas.bind("<Enter>", opened)
         for sequence in ("<Button-1>", "<Return>", "<space>"):
-            canvas.bind(sequence, press)
-        canvas.bind("<Enter>", lambda _e: (setattr(canvas, "hover", True), canvas.draw()))
-        canvas.bind("<Leave>", lambda _e: (setattr(canvas, "hover", False), canvas.draw()))
-        canvas.bind("<FocusIn>", lambda _e: (setattr(canvas, "focused", True), canvas.draw()))
-        canvas.bind("<FocusOut>", lambda _e: (setattr(canvas, "focused", False), canvas.draw()))
+            canvas.bind(sequence, opened)
+        canvas.bind("<Leave>", lambda _e: (setattr(canvas, "hover", False), canvas.draw(),
+                                           self._close_menu_soon()))
         return canvas
 
     # ---- drawing ----
 
+    def _icon_colours(self, kind: str):
+        view = self._view
+        if view is None or not view.visible:
+            return OFF, PAPER
+        if kind == MARK and view.marked:
+            if view.alarm and int(time.monotonic() * 2) % 2 == 0:
+                return RED, RED            # blinking: the part has run two minutes
+            return AMBER, AMBER            # a sensitive part is marked
+        return (RED if kind == STOP else BLUE), PAPER
+
+    def _draw_icon(self, canvas) -> None:
+        canvas.delete("all")
+        size = canvas.winfo_width() or ICON
+        ring, inside = self._icon_colours(canvas.kind)
+        if canvas.hover:
+            inside = HOVER if inside == PAPER else inside
+        art = self._icon_image(canvas.kind, size, ring, inside)
+        if art is not None:
+            # Held on the widget: a PhotoImage only the canvas refers to is
+            # collected, and the icon then draws as nothing.
+            canvas.art = art
+            canvas.create_image(0, 0, anchor="nw", image=art)
+            return
+        thick = max(2, round(3 * SCALE))
+        pad = thick / 2 + 1
+        canvas.create_oval(pad, pad, size - pad, size - pad, fill=inside, outline=ring,
+                           width=thick)
+        glyph = PAPER if inside != PAPER and inside != HOVER else ring
+        third = size / 3
+        if canvas.kind == STOP:
+            canvas.create_rectangle(third, third, size - third, size - third,
+                                    fill=glyph, outline=glyph)
+        else:
+            bar = size / 9
+            top, bottom = third * 0.95, size - third * 0.95
+            canvas.create_rectangle(size / 2 - 2.2 * bar, top, size / 2 - 0.8 * bar,
+                                    bottom, fill=glyph, outline=glyph)
+            canvas.create_rectangle(size / 2 + 0.8 * bar, top, size / 2 + 2.2 * bar,
+                                    bottom, fill=glyph, outline=glyph)
+
+    @staticmethod
+    def _icon_image(kind: str, size: int, ring: str, inside: str):
+        """
+        The icon drawn four times larger and scaled down, so the circle has a
+        smooth edge (tkinter's own circles are drawn as a staircase). None
+        without Pillow; the plain shapes are drawn instead.
+        """
+        if size < 8:
+            return None
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            return None
+
+        def rgb(colour):
+            return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+
+        ss = 4
+        big = size * ss
+        image = Image.new("RGB", (big, big), rgb(PAPER))
+        draw = ImageDraw.Draw(image)
+        thick = max(2, round(3 * SCALE)) * ss
+        pad = thick // 2 + ss
+        draw.ellipse([pad, pad, big - pad, big - pad], fill=rgb(inside), outline=rgb(ring),
+                     width=thick)
+        glyph = rgb(PAPER) if inside not in (PAPER, HOVER) else rgb(ring)
+        third = big / 3
+        if kind == STOP:
+            draw.rounded_rectangle([third, third, big - third, big - third],
+                                   radius=round(2 * SCALE) * ss, fill=glyph)
+        else:
+            bar, top, bottom = big / 9, third * 0.95, big - third * 0.95
+            for left in (big / 2 - 2.2 * bar, big / 2 + 0.8 * bar):
+                draw.rounded_rectangle([left, top, left + 1.4 * bar, bottom],
+                                       radius=round(1.5 * SCALE) * ss, fill=glyph)
+        return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
+
+    def _paint(self, view) -> None:
+        """The strip: a rounded backing, and the dot that says a recording is on."""
+        canvas = self.canvas
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=self._backdrop,
+                                outline=self._backdrop)
+        self._round_rect(canvas, 1, 1, WIDTH - 1, HEIGHT - 1, round(16 * SCALE),
+                         fill=PAPER, outline=EDGE, width=1)
+        colour = {"recording": RED, "waiting": AMBER, "problem": RED}.get(view.dot, MUTED)
+        centre = WIDTH / 2
+        top = round(9 * SCALE)
+        canvas.create_oval(centre - DOT / 2, top, centre + DOT / 2, top + DOT,
+                           fill=colour, outline=colour)
+
     @staticmethod
     def _round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
-        """A rounded rectangle, which tkinter does not have."""
         points = [
             x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
             x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
@@ -300,182 +361,19 @@ class Overlay:
         ]
         return canvas.create_polygon(points, smooth=True, **kwargs)
 
-    def _draw_button(self, canvas) -> None:
-        """Thick ring, white inside, the word in the ring's colour."""
-        canvas.delete("all")
-        width = canvas.winfo_width() or PAUSE_W
-        height = canvas.winfo_height() or PAUSE_H
-
-        if not canvas.enabled:
-            ring, ink, inside = OFF, OFF, PAPER
-        elif canvas.pressed:
-            # Pressed fills, briefly: the only moment either shape is solid,
-            # so a press is unmistakable without being loud.
-            ring, ink, inside = canvas.deep, PAPER, canvas.deep
-        else:
-            ring = canvas.deep if canvas.hover else canvas.colour
-            ink = ring
-            inside = self._tint(canvas.colour, 0.06) if canvas.hover else PAPER
-
-        art = self._shape_image(canvas, width, height, fill=inside, edge=ring)
-        if art is not None:
-            # Held on the widget: a PhotoImage only referenced from the canvas is
-            # collected, and the button then draws as an empty rectangle.
-            canvas.art = art
-            canvas.create_image(0, 0, anchor="nw", image=art)
-        else:
-            # No Pillow: the plain shapes, as before. Correct, just harder edged.
-            thick = round(4 * SCALE) if canvas.enabled else round(3 * SCALE)
-            pad = thick / 2 + 1
-            if canvas.shape == "circle":
-                canvas.create_oval(pad, pad, width - pad, height - pad,
-                                   fill=inside, outline=ring, width=thick)
-            else:
-                self._round_rect(canvas, pad, pad, width - pad, height - pad,
-                                 round(9 * SCALE), fill=inside, outline=ring,
-                                 width=thick)
-
-        if canvas.focused and canvas.enabled:
-            if canvas.shape == "circle":
-                canvas.create_oval(1, 1, width - 1, height - 1, outline=ring, width=1)
-            else:
-                self._round_rect(canvas, 1, 1, width - 1, height - 1,
-                                 round(11 * SCALE), fill="", outline=ring, width=1)
-
-        canvas.create_text(width / 2, height / 2 + 0.5, text=canvas.label,
-                           fill=ink, font=(FONT, 9, "bold"))
-
-    def _shape_image(self, canvas, width, height, *, fill, edge):
-        """
-        The button's shape as a supersampled image, or None if Pillow is absent.
-
-        tkinter's own `create_oval` and `create_polygon` have no antialiasing, so
-        a circle is drawn as a staircase and a 4 px ring turns that staircase
-        into the loudest thing on the card. Drawing at four times the size and
-        scaling down with a good filter is what makes the edge read as an edge.
-
-        The shape is filled rather than ringed, with a soft shadow beneath it and
-        a single hairline border. A solid shape at rest is calmer than a heavy
-        outline, and it leaves the one strong colour in the card for the label.
-        """
-        if width < 4 or height < 4:
-            return None
-        try:
-            from PIL import Image, ImageDraw, ImageFilter, ImageTk
-        except ImportError:
-            return None
-
-        ss = 4
-        big = (width * ss, height * ss)
-        pad = round(1.5 * SCALE) * ss
-        radius = (min(big) // 2 if canvas.shape == "circle"
-                  else round(10 * SCALE) * ss)
-
-        def box(offset=0):
-            return [pad, pad + offset, big[0] - pad - 1, big[1] - pad - 1 + offset]
-
-        layer = Image.new("RGBA", big, (0, 0, 0, 0))
-
-        # The shadow: the same shape, a little lower, blurred. Omitted while
-        # pressed, so the button reads as going down into the card.
-        if not canvas.pressed and canvas.enabled:
-            shadow = Image.new("RGBA", big, (0, 0, 0, 0))
-            ImageDraw.Draw(shadow).rounded_rectangle(
-                box(round(1.2 * SCALE) * ss), radius=radius, fill=(23, 28, 33, 64))
-            shadow = shadow.filter(ImageFilter.GaussianBlur(2.2 * ss))
-            layer = Image.alpha_composite(layer, shadow)
-
-        face = Image.new("RGBA", big, (0, 0, 0, 0))
-        ImageDraw.Draw(face).rounded_rectangle(
-            box(), radius=radius, fill=self._rgba(fill),
-            outline=self._rgba(edge), width=max(1, round(1.2 * SCALE) * ss))
-        layer = Image.alpha_composite(layer, face)
-
-        return ImageTk.PhotoImage(layer.resize((width, height), Image.LANCZOS))
-
-    @staticmethod
-    def _rgba(colour: str, alpha: int = 255):
-        red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
-        return (red, green, blue, alpha)
-
-    @staticmethod
-    def _tint(colour: str, amount: float) -> str:
-        """The colour, mostly white - for a hover that is felt, not seen."""
-        red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
-        mix = lambda c: int(round(255 + (c - 255) * amount))     # noqa: E731
-        return f"#{mix(red):02x}{mix(green):02x}{mix(blue):02x}"
-
-    def _paint(self, view, status: Dict[str, Any]) -> None:
-        """The card behind the two controls: state, time, and a line of words."""
-        canvas = self.canvas
-        canvas.delete("all")
-
-        recording = bool(status.get("is_recording"))
-        paused = bool(status.get("is_paused"))
-        accent = AMBER if paused else (RED if recording else MUTED)
-
-        note = self._words(view, status, recording, paused)
-        height = HEIGHT + (NOTE_HEIGHT if note else 0)
-        if height != self._height:
-            self._height = height
-            self._place()                       # where it is, not back to the corner
-
-        canvas.create_rectangle(0, 0, WIDTH, height + NOTE_HEIGHT,
-                                fill=self._backdrop, outline=self._backdrop)
-        # 3.9.5: paused two minutes - the border blinks red, twice a second.
-        blink = bool(getattr(view, "alarm", False)) and int(time.monotonic() * 2) % 2 == 0
-        self._round_rect(canvas, 1, 1, WIDTH - 1, height - 1, 14, fill=PAPER,
-                         outline=RED if blink else EDGE, width=3 if blink else 1)
-
-        if getattr(view, "alarm", False):
-            accent = RED
-        canvas.create_oval(18, 26, 26, 34, fill=accent, outline=accent)
-        canvas.create_text(33, 30, text="Paused" if paused else
-                           ("Recording" if recording else "Ready"),
-                           anchor="w", fill=INK, font=(FONT, 10, "bold"))
-        # 3.9.5: no clock while paused - a running clock looked like recording.
-        if not paused:
-            canvas.create_text(18, 55, text=format_duration(status.get("duration_seconds", 0)),
-                               anchor="w", fill=MUTED, font=("Consolas", 13))
-
-        if note:
-            canvas.create_text(18, height - 14, text=note[:44], anchor="w",
-                               fill=self._note_colour(note), font=(FONT, 8))
-
-    def _words(self, view, status, recording: bool, paused: bool) -> str:
-        """
-        The one line the card is allowed to say.
-
-        Whatever the recorder has to say (view.note). A pause is never a fault.
-        """
-        # Silence is not a fault: a consultation has long pauses, and a quiet
-        # voice is still a voice. Only a microphone that gives no signal at all
-        # is reported (the recorder's silent_session, in view.note); the level
-        # meter shows the sound itself.
-        return view.note or ""
-
-    @staticmethod
-    def _note_colour(note: str) -> str:
-        if "no signal" in note or note.startswith("Paused over"):
-            return RED
-        if "Confirmed" in note:
-            return TEAL
-        return MUTED
+    # ---- where the strip is ----
 
     def _place(self) -> None:
         """Where the doctor left it, or the top right; always wholly on the screen."""
         self.window.update_idletasks()
-        x, y = self._spot or (self.window.winfo_screenwidth() - WIDTH - MARGIN, MARGIN)
+        x, y = self._spot or (self.window.winfo_screenwidth() - WIDTH - MARGIN, TOP)
         x, y = self._on_screen(x, y)
         self.window.geometry(f"{WIDTH}x{self._height}+{x}+{y}")
 
     def _on_screen(self, x: int, y: int) -> tuple:
-        """The nearest position at which the whole card, Stop included, is visible."""
         right = self.window.winfo_screenwidth() - WIDTH
         bottom = self.window.winfo_screenheight() - self._height
         return max(0, min(int(x), right)), max(0, min(int(y), bottom))
-
-    # ---- dragging ----
 
     def _drag_start(self, event) -> None:
         self._grab = (event.x_root - self.window.winfo_rootx(),
@@ -487,6 +385,7 @@ class Overlay:
         x, y = self._on_screen(event.x_root - self._grab[0], event.y_root - self._grab[1])
         self._spot = (x, y)
         self.window.geometry(f"+{x}+{y}")
+        self._close_menu()
 
     def _drag_end(self, _event=None) -> None:
         self._grab = None
@@ -506,62 +405,50 @@ class Overlay:
             self.apply(self.state.view(status), status)
         except Exception as exc:
             logger.debug("On-screen control refresh failed: %s", exc)
-        # Four times a second while recording, for the meter; twice a second
-        # otherwise, still soon enough that the control appears as a recording
-        # starts.
         recording = bool(status) and (status.get("is_recording") or status.get("is_paused"))
         self.root.after(self.POLL_MS if recording else self.IDLE_POLL_MS, self._tick)
 
     def apply(self, view, status: Optional[Dict[str, Any]] = None) -> None:
         status = status if status is not None else {}
-        self.stop_button.enabled = view.stop_enabled
-        self.pause_button.enabled = view.pause_enabled
-        self.pause_button.label = view.pause_label
-        self._pause_text = view.pause_label
+        previous = self._view
+        self._view = view
         self.stop_button.draw()
-        self.pause_button.draw()
-        self._paint(view, status)
+        self.mark_button.draw()
+        self._paint(view)
+        self._show_note(view.note)
+
+        # A marked part that has run two minutes: its menu opens by itself, once.
+        mark_key = f"{status.get('session_id')}:{view.marked}" if view.marked else None
+        if view.alarm and mark_key and self._reminded != mark_key:
+            self._reminded = mark_key
+            self._open_menu(MARK, stay=True)
+        if not view.marked:
+            self._reminded = None
+        # The refusal closed or a part ended while its menu was open: redraw it.
+        if self.menu_window is not None and previous is not None and \
+                (previous.consent_open, previous.marked, previous.alarm) != \
+                (view.consent_open, view.marked, view.alarm):
+            self._open_menu(self.menu_kind, stay=True)
 
         if view.visible and self._visible:
             if self.window.state() == "withdrawn":
                 self._place()
                 self.window.deiconify()
-            # `active` covers paused as well as recording: a paused
-            # consultation is an open one, and its card is what Resume lives on.
             self._keep_on_top(active=bool(status.get("is_recording")
                                           or status.get("is_paused")))
         elif self.window.state() != "withdrawn":
-            # Say why, every time. "The control disappeared" is otherwise a
-            # report nobody can act on: this line distinguishes a card that
-            # hid because the consultation ended from one that hid because
-            # the agent briefly had no status to read.
-            logger.info("On-screen control hidden: recording=%s paused=%s "
-                        "session=%s form_open=%s",
-                        status.get("is_recording"), status.get("is_paused"),
-                        status.get("session_id"), self.state.form_open)
+            logger.info("On-screen control hidden: recording=%s session=%s menu_open=%s",
+                        status.get("is_recording"), status.get("session_id"),
+                        self.state.menu_open)
+            self._close_menu()
             self.window.withdraw()
 
     def _keep_on_top(self, *, active: bool = False) -> None:
         """
-        Stay in front, for as long as the consultation lasts.
-
-        Asking once, when the card appears, is not enough. Windows drops the
-        flag when another window takes focus in certain ways - opening the
-        reason form and closing it again is one of them - and the card then
-        sits behind CMED's browser. It has not gone, but it is gone as far as
-        anyone can tell, and Stop is what they cannot find.
-
-        Testing the flag first is not enough either, and that is what was
-        wrong: `attributes("-topmost")` reports the flag tk last set, not the
-        real stacking order. Another top-most window - a browser going full
-        screen, a notification, the reason form closing - can sit in front
-        while tk still believes the card is on top, so the check said "already
-        there" and nothing was re-asserted. A paused consultation lost its
-        card that way, and a card that cannot be found cannot be resumed.
-
-        So while a consultation is open the flag and the lift are re-applied
-        every tick, unconditionally. It costs two calls four times a second
-        and it is the only thing that keeps Stop and Resume reachable.
+        Stay in front for as long as the consultation lasts. Windows drops the
+        flag when another window takes focus in certain ways, and tk keeps
+        reporting the flag it set; so while a consultation is open the flag and
+        the lift are re-applied every tick.
         """
         try:
             if active:
@@ -571,131 +458,153 @@ class Overlay:
             elif not self.window.attributes("-topmost"):
                 self.window.attributes("-topmost", True)
                 self.window.lift()
-        except Exception as exc:                    # a window manager that will not
+        except Exception as exc:
             logger.debug("Could not keep the control on top: %s", exc)
 
     def _recover_if_offscreen(self) -> None:
-        """
-        Put the card back if it is no longer on a screen.
-
-        Unplugging a second monitor, or a resolution change, leaves the card at
-        coordinates that no longer exist. It is still "visible" as far as tk is
-        concerned, which is the same dead end as being behind something.
-        """
+        """Put the strip back if it is no longer on a screen (a monitor unplugged)."""
         try:
             x, y = self.window.winfo_rootx(), self.window.winfo_rooty()
             width = self.window.winfo_screenwidth()
             height = self.window.winfo_screenheight()
-            if x < -40 or y < -40 or x > width - 60 or y > height - 40:
+            if x < -40 or y < -40 or x > width - 40 or y > height - 40:
                 logger.info("On-screen control was off-screen at %s,%s; replacing it", x, y)
                 self._place()
         except Exception:
             pass
 
-    # ---- presses ----
+    # ---- the note beside the strip ----
 
-    def _on_stop(self) -> None:
-        if self.form is not None:
-            return
-        self.actions.press_stop()                    # the microphone cuts now
-        self._open_form("Why are you stopping?", self.actions.stop_choices,
-                        confirm=self._confirm_stop, cancel=self.actions.cancel_stop)
-
-    def _on_pause(self) -> None:
-        if self.form is not None:
-            return
-        if self._pause_text == "Resume":
-            self.actions.resume()
-            return
-        self._open_form("Why are you pausing?", self.actions.pause_choices,
-                        confirm=self.actions.confirm_pause, cancel=None)
-
-    def _confirm_stop(self, reason, detail):
-        result = self.actions.confirm_stop(reason, detail)
-        if result != NEEDS_DELETE_CONFIRMATION:
-            return result
-        from tkinter import messagebox
-        title, question = DELETE_QUESTION
-        if messagebox.askyesno(title, question, icon="warning", parent=self.form,
-                               default="no"):
-            return self.actions.confirm_stop(reason, detail, deletion_confirmed=True)
-        return ""                                    # back to the reason list (SRS-CNS-08)
-
-    # ---- the reason form (SRS-UIX-04..07) ----
-
-    def _open_form(self, title, choices, *, confirm, cancel) -> None:
+    def _show_note(self, text: str) -> None:
+        """A line of words beside the strip; none when there is nothing to say."""
         import tkinter as tk
 
-        self.state.form_open = True
-        form = tk.Toplevel(self.window, bg=PAPER, padx=16, pady=14)
-        form.title(title)
-        form.attributes("-topmost", True)
-        form.transient(self.window)
-        form.resizable(False, False)
-        self.form = form
+        if self.menu_window is not None or not text or self.window.state() == "withdrawn":
+            if self.toast is not None:
+                self.toast.destroy()
+                self.toast, self._toast_text = None, ""
+            return
+        if self.toast is not None and self._toast_text == text:
+            return
+        if self.toast is not None:
+            self.toast.destroy()
+        toast = tk.Toplevel(self.window, bg=EDGE)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        colour = RED if ("no signal" in text or "not working" in text) else \
+            TEAL if text == "Confirmed" else INK
+        tk.Label(toast, text=text, bg=PAPER, fg=colour, font=(FONT, 9), padx=10, pady=6,
+                 wraplength=MENU_WIDTH - 20, justify="left").pack(padx=1, pady=1)
+        self._beside(toast, self.window.winfo_rooty())
+        self.toast, self._toast_text = toast, text
 
-        tk.Label(form, text=title, font=(FONT, 11, "bold"), bg=PAPER, fg=INK
-                 ).pack(anchor="w", pady=(0, 8))
+    def _beside(self, popup, y: int) -> None:
+        """To the left of the strip, or to its right where there is no room."""
+        popup.update_idletasks()
+        width, height = popup.winfo_reqwidth(), popup.winfo_reqheight()
+        x = self.window.winfo_rootx() - width - round(8 * SCALE)
+        if x < 0:
+            x = self.window.winfo_rootx() + WIDTH + round(8 * SCALE)
+        y = max(0, min(y, self.window.winfo_screenheight() - height))
+        popup.geometry(f"+{x}+{y}")
 
-        # Not "": tkinter draws every radio button as selected while the
-        # variable is empty, which would look as if a reason were chosen.
-        unset = "__none__"
-        choice = tk.StringVar(value=unset)
-        for value, label in choices:
-            tk.Radiobutton(form, text=label, value=value, variable=choice, bg=PAPER,
-                           fg=INK, font=(FONT, 10), anchor="w", activebackground=PAPER,
-                           selectcolor=PAPER).pack(fill="x", anchor="w", pady=1)
-        tk.Label(form, text="Comment (needed for Other)", font=(FONT, 9), bg=PAPER,
-                 fg=MUTED).pack(anchor="w", pady=(10, 2))
-        comment = tk.Entry(form, font=(FONT, 10), width=40, relief="solid", bd=1)
-        comment.pack(fill="x", ipady=3)
-        problem = tk.Label(form, text="", font=(FONT, 9), bg=PAPER, fg=RED, anchor="w")
-        problem.pack(fill="x", pady=(5, 0))
+    # ---- the menus ----
 
-        def close():
-            self.state.form_open = False
-            self.form = None
-            form.grab_release()
-            form.destroy()
-            # The card lost the front to this form; take it back at once
-            # rather than at the next tick, so it never blinks out of sight.
-            self.window.attributes("-topmost", True)
-            self.window.lift()
+    def _open_menu(self, kind: Optional[str], *, stay: bool = False) -> None:
+        """An icon's menu, beside it: a title saying what happens, and the choices."""
+        import tkinter as tk
 
-        def on_confirm(_event=None):
-            chosen = choice.get()
-            outcome = confirm(None if chosen == unset else chosen, comment.get())
-            if outcome is None:
-                close()
-            else:
-                problem.configure(text=outcome)
+        if kind is None or self._view is None or not self._view.visible:
+            return
+        self._cancel_close()
+        if self.menu_window is not None and self.menu_kind == kind and not stay:
+            return
+        self._close_menu()
 
-        def on_cancel(_event=None):
-            if cancel is not None:
-                cancel()
-            close()
+        title, items = menu(kind, self._view)
+        box = tk.Toplevel(self.window, bg=EDGE)
+        box.overrideredirect(True)
+        box.attributes("-topmost", True)
+        inner = tk.Frame(box, bg=PAPER, padx=12, pady=10)
+        inner.pack(padx=1, pady=1)
+        tk.Label(inner, text=title, bg=PAPER, fg=MUTED, font=(FONT, 9),
+                 wraplength=MENU_WIDTH - 24, justify="left", anchor="w"
+                 ).pack(fill="x", anchor="w", pady=(0, 6))
+        for value, words, enabled in items:
+            row = tk.Label(inner, text=words, bg=PAPER, fg=INK if enabled else OFF,
+                           font=(FONT, 10, "bold" if enabled else "normal"), anchor="w",
+                           padx=8, pady=5, cursor="hand2" if enabled else "arrow",
+                           wraplength=MENU_WIDTH - 40, justify="left")
+            row.pack(fill="x", anchor="w", pady=1)
+            if enabled:
+                row.bind("<Enter>", lambda _e, r=row: r.configure(bg=HOVER))
+                row.bind("<Leave>", lambda _e, r=row: r.configure(bg=PAPER))
+                row.bind("<Button-1>", lambda _e, k=kind, v=value: self._choose(k, v))
+        box.bind("<Enter>", lambda _e: self._cancel_close())
+        box.bind("<Leave>", lambda _e: self._close_menu_soon())
 
-        buttons = tk.Frame(form, bg=PAPER)
-        buttons.pack(fill="x", pady=(12, 0))
-        tk.Button(buttons, text="Confirm", width=12, command=on_confirm,
-                  default="active", font=(FONT, 10, "bold"), cursor="hand2"
-                  ).pack(side="right")
-        tk.Button(buttons, text="Cancel", width=12, command=on_cancel,
-                  font=(FONT, 10), cursor="hand2").pack(side="right", padx=8)
-        # Closing the window is cancelling the action entirely, never a silent
-        # confirmation (SRS-UIX-07).
-        form.protocol("WM_DELETE_WINDOW", on_cancel)
-        form.bind("<Escape>", on_cancel)
-        form.bind("<Return>", on_confirm)
-        form.update_idletasks()
-        x = self.window.winfo_rootx() + WIDTH - form.winfo_reqwidth()
-        y = self.window.winfo_rooty() + self._height + 10
-        # The card may have been dragged low: then the form opens above it.
-        if y + form.winfo_reqheight() > self.window.winfo_screenheight():
-            y = self.window.winfo_rooty() - form.winfo_reqheight() - 10
-        form.geometry(f"+{max(0, x)}+{max(0, y)}")
-        form.grab_set()
-        form.focus_force()
+        icon = self.stop_button if kind == STOP else self.mark_button
+        self.menu_window, self.menu_kind = box, kind
+        self.state.menu_open = True
+        self._show_note("")                  # the menu takes the note's place
+        self._beside(box, icon.winfo_rooty())
+        self._set_alpha(self.window, NEAR_ALPHA)
+
+    def _choose(self, kind: str, value: str) -> None:
+        consent_open = bool(self._view and self._view.consent_open)
+        result = self.actions.choose(kind, value, consent_open=consent_open)
+        if result == NEEDS_DELETE_CONFIRMATION:
+            from tkinter import messagebox
+            title, question = DELETE_QUESTION
+            self._cancel_close()
+            confirmed = messagebox.askyesno(title, question, icon="warning",
+                                            parent=self.menu_window or self.window,
+                                            default="no")
+            result = self.actions.choose(kind, value, consent_open=consent_open,
+                                         deletion_confirmed=True) if confirmed else ""
+        if result:
+            self.post("overlay_message", {"text": result})
+        self._close_menu()
+
+    def _close_menu_soon(self) -> None:
+        self._cancel_close()
+        if self.window is not None:
+            self._close_job = self.window.after(CLOSE_DELAY_MS, self._close_if_away)
+
+    def _cancel_close(self) -> None:
+        if self._close_job is not None and self.window is not None:
+            try:
+                self.window.after_cancel(self._close_job)
+            except Exception:
+                pass
+        self._close_job = None
+
+    def _close_if_away(self) -> None:
+        """Close the menu unless the pointer is on it or on an icon."""
+        self._close_job = None
+        try:
+            x, y = self.window.winfo_pointerxy()
+            under = self.window.winfo_containing(x, y)
+        except Exception:
+            under = None
+        keep = (self.menu_window, self.stop_button, self.mark_button)
+        while under is not None:
+            if under in keep:
+                return
+            under = getattr(under, "master", None)
+        self._close_menu()
+
+    def _close_menu(self) -> None:
+        self._cancel_close()
+        if self.menu_window is not None:
+            try:
+                self.menu_window.destroy()
+            except Exception:
+                pass
+        self.menu_window, self.menu_kind = None, None
+        self.state.menu_open = False
+        if self.window is not None:
+            self._set_alpha(self.window, NEAR_ALPHA if self._near else IDLE_ALPHA)
 
 
 __all__ = ["Overlay"]

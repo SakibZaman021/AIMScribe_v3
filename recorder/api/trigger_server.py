@@ -679,6 +679,31 @@ def create_app(runtime: Runtime) -> FastAPI:
         reply = await runtime.ws.handle_message(_HTTP_CLIENT, raw)
         return JSONResponse(status_code=int(reply.get("status") or 200), content=reply)
 
+    @app.post("/api/v1/session/end")
+    async def session_end(request: Request):
+        """
+        API 4 over plain HTTP (3.9.8), exactly as API 1: {"request_id", "end":
+        {visit_id, patient_id, doctor_id, hospital_id, end_time, date}}, from a
+        trusted EHR page, through the WebSocket's own handler.
+        """
+        origin = request.headers.get("origin")
+        if not origin or not cfg.security.origin_allowed(origin):
+            logger.warning("Rejected HTTP end from origin %r", origin)
+            if origin:
+                return _origin_refused(request, origin)
+            return _error_response(403, "ORIGIN_NOT_ALLOWED",
+                                   "This request names no page (no Origin header), so it may "
+                                   "not control the recorder.")
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            message = None
+        if isinstance(message, dict):
+            raw = json.dumps({**message, "command": "end"})
+        reply = await runtime.ws.handle_message(_HTTP_CLIENT, raw)
+        return JSONResponse(status_code=int(reply.get("status") or 200), content=reply)
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         if not await runtime.ws.connect(websocket):

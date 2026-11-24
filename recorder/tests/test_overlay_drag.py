@@ -51,7 +51,7 @@ def where(o):
 
 def test_it_starts_at_the_top_right(card):
     x, y = where(card)
-    assert x == card.window.winfo_screenwidth() - ov.WIDTH - ov.MARGIN and y == ov.MARGIN
+    assert x == card.window.winfo_screenwidth() - ov.WIDTH - ov.MARGIN and y == ov.TOP
 
 
 def test_dragging_moves_it_and_it_stays_there(card):
@@ -68,8 +68,7 @@ def test_dragging_moves_it_and_it_stays_there(card):
     card._place()
     card.window.deiconify()
     assert where(card) == moved
-    # Growing by a line of words does not send it back to the corner either.
-    card._height = ov.HEIGHT + ov.NOTE_HEIGHT
+    # Placing it again does not send it back to the corner either.
     card._place()
     assert where(card) == moved
 
@@ -86,7 +85,7 @@ def test_it_cannot_be_dragged_off_the_screen(card):
 
 
 def test_the_buttons_are_not_drag_handles(card):
-    # The drag is bound on the card's canvas only; Stop and Pause keep their press.
+    # The drag is bound on the strip's canvas only; the icons open their menus.
     assert card.canvas.bind("<B1-Motion>")
     assert not card.stop_button.bind("<B1-Motion>")
     assert card.stop_button.bind("<Button-1>")

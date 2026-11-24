@@ -49,6 +49,11 @@ CODES: Dict[str, Tuple[int, str]] = {
     "SESSION_ALREADY_ACTIVE": (409, "This consultation is already being recorded."),
     "NO_ACTIVE_SESSION": (409, "Nothing is being recorded."),
     "PATIENT_MISMATCH": (409, "That signal belongs to a different consultation."),
+    # API 4 (3.9.8): the end of a visit.
+    "RECORDING_ENDED": (200, "Recording ended. The visit is closed."),
+    "VISIT_ALREADY_ENDED": (200, "That visit's recording had already ended."),
+    "VISIT_MISMATCH": (409, "That visit is not the one being recorded; the recording "
+                            "continues."),
     "DEVICE_NOT_ENROLLED": (423, "This PC is not registered with AIMS LAB."),
     "AGENT_NOT_READY": (503, "The recorder is not ready. Try again in a moment."),
     # Outside the CMED contract: replies to the commands CMED does not use
@@ -60,7 +65,7 @@ CODES: Dict[str, Tuple[int, str]] = {
 }
 
 # The commands whose replies must stay inside Appendix A (SRS-IF1-10).
-CMED_COMMANDS = frozenset({"start", "prescription_built"})
+CMED_COMMANDS = frozenset({"start", "prescription_built", "end"})
 
 
 class ProtocolError(Exception):
@@ -109,6 +114,21 @@ class PrescriptionBuilt:
     patient_id: str
     session_id: str
     occurred_at: Optional[str]
+
+
+@dataclass(frozen=True)
+class VisitEnd:
+    """
+    API 4 (3.9.8): CMED closed the visit. The only message that ends a
+    recording before the next patient is opened. Sent like API 1, from the
+    EHR page: the visit, its patient and doctor, and when it ended.
+    """
+    patient_id: str
+    doctor_id: str
+    end_time: str             # exactly as CMED's server wrote it
+    visit_id: str = ""
+    hospital_id: str = ""
+    date: str = ""
 
 
 def _required_text(body: Dict[str, Any], name: str) -> str:
@@ -176,6 +196,44 @@ def parse_trigger(message: Dict[str, Any]) -> Trigger:
                    start_time=start_time, date=day, visit_id=visit_id)
 
 
+def parse_end(message: Dict[str, Any]) -> VisitEnd:
+    """
+    Read API 4: {"request_id", "end": {visit_id, patient_id, doctor_id,
+    hospital_id, end_time, date}}. patient_id, doctor_id and end_time are
+    required; visit_id is required whenever API 1 sent one (the controller
+    checks that), and hospital_id and date are taken when sent.
+    """
+    body = message.get("end")
+    if not isinstance(body, dict):
+        raise ProtocolError("MISSING_FIELD", "'end' is required.", field="end")
+    patient_id = _identifier(body, "patient_id")
+    doctor_id = _identifier(body, "doctor_id")
+    end_time = _required_text(body, "end_time")
+    try:
+        parsed = datetime.fromisoformat(end_time)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        raise ProtocolError("MISSING_FIELD",
+                            "'end_time' must be a date and time with its time zone, "
+                            "for example 2026-11-26T10:31:05+06:00.", field="end_time")
+    visit_id = body.get("visit_id")
+    if visit_id in (None, ""):
+        visit_id = ""
+    elif not isinstance(visit_id, str) or not VISIT_ID.match(visit_id.strip()):
+        raise ProtocolError("INVALID_IDENTIFIER",
+                            "'visit_id' may contain only letters, digits and '-', up to 64 "
+                            "characters.", field="visit_id")
+    else:
+        visit_id = visit_id.strip()
+    hospital_id = body.get("hospital_id")
+    hospital_id = hospital_id.strip() if isinstance(hospital_id, str)         and IDENTIFIER.match(hospital_id.strip()) else ""
+    day = body.get("date")
+    day = day.strip() if isinstance(day, str) and _DATE.match(day.strip()) else ""
+    return VisitEnd(patient_id=patient_id, doctor_id=doctor_id, end_time=end_time,
+                    visit_id=visit_id, hospital_id=hospital_id, date=day)
+
+
 def parse_prescription_built(message: Dict[str, Any]) -> PrescriptionBuilt:
     patient_id = _identifier(message, "patient_id")
     session_id = _identifier(message, "session_id")
@@ -222,5 +280,6 @@ def reply(command: str, code: str, *, request_id: Optional[str] = None,
 
 
 __all__ = ["CODES", "CMED_COMMANDS", "IDENTIFIER", "ProtocolError", "Trigger",
-           "PrescriptionBuilt", "parse_trigger", "parse_prescription_built",
+           "PrescriptionBuilt", "VisitEnd", "parse_trigger", "parse_end",
+           "parse_prescription_built",
            "request_id_of", "reply"]

@@ -808,6 +808,7 @@ const confirmTag = (v) => {
 // "stopped early", and alerts the collectors and researchers.
 const ENDED = {
   superseded_by_new_patient: ["good", "Next patient"],
+  consultation_ended: ["good", "CMED closed the visit (API 4)"],
   counselling_limit: ["good", "2 min after prescription"],
   prescription_built: ["good", "Prescription"],
   doctor_stopped: ["good", "Consultation finished"],

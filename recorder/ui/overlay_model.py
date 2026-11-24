@@ -1,107 +1,88 @@
 """
-What the on-screen control shows, and what its two buttons do.
+What the on-screen control shows, and what its two icons do (3.9.8).
 
-SRS 3.2 §7.8 (the control) and §7.8a (a patient's refusal). No tkinter here, so
-every rule can be tested; ui/overlay.py only draws what this decides.
+Two small see-through icons, one above the other, and no clock. One tap or a
+hover opens an icon's menu; one more click chooses. A tap alone never does
+anything.
 
-    Stop   - red circle.     3.9.4: the recording carries on while the reason
-                             form is open; a saved reason closes the session,
-                             Cancel changes nothing. "Patient did not consent"
-                             comes first and asks once before deleting - all
-                             of it, the form's seconds too (SRS-CNS-02, -08).
-    Pause  - blue rectangle. Takes effect only after a reason (SRS-UIX-05).
-                             While paused the same button resumes; after two
-                             minutes paused the card says so in red.
+    Stop   - a square in a circle.
+             "Patient did not consent" is offered until CMED's API 2
+             (demographics) reaches the server; it really stops the recording
+             and deletes it, after one confirmation (SRS-CNS-02, -08).
+             "Consultation finished", "Patient left the room" and "Emergency"
+             are logged at this second of the audio. The recording continues
+             until CMED's API 4 or the next patient, and the menu says so.
+    Mark   - two bars in a circle.
+             Marks the start of a sensitive part, with a reason. The recording
+             continues; the lab removes the part before anyone listens to it,
+             and the menu says so. While a part is marked the same icon ends
+             it; after two minutes it blinks and asks whether the part is over.
+
+No tkinter here, so every rule can be tested; ui/overlay.py only draws what
+this decides.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from core.session_controller import REFUSAL_REASON, STOP_HOLD_REASON
+from core.session_controller import REFUSAL_REASON
 
 REFUSAL = REFUSAL_REASON
 
-# First is the refusal (SRS-CNS-02). The list itself is OD-07, to be agreed
-# with the clinical team; changing it changes no code but this table.
-STOP_REASONS: List[Tuple[str, str]] = [
+STOP = "stop"
+MARK = "mark"
+
+STOP_TITLE = ("Your reason is logged. Recording continues until the visit is "
+              "closed in CMED.")
+STOP_MENU: List[Tuple[str, str]] = [
     (REFUSAL, "Patient did not consent"),
     ("consultation_finished", "Consultation finished"),
     ("patient_left", "Patient left the room"),
-    ("urgent_interruption", "Emergency or urgent interruption"),
-    ("technical_problem", "Problem with the recorder or microphone"),
-    ("other", "Other - please describe"),
+    ("urgent_interruption", "Emergency"),
 ]
+# Shown under the refusal once it is closed, so a doctor knows why it is grey.
+REFUSAL_CLOSED = "Patient did not consent (closed once CMED sent the patient's details)"
 
-PAUSE_LABELS: Dict[str, str] = {
-    "patient_declined": "Patient asked to pause",
-    "sensitive_personal_matter": "Sensitive personal matter",
-    "non_clinical_interruption": "Interruption not about the patient",
-    "other": "Other - please describe",
-}
+MARK_TITLE = ("Mark sensitive part. Recording continues. This part will be removed "
+              "before anyone listens to it.")
+MARK_MENU: List[Tuple[str, str]] = [
+    ("patient_request", "Patient's request"),
+    ("sensitive_personal_matter", "Sensitive personal matter"),
+    ("interruption", "Interruption"),
+]
+SENSITIVE_END = "sensitive_end"
+MARKED_TITLE = ("Sensitive part marked ({label}). Recording continues; this part will "
+                "be removed before anyone listens to it.")
+MARKED_OVER = "Sensitive part over?"
+END_LABEL = "Yes, it is over"
+# After this long the Mark icon blinks and its menu opens by itself, once.
+REMINDER_SECONDS = 120
 
-DELETE_QUESTION = ("Delete this recording?", "It cannot be recovered.")
-
-# Returned by confirm_stop when the refusal still needs its one confirmation.
+DELETE_QUESTION = ("Delete this recording?",
+                   "The patient did not consent. The recording is deleted and cannot "
+                   "be recovered.")
+# Returned by choose() when the refusal still needs its one confirmation.
 NEEDS_DELETE_CONFIRMATION = "needs_delete_confirmation"
 
-# Plain words for the doctor (SRS-NFU-04). Shown once per consultation and
-# never modal (SRS-LVL-06).
+# Plain words for the doctor (SRS-NFU-04), shown briefly beside the icons.
 NOTES = {
     "session_confirming": "Checking with CMED…",
     "session_confirmed": "Confirmed",
     "session_unconfirmed": "Not confirmed by CMED yet - still recording",
 }
-MESSAGE_SECONDS = 8.0
-# 3.9.4: a pause this long is pointed out on the card (and alerted on the server).
-PAUSE_REMINDER_SECONDS = 120
-PAUSE_REMINDER = "Paused over 2 min - press Resume to record"
-# 3.9.5: no clock while paused - it looked like recording time. Just this.
-PAUSED_NOTE = "Press Resume to record"
-
-
-def pause_reasons(configured: Iterable[str]) -> List[Tuple[str, str]]:
-    return [(r, PAUSE_LABELS.get(r, r.replace("_", " ").capitalize())) for r in configured]
-
-
-def close_reason_for(reason: str) -> str:
-    """
-    What the session is closed with. A finished consultation is the normal
-    close; anything else is marked so the server raises it for review (SRS-SES-08).
-    """
-    return "doctor_stopped" if reason == "consultation_finished" else f"doctor_stopped:{reason}"
-
-
-def check_reason(reason: Optional[str], detail: str,
-                 choices: List[Tuple[str, str]]) -> Optional[str]:
-    """None if the form may be confirmed, otherwise what to tell the doctor."""
-    if not reason:
-        return "Choose a reason."
-    if reason not in {value for value, _ in choices}:
-        return "Choose a reason from the list."
-    if reason == "other" and not (detail or "").strip():
-        return "Please describe the reason."
-    return None
-
-
-def format_duration(seconds: float) -> str:
-    total = int(seconds or 0)
-    hours, rest = divmod(total, 3600)
-    minutes, secs = divmod(rest, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+MESSAGE_SECONDS = 6.0
 
 
 @dataclass
 class OverlayView:
     visible: bool
-    headline: str
-    note: str
-    pause_label: str          # "Pause" or "Resume"
-    stop_enabled: bool
-    pause_enabled: bool
-    # 3.9.5: paused two minutes or more - the card turns red and blinks.
-    alarm: bool = False
+    note: str                       # one line to show beside the icons, or ""
+    consent_open: bool              # the refusal can still be chosen
+    marked: Optional[str]           # the open sensitive part's reason, words
+    alarm: bool                     # marked two minutes or more: blink and ask
+    dot: str                        # "recording" | "waiting" | "problem" | "off"
 
 
 class OverlayState:
@@ -112,7 +93,7 @@ class OverlayState:
         self.session_id: Optional[str] = None
         self.note = ""
         self.shown: set = set()
-        self.form_open = False
+        self.menu_open = False
         self.message = ""
         self.message_until = 0.0
 
@@ -130,8 +111,17 @@ class OverlayState:
         if event in NOTES and session_id in (None, self.session_id):
             self.note = NOTES[event]
             return
+        if event == "doctor_marked":
+            words = dict(STOP_MENU).get(data.get("reason"), "Reason")
+            self._say(f"Noted: {words}. Recording continues.")
+            return
+        if event == "sensitive_started":
+            self._say("Marked. This part will be removed before anyone listens to it.")
+            return
+        if event == "sensitive_ended":
+            self._say("Sensitive part ended.")
+            return
         if event == "sound_restored" and session_id in (None, self.session_id):
-            # Sound is back: the warning goes, and may come again if it stops.
             self.shown.discard("silent_session")
             if self.note.startswith("Microphone gives no signal"):
                 self.note = ""
@@ -161,97 +151,100 @@ class OverlayState:
             self._say(str(data.get("text", ""))[:200])
 
     def view(self, status: Dict[str, Any]) -> OverlayView:
-        recording = bool(status.get("is_recording"))
-        paused = bool(status.get("is_paused"))
-        active = recording or paused
-        pause = status.get("pause") or {}
-        holding = paused and pause.get("reason") == STOP_HOLD_REASON
-
-        if holding:
-            headline = "Stopped - choose a reason"
-        elif paused:
-            headline = "Paused"
-        elif recording:
-            headline = f"Recording  {format_duration(status.get('duration_seconds', 0))}"
-        else:
-            headline = ""
+        active = bool(status.get("is_recording") or status.get("is_paused"))
+        sensitive = status.get("sensitive") or None
+        marked = (sensitive.get("label") or sensitive.get("reason")) if sensitive else None
+        alarm = bool(sensitive) and float(sensitive.get("seconds") or 0) >= REMINDER_SECONDS
 
         note = self.note
-        alarm = False
-        if paused and not holding:
-            alarm = float(pause.get("seconds") or 0) >= PAUSE_REMINDER_SECONDS
-            note = PAUSE_REMINDER if alarm else PAUSED_NOTE
         if active and not note:
             if status.get("authorisation") == "pending":
                 note = "Recording - waiting for the AIMS LAB server"
             elif status.get("confirmation") == "confirming":
                 note = NOTES["session_confirming"]
-
         message_on = self._clock() < self.message_until
-        if not active and message_on:
-            headline, note = self.message, ""
-        elif active and message_on:
+        if message_on:
             note = self.message
 
+        if not active:
+            dot = "off"
+        elif "no signal" in self.note or "not working" in self.note:
+            dot = "problem"
+        elif status.get("authorisation") == "pending":
+            dot = "waiting"
+        else:
+            dot = "recording"
+
         return OverlayView(
-            visible=active or self.form_open or message_on,
-            headline=headline,
-            note=note,
-            pause_label="Resume" if paused and not holding else "Pause",
-            stop_enabled=active,
-            pause_enabled=active and not holding,
-            alarm=alarm,
+            visible=active or self.menu_open or message_on,
+            note=note if (active or message_on) else "",
+            consent_open=active and status.get("consent_open", True) is not False,
+            marked=marked if active else None,
+            alarm=alarm and active,
+            dot=dot,
         )
+
+
+def menu(kind: str, view: OverlayView) -> Tuple[str, List[Tuple[str, str, bool]]]:
+    """
+    The title and the (value, words, enabled) choices an icon's menu offers now.
+    """
+    if kind == STOP:
+        items = []
+        for value, words in STOP_MENU:
+            if value == REFUSAL:
+                items.append((value, words if view.consent_open else REFUSAL_CLOSED,
+                              view.consent_open))
+            else:
+                items.append((value, words, True))
+        return STOP_TITLE, items
+    if view.marked:
+        title = MARKED_OVER if view.alarm else MARKED_TITLE.format(label=view.marked)
+        return title, [(SENSITIVE_END, END_LABEL, True)]
+    return MARK_TITLE, [(value, words, True) for value, words in MARK_MENU]
 
 
 Submit = Callable[[Callable[[Any], Awaitable[Any]]], None]
 
 
 class OverlayActions:
-    """What each press and each confirmed form asks the controller to do."""
+    """What each choice asks the controller to do."""
 
-    def __init__(self, submit: Submit, pause_choices: List[Tuple[str, str]]):
+    def __init__(self, submit: Submit):
         self._submit = submit
-        self.pause_choices = pause_choices
-        self.stop_choices = STOP_REASONS
 
-    def press_stop(self) -> None:
-        """3.9.4: the form opens and the recording carries on until a reason is saved."""
-        self._submit(lambda c: c.stop_requested())
-
-    def cancel_stop(self) -> None:
-        """Cancelling the whole action changes nothing (SRS-UIX-07)."""
-        self._submit(lambda c: c.stop_cancelled())
-
-    def confirm_stop(self, reason: Optional[str], detail: str = "", *,
-                     deletion_confirmed: bool = False) -> Optional[str]:
-        problem = check_reason(reason, detail, self.stop_choices)
-        if problem:
-            return problem
-        if reason == REFUSAL:
-            if not deletion_confirmed:
-                return NEEDS_DELETE_CONFIRMATION
-            self._submit(lambda c: c.refuse_session())
+    def choose(self, kind: str, value: str, *, consent_open: bool = True,
+               deletion_confirmed: bool = False) -> Optional[str]:
+        """
+        None when the choice was sent; NEEDS_DELETE_CONFIRMATION when the
+        refusal still needs its one confirmation; otherwise what to tell the
+        doctor.
+        """
+        if kind == STOP:
+            if value == REFUSAL:
+                if not consent_open:
+                    return "Closed once CMED sent the patient's details."
+                if not deletion_confirmed:
+                    return NEEDS_DELETE_CONFIRMATION
+                self._submit(lambda c: c.refuse_session())
+                return None
+            if value not in dict(STOP_MENU):
+                return "Choose a reason from the list."
+            self._submit(lambda c: c.doctor_mark(value))
             return None
-        close_reason = close_reason_for(reason)
-        text = (detail or "").strip()[:500]
-        self._submit(lambda c: c.stop_session(reason=close_reason, detail=text))
-        return None
-
-    def confirm_pause(self, reason: Optional[str], detail: str = "") -> Optional[str]:
-        problem = check_reason(reason, detail, self.pause_choices)
-        if problem:
-            return problem
-        text = (detail or "").strip()[:500]
-        self._submit(lambda c: c.pause_session(reason=reason, reason_detail=text,
-                                               authorised_by="", expected_seconds=0))
-        return None
-
-    def resume(self) -> None:
-        self._submit(lambda c: c.resume_session())
+        if kind == MARK:
+            if value == SENSITIVE_END:
+                self._submit(lambda c: c.sensitive_end())
+                return None
+            if value not in dict(MARK_MENU):
+                return "Choose a reason from the list."
+            self._submit(lambda c: c.sensitive_start(value))
+            return None
+        return "Choose a reason from the list."
 
 
-__all__ = ["STOP_REASONS", "PAUSE_LABELS", "DELETE_QUESTION", "NEEDS_DELETE_CONFIRMATION",
-           "OverlayView", "OverlayState", "OverlayActions", "pause_reasons",
-           "close_reason_for", "check_reason", "format_duration", "REFUSAL",
-           "PAUSE_REMINDER", "PAUSED_NOTE"]
+__all__ = ["STOP", "MARK", "STOP_TITLE", "STOP_MENU", "MARK_TITLE", "MARK_MENU",
+           "MARKED_TITLE", "MARKED_OVER", "END_LABEL", "SENSITIVE_END", "REFUSAL",
+           "REFUSAL_CLOSED", "DELETE_QUESTION", "NEEDS_DELETE_CONFIRMATION",
+           "REMINDER_SECONDS", "MESSAGE_SECONDS", "OverlayView", "OverlayState",
+           "OverlayActions", "menu"]

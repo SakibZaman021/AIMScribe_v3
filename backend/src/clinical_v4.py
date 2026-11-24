@@ -539,6 +539,9 @@ async def receive(request: Request, kind: str):
                 await conn.execute("UPDATE patient_visit SET aims_id = $2 WHERE id = $1 "
                                    "AND aims_id IS DISTINCT FROM $2", record_id,
                                    recording["session_id"])
+            if kind == "patient_information" and recording.get("closed_at") is None:
+                # 3.9.8: the recorder closes the doctor's refusal choice now.
+                await api_v2._repo().note_demographics(recording["session_id"])
             if kind == "prescription" and recording.get("closed_at") is None:
                 # The recorder ends this recording about two minutes from now,
                 # unless the next patient is opened first (the heartbeat tells it).

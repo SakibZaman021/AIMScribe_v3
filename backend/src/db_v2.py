@@ -1862,6 +1862,22 @@ class V2Repository:
             await conn.execute("UPDATE sessions SET visit_id = $2 WHERE session_id = $1 "
                                "AND visit_id IS DISTINCT FROM $2", session_id, visit_id)
 
+    async def note_demographics(self, session_id: str) -> None:
+        """CMED's API 2 for this open recording arrived (3.9.8). Once."""
+        async with self._acquire() as conn:
+            await conn.execute("UPDATE sessions SET demographics_received_at = now() "
+                               "WHERE session_id = $1 AND demographics_received_at IS NULL",
+                               session_id)
+
+    async def demographics_notice(self, device_id: str, session_id: str) -> bool:
+        """Has API 2 arrived for this PC's open recording? What the heartbeat says."""
+        async with self._acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM sessions
+                 WHERE session_id = $1 AND device_id = $2 AND closed_at IS NULL
+                   AND demographics_received_at IS NOT NULL
+            """, session_id, device_id))
+
     async def note_prescription(self, session_id: str) -> None:
         """CMED's API 3 for this recording arrived. Once: a correction moves nothing."""
         async with self._acquire() as conn:

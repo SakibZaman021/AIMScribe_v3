@@ -995,6 +995,8 @@ def _ended_words(close_reason: Optional[str], refused: bool, closed: bool) -> st
         return "still open"
     if close_reason == "superseded_by_new_patient":
         return "next patient came in"
+    if close_reason == "consultation_ended":
+        return "CMED closed the visit"
     if collectors.stop_kind(close_reason) is None:
         return "consultation finished"
     return collectors.stop_label(close_reason)

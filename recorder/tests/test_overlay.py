@@ -1,12 +1,11 @@
 """
-The on-screen Stop and Pause control (SRS 3.2 §7.8, §7.8a).
+The on-screen control (3.9.8): two see-through icons, menus, no clock.
 
 The rules are tested on the model, which has no tkinter; the controller side is
-tested for real; the window itself gets one smoke test that builds it hidden.
+tested for real; the window itself gets a smoke test that builds it hidden.
 """
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -15,21 +14,18 @@ from core.session_controller import REFUSAL_REASON, STOP_HOLD_REASON, SessionErr
 from core.spool import SessionSpool
 from core.uploader import AuthOutcome
 from tests.fakes import ScriptedUploader, make_controller, trigger
-from ui.overlay_model import (MESSAGE_SECONDS, NEEDS_DELETE_CONFIRMATION, STOP_REASONS,
-                              OverlayActions, OverlayState, pause_reasons)
+from ui.overlay_model import (END_LABEL, MARK, MARK_MENU, MARK_TITLE, MARKED_OVER,
+                              MESSAGE_SECONDS, NEEDS_DELETE_CONFIRMATION, REFUSAL_CLOSED,
+                              REMINDER_SECONDS, SENSITIVE_END, STOP, STOP_MENU, STOP_TITLE,
+                              OverlayActions, OverlayState, menu)
 
-PAUSES = pause_reasons(("patient_declined", "sensitive_personal_matter",
-                        "non_clinical_interruption", "other"))
+GRANTED = AuthOutcome("granted", "GRANTED", "", None, "confirmed")
 
 
 def recording(**extra):
     return {"is_recording": True, "is_paused": False, "duration_seconds": 65,
-            "authorisation": "granted", "confirmation": "confirmed", **extra}
-
-
-def paused(reason="patient_declined"):
-    return {"is_recording": False, "is_paused": True, "pause": {"reason": reason},
-            "authorisation": "granted", "confirmation": "confirmed"}
+            "authorisation": "granted", "confirmation": "confirmed",
+            "consent_open": True, **extra}
 
 
 class Clock:
@@ -45,86 +41,103 @@ class Clock:
 # ============================================================
 
 def test_hidden_when_nothing_is_recording():
-    """SRS-UIX-01."""
     assert OverlayState().view({}).visible is False
 
 
-def test_recording_shows_both_controls():
+def test_recording_shows_a_dot_and_no_clock():
     view = OverlayState().view(recording())
-    assert view.visible and view.headline == "Recording  01:05"
-    assert (view.stop_enabled, view.pause_enabled, view.pause_label) == (True, True, "Pause")
+    assert view.visible and view.dot == "recording"
+    assert not hasattr(view, "headline"), "3.9.8 shows no clock or headline"
 
 
-def test_paused_offers_resume():
-    view = OverlayState().view(paused())
-    assert (view.headline, view.pause_label, view.pause_enabled) == ("Paused", "Resume", True)
+def test_the_stop_menu_says_recording_continues_and_offers_four_choices():
+    title, items = menu(STOP, OverlayState().view(recording()))
+    assert title == STOP_TITLE and "Recording continues" in title
+    assert [(v, w) for v, w, _ in items] == STOP_MENU
+    assert items[0][0] == REFUSAL_REASON and all(enabled for _, _, enabled in items)
 
 
-def test_holding_for_stop_offers_only_the_form():
-    view = OverlayState().view(paused(STOP_HOLD_REASON))
-    assert view.headline == "Stopped - choose a reason"
-    assert (view.stop_enabled, view.pause_enabled, view.pause_label) == (True, False, "Pause")
+def test_the_refusal_greys_out_once_api2_has_arrived():
+    title, items = menu(STOP, OverlayState().view(recording(consent_open=False)))
+    refusal = items[0]
+    assert refusal == (REFUSAL_REASON, REFUSAL_CLOSED, False)
+    assert all(enabled for _, _, enabled in items[1:])
+
+
+def test_the_mark_menu_says_the_part_will_be_removed():
+    title, items = menu(MARK, OverlayState().view(recording()))
+    assert title == MARK_TITLE and "will be removed before anyone listens" in title
+    assert [(v, w) for v, w, _ in items] == MARK_MENU
+    assert [w for _, w in MARK_MENU] == ["Patient's request", "Sensitive personal matter",
+                                         "Interruption"]
+
+
+def test_a_marked_part_offers_to_end_it_and_asks_after_two_minutes():
+    marked = recording(sensitive={"reason": "patient_request", "label": "Patient's request",
+                                  "seconds": 30})
+    view = OverlayState().view(marked)
+    assert view.marked == "Patient's request" and not view.alarm
+    title, items = menu(MARK, view)
+    assert "Patient's request" in title and items == [(SENSITIVE_END, END_LABEL, True)]
+    late = recording(sensitive={"reason": "patient_request", "label": "Patient's request",
+                                "seconds": REMINDER_SECONDS})
+    view = OverlayState().view(late)
+    assert view.alarm and menu(MARK, view)[0] == MARKED_OVER
 
 
 def test_confirming_is_said_in_plain_words():
-    """SRS-UIX-13: no error, no sound - just what is happening."""
-    state = OverlayState()
-    assert state.view(recording(confirmation="confirming")).note == "Checking with CMED…"
-    assert "waiting for the AIMS LAB server" in state.view(
-        recording(authorisation="pending")).note
+    view = OverlayState().view(recording(confirmation="confirming"))
+    assert view.note == "Checking with CMED…"
 
 
-def test_confirmation_events_update_the_note():
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("session_unconfirmed", {"session_id": "S1"})
-    assert state.view(recording()).note == "Not confirmed by CMED yet - still recording"
-    state.on_event("session_confirmed", {"session_id": "OTHER"})       # not this one
-    assert "Not confirmed" in state.view(recording()).note
-    state.on_event("session_confirmed", {"session_id": "S1"})
-    assert state.view(recording()).note == "Confirmed"
+def test_a_choice_is_acknowledged_briefly():
+    clock = Clock()
+    state = OverlayState(clock)
+    state.on_event("doctor_marked", {"reason": "patient_left"})
+    assert state.view(recording()).note == "Noted: Patient left the room. Recording continues."
+    clock.now += MESSAGE_SECONDS + 1
+    assert state.view(recording()).note == ""
 
 
-def test_a_warning_appears_once_per_consultation():
-    """SRS-LVL-06."""
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("integrity_alert", {"alert_type": "silent_session"})
-    assert "gives no signal" in state.view(recording()).note
-    state.note = "Confirmed"
-    state.on_event("integrity_alert", {"alert_type": "silent_session"})
-    assert state.view(recording()).note == "Confirmed"
-    state.on_event("recording_started", {"session_id": "S2"})
-    state.on_event("integrity_alert", {"alert_type": "silent_session"})
-    assert "muted" in state.view(recording()).note
-
-
-def test_why_a_recording_ended_stays_on_screen_briefly():
+def test_why_a_recording_was_deleted_stays_on_screen_briefly():
     clock = Clock()
     state = OverlayState(clock)
     state.on_event("session_refused", {"session_id": "S1"})
     view = state.view({})
-    assert view.visible and "deleted" in view.headline
+    assert view.visible and "did not consent" in view.note
     clock.now += MESSAGE_SECONDS + 1
     assert state.view({}).visible is False
 
 
-def test_a_held_recording_says_it_is_kept_not_deleted():
-    state = OverlayState(Clock())
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("session_held", {"session_id": "S1",
-                                    "message": "Recording. Kept on this PC."})
-    assert state.note == "Recording. Kept on this PC."
-
-
-def test_an_open_form_keeps_the_control_visible():
+def test_the_no_signal_warning_goes_when_sound_comes_back():
     state = OverlayState()
-    state.form_open = True
+    state.on_event("recording_started", {"session_id": "S1"})
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
+    view = state.view(recording())
+    assert "gives no signal" in view.note and view.dot == "problem"
+    state.on_event("sound_restored", {"session_id": "S1"})
+    assert "no signal" not in state.view(recording()).note
+
+
+def test_the_card_says_which_way_the_microphone_moved():
+    state = OverlayState()
+    state.on_event("recording_started", {"session_id": "S1"})
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
+                                       "device": "Microphone Array (2- Realtek(R) Audio)"})
+    assert "Jabra unplugged" in state.view(recording()).note
+    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
+                                       "device": "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"})
+    assert state.view(recording()).note == "Back on the Jabra speakerphone."
+
+
+def test_an_open_menu_keeps_the_control_visible():
+    state = OverlayState()
+    state.menu_open = True
     assert state.view({}).visible
 
 
 # ============================================================
-# What the buttons do
+# What the choices do
 # ============================================================
 
 class Calls:
@@ -137,41 +150,56 @@ class Calls:
         make(self)
 
     def __getattr__(self, name):
-        def record(**kwargs):
-            self.made.append((name, kwargs))
+        def record(*args, **kwargs):
+            self.made.append((name, args, kwargs))
         return record
 
 
 def actions():
     calls = Calls()
-    return OverlayActions(calls.submit, PAUSES), calls
+    return OverlayActions(calls.submit), calls
 
 
-def test_refusal_is_the_first_stop_reason():
-    """SRS-CNS-02."""
-    assert STOP_REASONS[0] == (REFUSAL_REASON, "Patient did not consent")
-
-
-def test_stop_press_and_cancel():
-    """3.9.4: Stop no longer cuts the microphone; the recording carries on until a
-    reason is saved, and Cancel changes nothing."""
+def test_stop_reasons_are_logged_not_obeyed():
     act, calls = actions()
-    act.press_stop()
-    act.cancel_stop()
-    assert [name for name, _ in calls.made] == ["stop_requested", "stop_cancelled"]
+    for value, _ in STOP_MENU[1:]:
+        assert act.choose(STOP, value) is None
+    assert [c[0] for c in calls.made] == ["doctor_mark"] * 3
+    assert all(c[0] not in ("stop_session", "pause_session") for c in calls.made)
 
 
-def test_a_long_pause_is_pointed_out_on_the_card():
-    from ui.overlay_model import PAUSE_REMINDER
-    state = OverlayState()
-    short = state.view({"is_paused": True, "pause": {"reason": "other", "seconds": 30}})
-    assert short.headline == "Paused" and short.note != PAUSE_REMINDER
-    long = state.view({"is_paused": True, "pause": {"reason": "other", "seconds": 125}})
-    assert long.note == PAUSE_REMINDER
-    # 3.9.5: no clock while paused, just words; at two minutes red and blinking.
-    from ui.overlay_model import PAUSED_NOTE
-    assert short.note == PAUSED_NOTE and short.alarm is False
-    assert long.alarm is True
+def test_the_refusal_asks_once_then_deletes():
+    act, calls = actions()
+    assert act.choose(STOP, REFUSAL_REASON) == NEEDS_DELETE_CONFIRMATION
+    assert calls.made == []
+    assert act.choose(STOP, REFUSAL_REASON, deletion_confirmed=True) is None
+    assert calls.made == [("refuse_session", (), {})]
+
+
+def test_the_refusal_cannot_be_chosen_once_closed():
+    act, calls = actions()
+    problem = act.choose(STOP, REFUSAL_REASON, consent_open=False, deletion_confirmed=True)
+    assert problem and calls.made == []
+
+
+def test_marking_and_ending_a_sensitive_part():
+    act, calls = actions()
+    assert act.choose(MARK, "patient_request") is None
+    assert act.choose(MARK, SENSITIVE_END) is None
+    assert [c[0] for c in calls.made] == ["sensitive_start", "sensitive_end"]
+    assert act.choose(MARK, "made_up") == "Choose a reason from the list."
+
+
+# ============================================================
+# The controller (unchanged methods, still used by the tray and older paths)
+# ============================================================
+
+@pytest.fixture
+def ctl(monkeypatch, spool, device_key):
+    controller = make_controller(monkeypatch, spool, device_key, ScriptedUploader([GRANTED]))
+    controller.cfg.pause = SimpleNamespace(
+        reasons=("patient_declined", "other"), self_authorise_seconds=300)
+    return controller
 
 
 async def test_stop_pressed_keeps_recording_until_a_reason_is_saved(ctl):
@@ -200,65 +228,6 @@ async def test_each_recording_keeps_its_own_log_and_sends_it(ctl, spool, device_
     assert any(e == "recording_resumed" for e, _ in events)
     again = SessionSpool.load(session.directory, device_key=device_key, spool_key=spool._key)
     assert [e["event"] for e in again.events] == [e for e, _ in events]
-
-
-@pytest.mark.parametrize("reason,detail,problem", [
-    (None, "", "Choose a reason."),
-    ("made_up", "", "Choose a reason from the list."),
-    ("other", "   ", "Please describe the reason."),
-])
-def test_stop_needs_a_reason(reason, detail, problem):
-    """SRS-UIX-06, -07: nothing closes without a reason."""
-    act, calls = actions()
-    assert act.confirm_stop(reason, detail) == problem
-    assert calls.made == []
-
-
-def test_refusal_asks_once_before_deleting():
-    """SRS-CNS-08."""
-    act, calls = actions()
-    assert act.confirm_stop(REFUSAL_REASON) == NEEDS_DELETE_CONFIRMATION
-    assert calls.made == []
-    assert act.confirm_stop(REFUSAL_REASON, deletion_confirmed=True) is None
-    assert calls.made == [("refuse_session", {})]
-
-
-def test_stop_reasons_become_close_reasons():
-    act, calls = actions()
-    act.confirm_stop("consultation_finished")
-    act.confirm_stop("patient_left", "  went for an X-ray  ")
-    assert calls.made == [
-        ("stop_session", {"reason": "doctor_stopped", "detail": ""}),
-        ("stop_session", {"reason": "doctor_stopped:patient_left",
-                          "detail": "went for an X-ray"}),
-    ]
-
-
-def test_pause_needs_a_reason_then_pauses():
-    """SRS-UIX-05."""
-    act, calls = actions()
-    assert act.confirm_pause(None) == "Choose a reason."
-    assert act.confirm_pause("other") == "Please describe the reason."
-    assert act.confirm_pause(STOP_HOLD_REASON) == "Choose a reason from the list."
-    assert act.confirm_pause("sensitive_personal_matter") is None
-    assert calls.made[-1] == ("pause_session", {"reason": "sensitive_personal_matter",
-                                                "reason_detail": "", "authorised_by": "",
-                                                "expected_seconds": 0})
-
-
-# ============================================================
-# The controller: hold for Stop
-# ============================================================
-
-GRANTED = AuthOutcome("granted", "GRANTED", "", None, "confirmed")
-
-
-@pytest.fixture
-def ctl(monkeypatch, spool, device_key):
-    controller = make_controller(monkeypatch, spool, device_key, ScriptedUploader([GRANTED]))
-    controller.cfg.pause = SimpleNamespace(
-        reasons=("patient_declined", "other"), self_authorise_seconds=300)
-    return controller
 
 
 async def test_stop_press_cuts_the_microphone_at_once(ctl):
@@ -314,93 +283,56 @@ async def test_the_hold_reason_cannot_be_chosen_from_outside(ctl):
         await ctl.pause_session(reason=STOP_HOLD_REASON, reason_detail="")
 
 
+
 # ============================================================
 # The window itself
 # ============================================================
 
-def test_the_window_builds(tmp_path):
-    """Smoke test: the real tkinter window builds and takes a view, hidden."""
+def test_the_window_builds_and_opens_its_menus():
+    """Smoke test: the real tkinter window builds, takes a view and opens both menus."""
     tk = pytest.importorskip("tkinter")
     from ui.overlay import Overlay
 
-    runtime = SimpleNamespace(cfg=SimpleNamespace(pause=SimpleNamespace(
-        reasons=("patient_declined", "other"))), controller=None, loop=None)
+    runtime = SimpleNamespace(cfg=SimpleNamespace(pause=SimpleNamespace(reasons=())),
+                              controller=None, loop=None)
     overlay = Overlay(runtime, visible=False)
     try:
         overlay.build()
     except tk.TclError as exc:
         pytest.skip(f"no display: {exc}")
-    def drawn(overlay):
-        """Every piece of text currently on the card."""
-        canvas = overlay.canvas
-        return [canvas.itemcget(item, "text") for item in canvas.find_all()
-                if canvas.type(item) == "text"]
+
+    def texts(window):
+        found = []
+
+        def walk(widget):
+            try:
+                found.append(widget.cget("text"))
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+        walk(window)
+        return found
 
     try:
         status = recording()
         overlay.apply(OverlayState().view(status), status)
-        words = drawn(overlay)
-        assert "Recording" in words
-        assert "01:05" in words              # the elapsed time, read across a desk
+        overlay._open_menu(STOP)
+        words = texts(overlay.menu_window)
+        assert STOP_TITLE in words and "Patient did not consent" in words
+        assert "Emergency" in words
+        overlay._close_menu()
+        overlay._open_menu(MARK)
+        assert MARK_TITLE in texts(overlay.menu_window)
+        overlay._close_menu()
+        assert overlay.menu_window is None
 
-        status = paused()
-        overlay.apply(OverlayState().view(status), status)
-        assert "Paused" in drawn(overlay)
-        assert overlay._pause_text == "Resume"
-        assert overlay.window.state() == "withdrawn"
-
-        # A long pause is a consultation, not a fault: however many quiet ticks,
-        # the card says nothing about the microphone. Only the recorder's own
-        # "no signal" (digital silence) is shown, in red.
-        silent = dict(recording(), level=0.0)
-        for _ in range(40):
-            overlay.apply(OverlayState().view(silent), silent)
-        assert not any("no sound" in w or "no signal" in w for w in drawn(overlay))
-
-        state = OverlayState()
-        state.on_event("recording_started", {"session_id": None})
-        state.on_event("integrity_alert", {"alert_type": "silent_session"})
-        overlay.apply(state.view(silent), silent)
-        assert any("gives no signal - is it muted?" in w for w in drawn(overlay))
+        # Two minutes into a marked part its menu opens by itself and asks.
+        late = recording(session_id="S1", sensitive={"reason": "interruption",
+                                                     "label": "Interruption",
+                                                     "seconds": REMINDER_SECONDS + 1})
+        overlay.apply(OverlayState().view(late), late)
+        assert overlay.menu_window is not None and overlay.menu_kind == MARK
+        assert MARKED_OVER in texts(overlay.menu_window)
     finally:
         overlay.root.destroy()
-
-
-def test_a_paused_consultation_keeps_its_card():
-    """
-    Reported from the bench: after pausing, the control was gone and the
-    consultation could not be resumed.
-
-    A paused consultation is an open one. Its card carries Resume, and it is
-    the only thing that does - the tray can start nothing and the card has no
-    taskbar entry to click back. So `visible` must hold through a pause, for
-    every reason a doctor can choose.
-    """
-    for reason in ("patient_declined", "sensitive_personal_matter",
-                   "non_clinical_interruption", "other"):
-        view = OverlayState().view(paused(reason))
-        assert view.visible, f"the card hid while paused for {reason}"
-        assert view.stop_enabled, "Stop must stay reachable while paused"
-
-
-def test_the_no_signal_warning_goes_when_sound_comes_back():
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
-    assert "gives no signal" in state.view(recording()).note
-    state.on_event("sound_restored", {"session_id": "S1"})
-    assert "no signal" not in state.view(recording()).note
-    # It may come again if the microphone goes silent again.
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
-    assert "gives no signal" in state.view(recording()).note
-
-
-def test_the_card_says_which_way_the_microphone_moved():
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
-                                       "device": "Microphone Array (2- Realtek(R) Audio)"})
-    assert "Jabra unplugged" in state.view(recording()).note
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
-                                       "device": "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"})
-    assert state.view(recording()).note == "Back on the Jabra speakerphone."

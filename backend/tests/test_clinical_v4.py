@@ -629,3 +629,37 @@ async def test_a_prescription_received_before_is_never_a_new_version(cmed):
     code, reply = await send(cmed, "prescription", dict(b, issued_at="2025-11-15T12:20:00+06:00"))
     assert (code, reply["code"], reply["version"]) == (200, "ALREADY_RECEIVED", 2)
     assert await shown() == ["Seclo 40"]
+
+
+@postgres
+async def test_api2_reaching_an_open_recording_closes_the_refusal_on_the_pc(cmed):
+    """3.9.8: the heartbeat tells the recorder API 2 arrived; it greys out the refusal."""
+    first = api2()
+    sid = uuid.uuid4().hex[:26].upper()
+    opened = datetime.now(timezone.utc) - timedelta(minutes=2)
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                  protocol_version, status, session_date, opened_at,
+                                  segment_count)
+            VALUES ($1, $2, 'DR0042', 'HOSP003', $3, 2, 'active', $4, $5, 1)
+        """, sid, first["patient_id"], cmed.device["device_id"], opened.date(), opened)
+        await conn.execute("""
+            INSERT INTO session_clicks (session_id, entry_no, event, audio_seconds,
+                                        occurred_at, patient_id, doctor_id, cmed_hospital_id,
+                                        start_time, visit_date)
+            VALUES ($1, 1, 'patient_opened', 0, $2, $3, 'DR0042', 'CMED-DHOLPUR', $4, $5)
+        """, sid, opened, first["patient_id"], first["start_time"],
+            datetime.fromisoformat(first["date"]).date())
+    beat = api_v2.HeartbeatRequest(device_id=str(cmed.device["device_id"]), session_id=sid)
+    assert "demographics_received" not in await api_v2.heartbeat(beat, device=cmed.device)
+
+    code, reply = await send(cmed, "patient_information", first)
+    assert code in (200, 202), reply
+    reply = await api_v2.heartbeat(beat, device=cmed.device)
+    assert reply["demographics_received"] == {"session_id": sid}
+    # Another PC is told nothing; nor is anyone once the recording has closed.
+    assert not await cmed.dbs.repo.demographics_notice(uuid.uuid4(), sid)
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
+    assert not await cmed.dbs.repo.demographics_notice(cmed.device["device_id"], sid)

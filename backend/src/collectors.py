@@ -112,7 +112,9 @@ PROBLEMS = {
 # urgent, the rest as information. The recorder's form sends
 # "doctor_stopped:<reason>" for anything but "Consultation finished".
 ORDINARY_ENDS = {"doctor_stopped", "consultation_finished", "superseded_by_new_patient",
-                 "counselling_limit", "prescription_built", "software_update", ""}
+                 "counselling_limit", "prescription_built", "software_update", "",
+                 # 3.9.8: CMED's API 4 closed the visit.
+                 "consultation_ended"}
 TECHNICAL_ENDS = {"technical_problem", "recovered_after_unclean_shutdown", "pc_shutdown",
                   "agent_shutdown"}
 STOP_LABELS = {
@@ -2062,6 +2064,7 @@ class Notifier:
             if stop_kind(r["close_reason"]) is not None:
                 continue                          # an unusual end has its own alert
             how = ("next patient came in" if r["close_reason"] == "superseded_by_new_patient"
+                   else "CMED closed the visit" if r["close_reason"] == "consultation_ended"
                    else "consultation finished")
             minutes = round(float(r["total_duration_seconds"] or 0) / 60, 1)
             text = await cards.line(conn, r["closed_at"], f"{how}, {minutes} min recorded",
