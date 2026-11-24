@@ -61,6 +61,8 @@ admin_router = APIRouter(prefix="/api/v2/admin", tags=["researchers"])
 EVERYTHING_ONLY = {"recording_finished", "jabra_back", "handled"}
 PROBLEMS_ONLY = {"escalation", "pc_silent", "recording_problem", "no_shift_started",
                  "recording_too_long", "stopped_technical", "daily_report", "shift_report",
+                 # 25 Nov 2026
+                 "pc_not_on", "patients_not_recorded", "silent_recording",
                  "summary_csv", "summary_xlsx", "still_not_fixed", "problem_fixed",
                  "repeated_stops", "repeated_unusual",
                  "stopped_unusually", "jabra_unplugged", "jabra_not_plugged",
@@ -981,6 +983,7 @@ MIC_WORDS = {"jabra": "Jabra all through", "mixed": "switched off the Jabra",
              "pc": "PC microphone only", "unknown": "not reported"}
 ALERT_EVENTS = ("jabra_unplugged", "jabra_back", "jabra_not_plugged", "recording_problem",
                 "pc_silent", "recording_without_jabra", "recording_too_long",
+                "pc_not_on", "patients_not_recorded", "silent_recording",
                 "stopped_unusually", "stopped_technical", "no_shift_started",
                 "repeated_stops", "recording_paused", "still_paused", "repeated_unusual")
 
@@ -1533,6 +1536,8 @@ ALERT_NAMES = {
     "jabra_not_plugged": "Jabra not plugged in", "recording_problem": "recording problem",
     "pc_silent": "PC not reporting", "recording_without_jabra": "recorded without the Jabra",
     "recording_too_long": "recording not stopped",
+    "pc_not_on": "PC not on today", "patients_not_recorded": "patients not recorded",
+    "silent_recording": "recording is silent",
     "stopped_unusually": "stopped unusually", "stopped_technical": "stopped: technical problem",
     "recording_paused": "paused by the doctor", "recording_resumed": "resumed",
     "still_paused": "still paused after 2 min",

@@ -55,6 +55,7 @@ TECHNICAL = {"technical_problem", "recovered_after_unclean_shutdown", "pc_shutdo
 ALERT_EVENTS = ("jabra_unplugged", "jabra_not_plugged", "jabra_back", "recording_problem",
                 "recording_without_jabra", "stopped_unusually", "stopped_technical",
                 "recording_too_long", "still_paused", "pc_silent", "no_shift_started",
+                "pc_not_on", "patients_not_recorded", "silent_recording",
                 "repeated_stops", "repeated_unusual")
 ALERT_NAMES = {
     "jabra_unplugged": "Jabra unplugged", "jabra_not_plugged": "Jabra not plugged in",
@@ -62,6 +63,8 @@ ALERT_NAMES = {
     "recording_without_jabra": "Recorded without the Jabra",
     "stopped_unusually": "Stopped unusually", "stopped_technical": "Stopped: technical",
     "recording_too_long": "Recording not stopped", "still_paused": "Still paused after 2 min",
+    "pc_not_on": "PC not on today", "patients_not_recorded": "Patients not recorded",
+    "silent_recording": "Recording is silent",
     "pc_silent": "PC not reporting", "no_shift_started": "Nobody started the shift",
     "repeated_stops": "Repeated unusual stops",
     "repeated_unusual": "Same unusual event 3 times: contact the manager",

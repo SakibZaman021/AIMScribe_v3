@@ -2367,6 +2367,8 @@ const EVENT_LABELS = {
   no_shift_started: "Nobody on shift", escalation: "Not yet seen",
   recording_without_jabra: "Recorded without the Jabra", send_failures: "Alerts not sent",
   recording_too_long: "Recording not stopped", handled: "Seen", daily_report: "Daily report",
+  pc_not_on: "PC not on today", patients_not_recorded: "Patients not recorded",
+  silent_recording: "Recording is silent",
   still_not_fixed: "Still not fixed", problem_fixed: "Fixed", repeated_stops: "Repeated stops",
   shift_report: "Shift summary", summary_csv: "Summary CSV", summary_xlsx: "Summary workbook",
   stopped_unusually: "Stopped unusually", stopped_technical: "Stopped: technical problem",
