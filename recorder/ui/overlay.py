@@ -31,8 +31,8 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, REFUSAL,
-                              STOP, OverlayActions, OverlayState, menu)
+from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, STOP,
+                              OverlayActions, OverlayState, menu)
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,9 @@ BUTTON_FILL = "#f3f6fa"
 BUTTON_EDGE = "#cfd6df"
 BUTTON_HOVER_FILL = "#e4edfb"
 BUTTON_HOVER_EDGE = BLUE
-DANGER_EDGE = "#e6a3a9"        # the refusal: it deletes, so it looks different
-DANGER_HOVER_FILL = "#fbe9eb"
+FADED_FILL = "#fafbfc"         # a choice that is closed: faded out, not pressable
+FADED_EDGE = "#eef1f4"
+FADED_INK = "#c9ced5"
 CLOSE_DELAY_MS = 450           # the pointer may cross the gap to the menu
 
 SCALE = 1.0                    # display scale, set once by _enable_dpi_awareness()
@@ -623,9 +624,7 @@ class Overlay:
                  wraplength=inner_width, justify="left", anchor="w"
                  ).pack(fill="x", anchor="w", pady=(0, round(8 * SCALE)))
         for value, words, enabled in items:
-            danger = value == REFUSAL and enabled
             button = self._menu_button(inner, words, inner_width, enabled=enabled,
-                                       danger=danger,
                                        action=lambda k=kind, v=value: self._choose(k, v))
             button.pack(anchor="w", pady=(0, round(6 * SCALE)))
         inner.update_idletasks()
@@ -651,8 +650,7 @@ class Overlay:
         self._beside(box, icon.winfo_rooty())
         self._set_alpha(self.window, NEAR_ALPHA)
 
-    def _menu_button(self, parent, words: str, width: int, *, enabled: bool,
-                     danger: bool, action):
+    def _menu_button(self, parent, words: str, width: int, *, enabled: bool, action):
         """
         One choice drawn as a rounded button, so it is plain where to click.
         The whole button is the target; it lights up under the pointer.
@@ -660,24 +658,24 @@ class Overlay:
         import tkinter as tk
         import tkinter.font as tkfont
 
-        font = tkfont.Font(family=FONT, size=10, weight="bold" if enabled else "normal")
+        font = tkfont.Font(family=FONT, size=10, weight="bold" if enabled else "normal",
+                           slant="roman" if enabled else "italic")
         padx, pady = round(12 * SCALE), round(8 * SCALE)
         lines = self._wrap(words, font, width - 2 * padx)
         height = len(lines) * font.metrics("linespace") + 2 * pady
         button = tk.Canvas(parent, width=width, height=height, bg=PAPER,
                            highlightthickness=0, bd=0,
                            cursor="hand2" if enabled else "arrow")
-        ink = (RED_DEEP if danger else INK) if enabled else OFF
+        ink = INK if enabled else FADED_INK
 
         def draw(hover: bool = False) -> None:
             button.delete("all")
             if not enabled:
-                fill, edge = "#f7f8f9", "#e3e6ea"
+                fill, edge = FADED_FILL, FADED_EDGE      # faded out: closed
             elif hover:
-                fill = DANGER_HOVER_FILL if danger else BUTTON_HOVER_FILL
-                edge = RED if danger else BUTTON_HOVER_EDGE
+                fill, edge = BUTTON_HOVER_FILL, BUTTON_HOVER_EDGE
             else:
-                fill, edge = BUTTON_FILL, (DANGER_EDGE if danger else BUTTON_EDGE)
+                fill, edge = BUTTON_FILL, BUTTON_EDGE
             art = self._rounded_image(width, height, BUTTON_RADIUS, fill=fill, edge=edge,
                                       matte=PAPER, key=None)
             if art is not None:
