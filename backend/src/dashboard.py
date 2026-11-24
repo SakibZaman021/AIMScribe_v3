@@ -111,11 +111,14 @@ def _clinic(value: Optional[str]) -> Optional[str]:
 async def summary(from_date: Optional[str] = Query(None, alias="from"),
                   to_date: Optional[str] = Query(None, alias="to"),
                   hospital_id: Optional[str] = None,
+                  doctor_id: Optional[str] = None,
                   _: None = Depends(require_viewer),
                   scope: Any = Depends(collectors.hospital_scope)):
     """
     Everything §8.9 asks for, for a span of days: volume, confirmation,
     integrity, recorder health, reconciliation and the state of the copies.
+    25 Nov 2026: `doctor_id` narrows the recording counts (volume,
+    confirmation, integrity) to one doctor; the PCs and copies stay whole.
     """
     today = clinic_today()
     start = _day(from_date, today)
@@ -124,15 +127,17 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
         start, end = end, start
     # 036: a data collector sees their place's hospitals only.
     clinic = collectors.narrow(scope, _clinic(hospital_id))
+    doctor = _clinic(doctor_id) if doctor_id else None
 
     async with _pool().acquire() as conn:
         return {
             "from": start.isoformat(), "to": end.isoformat(),
             "hospital_id": _clinic(hospital_id),
             "scope": clinic if isinstance(scope, list) else None,
-            "volume": await _volume(conn, start, end, clinic),
-            "confirmation": await _confirmation(conn, start, end, clinic),
-            "integrity": await _integrity(conn, start, end, clinic),
+            "doctor_id": doctor,
+            "volume": await _volume(conn, start, end, clinic, doctor),
+            "confirmation": await _confirmation(conn, start, end, clinic, doctor),
+            "integrity": await _integrity(conn, start, end, clinic, doctor),
             "recorders": await _recorders(conn, clinic),
             "review": await _review(conn, clinic),
             "reconciliation": await _reconciliation(conn, start, end, clinic),
@@ -140,7 +145,8 @@ async def summary(from_date: Optional[str] = Query(None, alias="from"),
         }
 
 
-async def _volume(conn, start: date, end: date, clinic: Optional[str]) -> Dict[str, Any]:
+async def _volume(conn, start: date, end: date, clinic: Optional[str],
+                  doctor: Optional[str] = None) -> Dict[str, Any]:
     """`SRS-DSH-01`: recordings and recorded hours, by clinic and by doctor."""
     rows = await conn.fetch("""
         SELECT session_date, hospital_id, doctor_id,
@@ -150,9 +156,10 @@ async def _volume(conn, start: date, end: date, clinic: Optional[str]) -> Dict[s
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND confirmation <> 'refused'
+           AND ($4::text IS NULL OR doctor_id = $4)
          GROUP BY session_date, hospital_id, doctor_id
          ORDER BY session_date, hospital_id, doctor_id
-    """, start, end, clinic)
+    """, start, end, clinic, doctor)
 
     by_day: Dict[str, Dict[str, Any]] = {}
     by_clinic: Dict[str, Dict[str, Any]] = {}
@@ -183,16 +190,17 @@ async def _volume(conn, start: date, end: date, clinic: Optional[str]) -> Dict[s
 
 
 async def _confirmation(conn, start: date, end: date,
-                        clinic: Optional[str]) -> Dict[str, Any]:
+                        clinic: Optional[str], doctor: Optional[str] = None) -> Dict[str, Any]:
     """`SRS-DSH-08`: confirmed, still confirming, unconfirmed - per day and clinic."""
     rows = await conn.fetch("""
         SELECT session_date, hospital_id, confirmation, count(*) AS n
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
+           AND ($4::text IS NULL OR doctor_id = $4)
          GROUP BY session_date, hospital_id, confirmation
          ORDER BY session_date, hospital_id
-    """, start, end, clinic)
+    """, start, end, clinic, doctor)
 
     totals: Dict[str, int] = {}
     per_day: Dict[str, Dict[str, Any]] = {}
@@ -207,7 +215,7 @@ async def _confirmation(conn, start: date, end: date,
 
 
 async def _integrity(conn, start: date, end: date,
-                     clinic: Optional[str]) -> Dict[str, Any]:
+                     clinic: Optional[str], doctor: Optional[str] = None) -> Dict[str, Any]:
     """
     `SRS-DSH-03`: chains that failed, recordings quarantined and why, and
     consultations the doctor stopped before the end.
@@ -221,9 +229,10 @@ async def _integrity(conn, start: date, end: date,
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
            AND quarantine_reason IS NOT NULL
+           AND ($4::text IS NULL OR doctor_id = $4)
          GROUP BY hospital_id, doctor_id, quarantine_reason
          ORDER BY n DESC
-    """, start, end, clinic)
+    """, start, end, clinic, doctor)
 
     stopped = await conn.fetch("""
         SELECT hospital_id, doctor_id,
@@ -234,10 +243,11 @@ async def _integrity(conn, start: date, end: date,
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
+           AND ($4::text IS NULL OR doctor_id = $4)
            AND """ + _stopped_early("sessions.") + """
          GROUP BY 1, 2, 3
          ORDER BY n DESC
-    """, start, end, clinic)
+    """, start, end, clinic, doctor)
 
     alerts = await conn.fetch("""
         SELECT a.alert_type, a.severity, count(*) AS n
@@ -266,7 +276,8 @@ async def _integrity(conn, start: date, end: date,
           FROM sessions
          WHERE session_date BETWEEN $1 AND $2
            AND ($3::text[] IS NULL OR hospital_id = ANY($3::text[]))
-    """, start, end, clinic)
+           AND ($4::text IS NULL OR doctor_id = $4)
+    """, start, end, clinic, doctor)
 
     return {
         "not_jabra_total": int(more["not_jabra"] or 0) if more else 0,
@@ -550,6 +561,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                      hospital_id: Optional[str] = None,
                      doctor_id: Optional[str] = None,
                      patient_id: Optional[str] = None,
+                     visit_id: Optional[str] = None,
                      state: Optional[str] = None,
                      search: Optional[str] = None,
                      limit: int = 100,
@@ -582,7 +594,13 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     if doctor:
         add("s.doctor_id = $N", doctor)
     if patient:
-        add("s.patient_id = $N", patient)
+        # 25 Nov 2026: the start of a patient ID finds it (CMED's are long).
+        add("starts_with(s.patient_id, $N)", patient)
+    if isinstance(visit_id, str) and visit_id.strip():
+        # 25 Nov 2026: CMED's visit ID, as the recording's trigger or grant carried it.
+        add("(s.manifest->'trigger'->>'visit_id' = $N OR EXISTS ("
+            "SELECT 1 FROM grant_authorisations g WHERE g.jti = s.grant_jti "
+            "AND g.visit_id = $N))", visit_id.strip()[:128])
     if isinstance(search, str) and search:
         # Part of a file name, on the trigram index (SRS-DBA-24).
         add("s.file_stem ILIKE '%' || $N || '%'", search[:128])

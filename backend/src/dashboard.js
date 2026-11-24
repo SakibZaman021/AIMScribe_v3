@@ -1063,7 +1063,16 @@ function fillRecDoctors(clinic) {
     + ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
   sel.value = ids.includes(chosen) ? chosen : "";
 }
-$("recDoctor").addEventListener("change", () => loadRecordings());
+// 25 Nov 2026: the doctor narrows the counts too (All, Waiting for CMED, ...),
+// so a change refreshes the summary; patient and visit narrow the list only.
+$("recDoctor").addEventListener("change", () => refresh());
+let recSearchTimer = null;
+for (const id of ["recPatient", "recVisit"]) {
+  $(id).addEventListener("input", () => {
+    clearTimeout(recSearchTimer);
+    recSearchTimer = setTimeout(loadRecordings, 400);
+  });
+}
 
 async function loadRecordings() {
   const clinic = $("clinic").value;
@@ -1076,12 +1085,16 @@ async function loadRecordings() {
   try {
     const params = { from: $("from").value, to: $("to").value, hospital_id: clinic, limit: 200 };
     if (doctor) params.doctor_id = doctor;
+    const patient = $("recPatient").value.trim(), visitId = $("recVisit").value.trim();
+    if (patient) params.patient_id = patient;
+    if (visitId) params.visit_id = visitId;
     if (STATE) params.state = STATE;
     const d = await api("/recordings", params);
     if (seq !== recSeq) return;
     const list = d.recordings || [];
     $("recTable").innerHTML = recordingsTable(list);
-    $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
+    $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""}`
+      + `${patient ? ` · patient ${patient}…` : ""}${visitId ? ` · ${visitId}` : ""} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
   } catch (err) {
     if (seq !== recSeq) return;
     $("recTable").innerHTML = empty("Could not load recordings", err.message);
@@ -1189,8 +1202,10 @@ async function refresh() {
   BUSY = true;
   markRanges();
   try {
+    fillRecDoctors($("clinic").value);
     const d = await api("/summary", { from: $("from").value, to: $("to").value,
-                                      hospital_id: $("clinic").value });
+                                      hospital_id: $("clinic").value,
+                                      doctor_id: $("recDoctor").value });
     LAST = d;
     drawAll(d);
     await loadRecordings();

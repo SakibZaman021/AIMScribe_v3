@@ -119,6 +119,8 @@
       <section class="panel" aria-labelledby="recTitle" id="recPanel">
         <div class="head wrap"><h3 id="recTitle">Recordings</h3>
           <label class="field"><span>Doctor</span> <select id="recDoctor"><option value="">All doctors</option></select></label>
+          <label class="field"><span>Patient ID</span> <input id="recPatient" type="search" placeholder="start of the ID" autocomplete="off" size="14"></label>
+          <label class="field"><span>Visit ID</span> <input id="recVisit" type="search" placeholder="e.g. visit-5089c273" autocomplete="off" size="16"></label>
           <span class="hint" id="recHint"></span></div>
         <div class="chips small bar" id="stateFilters" role="group" aria-label="Filter recordings by state"></div>
         <div class="scroll tall"><div id="recTable"></div></div>
