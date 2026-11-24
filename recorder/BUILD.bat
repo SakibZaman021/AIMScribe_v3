@@ -50,6 +50,13 @@ if "%AIMS_BACKEND%"=="" (
     echo ERROR: set AIMS_BACKEND=https://^<the AIMS LAB server^> - new PCs are pointed at it.
     goto :fail
 )
+REM 25 Nov 2026: an installer never defaults to the beta / testing server (:9443).
+echo %AIMS_BACKEND% | findstr /C:":9443" >nul
+if not errorlevel 1 (
+    echo ERROR: AIMS_BACKEND is the BETA / testing server ^(%AIMS_BACKEND%^).
+    echo        Installers are built for the real server, https://aimscribe.iriic.uiu.ac.bd
+    goto :fail
+)
 REM AIMS_ORIGIN is optional: CMED's EHR addresses come from the AIMS LAB server,
 REM so one installer serves every hospital. Set it only for a development bench.
 

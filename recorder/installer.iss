@@ -55,8 +55,11 @@
 ; The server and the CMED page a NEW PC is pointed at. Required: an installer
 ; built without them used to fall back to the old v1 server on Render and a
 ; test page on vercel.app, so a PC set up from it talked to the wrong system.
-; An upgrade ignores these and keeps what that PC already has; /BACKEND= and
-; /ORIGIN= on the command line override both.
+; 25 Nov 2026 (the owner's rule): the server box ALWAYS shows the real
+; AIMScribe server, https://aimscribe.iriic.uiu.ac.bd - on a new PC and on an
+; upgrade alike - never the beta / testing server a test PC may have been
+; pointed at. Only /BACKEND= on the command line chooses another server.
+; The CMED address is still kept across an upgrade; /ORIGIN= overrides it.
 #ifndef DefaultBackend
   #error Build with /DDefaultBackend=https://<the AIMS LAB server> (see BUILD.bat)
 #endif
@@ -262,7 +265,11 @@ begin
   else
     ConfigPage.Add('Enrolment token (optional):', False);
 
-  ConfigPage.Values[0] := Choose('BACKEND', 'AIMS_BACKEND_URL', '{#DefaultBackend}');
+  { Always the real server unless the command line names one: the PC's own
+    value is not offered, so a test PC on the beta server is never shown
+    (or kept on) the beta address by pressing Next. }
+  ConfigPage.Values[0] := Trim(ExpandConstant('{param:BACKEND|}'));
+  if ConfigPage.Values[0] = '' then ConfigPage.Values[0] := '{#DefaultBackend}';
   ConfigPage.Values[1] := Choose('ORIGIN', 'AIMS_ALLOWED_ORIGINS', '{#DefaultOrigin}');
   ConfigPage.Values[2] := Trim(ExpandConstant('{param:TOKEN|}'));
   { Kept across an upgrade only if it was made by the secure generator. A key
@@ -314,6 +321,12 @@ begin
               'it empty and this PC joins by itself at its first consultation.';
 end;
 
+{ The beta / testing server: the same name on port 9443. }
+function IsBetaServer(const Url: String): Boolean;
+begin
+  Result := Pos(':9443', Lowercase(Url)) > 0;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   Problem: String;
@@ -328,6 +341,13 @@ begin
     Result := WizardSilent();
     Exit;
   end;
+  { Someone typed the beta address into the box: say what it is. }
+  if IsBetaServer(ConfigPage.Values[0]) and not WizardSilent() then
+    Result := MsgBox('This is the BETA / TESTING server, not the real AIMScribe server ' +
+                     '(https://aimscribe.iriic.uiu.ac.bd).' + #13#10 + #13#10 +
+                     'Recordings from this PC will go to the test server only. ' +
+                     'Use it only for a test PC. Continue with the BETA server?',
+                     mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
   { No token is fine from 3.7: the PC's key is in its TPM (setup stops on a PC
     without one), and it registers itself at its first CMED consultation. }
 end;
