@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse, Response
 
 import api_v2
 import collectors
+import environment
 from api_v2 import require_admin, require_viewer
 from integrity import safe_identifier
 
@@ -1388,8 +1389,15 @@ async def page() -> HTMLResponse:
         raise HTTPException(status_code=404, detail="dashboard.html is missing")
     # The same policy the gateway sets, so the page is as strict when it is
     # opened on the server itself, without the gateway in front.
-    return HTMLResponse(html.read_text(encoding="utf-8"),
-                        headers={"Content-Security-Policy": PAGE_POLICY})
+    text = html.read_text(encoding="utf-8")
+    if environment.is_beta():
+        # The beta server's page says so, in the tab, the sidebar and a banner.
+        text = text.replace("<title>AIMScribe Server Dashboard</title>",
+                            f"<title>{environment.title('AIMScribe Server Dashboard')}</title>", 1)
+        text = text.replace("<small>AIMS LAB server</small>",
+                            "<small>BETA - testing server</small>", 1)
+        text = text.replace("<body>", "<body>" + environment.banner_html("beta-banner"), 1)
+    return HTMLResponse(text, headers={"Content-Security-Policy": PAGE_POLICY})
 
 
 # The page's own policy: its script, its style and its own API, nothing else.

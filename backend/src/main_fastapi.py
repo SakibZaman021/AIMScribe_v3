@@ -22,6 +22,7 @@ from message_queue.redis_async import AsyncRedisClient
 
 # Protocol 2: device identity, integrity chain, purge receipts, archive handshake.
 import api_v2
+import environment
 import schema_check
 from api_v2 import router as v2_router
 from clinical import router as clinical_router
@@ -362,7 +363,13 @@ _FRONT_PAGE = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def front_page():
-    return _FRONT_PAGE.format(version=SYSTEM_VERSION, srs=SRS_VERSION)
+    page = _FRONT_PAGE.format(version=SYSTEM_VERSION, srs=SRS_VERSION)
+    if environment.is_beta():
+        # The beta server's front page says so (25 Nov 2026).
+        page = page.replace("<title>AIMScribe v3</title>",
+                            f"<title>{environment.title('AIMScribe v3')}</title>", 1)
+        page = page.replace("<body><main>", "<body><main>" + environment.banner_html(), 1)
+    return page
 
 
 # ============================================================================
