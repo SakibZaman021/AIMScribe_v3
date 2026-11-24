@@ -309,6 +309,9 @@ def test_the_window_builds_and_opens_its_menus():
                 found.append(widget.cget("text"))
             except Exception:
                 pass
+            if widget.winfo_class() == "Canvas":       # the choices are drawn buttons
+                found.extend(widget.itemcget(item, "text") for item in widget.find_all()
+                             if widget.type(item) == "text")
             for child in widget.winfo_children():
                 walk(child)
         walk(window)
