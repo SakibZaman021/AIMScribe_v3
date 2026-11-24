@@ -759,6 +759,24 @@ class V2Repository:
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
                  close_reason or None, local_date, local_start, local_end)
+            # 25 Nov 2026 (recorder 3.9.7): every microphone the recording used,
+            # from its own log - the heartbeat saw one every 30 s, so a short
+            # recording or a third microphone between two heartbeats was missed.
+            # Added after those already known, each once, in the order used.
+            used = [str(e.get("detail"))[:200] for e in (manifest.get("events") or [])
+                    if isinstance(e, dict) and e.get("event") == "microphone"
+                    and e.get("detail")]
+            if used:
+                await conn.execute("""
+                    UPDATE sessions
+                       SET microphones = (
+                           SELECT array_agg(m ORDER BY first)
+                             FROM (SELECT m, min(n) AS first
+                                     FROM unnest(COALESCE(microphones, '{}') || $2::text[])
+                                          WITH ORDINALITY AS u(m, n)
+                                    GROUP BY m) AS x)
+                     WHERE session_id = $1
+                """, session_id, used)
 
     async def note_pause(self, session_id: str, at: Optional[str],
                          reason: Optional[str]) -> None:

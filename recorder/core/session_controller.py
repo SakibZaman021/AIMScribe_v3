@@ -581,6 +581,11 @@ class SessionController:
             segmenter.start(opened_at)
             try:
                 recorder.start()
+                # 3.9.7: the microphone the recording opened on, in its own log.
+                try:
+                    spool_session.log_event("microphone", recorder.device_name)
+                except Exception as exc:
+                    logger.debug("Microphone not logged: %s", exc)
             except AudioCaptureError as exc:
                 segmenter.stop(seal_remaining=False)
                 self._emit("integrity_alert", {
@@ -1604,6 +1609,17 @@ class SessionController:
     def _on_microphone_switched(self, device: str, seconds_lost: float) -> None:
         """Called from the audio watchdog: the recording moved to another microphone."""
         active = self._active
+        why = getattr(getattr(active, "recorder", None), "last_switch_reason", "") if active else ""
+        # 3.9.7: every microphone the recording used, in its own log, by its full
+        # name - the heartbeat saw only one every 30 s, so a short recording or a
+        # third microphone used between two heartbeats was never known.
+        if active is not None:
+            try:
+                active.spool.log_event("microphone", device)
+                if why:
+                    active.spool.log_event("microphone_switch", f"{why}; now {device}")
+            except Exception as exc:
+                logger.debug("Microphone not logged: %s", exc)
         if active is not None and seconds_lost >= 0.5:
             # The gap is real time with no audio. Without this every later clip's
             # timestamps would be early by the length of the gap.
@@ -1698,6 +1714,11 @@ class SessionController:
                                        "heartbeat until it joins at its first CMED patient")
                     continue
                 self._told_not_joined = False
+                if self._active is None:
+                    # 3.9.7: between patients too, the Jabra is made the Windows
+                    # default (100%, unmuted) as soon as it is plugged in - not
+                    # only when a recording starts.
+                    await self._ready_microphone()
                 payload = self.heartbeat_payload()
                 health = getattr(self._uploader, "health", None)
                 reply = await self._uploader.heartbeat(payload)

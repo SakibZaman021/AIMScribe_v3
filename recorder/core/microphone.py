@@ -227,6 +227,19 @@ def endpoint_names() -> List[str]:
         return []
 
 
+def readable_name(name: str) -> str:
+    """
+    3.9.7: a device name as Windows shows it. The audio library decodes the
+    MME name with the wrong code page, so "Intel®" arrived as "IntelÂ®";
+    undone where it can be, else left as it was.
+    """
+    try:
+        fixed = name.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+    return fixed if fixed != name else name
+
+
 def same_device(short: str, full: str) -> bool:
     """
     Whether the audio library's name for a device (cut to 31 characters, as
@@ -271,4 +284,4 @@ def current() -> Optional[Endpoint]:
 
 
 __all__ = ["DEFAULT_PREFERRED", "Endpoint", "make_ready", "recording_devices",
-           "endpoint_names", "same_device", "current"]
+           "endpoint_names", "same_device", "readable_name", "current"]
