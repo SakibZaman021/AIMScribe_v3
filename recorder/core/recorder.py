@@ -89,6 +89,13 @@ class AudioRecorder:
     # How often, while recording on another microphone, to look for the
     # clinic's own (the Jabra) having been plugged back in.
     PREFERRED_CHECK_SECONDS = 5.0
+    # 3.9.7 (25 Nov 2026): GP-Males' own microphone gave exact zeros for 45
+    # recordings. On any microphone but the clinic's, this long of pure
+    # digital silence moves the recording: to the Jabra if it is plugged in,
+    # else to another microphone that gives sound. On the Jabra it never
+    # moves - a quiet room is silence too.
+    SILENCE_SECONDS = 5.0
+    SILENCE_RETRY_SECONDS = 60.0
 
     def __init__(
         self,
@@ -131,6 +138,12 @@ class AudioRecorder:
         self._last_read = 0.0
         self._abandoned: list = []
         self.device_name = "microphone"
+        self.device_index: Optional[int] = None
+        # 3.9.7: why the last switch happened, for the recording's log.
+        self.last_switch_reason = ""
+        # 3.9.7: when the current stream began giving pure zeros (None: it gives sound).
+        self._zero_since: Optional[float] = None
+        self._silence_tried_at = 0.0
 
         self.stats = CaptureStats()
 
@@ -257,6 +270,7 @@ class AudioRecorder:
                                "Windows default instead", index, last)
             self._pyaudio, self._stream = handle, stream
             self.device_name = self._name_of(handle, candidate)
+            self.device_index = candidate
             return
         try:
             handle.terminate()
@@ -308,7 +322,8 @@ class AudioRecorder:
             listed = str(info.get("name", "microphone"))
         except Exception:
             return "microphone"
-        from core.microphone import endpoint_names, same_device
+        from core.microphone import endpoint_names, readable_name, same_device
+        listed = readable_name(listed)
         return next((full for full in endpoint_names() if same_device(listed, full)), listed)
 
     def _launch(self) -> None:
@@ -316,6 +331,7 @@ class AudioRecorder:
         self._generation += 1
         self._failed = False
         self._last_read = time.monotonic()
+        self._zero_since = None
         self._thread = threading.Thread(
             target=self._capture_loop, args=(self._generation, self._stream),
             name="AudioCapture", daemon=True)
@@ -398,6 +414,13 @@ class AudioRecorder:
             if generation != self._generation:
                 break                   # replaced while this read was blocked
             self._last_read = time.monotonic()
+            # 3.9.7: pure digital silence (every byte zero) is a microphone giving
+            # nothing - not a quiet room, which always has some noise.
+            if data and not data.strip(b"\x00"):
+                if self._zero_since is None:
+                    self._zero_since = self._last_read
+            else:
+                self._zero_since = None
             self.stats.frames += chunk_frames
             self.stats.bytes_captured += len(data)
 
@@ -439,9 +462,93 @@ class AudioRecorder:
             if self._failed or stalled:
                 self._failover("reads failed" if self._failed else
                                f"no audio for {self.stall_seconds:.1f}s")
+            elif self._silent_too_long():
+                self._escape_silence()
             elif time.monotonic() - checked >= self.PREFERRED_CHECK_SECONDS:
                 checked = time.monotonic()
                 self._return_to_preferred()
+
+    def _silent_too_long(self) -> bool:
+        """Pure zeros for SILENCE_SECONDS on a microphone that is not the clinic's."""
+        since = self._zero_since
+        if since is None or self.on_preferred():
+            return False
+        now = time.monotonic()
+        return (now - since >= self.SILENCE_SECONDS
+                and now - self._silence_tried_at >= self.SILENCE_RETRY_SECONDS)
+
+    def _escape_silence(self) -> None:
+        """
+        3.9.7: the microphone gives pure silence. The Jabra first, if it is plugged
+        in; else the first other microphone that gives sound. Tried at most once
+        a minute; when nothing better exists the recording stays where it is.
+        """
+        self._silence_tried_at = time.monotonic()
+        silent = self.device_name
+        logger.critical("%s gives pure silence; looking for a microphone with sound", silent)
+        self._return_to_preferred()
+        if self.on_preferred():
+            return
+        import pyaudio
+        handle = pyaudio.PyAudio()
+        try:
+            host = handle.get_default_host_api_info()["index"]
+        except Exception:
+            host = None
+        try:
+            count = handle.get_device_count()
+        except Exception:
+            count = 0
+        for index in range(count):
+            if index == self.device_index:
+                continue
+            try:
+                info = handle.get_device_info_by_index(index)
+            except Exception:
+                continue
+            if int(info.get("maxInputChannels", 0)) <= 0 or \
+                    (host is not None and info.get("hostApi") != host):
+                continue
+            stream = None
+            try:
+                stream = handle.open(
+                    format=pyaudio.paInt16 if self.sample_width == 2 else pyaudio.paInt32,
+                    channels=self.channels, rate=self.sample_rate, input=True,
+                    input_device_index=index, frames_per_buffer=self.frames_per_buffer)
+                probe = b"".join(stream.read(self.frames_per_buffer, exception_on_overflow=False)
+                                 for _ in range(4))
+            except Exception as exc:
+                logger.info("Microphone %s could not be tried: %s", info.get("name"), exc)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                continue
+            if not probe.strip(b"\x00"):
+                stream.close()                   # silent too
+                continue
+            with self._state_lock:
+                if not self._running.is_set():
+                    stream.close()
+                    handle.terminate()
+                    return
+                self._abandon()
+                self._pyaudio, self._stream = handle, stream
+                self.device_name = self._name_of(handle, index)
+                self.device_index = index
+                self.stats.device_changes += 1
+                self._launch()
+            logger.warning("%s gave pure silence: recording continues on %s",
+                           silent, self.device_name)
+            if self._on_device_change:
+                self.last_switch_reason = f"{silent} gave pure silence"
+                self._on_device_change(self.device_name, 0.0)
+            return
+        handle.terminate()
+        logger.critical("%s gives pure silence and no other microphone gives sound", silent)
+        if self._on_error:
+            self._on_error(f"{silent} gives no sound and no other microphone is available")
 
     def on_preferred(self) -> bool:
         """Whether the recording is on the clinic's own microphone (or none is named)."""
@@ -489,11 +596,13 @@ class AudioRecorder:
             self._abandon()                     # the old reader sees a newer generation and stops
             self._pyaudio, self._stream = handle, stream
             self.device_name = self._name_of(handle, index)
+            self.device_index = index
             self.stats.device_changes += 1
             self._launch()
         logger.warning("The clinic microphone is back: recording continues on %s",
                        self.device_name)
         if self._on_device_change:
+            self.last_switch_reason = "the clinic microphone is back"
             self._on_device_change(self.device_name, 0.0)
 
     def _failover(self, why: str) -> None:
@@ -531,6 +640,7 @@ class AudioRecorder:
         logger.warning("Recording continues on %s after %.1fs without audio",
                        self.device_name, gap)
         if self._on_device_change:
+            self.last_switch_reason = why
             self._on_device_change(self.device_name, gap)
 
     # ---- metrics ----
