@@ -31,8 +31,8 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, STOP,
-                              OverlayActions, OverlayState, menu)
+from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, REFUSAL,
+                              STOP, OverlayActions, OverlayState, menu)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,15 @@ DOT = 10
 IDLE_ALPHA = 0.85              # a little see-through until the pointer comes near
 NEAR_ALPHA = 1.0
 MENU_WIDTH = 300
+MENU_KEY = "#fdfdfc"           # around the menu's rounded corners: see-through
+MENU_RADIUS = 14               # the menu's corners
+BUTTON_RADIUS = 9              # each choice's corners
+BUTTON_FILL = "#f3f6fa"
+BUTTON_EDGE = "#cfd6df"
+BUTTON_HOVER_FILL = "#e4edfb"
+BUTTON_HOVER_EDGE = BLUE
+DANGER_EDGE = "#e6a3a9"        # the refusal: it deletes, so it looks different
+DANGER_HOVER_FILL = "#fbe9eb"
 CLOSE_DELAY_MS = 450           # the pointer may cross the gap to the menu
 
 SCALE = 1.0                    # display scale, set once by _enable_dpi_awareness()
@@ -118,9 +127,10 @@ def _enable_dpi_awareness() -> float:
 
 def _apply_scale() -> None:
     """Grow the strip to match the display scale (fonts follow `tk scaling`)."""
-    global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP
+    global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP, MENU_RADIUS, BUTTON_RADIUS
     if SCALE == 1.0:
         return
+    MENU_RADIUS, BUTTON_RADIUS = round(MENU_RADIUS * SCALE), round(BUTTON_RADIUS * SCALE)
     WIDTH, HEIGHT = round(WIDTH * SCALE), round(HEIGHT * SCALE)
     TOP = round(TOP * SCALE)
     ICON, DOT = round(ICON * SCALE), round(DOT * SCALE)
@@ -594,24 +604,43 @@ class Overlay:
         self._close_menu()
 
         title, items = menu(kind, self._view)
-        box = tk.Toplevel(self.window, bg=EDGE)
+        pad = round(14 * SCALE)
+        inner_width = MENU_WIDTH - 2 * pad
+
+        # A rounded card: the window's own background is see-through, and the
+        # card is drawn on it as an image with smooth corners.
+        box = tk.Toplevel(self.window, bg=MENU_KEY)
         box.overrideredirect(True)
         box.attributes("-topmost", True)
-        inner = tk.Frame(box, bg=PAPER, padx=12, pady=10)
-        inner.pack(padx=1, pady=1)
+        try:
+            box.attributes("-transparentcolor", MENU_KEY)
+        except Exception:
+            pass
+        card = tk.Canvas(box, bg=MENU_KEY, highlightthickness=0, bd=0)
+        card.pack()
+        inner = tk.Frame(card, bg=PAPER)
         tk.Label(inner, text=title, bg=PAPER, fg=MUTED, font=(FONT, 9),
-                 wraplength=MENU_WIDTH - 24, justify="left", anchor="w"
-                 ).pack(fill="x", anchor="w", pady=(0, 6))
+                 wraplength=inner_width, justify="left", anchor="w"
+                 ).pack(fill="x", anchor="w", pady=(0, round(8 * SCALE)))
         for value, words, enabled in items:
-            row = tk.Label(inner, text=words, bg=PAPER, fg=INK if enabled else OFF,
-                           font=(FONT, 10, "bold" if enabled else "normal"), anchor="w",
-                           padx=8, pady=5, cursor="hand2" if enabled else "arrow",
-                           wraplength=MENU_WIDTH - 40, justify="left")
-            row.pack(fill="x", anchor="w", pady=1)
-            if enabled:
-                row.bind("<Enter>", lambda _e, r=row: r.configure(bg=HOVER))
-                row.bind("<Leave>", lambda _e, r=row: r.configure(bg=PAPER))
-                row.bind("<Button-1>", lambda _e, k=kind, v=value: self._choose(k, v))
+            danger = value == REFUSAL and enabled
+            button = self._menu_button(inner, words, inner_width, enabled=enabled,
+                                       danger=danger,
+                                       action=lambda k=kind, v=value: self._choose(k, v))
+            button.pack(anchor="w", pady=(0, round(6 * SCALE)))
+        inner.update_idletasks()
+        width = inner_width + 2 * pad
+        height = inner.winfo_reqheight() + 2 * pad - round(6 * SCALE)
+        card.configure(width=width, height=height)
+        art = self._rounded_image(width, height, MENU_RADIUS, fill=PAPER, edge=EDGE,
+                                  matte=PAPER, key=MENU_KEY)
+        if art is not None:
+            card.art = art
+            card.create_image(0, 0, anchor="nw", image=art)
+        else:
+            self._round_rect(card, 1, 1, width - 1, height - 1, MENU_RADIUS,
+                             fill=PAPER, outline=EDGE)
+        card.create_window(pad, pad, anchor="nw", window=inner)
         box.bind("<Enter>", lambda _e: self._cancel_close())
         box.bind("<Leave>", lambda _e: self._close_menu_soon())
 
@@ -621,6 +650,98 @@ class Overlay:
         self._show_note("")                  # the menu takes the note's place
         self._beside(box, icon.winfo_rooty())
         self._set_alpha(self.window, NEAR_ALPHA)
+
+    def _menu_button(self, parent, words: str, width: int, *, enabled: bool,
+                     danger: bool, action):
+        """
+        One choice drawn as a rounded button, so it is plain where to click.
+        The whole button is the target; it lights up under the pointer.
+        """
+        import tkinter as tk
+        import tkinter.font as tkfont
+
+        font = tkfont.Font(family=FONT, size=10, weight="bold" if enabled else "normal")
+        padx, pady = round(12 * SCALE), round(8 * SCALE)
+        lines = self._wrap(words, font, width - 2 * padx)
+        height = len(lines) * font.metrics("linespace") + 2 * pady
+        button = tk.Canvas(parent, width=width, height=height, bg=PAPER,
+                           highlightthickness=0, bd=0,
+                           cursor="hand2" if enabled else "arrow")
+        ink = (RED_DEEP if danger else INK) if enabled else OFF
+
+        def draw(hover: bool = False) -> None:
+            button.delete("all")
+            if not enabled:
+                fill, edge = "#f7f8f9", "#e3e6ea"
+            elif hover:
+                fill = DANGER_HOVER_FILL if danger else BUTTON_HOVER_FILL
+                edge = RED if danger else BUTTON_HOVER_EDGE
+            else:
+                fill, edge = BUTTON_FILL, (DANGER_EDGE if danger else BUTTON_EDGE)
+            art = self._rounded_image(width, height, BUTTON_RADIUS, fill=fill, edge=edge,
+                                      matte=PAPER, key=None)
+            if art is not None:
+                button.art = art
+                button.create_image(0, 0, anchor="nw", image=art)
+            else:
+                self._round_rect(button, 1, 1, width - 1, height - 1, BUTTON_RADIUS,
+                                 fill=fill, outline=edge)
+            button.create_text(padx, height / 2, text="\n".join(lines), anchor="w",
+                               fill=ink, font=font, justify="left")
+
+        draw()
+        if enabled:
+            button.bind("<Enter>", lambda _e: draw(True))
+            button.bind("<Leave>", lambda _e: draw(False))
+            button.bind("<Button-1>", lambda _e: action())
+        return button
+
+    @staticmethod
+    def _wrap(text: str, font, width: int):
+        """Break the words into lines that fit the button."""
+        lines, line = [], ""
+        for word in text.split():
+            trial = f"{line} {word}".strip()
+            if line and font.measure(trial) > width:
+                lines.append(line)
+                line = word
+            else:
+                line = trial
+        return lines + [line] if line else lines or [""]
+
+    @staticmethod
+    def _rounded_image(width: int, height: int, radius: int, *, fill: str, edge: str,
+                       matte: str, key: Optional[str]):
+        """
+        A rounded rectangle drawn four times larger and scaled down, so its
+        corners are smooth; outside the corners the pixels are `key` (shown
+        see-through) when given. None without Pillow.
+        """
+        if width < 4 or height < 4:
+            return None
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            return None
+
+        def rgb(colour):
+            return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+
+        ss = 4
+        big = (width * ss, height * ss)
+        image = Image.new("RGB", big, rgb(matte))
+        line = max(1, round(1.2 * SCALE)) * ss
+        box = [line // 2, line // 2, big[0] - 1 - line // 2, big[1] - 1 - line // 2]
+        ImageDraw.Draw(image).rounded_rectangle(box, radius=radius * ss, fill=rgb(fill),
+                                                outline=rgb(edge), width=line)
+        small = image.resize((width, height), Image.LANCZOS)
+        if key is not None:
+            mask = Image.new("L", big, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius * ss, fill=255)
+            mask = mask.resize((width, height), Image.LANCZOS)
+            small.paste(Image.new("RGB", (width, height), rgb(key)), (0, 0),
+                        mask.point(lambda v: 255 if v == 0 else 0))
+        return ImageTk.PhotoImage(small)
 
     def _choose(self, kind: str, value: str) -> None:
         consent_open = bool(self._view and self._view.consent_open)
