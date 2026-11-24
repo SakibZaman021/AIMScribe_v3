@@ -65,6 +65,10 @@ THROTTLE = timedelta(minutes=10)          # one PC, one kind of event: one mail 
 ESCALATE_AFTER = timedelta(minutes=15)    # an urgent mail nobody marked seen
 NO_SHIFT_AFTER = timedelta(minutes=30)    # nobody pressed Start shift
 SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
+PC_ON_GRACE = timedelta(minutes=20)       # 25 Nov: first patient this old, PC still not on
+UNRECORDED_AFTER = timedelta(minutes=5)   # a patient untaken this long had no recording
+UNRECORDED_MIN = 2                        # ...and this many in the hour is told
+SILENT_RECORDING_SECONDS = 8              # this much pure silence is told
 AUTO_CLOSE_AFTER = timedelta(hours=1)     # a shift nobody ended
 TOO_LONG = timedelta(minutes=60)          # a recording nobody stopped (038)
 PAUSE_ALERT = timedelta(minutes=2)        # 18 Nov: a recording paused this long
@@ -1533,6 +1537,9 @@ class Notifier:
         for step in (self.telegram_updates, self.close_forgotten_shifts, self.alerts,
                      self.idle_microphones, self.recordings_without_jabra,
                      self.recordings_too_long, self.refusals, self.silent_pcs,
+                     # 25 Nov 2026: a PC not on while its clinic sees patients,
+                     # patients CMED sent that nobody recorded, silent recordings.
+                     self.pcs_not_on, self.patients_not_recorded, self.silent_recordings,
                      self.no_shift_started, self.pauses, self.still_paused,
                      self.normal_ends,
                      self.escalate, watchers.handled_followups, watchers.persisting,
@@ -1739,6 +1746,112 @@ class Notifier:
                          event_key=f"silent:{row['device_id']}:{row['last_seen_at'].isoformat()}",
                          urgent=True, everyone_if_nobody=False, device_id=row["device_id"],
                          not_before=row["last_seen_at"])
+
+    # -- 25 Nov 2026: a clinic PC that never came on while its clinic sees patients
+    async def pcs_not_on(self, conn) -> None:
+        """
+        24 Nov: GP-Female was off from 08:00 to 20:50 while CMED sent the clinic
+        171 patients; 88 went unrecorded and nobody was told, because "PC not
+        reporting" is only for a PC that goes quiet. Now: once the clinic's
+        first patient of the day is PC_ON_GRACE old, each of its PCs not heard
+        from today is reported - once a day.
+        """
+        local = datetime.now(zone())
+        midnight = datetime.combine(local.date(), dtime(0, 0), tzinfo=zone())
+        rows = await conn.fetch("""
+            SELECT d.device_id, d.hospital_id, d.machine_name, d.last_seen_at,
+                   min(n.received_at) AS first_patient
+              FROM devices d
+              JOIN hospitals h ON h.hospital_id = d.hospital_id AND h.active
+              JOIN confirmation_notices n ON n.hospital_id = d.hospital_id
+                                         AND n.received_at >= $1
+             WHERE d.revoked_at IS NULL AND d.blocked_at IS NULL
+               AND COALESCE(d.approval, 'approved') = 'approved'
+               AND (d.last_seen_at IS NULL OR d.last_seen_at < $1)
+             GROUP BY 1, 2, 3, 4
+            HAVING min(n.received_at) < now() - $2::interval
+        """, midnight, PC_ON_GRACE)
+        for r in rows:
+            where = f"{r['hospital_id']}, {r['machine_name'] or 'a PC'}"
+            last = (f"It was last heard from at "
+                    f"{r['last_seen_at'].astimezone(zone()):%d %b %H:%M}."
+                    if r["last_seen_at"] else "It has never reported.")
+            await notify(conn, hospital_id=r["hospital_id"], event="pc_not_on",
+                         subject=f"PC not on today: {where}",
+                         body=(f"The clinic has been seeing patients since "
+                               f"{_hhmm(r['first_patient'])}, but the PC at {where} has not "
+                               f"come on today. {last}\n\nPlease switch it on and sign in, "
+                               "so the recorder starts: until then this room's consultations "
+                               "are not recorded.") + _footer(),
+                         event_key=f"noton:{r['device_id']}:{local.date()}", urgent=True,
+                         everyone_if_nobody=True, device_id=r["device_id"])
+
+    # -- 25 Nov 2026: patients CMED sent that no recording took
+    async def patients_not_recorded(self, conn) -> None:
+        """
+        Each patient CMED sends (API 2) is taken by the recording made for it.
+        One still untaken UNRECORDED_AFTER after it arrived had no recording -
+        a PC off, the recorder not running, a page it refused. Counted per
+        clinic over the last hour, and told at most once an hour.
+        """
+        local = datetime.now(zone())
+        rows = await conn.fetch("""
+            SELECT n.hospital_id, count(*) AS n, min(n.received_at) AS first,
+                   max(n.received_at) AS last
+              FROM confirmation_notices n
+              JOIN hospitals h ON h.hospital_id = n.hospital_id AND h.active
+             WHERE n.claimed_by_jti IS NULL
+               AND n.received_at > now() - interval '60 minutes'
+               AND n.received_at < now() - $1::interval
+             GROUP BY 1
+            HAVING count(*) >= $2
+        """, UNRECORDED_AFTER, UNRECORDED_MIN)
+        for r in rows:
+            await notify(conn, hospital_id=r["hospital_id"], event="patients_not_recorded",
+                         subject=f"{r['n']} patients not recorded: {r['hospital_id']}",
+                         body=(f"CMED sent {r['n']} patients at {r['hospital_id']} between "
+                               f"{_hhmm(r['first'])} and {_hhmm(r['last'])} and no recording "
+                               "was made for them.\n\nPlease check each room: is the PC on, "
+                               "is the recorder running, and does it start when the doctor "
+                               "opens a patient?") + _footer(),
+                         event_key=f"unrec:{r['hospital_id']}:{local:%Y-%m-%d-%H}",
+                         urgent=True, everyone_if_nobody=True)
+
+    # -- 25 Nov 2026: a recording that is pure digital silence
+    async def silent_recordings(self, conn) -> None:
+        """
+        24 Nov: GP-Males' own microphone gave exact zeros - 336 pieces, 45
+        recordings - and nobody knew. A recording whose pieces are all
+        silence (rms exactly 0) is told at once, naming its microphone.
+        """
+        rows = await conn.fetch("""
+            SELECT s.session_id, s.hospital_id, s.device_id, s.opened_at, d.machine_name,
+                   COALESCE(s.microphones[cardinality(s.microphones)], d.microphone) AS mic,
+                   sum(g.duration_seconds) AS seconds
+              FROM sessions s
+              JOIN devices d ON d.device_id = s.device_id
+              JOIN segments g ON g.session_id = s.session_id
+             WHERE s.opened_at > now() - interval '2 hours'
+               AND s.confirmation IS DISTINCT FROM 'refused'
+               AND NOT EXISTS (SELECT 1 FROM collector_notifications x
+                                WHERE x.event_key = 'silentrec:' || s.session_id)
+             GROUP BY 1, 2, 3, 4, 5, 6
+            HAVING bool_and(COALESCE(g.rms_mean, 1) = 0)
+               AND sum(g.duration_seconds) >= $1
+             LIMIT 50
+        """, SILENT_RECORDING_SECONDS)
+        for r in rows:
+            where = f"{r['hospital_id']}, {r['machine_name'] or 'a PC'}"
+            mic = r["mic"] or "the PC microphone"
+            await notify(conn, hospital_id=r["hospital_id"], event="silent_recording",
+                         subject=f"Recording is silent: {where}",
+                         body=(f"The recording at {where} that began at "
+                               f"{_hhmm(r['opened_at'])} has no sound at all: {mic} gives "
+                               "silence.\n\nPlease plug in the Jabra. If the Jabra is "
+                               "plugged in, check that it is not muted.") + _footer(),
+                         event_key=f"silentrec:{r['session_id']}", urgent=True,
+                         everyone_if_nobody=True, device_id=r["device_id"],
+                         session_id=r["session_id"], happened_at=r["opened_at"])
 
     # -- a new patient recorded while the Jabra is still unplugged
     async def recordings_without_jabra(self, conn) -> None:
