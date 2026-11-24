@@ -66,6 +66,7 @@ ESCALATE_AFTER = timedelta(minutes=15)    # an urgent mail nobody marked seen
 NO_SHIFT_AFTER = timedelta(minutes=30)    # nobody pressed Start shift
 SILENT_AFTER = timedelta(minutes=3)       # three missed heartbeats
 PC_ON_GRACE = timedelta(minutes=20)       # 25 Nov: first patient this old, PC still not on
+PC_IN_USE_DAYS = 14                       # ...and only PCs heard from in this many days
 UNRECORDED_AFTER = timedelta(minutes=5)   # a patient untaken this long had no recording
 UNRECORDED_MIN = 2                        # ...and this many in the hour is told
 SILENT_RECORDING_SECONDS = 8              # this much pure silence is told
@@ -1753,38 +1754,48 @@ class Notifier:
         24 Nov: GP-Female was off from 08:00 to 20:50 while CMED sent the clinic
         171 patients; 88 went unrecorded and nobody was told, because "PC not
         reporting" is only for a PC that goes quiet. Now: once the clinic's
-        first patient of the day is PC_ON_GRACE old, each of its PCs not heard
-        from today is reported - once a day.
+        first patient of the day is PC_ON_GRACE old, the clinic's PCs in use
+        (heard from in the last PC_IN_USE_DAYS) but not heard from today are
+        told in one alert per clinic, once a day. A PC retired without being
+        revoked, or one that never reported, is not "off today".
         """
         local = datetime.now(zone())
         midnight = datetime.combine(local.date(), dtime(0, 0), tzinfo=zone())
         rows = await conn.fetch("""
-            SELECT d.device_id, d.hospital_id, d.machine_name, d.last_seen_at,
-                   min(n.received_at) AS first_patient
+            SELECT d.hospital_id,
+                   array_agg(COALESCE(d.machine_name, 'a PC') ORDER BY d.machine_name) AS pcs,
+                   array_agg(d.last_seen_at ORDER BY d.machine_name) AS last_seen,
+                   (SELECT min(n.received_at) FROM confirmation_notices n
+                     WHERE n.hospital_id = d.hospital_id AND n.received_at >= $1)
+                       AS first_patient
               FROM devices d
               JOIN hospitals h ON h.hospital_id = d.hospital_id AND h.active
-              JOIN confirmation_notices n ON n.hospital_id = d.hospital_id
-                                         AND n.received_at >= $1
              WHERE d.revoked_at IS NULL AND d.blocked_at IS NULL
                AND COALESCE(d.approval, 'approved') = 'approved'
-               AND (d.last_seen_at IS NULL OR d.last_seen_at < $1)
-             GROUP BY 1, 2, 3, 4
-            HAVING min(n.received_at) < now() - $2::interval
-        """, midnight, PC_ON_GRACE)
+               AND d.last_seen_at < $1
+               AND d.last_seen_at > $1 - make_interval(days => $3)
+             GROUP BY d.hospital_id
+            HAVING (SELECT min(n.received_at) FROM confirmation_notices n
+                     WHERE n.hospital_id = d.hospital_id AND n.received_at >= $1)
+                   < now() - $2::interval
+        """, midnight, PC_ON_GRACE, PC_IN_USE_DAYS)
         for r in rows:
-            where = f"{r['hospital_id']}, {r['machine_name'] or 'a PC'}"
-            last = (f"It was last heard from at "
-                    f"{r['last_seen_at'].astimezone(zone()):%d %b %H:%M}."
-                    if r["last_seen_at"] else "It has never reported.")
+            pcs = list(r["pcs"])
+            lines = "\n".join(
+                f"- {name}: last heard from {seen.astimezone(zone()):%d %b %H:%M}"
+                for name, seen in list(zip(pcs, r["last_seen"]))[:10])
+            names = ", ".join(pcs[:3]) + (f" and {len(pcs) - 3} more" if len(pcs) > 3 else "")
             await notify(conn, hospital_id=r["hospital_id"], event="pc_not_on",
-                         subject=f"PC not on today: {where}",
+                         subject=f"PC not on today: {r['hospital_id']}, {names}",
                          body=(f"The clinic has been seeing patients since "
-                               f"{_hhmm(r['first_patient'])}, but the PC at {where} has not "
-                               f"come on today. {last}\n\nPlease switch it on and sign in, "
-                               "so the recorder starts: until then this room's consultations "
-                               "are not recorded.") + _footer(),
-                         event_key=f"noton:{r['device_id']}:{local.date()}", urgent=True,
-                         everyone_if_nobody=True, device_id=r["device_id"])
+                               f"{_hhmm(r['first_patient'])}, but "
+                               f"{'this PC has' if len(pcs) == 1 else 'these PCs have'} not "
+                               f"come on today:\n{lines}\n\nPlease switch "
+                               f"{'it' if len(pcs) == 1 else 'them'} on and sign in, so the "
+                               "recorder starts: until then those rooms' consultations are "
+                               "not recorded.") + _footer(),
+                         event_key=f"noton:{r['hospital_id']}:{local.date()}", urgent=True,
+                         everyone_if_nobody=True)
 
     # -- 25 Nov 2026: patients CMED sent that no recording took
     async def patients_not_recorded(self, conn) -> None:
