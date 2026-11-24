@@ -262,6 +262,8 @@ def ended(r: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         return "Next patient", None
     if reason in ("counselling_limit", "prescription_built"):
         return "2 min after the prescription", None
+    if reason == "consultation_ended":
+        return "CMED closed the visit (API 4)", None
     kind = collectors.stop_kind(reason)
     if kind is None:
         return "Doctor finished", None
@@ -511,6 +513,26 @@ def _file_values(r: Dict[str, Any]) -> List[Tuple[Any, Optional[str]]]:
     ]
 
 
+# 3.9.8: what the recorder logs from the doctor's on-screen choices, and from
+# CMED's API 4. None of them stopped the recording.
+DOCTOR_LOG = {
+    "doctor_mark": "Doctor's reason (recording continued)",
+    "sensitive_start": "Sensitive part marked (to remove)",
+    "sensitive_end": "Sensitive part ended",
+    "api4_end": "CMED closed the visit (API 4)",
+    "api4_mismatch": "API 4 for another visit (ignored)",
+}
+
+
+def _audio_at(seconds: Any) -> str:
+    """Where in the recording, as m:ss - what the lab trims by."""
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    return f"at {total // 60}:{total % 60:02d} of the audio"
+
+
 def _file_events(r: Dict[str, Any]) -> List[List[Any]]:
     """A file's pauses and how it stopped, in time order: [time, event, reason, minutes]."""
     events: List[Tuple[datetime, List[Any]]] = []
@@ -523,6 +545,13 @@ def _file_events(r: Dict[str, Any]) -> List[List[Any]]:
         if e.get("event") in ("stop_pressed", "stop_cancelled") and at:
             events.append((at, [_hhmm(at), "Stop pressed" if e["event"] == "stop_pressed"
                                 else "Stop cancelled", e.get("detail") or "", ""]))
+        # 3.9.8: the doctor's logged choices; the recording did not stop.
+        elif e.get("event") in DOCTOR_LOG and at:
+            where = _audio_at(e.get("audio_seconds"))
+            words = DOCTOR_LOG[e["event"]]
+            detail = e.get("detail") or ""
+            events.append((at, [_hhmm(at), words,
+                                f"{detail}{' - ' + where if where else ''}", ""]))
     how, column = ended(r)
     if r["refused"]:
         events.append((r["refused_at"] or r["opened_at"],

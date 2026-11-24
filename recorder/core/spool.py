@@ -838,10 +838,17 @@ class SessionSpool:
             })
             return entry
 
-    def log_event(self, event: str, detail: Any = "") -> None:
-        """3.9.5: one line of this recording's log. Never fails the recording."""
+    def log_event(self, event: str, detail: Any = "", *,
+                  audio_seconds: Optional[float] = None) -> None:
+        """
+        3.9.5: one line of this recording's log. Never fails the recording.
+        3.9.8: with the second of audio it happened at, when known - what the
+        lab trims by.
+        """
         record = {"at": crypto.iso_utc(datetime.now(timezone.utc)), "event": str(event)[:64],
                   "detail": str(detail or "")[:300]}
+        if audio_seconds is not None:
+            record["audio_seconds"] = round(float(audio_seconds), 1)
         try:
             with self._lock:
                 if len(self.events) >= 500:

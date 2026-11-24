@@ -68,6 +68,27 @@ STOP_HOLD_REASON = "stop_requested"
 SHUTDOWN_HOLD_REASON = "pc_shutdown_pending"
 _INTERNAL_PAUSES = (STOP_HOLD_REASON, SHUTDOWN_HOLD_REASON)
 
+# 3.9.8: CMED's API 4 closed the visit - an ordinary end, like the next patient.
+API4_END_REASON = "consultation_ended"
+# Written once a PC has received API 4. From then on the recording waits for
+# API 4 (or the next patient) and the two-minute rule after API 3 is not used:
+# CMED's page at this clinic sends the end of every visit.
+API4_FLAG_FILE = "api4_seen"
+
+# 3.9.8: what the doctor's on-screen choices are logged as. Logged only - the
+# recording carries on until API 4 or the next patient; the lab trims the audio
+# afterwards from this log and the data collectors' records.
+DOCTOR_MARKS = {
+    "consultation_finished": "Consultation finished",
+    "patient_left": "Patient left the room",
+    "urgent_interruption": "Emergency",
+}
+SENSITIVE_REASONS = {
+    "patient_request": "Patient's request",
+    "sensitive_personal_matter": "Sensitive personal matter",
+    "interruption": "Interruption",
+}
+
 # What the doctor's screen says when the server has not accepted a recording
 # yet. The recording carries on and is kept on this PC; nothing is deleted.
 HOLD_MESSAGES = {
@@ -163,6 +184,12 @@ class ActiveSession:
     paused_seconds: float = 0.0
     pause: Optional[PauseRecord] = None
     pauses: List[Dict[str, Any]] = field(default_factory=list)
+    # 3.9.8: when the server said CMED's API 2 (demographics) arrived for this
+    # recording. Until then the doctor may record a refusal.
+    demographics_at: Optional[datetime] = None
+    # 3.9.8: a part the doctor marked sensitive, still open: reason, when, and
+    # where in the audio it began. Nothing stops; the lab removes the part.
+    sensitive: Optional[Dict[str, Any]] = None
     # Where this recording's clips are written, bound when it opens. A clip
     # that waited for disk space is written into its own recording, never into
     # whichever one is open when the disk frees up.
@@ -228,6 +255,12 @@ class SessionController:
         self._keeper = StartKeeper(getattr(paths, "state_dir", None))
         self._wanted: Optional[Dict[str, str]] = None
         self._start_retry: Optional[asyncio.Task] = None
+        # 3.9.8: API 4 has reached this PC before (kept on disk), and the visit
+        # the last recording belonged to, so a late or repeated API 4 for it is
+        # answered without touching the recording now running.
+        self._state_dir = getattr(paths, "state_dir", None)
+        self._api4_seen = self._read_api4_flag()
+        self._last_closed: Optional[Dict[str, str]] = None
 
     # ---- startup / shutdown ----
 
@@ -853,6 +886,9 @@ class SessionController:
         if isinstance(reply, dict) and reply.get("trusted_origins"):
             from core import trusted_origins
             trusted_origins.apply(reply["trusted_origins"])
+        told = reply.get("demographics_received") if isinstance(reply, dict) else None
+        if isinstance(told, dict) and told.get("session_id"):
+            self.demographics_received(session_id=str(told["session_id"]))
         notice = reply.get("prescription_received") if isinstance(reply, dict) else None
         if isinstance(notice, dict) and notice.get("session_id"):
             try:
@@ -932,7 +968,7 @@ class SessionController:
             if self._active is not active or self._limits_wait(active):
                 continue
             now = time.monotonic()
-            if active.armed_at is not None:
+            if active.armed_at is not None and not self._api4_seen:
                 limit = self._knob("counselling_limit_seconds", 120.0)
                 if limit > 0 and now - active.armed_at >= limit:
                     if await self._end_at_a_pause(active, "counselling_limit"):
@@ -1218,6 +1254,11 @@ class SessionController:
         active = self._active
         assert active is not None
         self.state = CLOSING
+        # 3.9.8: a sensitive part still marked ends with the recording.
+        self._end_sensitive_mark(active, how="ended with the recording")
+        self._last_closed = {"session_id": active.session_id,
+                             "visit_id": active.visit_id,
+                             "patients": ",".join(active.seen) or active.patient_ref}
 
         # A held recording's loop sleeps for minutes between questions. Left
         # running past the close it outlived the consultation it was asking
@@ -1374,6 +1415,151 @@ class SessionController:
         elif self._disk_full_reported and free > 2 * MIN_FREE_BYTES:
             self._disk_full_reported = False
         return free
+
+    # ---- 3.9.8: API 4, the doctor's logged choices, the consent window ----
+
+    def _read_api4_flag(self) -> bool:
+        if not self._state_dir:
+            return False
+        try:
+            from pathlib import Path
+            return (Path(self._state_dir) / API4_FLAG_FILE).exists()
+        except OSError:
+            return False
+
+    def _note_api4_seen(self) -> None:
+        if self._api4_seen:
+            return
+        self._api4_seen = True
+        logger.info("API 4 received on this PC: recordings now end on API 4 or the "
+                    "next patient, no longer two minutes after API 3")
+        if not self._state_dir:
+            return
+        try:
+            from pathlib import Path
+            folder = Path(self._state_dir)
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / API4_FLAG_FILE).write_text(
+                crypto.iso_utc(datetime.now(timezone.utc)) + "\n", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not keep the API 4 flag on disk: %s", exc)
+
+    async def end_visit(self, end) -> Dict[str, Any]:
+        """
+        API 4: CMED closed the visit. Ends the recording - kept whole, an
+        ordinary end - when the visit is the one being recorded: its patient
+        was opened during this recording, the doctor is the same, and the
+        visit_id is the same whenever both were sent. A late or repeated API 4
+        for the visit that has just ended changes nothing; one for any other
+        visit is refused and the recording carries on.
+        """
+        self._note_api4_seen()
+        async with self._lock:
+            active = self._active
+            if active is None or self.state == CLOSING:
+                if self._is_last_closed(end):
+                    return {"status": "already_ended",
+                            "session_id": self._last_closed["session_id"]}
+                raise SessionError("Nothing is being recorded.", code="NO_ACTIVE_SESSION")
+            same_patient = end.patient_id in active.seen or \
+                end.patient_id == active.patient_ref
+            same_doctor = not active.doctor_id or end.doctor_id == active.doctor_id
+            same_visit = not (active.visit_id and end.visit_id) or \
+                end.visit_id == active.visit_id
+            missing_visit = bool(active.visit_id) and not end.visit_id
+            if not (same_patient and same_doctor and same_visit) or missing_visit:
+                if self._is_last_closed(end):
+                    return {"status": "already_ended",
+                            "session_id": self._last_closed["session_id"]}
+                active.spool.log_event("api4_mismatch", (
+                    f"visit={end.visit_id or '-'} patient={self._pseudonym(end.patient_id)} "
+                    f"doctor={end.doctor_id}"), audio_seconds=self._audio_position(active))
+                raise SessionError("That visit is not the one being recorded; the "
+                                   "recording continues.", code="VISIT_MISMATCH")
+            active.spool.log_event("api4_end", f"end_time={end.end_time}",
+                                   audio_seconds=self._audio_position(active))
+            self._forget()
+            logger.info("Session %s ended by CMED's API 4", active.session_id)
+            return await self._close_active(reason=API4_END_REASON,
+                                            detail=f"end_time={end.end_time}")
+
+    def _is_last_closed(self, end) -> bool:
+        last = self._last_closed
+        if not last:
+            return False
+        if end.visit_id and last.get("visit_id"):
+            return end.visit_id == last["visit_id"]
+        return end.patient_id in (last.get("patients") or "").split(",")
+
+    def demographics_received(self, *, session_id: str) -> bool:
+        """The server says CMED's API 2 arrived for this recording: the refusal closes."""
+        active = self._active
+        if active is None or active.session_id != session_id or \
+                active.demographics_at is not None:
+            return False
+        active.demographics_at = datetime.now(timezone.utc)
+        active.spool.log_event("api2_received", "refusal option closed",
+                               audio_seconds=self._audio_position(active))
+        self._emit("consent_closed", {"session_id": session_id})
+        return True
+
+    async def doctor_mark(self, reason: str) -> Dict[str, Any]:
+        """
+        A reason from the Stop menu, logged at this second of the audio. The
+        recording is NOT stopped: it ends on API 4 or the next patient.
+        """
+        if reason not in DOCTOR_MARKS:
+            raise SessionError("Choose a reason from the list.")
+        active = self._require_active()
+        at = self._audio_position(active)
+        active.spool.log_event("doctor_mark", DOCTOR_MARKS[reason], audio_seconds=at)
+        self._emit("doctor_marked", {"session_id": active.session_id, "reason": reason,
+                                     "audio_seconds": at})
+        return {"status": "logged", "session_id": active.session_id, "reason": reason,
+                "audio_seconds": at}
+
+    async def sensitive_start(self, reason: str) -> Dict[str, Any]:
+        """
+        The doctor marks the start of a sensitive part. Recording continues;
+        the part is removed by the lab before anyone listens to it.
+        """
+        if reason not in SENSITIVE_REASONS:
+            raise SessionError("Choose a reason from the list.")
+        active = self._require_active()
+        if active.sensitive is not None:
+            return {"status": "already_marked", "session_id": active.session_id,
+                    "reason": active.sensitive["reason"]}
+        at = self._audio_position(active)
+        active.sensitive = {"reason": reason, "monotonic": time.monotonic(),
+                            "at": datetime.now(timezone.utc), "audio_seconds": at}
+        active.spool.log_event("sensitive_start", SENSITIVE_REASONS[reason],
+                               audio_seconds=at)
+        self._emit("sensitive_started", {"session_id": active.session_id, "reason": reason})
+        return {"status": "marked", "session_id": active.session_id, "reason": reason,
+                "audio_seconds": at}
+
+    async def sensitive_end(self) -> Dict[str, Any]:
+        """The doctor says the sensitive part is over."""
+        active = self._require_active()
+        if active.sensitive is None:
+            return {"status": "not_marked", "session_id": active.session_id}
+        result = self._end_sensitive_mark(active, how="doctor")
+        self._emit("sensitive_ended", {"session_id": active.session_id})
+        return {"status": "ended", "session_id": active.session_id, **(result or {})}
+
+    def _end_sensitive_mark(self, active: ActiveSession, *, how: str) -> Optional[Dict]:
+        mark = active.sensitive
+        if mark is None:
+            return None
+        active.sensitive = None
+        end = self._audio_position(active)
+        seconds = round(max(0.0, end - mark["audio_seconds"]), 1)
+        active.spool.log_event(
+            "sensitive_end",
+            f"{SENSITIVE_REASONS.get(mark['reason'], mark['reason'])}; from "
+            f"{mark['audio_seconds']:.1f}s to {end:.1f}s of the audio ({seconds:.0f} s); "
+            f"ended by {how}", audio_seconds=end)
+        return {"from_seconds": mark["audio_seconds"], "to_seconds": end, "seconds": seconds}
 
     async def refuse_session(self) -> Dict[str, Any]:
         """
@@ -1851,6 +2037,17 @@ class SessionController:
             # which is the thing a doctor most needs to be able to see.
             "level": self._live_level(active),
         }
+        if active is not None:
+            # 3.9.8: the refusal is offered until CMED's API 2 arrives.
+            payload["consent_open"] = active.demographics_at is None
+            if active.sensitive is not None:
+                payload["sensitive"] = {
+                    "reason": active.sensitive["reason"],
+                    "label": SENSITIVE_REASONS.get(active.sensitive["reason"],
+                                                   active.sensitive["reason"]),
+                    "seconds": round(time.monotonic() - active.sensitive["monotonic"], 1),
+                }
+        payload["ends_on_api4"] = self._api4_seen
         if active and active.pause:
             payload["pause"] = {
                 "reason": active.pause.reason,

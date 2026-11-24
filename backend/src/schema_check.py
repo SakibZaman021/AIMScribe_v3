@@ -219,6 +219,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it CMED staff cannot be given their own role (no audio).
     ("049_v3_cmed_role.sql", "recordings", "role 'cmed' allowed",
      _check_allows("portal_people", "role", "cmed")),
+    # Without it the recorder is never told API 2 arrived (3.9.8 refusal window).
+    ("050_v3_demographics_notice.sql", "recordings", "column sessions.demographics_received_at",
+     _column("sessions", "demographics_received_at")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

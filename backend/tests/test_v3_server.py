@@ -99,6 +99,16 @@ class FakeRepo:
         if s is not None and microphone not in (s.get("microphones") or []):
             s["microphones"] = (s.get("microphones") or []) + [microphone]
 
+    async def note_demographics(self, session_id):
+        s = self.sessions.get(session_id)
+        if s is not None and s.get("demographics_received_at") is None:
+            s["demographics_received_at"] = NOW()
+
+    async def demographics_notice(self, device_id, session_id):
+        s = self.sessions.get(session_id)
+        return bool(s and not s.get("closed_at") and s.get("demographics_received_at")
+                    and str(s.get("device_id")) == str(device_id))
+
     async def note_prescription(self, session_id):
         s = self.sessions.get(session_id)
         if s is not None and s.get("prescription_received_at") is None:

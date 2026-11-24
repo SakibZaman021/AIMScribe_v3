@@ -248,18 +248,16 @@ class AgentTray:
             MenuItem("Open log folder", self.on_open_logs),
             MenuItem("Copy diagnostics", self.on_copy_diagnostics),
             Menu.SEPARATOR,
-            # Recording control lives here as well as in CMED. A pause still
-            # carries a reason - chosen from the same fixed list, so the gap in
-            # the audio is explained either way - but it no longer depends on a
-            # browser being able to reach the agent. A consultation once ran for
-            # an hour with no way to stop it because the page had lost its
-            # patient, which is not a state a clinical recorder should allow.
-            MenuItem("Pause recording", Menu(*self._pause_items(MenuItem)),
-                     enabled=lambda _: self._is_recording() and not self._is_paused()),
+            # 3.9.8: a recording ends on CMED's API 4 or the next patient; the
+            # doctor's on-screen choices are logged, not obeyed. The tray keeps
+            # Resume, for a recording an older hold left paused, and Stop for
+            # an administrator only - a recording that cannot end otherwise
+            # (CMED's page lost) must still be closable by IT.
             MenuItem("Resume recording", self.on_resume,
                      enabled=lambda _: self._is_paused()),
-            MenuItem("Stop recording", self.on_stop,
-                     enabled=lambda _: self._is_recording()),
+            MenuItem("Stop recording (administrator only)" if not is_administrator()
+                     else "Stop recording", self.on_stop,
+                     enabled=lambda _: self._is_recording() and is_administrator()),
             Menu.SEPARATOR,
             MenuItem(
                 "Exit (administrator only)" if not is_administrator() else "Exit",

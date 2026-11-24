@@ -1736,6 +1736,8 @@ async def reassign_session(body: ReassignRequest, device=Depends(require_device)
 NORMAL_CLOSE_REASONS = frozenset({
     "doctor_stopped", "superseded_by_new_patient", "counselling_limit",
     "no_activity_limit", "pc_shutdown",
+    # 3.9.8: CMED's API 4 closed the visit.
+    "consultation_ended",
     # The recorder closes its recording itself while an installer upgrades it.
     "software_update",
 })
@@ -1994,6 +1996,15 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
     # here within 30 seconds; before 3.9.3 it kept the clinic it joined at and
     # refused every grant for the new one (17 Nov, CMED's PC at TEST/Karail).
     reply: Dict[str, Any] = {"status": "ok", "hospital_id": device["hospital_id"]}
+    # 3.9.8: CMED's API 2 (demographics) for the open recording has arrived;
+    # the recorder then closes the doctor's "Patient did not consent" choice.
+    if body.session_id:
+        try:
+            if await _repo().demographics_notice(device["device_id"],
+                                                 str(body.session_id)[:64]):
+                reply["demographics_received"] = {"session_id": body.session_id}
+        except Exception as exc:
+            logger.warning("Could not look up a demographics notice: %s", exc)
     # Interface 4: CMED's API 3 for the recording this PC has open has arrived.
     # The recorder ends it about two minutes after that, unless the next
     # patient is opened first; it is told on every heartbeat until it closes.

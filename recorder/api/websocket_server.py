@@ -13,7 +13,9 @@ What v3 changes is what the page sends. It no longer signs a grant or holds a
 key: it sends five plain fields (API 1), and the recorder asks the AIMS LAB
 server for the grant. The page cannot choose the clinic - that is this PC's
 enrolment - and it cannot end a consultation early: a new trigger is refused
-until `prescription_built` (API 3) has armed the gate.
+until `prescription_built` (API 3) has armed the gate. From 3.9.8 the page may
+end one in a single way, API 4 (`end`): only the visit being recorded, named by
+its patient, doctor and visit_id, and the recording is kept whole.
 
 Every command gets exactly one reply carrying `request_id`, `status` and `code`
 (api/protocol.py). Pages act on `code`, never on `message`.
@@ -244,6 +246,7 @@ class WebSocketManager:
         return {
             "start": self._start,
             "prescription_built": self._prescription_built,
+            "end": self._end,
             "stop": self._stop,
             "pause": self._pause,
             "resume": self._resume,
@@ -322,6 +325,21 @@ class WebSocketManager:
         code = "GATE_ALREADY_ARMED" if result.get("already") else "GATE_ARMED"
         return code, {"session_id": result["session_id"], "armed": True}
 
+    async def _end(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """
+        API 4 (3.9.8): CMED closed the visit. Ends the recording when it is
+        this visit's, and keeps every second of it; a late or repeated API 4
+        for a visit already ended is answered VISIT_ALREADY_ENDED, and one for
+        another visit VISIT_MISMATCH, the recording carrying on.
+        """
+        end = protocol.parse_end(message)
+        result = await self._controller.end_visit(end)
+        if result.get("status") == "already_ended":
+            return "VISIT_ALREADY_ENDED", {"session_id": result.get("session_id")}
+        return "RECORDING_ENDED", {"session_id": result.get("session_id"),
+                                   "duration_seconds": result.get("duration_seconds"),
+                                   "visit_id": end.visit_id or None}
+
     # ---- commands CMED does not use ----
 
     def _doctor_only(self) -> None:
@@ -334,9 +352,8 @@ class WebSocketManager:
         """
         if not getattr(self.cfg.security, "developer_mode", False):
             raise ProtocolError(
-                "REFUSED", "Only the doctor can stop or pause a recording, on the "
-                "recorder. It ends at the next patient, or two minutes after the "
-                "prescription.")
+                "REFUSED", "A recording ends with CMED's API 4 (end) or when the next "
+                "patient is opened.")
 
     async def _stop(self, message: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
