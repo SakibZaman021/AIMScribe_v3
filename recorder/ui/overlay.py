@@ -50,13 +50,33 @@ HOVER = "#eef3fb"
 FONT = "Segoe UI"
 
 KEY = "#010203"                # the strip's background: drawn see-through
+
+# 3.9.8: two looks, by clinic. Only the dot and the two icons are drawn; around
+# them the screen shows through. Their edges are smoothed against the colour
+# they sit on, so they are sharp at any display scale.
+#   sidebar - Amader Susastho: at the left edge, over the EHR's dark teal
+#             sidebar, below its own icons.
+#   light   - Aalo Clinic and everything else: top right, over a white page.
+THEMES = {
+    "sidebar": {"matte": "#00566f", "key": "#00566e", "side": "left", "height": 0.42,
+                "dot_off": "#7fb3c1"},
+    "light": {"matte": "#ffffff", "key": "#fefefd", "side": "right", "height": None,
+              "dot_off": "#b8bec4"},
+}
+
+
+def theme_for(hospital_id, override: str = "") -> str:
+    """Which look a PC uses: AIMS_OVERLAY_THEME when set, else by its clinic."""
+    if override in THEMES:
+        return override
+    return "sidebar" if "SUSASTHO" in str(hospital_id or "").upper() else "light"
 WIDTH, HEIGHT = 56, 132        # the strip
 NOTE_HEIGHT = 0                # kept for older callers: notes now sit beside it
 MARGIN = 20                    # from the screen's right edge, where the strip starts
 TOP = 120                      # from the top: below a browser's own close button
 ICON = 44                      # each icon's diameter
 DOT = 10
-IDLE_ALPHA = 0.55              # see-through until the pointer comes near
+IDLE_ALPHA = 0.85              # a little see-through until the pointer comes near
 NEAR_ALPHA = 1.0
 MENU_WIDTH = 300
 CLOSE_DELAY_MS = 450           # the pointer may cross the gap to the menu
@@ -132,6 +152,9 @@ class Overlay:
         self._close_job = None
         self._reminded: Optional[str] = None    # the marked part already asked about
         self._near = False
+        import os
+        self._theme_override = os.environ.get("AIMS_OVERLAY_THEME", "").strip().lower()
+        self._theme = theme_for("", self._theme_override)
 
     # ---- lifecycle ----
 
@@ -194,15 +217,18 @@ class Overlay:
         except Exception:
             pass
 
-        win = tk.Toplevel(self.root, bg=KEY)
+        key = THEMES[self._theme]["key"]
+        win = tk.Toplevel(self.root, bg=key)
         win.overrideredirect(True)                  # no title bar: no minimise, no close
         win.attributes("-topmost", True)
         win.withdraw()
         try:
-            win.attributes("-transparentcolor", KEY)
-            self._backdrop = KEY
+            win.attributes("-transparentcolor", key)
+            self._backdrop = key
+            self._see_through = True
         except Exception:
-            self._backdrop = PAPER
+            self._backdrop = THEMES[self._theme]["matte"]
+            self._see_through = False
         self._set_alpha(win, IDLE_ALPHA)
         self.window = win
 
@@ -240,7 +266,7 @@ class Overlay:
         """An icon that opens its menu on hover or tap, and does nothing else."""
         import tkinter as tk
 
-        canvas = tk.Canvas(parent, bg=PAPER, highlightthickness=0, bd=0,
+        canvas = tk.Canvas(parent, bg=self._backdrop, highlightthickness=0, bd=0,
                            takefocus=1, cursor="hand2")
         canvas.kind = kind
         canvas.hover = False
@@ -277,7 +303,9 @@ class Overlay:
         ring, inside = self._icon_colours(canvas.kind)
         if canvas.hover:
             inside = HOVER if inside == PAPER else inside
-        art = self._icon_image(canvas.kind, size, ring, inside)
+        theme = THEMES[self._theme]
+        art = self._icon_image(canvas.kind, size, ring, inside, matte=theme["matte"],
+                               key=self._backdrop if self._see_through else None)
         if art is not None:
             # Held on the widget: a PhotoImage only the canvas refers to is
             # collected, and the icon then draws as nothing.
@@ -302,11 +330,14 @@ class Overlay:
                                     bottom, fill=glyph, outline=glyph)
 
     @staticmethod
-    def _icon_image(kind: str, size: int, ring: str, inside: str):
+    def _icon_image(kind: str, size: int, ring: str, inside: str, *,
+                    matte: str = PAPER, key: Optional[str] = None):
         """
         The icon drawn four times larger and scaled down, so the circle has a
-        smooth edge (tkinter's own circles are drawn as a staircase). None
-        without Pillow; the plain shapes are drawn instead.
+        smooth edge (tkinter's own circles are drawn as a staircase). Its edge
+        blends into `matte`, the colour it sits on; outside the circle the
+        pixels are `key`, which the window shows as see-through. None without
+        Pillow; the plain shapes are drawn instead.
         """
         if size < 8:
             return None
@@ -320,7 +351,7 @@ class Overlay:
 
         ss = 4
         big = size * ss
-        image = Image.new("RGB", (big, big), rgb(PAPER))
+        image = Image.new("RGB", (big, big), rgb(matte))
         draw = ImageDraw.Draw(image)
         thick = max(2, round(3 * SCALE)) * ss
         pad = thick // 2 + ss
@@ -336,17 +367,46 @@ class Overlay:
             for left in (big / 2 - 2.2 * bar, big / 2 + 0.8 * bar):
                 draw.rounded_rectangle([left, top, left + 1.4 * bar, bottom],
                                        radius=round(1.5 * SCALE) * ss, fill=glyph)
-        return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
+        small = image.resize((size, size), Image.LANCZOS)
+        if key is not None:
+            # Wholly outside the circle: see-through. The edge keeps its blend.
+            mask = Image.new("L", (big, big), 0)
+            ImageDraw.Draw(mask).ellipse([pad - thick // 2, pad - thick // 2,
+                                          big - pad + thick // 2, big - pad + thick // 2],
+                                         fill=255)
+            mask = mask.resize((size, size), Image.LANCZOS)
+            small.paste(Image.new("RGB", (size, size), rgb(key)), (0, 0),
+                        mask.point(lambda v: 255 if v == 0 else 0))
+        return ImageTk.PhotoImage(small)
+
+    def _set_theme(self, theme: str) -> None:
+        """Change look when the PC's clinic is known (or changes)."""
+        if theme == self._theme or theme not in THEMES:
+            return
+        self._theme = theme
+        if self._see_through:
+            key = THEMES[theme]["key"]
+            self._backdrop = key
+            try:
+                self.window.configure(bg=key)
+                self.window.attributes("-transparentcolor", key)
+            except Exception:
+                pass
+        else:
+            self._backdrop = THEMES[theme]["matte"]
+        for widget in (self.canvas, self.stop_button, self.mark_button):
+            widget.configure(bg=self._backdrop)
+        if self._spot is None:
+            self._place()
 
     def _paint(self, view) -> None:
-        """The strip: a rounded backing, and the dot that says a recording is on."""
+        """Only the dot that says a recording is on; the screen shows around it."""
         canvas = self.canvas
         canvas.delete("all")
         canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=self._backdrop,
                                 outline=self._backdrop)
-        self._round_rect(canvas, 1, 1, WIDTH - 1, HEIGHT - 1, round(16 * SCALE),
-                         fill=PAPER, outline=EDGE, width=1)
-        colour = {"recording": RED, "waiting": AMBER, "problem": RED}.get(view.dot, MUTED)
+        colour = {"recording": RED, "waiting": AMBER, "problem": RED}.get(
+            view.dot, THEMES[self._theme]["dot_off"])
         centre = WIDTH / 2
         top = round(9 * SCALE)
         canvas.create_oval(centre - DOT / 2, top, centre + DOT / 2, top + DOT,
@@ -366,9 +426,19 @@ class Overlay:
     def _place(self) -> None:
         """Where the doctor left it, or the top right; always wholly on the screen."""
         self.window.update_idletasks()
-        x, y = self._spot or (self.window.winfo_screenwidth() - WIDTH - MARGIN, TOP)
+        x, y = self._spot or self._home()
         x, y = self._on_screen(x, y)
         self.window.geometry(f"{WIDTH}x{self._height}+{x}+{y}")
+
+    def _home(self) -> tuple:
+        """Where the strip starts for this look, before the doctor moves it."""
+        theme = THEMES[self._theme]
+        if theme["side"] == "left":
+            # Centred on the EHR's sidebar, below its own icons.
+            sidebar = round(86 * SCALE)
+            return (max(0, (sidebar - WIDTH) // 2),
+                    round(self.window.winfo_screenheight() * theme["height"]))
+        return self.window.winfo_screenwidth() - WIDTH - MARGIN, TOP
 
     def _on_screen(self, x: int, y: int) -> tuple:
         right = self.window.winfo_screenwidth() - WIDTH
@@ -410,6 +480,8 @@ class Overlay:
 
     def apply(self, view, status: Optional[Dict[str, Any]] = None) -> None:
         status = status if status is not None else {}
+        if status.get("hospital_id"):
+            self._set_theme(theme_for(status.get("hospital_id"), self._theme_override))
         previous = self._view
         self._view = view
         self.stop_button.draw()
