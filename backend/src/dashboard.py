@@ -660,7 +660,15 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                    -- 18 Nov: the visit CMED's API 2 and API 3 are matched on.
                    g.cmed_hospital_id AS cmed_code,
                    COALESCE(s.visit_id, g.visit_id) AS cmed_visit_id,
-                   g.start_time AS cmed_start_time
+                   g.start_time AS cmed_start_time,
+                   -- 26 Nov (recorder 3.9.8+): the doctor's Stop and Pause choices,
+                   -- from the recording's own log (it arrives when it closes).
+                   (SELECT json_agg(e ORDER BY e->>'at')
+                      FROM jsonb_array_elements(
+                               CASE WHEN jsonb_typeof(s.manifest->'events') = 'array'
+                                    THEN s.manifest->'events' ELSE '[]'::jsonb END) e
+                     WHERE e->>'event' IN ('doctor_mark', 'sensitive_start', 'sensitive_end'))
+                       AS doctor_events
               FROM sessions s
               LEFT JOIN grant_authorisations g
                      ON g.jti = s.grant_jti AND g.patient_id = s.patient_id
@@ -913,6 +921,8 @@ def _recording_row(row) -> Dict[str, Any]:
         if "paused_seconds" in row.keys() else 0,
         "pauses": int(row["pauses"] or 0) if "pauses" in row.keys() else 0,
         "pause_list": _pause_list(row),
+        # 26 Nov: what the doctor chose on the recorder's buttons (Stop / Pause).
+        "doctor_log": _doctor_log(row),
         # 20 Nov (recorder 3.9.6+): piece numbers still on its PC, and when said.
         "pc_waiting": list(row["pc_still_waiting"] or [])
         if "pc_still_waiting" in row.keys() else [],
@@ -921,6 +931,37 @@ def _recording_row(row) -> Dict[str, Any]:
         "pieces_folder": (f"audio/{row['object_prefix'] or row['session_id']}/"
                           if "object_prefix" in row.keys() else None),
     }
+
+
+DOCTOR_EVENTS = {"doctor_mark": "Stop", "sensitive_start": "Pause",
+                 "sensitive_end": "Pause ended"}
+
+
+def _doctor_log(row) -> List[Dict[str, Any]]:
+    """
+    26 Nov 2026: the doctor's Stop and Pause choices on the recorder's buttons,
+    in order - when (UTC, the page shows Dhaka time), which button, the reason,
+    and the second of the audio. None of them stopped the recording. A Pause
+    ended says which part it closed in its reason ("from 43.9s to 46.8s").
+    """
+    if "doctor_events" not in row.keys() or not row["doctor_events"]:
+        return []
+    events = row["doctor_events"]
+    if isinstance(events, str):
+        import json
+        events = json.loads(events)
+    out = []
+    for e in events or []:
+        if not isinstance(e, dict) or e.get("event") not in DOCTOR_EVENTS:
+            continue
+        seconds = e.get("audio_seconds")
+        try:
+            seconds = round(float(seconds), 1)
+        except (TypeError, ValueError):
+            seconds = None
+        out.append({"at": e.get("at"), "button": DOCTOR_EVENTS[e["event"]],
+                    "reason": str(e.get("detail") or ""), "audio_seconds": seconds})
+    return out
 
 
 def _pause_list(row) -> List[Dict[str, Any]]:
