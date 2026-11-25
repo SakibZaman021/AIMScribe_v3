@@ -83,3 +83,61 @@ async def test_the_same_server_is_never_asked(tmp_path, monkeypatch):
         raise AssertionError("asked")
     monkeypatch.setattr(enrollment, "login_unknown_here", never)
     assert (await enrollment.ensure_enrolled(cfg, Key())).device_id == "D1"
+
+
+# ---- a beta recording still on the PC when it is reinstalled for the real server ----
+
+from tests.test_authorisation import open_spooled, reload, seal, uploader_for  # noqa: E402
+
+
+def made_for(spool, device_key, server):
+    session = spool.open_session(
+        device_key=device_key, device_id="DEV1", doctor_id="DR0042", hospital_id="HOSP003",
+        patient_ref="P0012345", consent_method="reception",
+        audio={"sample_rate": 44100, "channels": 1, "sample_width": 2},
+        trigger={"patient_id": "P0012345", "doctor_id": "DR0042", "hospital_id": "HOSP003",
+                 "start_time": "2026-11-26T10:00:00+06:00", "date": "2026-11-26"},
+        server=server)
+    seal(session)
+    return session
+
+
+def set_to(uploader, url):
+    uploader.cfg.backend.base_url = url
+
+
+async def test_a_beta_recording_is_never_sent_to_the_real_server(spool, device_key):
+    test = made_for(spool, device_key, BETA)
+    assert reload(spool, device_key, test).meta["server"] == BETA    # survives a restart
+    uploader = uploader_for(spool, device_key, responses=[(200, {})])
+    set_to(uploader, REAL)
+    await uploader.track(test)
+    await uploader._drain_once()
+    assert uploader.calls == []                                      # nothing asked, nothing sent
+    assert uploader.delivery_report()["recordings"] == []            # nor reported
+    assert test.directory.exists()                                   # and kept on the PC
+
+
+async def test_the_servers_own_recordings_and_older_ones_still_go(spool, device_key):
+    real = made_for(spool, device_key, REAL + "/")
+    older = open_spooled(spool, device_key)                          # before 3.9.9: no server
+    seal(older)
+    uploader = uploader_for(spool, device_key, responses=[(503, {})])
+    set_to(uploader, REAL)
+    assert not uploader.made_for_another_server(real)
+    assert not uploader.made_for_another_server(older)
+    await uploader.track(real)
+    await uploader._drain_once()
+    assert uploader.calls                                            # it tried to send
+
+
+async def test_each_new_recording_names_its_server(monkeypatch, spool, device_key):
+    from api.protocol import Trigger
+    from tests.test_markers import at, ctl_with
+    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl.cfg.backend = SimpleNamespace(base_url=REAL)
+    await ctl.open_session(Trigger(patient_id="P1", doctor_id="DR0042",
+                                   hospital_id="CMED-DHK-BANANI-01", start_time=at(1),
+                                   date="2026-09-13"))
+    assert ctl._active.spool.meta["server"] == REAL
+    await ctl.close()

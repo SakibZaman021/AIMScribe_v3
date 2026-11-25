@@ -196,6 +196,7 @@ class UploadManager:
         self._reported_quarantines: set = set()
 
         self._sessions: List[SessionSpool] = []
+        self._other_server_noted: set = set()     # 3.9.9: logged once each
         self._http: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._wake = asyncio.Event()
@@ -354,7 +355,28 @@ class UploadManager:
 
         self._check_stall()
 
+    def made_for_another_server(self, session: SessionSpool) -> bool:
+        """
+        3.9.9 (26 Nov 2026): a recording made while this PC was set to another
+        server - a field team's test on beta, still on the PC when it was
+        reinstalled for the real server. It is never sent here: it stays on
+        the PC and goes if the PC is set back to its own server. A recording
+        from before 3.9.9 names no server and is sent as before.
+        """
+        from core.enrollment import _server_key
+        made_for = (getattr(session, "meta", None) or {}).get("server")
+        backend = getattr(self.cfg, "backend", None)
+        here = getattr(backend, "base_url", "") if backend is not None else ""
+        return bool(made_for and here and _server_key(made_for) != _server_key(here))
+
     async def _drain_session(self, session: SessionSpool) -> None:
+        if self.made_for_another_server(session):
+            if session.session_id not in self._other_server_noted:
+                self._other_server_noted.add(session.session_id)
+                logger.warning("Recording %s was made for %s; kept on this PC, not sent "
+                               "to %s", session.session_id, session.meta.get("server"),
+                               self.cfg.backend.base_url)
+            return
         if not await self._settle_before_upload(session):
             return
 
@@ -1375,6 +1397,8 @@ class UploadManager:
         sent_states = (COMMITTED, RECEIPTED, spool_mod.PURGED)
         rows = []
         for session in list(self._sessions):
+            if self.made_for_another_server(session):
+                continue                  # not this server's; it never hears of it
             pieces = session.segment_list()
             waiting = [p.seq_no for p in pieces if p.state == PENDING]
             rejected = [p.seq_no for p in pieces if p.state == spool_mod.QUARANTINED]

@@ -585,6 +585,7 @@ class SessionController:
                 # With a grant in hand there is nothing to ask for later.
                 trigger=None if grant is not None else trigger.fields(),
                 continues_session_id=continues_session_id,
+                server=getattr(getattr(self.cfg, "backend", None), "base_url", None),
             )
 
             sink = SegmentSink(spool=spool_session)

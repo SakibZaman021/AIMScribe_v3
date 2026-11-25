@@ -227,6 +227,7 @@ class SessionSpool:
         opened_at: Optional[datetime] = None,
         trigger: Optional[Dict[str, str]] = None,
         continues_session_id: Optional[str] = None,
+        server: Optional[str] = None,
     ) -> "SessionSpool":
         session_id = session_id or new_ulid()
         directory = root / session_id
@@ -250,6 +251,10 @@ class SessionSpool:
         if continues_session_id:
             # The same consultation, carried on after the recorder restarted.
             spool.meta["continues_session_id"] = continues_session_id
+        if server:
+            # 3.9.9: the server this recording was made for. A PC reinstalled
+            # for another server (beta, then the real one) never sends it there.
+            spool.meta["server"] = server
 
         spool._append_journal({
             "rec": "session",
@@ -323,6 +328,8 @@ class SessionSpool:
                         spool.authorisation = "pending"
                     if record.get("continues_session_id"):
                         spool.meta["continues_session_id"] = record["continues_session_id"]
+                    if record.get("server"):
+                        spool.meta["server"] = record["server"]
                 elif spool is None:
                     continue
                 elif kind == "chain":
