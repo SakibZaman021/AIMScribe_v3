@@ -29,6 +29,7 @@ the recorder's own on-screen control, which calls the controller directly. A
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -190,7 +191,13 @@ class WebSocketManager:
 
     # ---- dispatch ----
 
-    async def handle_message(self, websocket: WebSocket, raw: str) -> Dict[str, Any]:
+    async def handle_message(self, websocket: WebSocket, raw: str, *,
+                             origin: Optional[str] = None) -> Dict[str, Any]:
+        # The page this came from: the HTTP routes pass it, a socket carries it.
+        if origin is None:
+            headers = getattr(websocket, "headers", None)
+            origin = headers.get("origin") if headers is not None else None
+        self._origin = origin or ""
         bucket = self._buckets.setdefault(id(websocket), _Bucket())
         if not bucket.take():
             return self._stamp(protocol.reply("", "AGENT_NOT_READY",
@@ -270,6 +277,8 @@ class WebSocketManager:
         already said yes, 202 RECORDING_PROVISIONAL while it is still being asked.
         """
         trigger = protocol.parse_trigger(message)
+        if getattr(self, "_origin", ""):
+            trigger = dataclasses.replace(trigger, origin=self._origin)
         grant = None if self.cfg.security.require_grant else self._development_grant(trigger)
         result = await self._controller.open_session(trigger, grant=grant)
         code = ("RECORDING_STARTED" if result.get("authorisation") == "granted"

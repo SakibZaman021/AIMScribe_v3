@@ -226,6 +226,12 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # be switched to CMED's API 4.
     ("051_v3_clinic_end_rule.sql", "recordings", "column hospitals.end_rule",
      _column("hospitals", "end_rule")),
+    # Without it a 3.9.9 grant cannot keep its page, and the real server's
+    # "no automatic approval" switch has nowhere to live.
+    ("052_v3_origin_lock.sql", "recordings", "column grant_authorisations.origin",
+     _column("grant_authorisations", "origin")),
+    ("052_v3_origin_lock.sql", "recordings", "table server_settings",
+     _table("server_settings")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

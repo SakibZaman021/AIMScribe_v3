@@ -3,8 +3,8 @@
 dashboard lists only what is real.
 
 - A revoked PC is still in the reply, marked revoked; the page hides it unless
-  "Revoked" is chosen (the test PCs are revoked on the real server and live on
-  beta). Removed addresses and revoked CMED connections: the same, behind a
+  "Revoked" is chosen. 26 Nov 2026: on the real server a revoked PC that has no
+  recording here is not in the reply at all (the test PCs live on beta). Removed addresses and revoked CMED connections: the same, behind a
   "Show removed" switch.
 - A clinic switched off (hospitals.active = false) is not offered: the test
   clinics, once moved.
@@ -53,9 +53,69 @@ async def test_revoked_pcs_and_switched_off_clinics_are_not_listed(dbs):
         _unserve()
     state = {str(r["device_id"]): r["revoked"] for r in listed["rooms"]}
     assert state[str(kept["device_id"])] is False
-    assert state[str(revoked["device_id"])] is True
+    # 26 Nov 2026: on the real server a revoked PC with no recording here is
+    # not listed at all; beta lists it, marked revoked.
+    assert str(revoked["device_id"]) not in state
     offered = {c["hospital_id"] for c in clinics["clinics"]}
     assert "HOSP003" in offered and test_clinic not in offered
+
+
+async def test_beta_still_lists_its_revoked_pcs(dbs, monkeypatch):
+    repo = dbs.repo
+    revoked = await enrolled_device(repo)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE devices SET revoked_at = now() WHERE device_id = $1",
+                           revoked["device_id"])
+    monkeypatch.setenv("AIMS_ENVIRONMENT", "beta")
+    _server(dbs)
+    try:
+        async with dashboard._pool().acquire() as conn:
+            listed = await dashboard._recorders(conn, None)
+    finally:
+        _unserve()
+    state = {str(r["device_id"]): r["revoked"] for r in listed["rooms"]}
+    assert state[str(revoked["device_id"])] is True
+
+
+async def test_a_revoked_pc_that_recorded_here_stays_listed(dbs):
+    from datetime import timedelta
+    from test_db_integration import a_session
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    await a_session(repo, device, opened_ago=timedelta(minutes=3))
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE devices SET revoked_at = now() WHERE device_id = $1",
+                           device["device_id"])
+    _server(dbs)
+    try:
+        async with dashboard._pool().acquire() as conn:
+            listed = await dashboard._recorders(conn, None)
+    finally:
+        _unserve()
+    assert str(device["device_id"]) in {str(r["device_id"]) for r in listed["rooms"]}
+
+
+async def test_the_real_server_can_stop_approving_pcs_by_itself(dbs):
+    """052: with auto_approve_pcs off, CMED's confirmations never approve a PC."""
+    from datetime import timedelta
+    from test_db_integration import a_session
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    async with dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE devices SET approval = 'pending' WHERE device_id = $1",
+                           device["device_id"])
+        await conn.execute("UPDATE server_settings SET value = 'off' "
+                           "WHERE name = 'auto_approve_pcs'")
+        try:
+            for ago in (3, 2):
+                sid = await a_session(repo, device, opened_ago=timedelta(minutes=ago))
+                await conn.execute("UPDATE sessions SET confirmation = 'confirmed' "
+                                   "WHERE session_id = $1", sid)
+            assert await conn.fetchval("SELECT approval FROM devices WHERE device_id = $1",
+                                       device["device_id"]) == "pending"
+        finally:
+            await conn.execute("UPDATE server_settings SET value = 'on' "
+                               "WHERE name = 'auto_approve_pcs'")
 
 
 async def test_recordings_all_on_the_jabra_have_their_own_filter(dbs):
