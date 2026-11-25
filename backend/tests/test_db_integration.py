@@ -4907,6 +4907,28 @@ async def test_the_same_unusual_event_three_times_asks_for_the_hospital_manager(
             assert "Seen" in str(told[0].get("reply_markup"))   # the collector presses Seen
             assert fake.sent_to(9502)[-1]["text"].startswith("\U0001F534 Patient left")
 
+            # 26 Nov: three more - the same message is EDITED to "6 times today",
+            # the collector's Seen button kept; nothing new is sent.
+            for n in range(3):
+                sid = await _clinic_session(dbs, device, "HOSP9R1",
+                                            opened_ago=timedelta(seconds=9 - n * 2))
+                await conn.execute("UPDATE sessions SET closed_at = now() - $2::interval, "
+                                   "close_reason = 'doctor_stopped:patient_left' "
+                                   "WHERE session_id = $1", sid, timedelta(seconds=6 - n * 2))
+            await watchers.repeated_unusual(conn)
+            await watchers.repeated_unusual(conn)
+            assert len(fake.sent_to(9501)) == 1 and len(fake.sent_to(9502)) == 1
+            edits = [p for m, p in fake.calls if m == "editMessageText"]
+            to_collector = [p for p in edits if p["chat_id"] == 9501]
+            to_researcher = [p for p in edits if p["chat_id"] == 9502]
+            assert len(to_collector) == 1 and len(to_researcher) == 1
+            assert "6 times today" in to_collector[0]["text"]
+            assert "Seen" in str(to_collector[0].get("reply_markup"))
+            assert "6 times today" in to_researcher[0]["text"]
+            assert await conn.fetchval(
+                "SELECT count(*) FROM collector_notifications WHERE event = 'repeated_unusual' "
+                "AND hospital_id = 'HOSP9R1'") == 2          # one row per person, edited
+
             # The single unusual message says what to do if it repeats.
             await collectors.notify(
                 conn, hospital_id="HOSP9R1", event="stopped_unusually",

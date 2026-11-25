@@ -780,21 +780,69 @@ async def repeated_unusual(conn, now: Optional[datetime] = None) -> None:
         if len(items) < REPEAT_TIMES:
             continue
         times = len(items) // REPEAT_TIMES * REPEAT_TIMES
-        key = f"manager:{hid}:{doctor_id}:{kind}:{day}:{times}"
-        if await conn.fetchval("SELECT 1 FROM collector_notifications WHERE event_key = $1 "
-                               "LIMIT 1", key):
-            continue
+        base = f"manager:{hid}:{doctor_id}:{kind}:{day}"
         items.sort(key=lambda r: r["at"])
         last = items[-1]
         when = ", ".join(collectors._hhmm(r["at"]) for r in items)
         label = UNUSUAL_WORDS[kind]
-        await collectors.notify(
-            conn, hospital_id=hid, event="repeated_unusual",
-            subject=f"{label}: {len(items)} times today",
-            body=(f"At {when}.\n\nPlease contact the hospital manager as soon as possible."
-                  + collectors._footer()),
-            event_key=key, urgent=True, everyone_if_nobody=True, device_id=last["device_id"],
-            session_id=last["session_id"], happened_at=last["at"])
+        subject = f"{label}: {len(items)} times today"
+        body = (f"At {when}.\n\nPlease contact the hospital manager as soon as possible."
+                + collectors._footer())
+        # 26 Nov 2026: on 25 Nov one doctor refused 44 patients and each researcher
+        # got this warning 14 times (at 3, 6, 9 ... 42). Now the first one is sent
+        # and every later count EDITS it - one message per doctor, kind and day.
+        sent = await conn.fetch("""
+            SELECT id, email, event, urgent, subject, body, audience, event_key, created_at,
+                   happened_at, device_id, session_id, place_id, hospital_id, seen_at,
+                   tg_chat_id, tg_message_id
+              FROM collector_notifications
+             WHERE event = 'repeated_unusual' AND hospital_id = $1 AND created_at >= $2
+               AND event_key IN (SELECT $3 || ':' || n FROM generate_series($4::int, $5::int, $4::int) n)
+        """, hid, day_start, base, REPEAT_TIMES, max(times, REPEAT_TIMES))
+        if not sent:
+            await collectors.notify(
+                conn, hospital_id=hid, event="repeated_unusual", subject=subject, body=body,
+                event_key=f"{base}:{times}", urgent=True, everyone_if_nobody=True,
+                device_id=last["device_id"], session_id=last["session_id"],
+                happened_at=last["at"])
+            continue
+        await _update_repeat_warning(conn, [dict(r) for r in sent], len(items), body, last)
+
+
+_TIMES_TODAY = re.compile(r"(?<![0-9])[0-9]+ times today")
+
+
+async def _update_repeat_warning(conn, sent: List[Dict[str, Any]], count: int, body: str,
+                                 last: Dict[str, Any]) -> None:
+    """
+    The repeated-event warning each person already has, edited to the new count.
+    Only the count changes: each person's own wording ("Nobody on shift: ...",
+    the doctor named for a researcher) is kept.
+    """
+    for note in sent:
+        subject = _TIMES_TODAY.sub(f"{count} times today", note["subject"] or "", count=1)
+        if subject == note["subject"]:
+            continue                                    # this count is already shown
+        await conn.execute("""
+            UPDATE collector_notifications
+               SET subject = $2, body = $3, happened_at = $4, session_id = $5
+             WHERE id = $1
+        """, note["id"], subject, body, last["at"], last["session_id"])
+        if not (note.get("tg_chat_id") and note.get("tg_message_id")):
+            continue                     # not delivered yet: it goes out with the new text
+        note.update(subject=subject, body=body, happened_at=last["at"],
+                    session_id=last["session_id"])
+        payload: Dict[str, Any] = {
+            "chat_id": note["tg_chat_id"], "message_id": note["tg_message_id"],
+            "text": await collectors._telegram_body(conn, note),
+            "disable_web_page_preview": True}
+        if note["urgent"] and note["audience"] == "collector" and not note.get("seen_at"):
+            # The collector keeps the Seen button an edit would otherwise remove.
+            payload["reply_markup"] = {"inline_keyboard": [[
+                {"text": "✅ Seen - I am on it", "callback_data": f"seen:{note['id']}"}]]}
+        result, error = await collectors._telegram("editMessageText", payload)
+        if result is None and not (error and "not modified" in error):
+            logger.info("Repeat warning %s could not be edited: %s", note["id"], error)
 
 
 async def repeated_stops(conn, now: Optional[datetime] = None) -> None:

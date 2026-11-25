@@ -445,7 +445,11 @@ def _summary_row(recs: List[Dict[str, Any]]) -> List[Any]:
             counts["pauses"] += len(r["pauses"])
             paused_s += sum(p["seconds"] or 0 for p in r["pauses"])
         counts["alerts"] += len(r["alerts"])
-    return ([len({r["patient_id"] for r in recs}), len(recs), counts["pc"], counts["server"],
+    # 26 Nov 2026: patients with a recording kept. A refused recording's patient
+    # ID is wiped (REDACTED), so counting it made 44 refusals look like "1 patient";
+    # refusals are counted in their own column.
+    kept = {r["patient_id"] for r in recs if not r["refused"]}
+    return ([len(kept), len(recs), counts["pc"], counts["server"],
              counts["archived"], counts["cloud"], counts["confirmed"], counts["api2"],
              counts["api2_missing"], counts["api3"], counts["api3_missing"], counts["jabra"],
              counts["not_jabra"], counts["no_sound"], counts["normal"]]
