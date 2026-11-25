@@ -184,6 +184,71 @@ def load_identity(cfg, device_key: DeviceKey) -> Optional[DeviceIdentity]:
     return identity
 
 
+def server_moved(cfg, identity: Optional["DeviceIdentity"]) -> bool:
+    """Was this PC's login made with another server than the one it is set to?"""
+    return bool(identity is not None and identity.backend_url and
+                _server_key(identity.backend_url) != _server_key(cfg.backend.base_url))
+
+
+async def login_unknown_here(cfg, *, ssl_context=None) -> bool:
+    """
+    Does the server this PC is set to say it does not know this PC's login?
+    Only a plain "unknown device token" counts: a server that cannot be
+    reached, a revoked PC or any other answer changes nothing.
+    """
+    token = load_device_token(cfg)
+    if not token:
+        return False
+    timeout = aiohttp.ClientTimeout(total=cfg.backend.request_timeout)
+    connector = aiohttp.TCPConnector(ssl=ssl_context) if ssl_context else None
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(cfg.backend.url("/doctors"),
+                                   params={"hospital_id": "-"},
+                                   headers={"X-Device-Token": token}) as reply:
+                if reply.status != 401:
+                    return False
+                body = await reply.text()
+    except Exception as exc:
+        logger.info("Could not ask the server about this PC's login: %s", exc)
+        return False
+    return "unknown device token" in body
+
+
+SERVERS_DIR = "servers"
+
+
+def _server_key(url: str) -> str:
+    """One folder name per server address: host and port, nothing else."""
+    from urllib.parse import urlsplit
+    parts = urlsplit((url or "").strip())
+    host = (parts.hostname or "").lower()
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return f"{host}_{port}" if host else ""
+
+
+def _switch_server(cfg, device_key: DeviceKey, identity: "DeviceIdentity"):
+    state = cfg.paths.state_dir
+    current = (identity_path(cfg), device_token_path(cfg))
+    keep = state / SERVERS_DIR / _server_key(identity.backend_url)
+    keep.mkdir(parents=True, exist_ok=True)
+    for path in current:
+        if path.is_file():
+            os.replace(path, keep / path.name)
+    saved = state / SERVERS_DIR / _server_key(cfg.backend.base_url)
+    if (saved / IDENTITY_FILE).is_file():
+        for path in current:
+            if (saved / path.name).is_file():
+                os.replace(saved / path.name, path)
+        logger.warning("Server changed from %s to %s: this PC's login for %s is back in use",
+                       identity.backend_url, cfg.backend.base_url, cfg.backend.base_url)
+        return load_identity(cfg, device_key)
+    logger.warning("Server changed from %s to %s: the old login is kept aside; this PC "
+                   "joins %s by itself at its next patient",
+                   identity.backend_url, cfg.backend.base_url, cfg.backend.base_url)
+    return None
+
+
 def read_pending_token(cfg) -> Optional[str]:
     path = token_path(cfg)
     if not path.is_file():
@@ -389,6 +454,13 @@ async def ensure_enrolled(cfg, device_key: DeviceKey, *, ssl_context=None) -> Op
     and refuses to record.
     """
     identity = load_identity(cfg, device_key)
+    if server_moved(cfg, identity) and await login_unknown_here(cfg, ssl_context=ssl_context):
+        # 3.9.9 (26 Nov 2026): a field team tests a new PC on beta, then
+        # reinstalls it for the real server. Beta's login means nothing there
+        # (401, and nothing would ever upload), so it is put aside; this
+        # server's own login comes back if the PC has been here before, and
+        # otherwise the PC joins this server by itself at its next patient.
+        identity = _switch_server(cfg, device_key, identity)
     if identity is not None:
         return identity
 
