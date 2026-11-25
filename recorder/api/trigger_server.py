@@ -492,12 +492,19 @@ def create_app(runtime: Runtime) -> FastAPI:
         def is_allowed_origin(self, origin: str) -> bool:
             return cfg.security.origin_allowed(origin)
 
+    # 26 Nov 2026: Chrome asks a page's permission to reach this PC with
+    # "Access-Control-Request-Private-Network: true" in its preflight. Starlette
+    # refuses that unless allow_private_network is on ("400 Disallowed CORS
+    # private-network"), so Chrome never sent API 1 from a trusted CMED page and
+    # nothing was recorded. It is answered only for a trusted origin: the origin
+    # check above still decides who may call.
     app.add_middleware(
         LiveOriginCORS,
         allow_origins=sorted(cfg.security.allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type", "X-API-Key"],
+        allow_private_network=True,
         max_age=600,
     )
 

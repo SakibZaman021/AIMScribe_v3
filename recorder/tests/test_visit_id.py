@@ -210,6 +210,17 @@ async def test_api1_over_http_is_the_websocket_start_with_the_same_origin_rule(
         assert other.status_code == 403 and other.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
         assert ctl.state != "recording"
 
+        # 26 Nov: Chrome's preflight asks for private-network access. A trusted
+        # page gets it; before, Starlette answered 400 and Chrome sent nothing.
+        pna = {"Access-Control-Request-Method": "POST",
+               "Access-Control-Request-Headers": "content-type",
+               "Access-Control-Request-Private-Network": "true"}
+        pre = await http.options(url, headers={"Origin": origin, **pna})
+        assert pre.status_code == 200, pre.text
+        assert pre.headers["access-control-allow-origin"] == origin
+        assert pre.headers["access-control-allow-private-network"] == "true"
+        assert ctl.state != "recording"
+
         first = await http.post(url, json=body("VIS-A", "P1", 0), headers={"Origin": origin})
         assert first.status_code == 200, first.text
         assert first.json()["code"] == "RECORDING_STARTED"
