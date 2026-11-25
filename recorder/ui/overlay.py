@@ -92,7 +92,7 @@ def theme_for(hospital_id, override: str = "") -> str:
 _BOX = glass.layout(1.0)
 WIDTH, HEIGHT = _BOX.width, _BOX.height
 NOTE_HEIGHT = 0                # kept for older callers: notes now sit beside it
-MARGIN = 12                    # from the screen's right edge, where the strip starts
+MARGIN = 12                    # from the screen's left edge and the taskbar
 TOP = 112                      # from the top: below a browser's own close button
 ICON = glass.TILE              # each tile's side
 DOT = 10                       # kept for older callers: 3.9.11 draws no dot
@@ -160,6 +160,22 @@ def _apply_scale() -> None:
     TOP = round(TOP * SCALE)
     ICON, DOT = _BOX.stop[2] - _BOX.stop[0], round(DOT * SCALE)
     MENU_WIDTH = round(MENU_WIDTH * SCALE)
+
+
+def _work_area_bottom() -> int:
+    """The bottom of the screen above the taskbar, in pixels; 0 when unknown."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        area = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(area), 0):
+            return int(area.bottom)                     # SPI_GETWORKAREA
+    except Exception:
+        pass
+    return 0
 
 
 class Overlay:
@@ -433,14 +449,13 @@ class Overlay:
         self.window.geometry(f"{WIDTH}x{self._height}+{x}+{y}")
 
     def _home(self) -> tuple:
-        """Where the strip starts for this look, before the doctor moves it."""
-        theme = THEMES[self._theme]
-        if theme["side"] == "left":
-            # Centred on the EHR's sidebar, below its own icons.
-            sidebar = round(86 * SCALE)
-            return (max(0, (sidebar - WIDTH) // 2),
-                    round(self.window.winfo_screenheight() * theme["height"]))
-        return self.window.winfo_screenwidth() - WIDTH - MARGIN, TOP
+        """
+        Where the strip starts, before the doctor moves it. 26 Nov 2026 (the
+        owner): the lower left of the screen, on every clinic's page, just above
+        the taskbar.
+        """
+        bottom = _work_area_bottom() or self.window.winfo_screenheight()
+        return MARGIN, max(0, bottom - self._height - MARGIN)
 
     def _on_screen(self, x: int, y: int) -> tuple:
         right = self.window.winfo_screenwidth() - WIDTH

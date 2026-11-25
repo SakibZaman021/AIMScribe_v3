@@ -27,9 +27,9 @@ RED = (240, 68, 56)
 BLUE = (0, 122, 255)
 AMBER = (255, 149, 0)
 
-TILE = 40                               # a tile's side at 100% display scale (26 Nov: smaller)
-PAD = 14                                # room around a tile for its shadow and glow
-GAP = 12                                # between the two tiles
+TILE = 28                               # a tile's side at 100% display scale (26 Nov: much smaller)
+PAD = 10                                # room around a tile for its shadow and glow
+GAP = 8                                 # between the two tiles
 # Behind everything, so the strip can be grabbed and dragged between the tiles:
 # 1 of 255 is invisible on any page but still catches the pointer.
 GRIP_ALPHA = 1
