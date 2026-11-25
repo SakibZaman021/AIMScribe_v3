@@ -148,7 +148,15 @@ class AsyncAppContext:
         it did before, saying so each time.
         """
         bucket = os.getenv(f"{prefix}_BUCKET", "").strip()
-        if bucket and bucket == settings.minio_bucket:
+        if bucket and bucket == settings.minio_bucket and environment.is_beta():
+            # 26 Nov 2026, the owner's choice: beta keeps everything - pieces
+            # and copies - in its one bucket, aimscribe-beta. The pieces sit
+            # under audio/, the copies under the clinic folders, and every
+            # delete names one exact object, so neither touches the other. The
+            # separate locked copy store protects the clinics' real recordings;
+            # beta holds test recordings only.
+            logger.warning("Beta: the copies are kept in the pieces' bucket (%s)", bucket)
+        elif bucket and bucket == settings.minio_bucket:
             logger.critical(
                 "%s_BUCKET is the same bucket as the pieces (%s). The copy must be "
                 "a separate bucket, locked against deletion (SRS-ARC-12). No copies "

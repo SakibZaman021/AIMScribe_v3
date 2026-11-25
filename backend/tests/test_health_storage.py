@@ -105,3 +105,21 @@ def test_the_answer_is_reused_for_thirty_seconds(monkeypatch):
     for _ in range(5):
         health()
     assert bucket.calls == 1
+
+
+def _copy_store_with_the_pieces_bucket(monkeypatch, environment_name):
+    monkeypatch.setattr(app_module, "MinIOClient", lambda **kw: ("client", kw["bucket"]))
+    monkeypatch.setenv("AIMS_COPY_BUCKET", app_module.settings.minio_bucket)
+    monkeypatch.setenv("AIMS_ENVIRONMENT", environment_name)
+    return app_module.AsyncAppContext._copy_bucket()
+
+
+def test_the_real_server_never_keeps_copies_with_the_pieces(monkeypatch):
+    """SRS-ARC-12: the real recordings' copies live in their own locked store."""
+    assert _copy_store_with_the_pieces_bucket(monkeypatch, "") is None
+
+
+def test_beta_keeps_its_copies_in_its_one_bucket(monkeypatch):
+    """26 Nov 2026: beta's test recordings, pieces and copies, all in aimscribe-beta."""
+    made = _copy_store_with_the_pieces_bucket(monkeypatch, "beta")
+    assert made == ("client", app_module.settings.minio_bucket)
