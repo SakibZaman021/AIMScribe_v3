@@ -22,7 +22,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
@@ -550,31 +550,40 @@ async def _copies(conn, clinic: Optional[List[str]] = None) -> Dict[str, Any]:
 # The rows behind every number (SRS-DSH-02, -07)
 # ============================================================
 
-@router.get("/recordings")
-async def recordings(from_date: Optional[str] = Query(None, alias="from"),
-                     to_date: Optional[str] = Query(None, alias="to"),
-                     hospital_id: Optional[str] = None,
-                     doctor_id: Optional[str] = None,
-                     patient_id: Optional[str] = None,
-                     state: Optional[str] = None,
-                     search: Optional[str] = None,
-                     limit: int = 100,
-                     _: None = Depends(require_viewer),
-                     scope: Any = Depends(collectors.hospital_scope)):
-    """
-    Clinic, then doctor, then date, then patient - and a recording at any
-    level (`SRS-DSH-02`). `state` opens one of the summary's counts:
+# The Recordings panel's states beside the confirmation ones (`s` = sessions,
+# `g` = the recording's grant). One definition for the list and its counts.
+_NOT_JABRA_MIC = "m NOT ILIKE '%jabra%' AND m NOT ILIKE 'echo cancelling speakerphone (j%'"
+RECORDING_STATES: Dict[str, str] = {
+    "quarantined": "s.quarantine_reason IS NOT NULL",
+    "stopped_early": _stopped_early("s."),
+    "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
+    "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
+                "AND s.confirmation = 'confirmed'",
+    # 24 Nov 2026: every part recorded on the Jabra.
+    "on_jabra": "cardinality(s.microphones) > 0 AND NOT EXISTS (SELECT 1 FROM "
+                f"unnest(s.microphones) m WHERE {_NOT_JABRA_MIC})",
+    # 036: any part recorded on something other than the Jabra.
+    "not_jabra": f"EXISTS (SELECT 1 FROM unnest(s.microphones) m WHERE {_NOT_JABRA_MIC})",
+    # 26 Nov 2026: every piece that arrived is digital silence (RMS 0) - a
+    # muted or switched-off microphone, as GP-Males' built-in one on 24-25 Nov.
+    "no_sound": "EXISTS (SELECT 1 FROM segments q WHERE q.session_id = s.session_id) "
+                "AND NOT EXISTS (SELECT 1 FROM segments q WHERE q.session_id = s.session_id "
+                "AND (q.rms_mean IS NULL OR q.rms_mean > 0))",
+}
+_CONFIRMATIONS = ("pending", "unconfirmed", "confirmed", "refused", "expired", "legacy")
 
-        confirmed | pending | unconfirmed | refused | expired | legacy
-        quarantined | stopped_early | unarchived | uncopied | on_jabra | not_jabra
-    """
+
+def _recording_filter(from_date: Optional[str], to_date: Optional[str], scope: Any, *,
+                      hospital_id: Optional[str] = None, doctor_id: Optional[str] = None,
+                      patient_id: Optional[str] = None, search: Optional[str] = None,
+                      find: Optional[str] = None) -> Tuple[List[str], List[Any]]:
+    """The WHERE clauses and arguments every Recordings query shares."""
     today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
     end = _day(to_date, today)
     clinics = collectors.narrow(scope, _clinic(hospital_id))
     doctor = _clinic(doctor_id) if doctor_id else None
     patient = _clinic(patient_id) if patient_id else None
-    limit = max(1, min(limit if isinstance(limit, int) else 100, 500))
 
     where = ["s.session_date BETWEEN $1 AND $2"]
     args: List[Any] = [start, end]
@@ -592,26 +601,85 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
     if isinstance(search, str) and search:
         # Part of a file name, on the trigram index (SRS-DBA-24).
         add("s.file_stem ILIKE '%' || $N || '%'", search[:128])
+    if isinstance(find, str) and find.strip():
+        # 26 Nov 2026: a patient ID or CMED's visit ID, exactly (any case).
+        add("(lower(s.patient_id) = lower($N) OR lower(COALESCE(s.visit_id, "
+            "CASE WHEN g.patient_id = s.patient_id THEN g.visit_id END)) = lower($N))",
+            find.strip()[:128])
+    return where, args
 
-    states = {
-        "quarantined": "s.quarantine_reason IS NOT NULL",
-        "stopped_early": _stopped_early("s."),
-        "unarchived": "s.closed_at IS NOT NULL AND s.archived_at IS NULL",
-        "uncopied": "s.archived_at IS NOT NULL AND s.copied_at IS NULL "
-                    "AND s.confirmation = 'confirmed'",
-        # 24 Nov 2026: every part recorded on the Jabra.
-        "on_jabra": "cardinality(s.microphones) > 0 AND NOT EXISTS (SELECT 1 FROM "
-                    "unnest(s.microphones) m WHERE m NOT ILIKE '%jabra%' "
-                    "AND m NOT ILIKE 'echo cancelling speakerphone (j%')",
-        # 036: any part recorded on something other than the Jabra.
-        "not_jabra": "EXISTS (SELECT 1 FROM unnest(s.microphones) m "
-                     "WHERE m NOT ILIKE '%jabra%' "
-                     "AND m NOT ILIKE 'echo cancelling speakerphone (j%')",
-    }
-    if state in states:
-        where.append(states[state])
+
+@router.get("/recordings/facets")
+async def recording_facets(from_date: Optional[str] = Query(None, alias="from"),
+                           to_date: Optional[str] = Query(None, alias="to"),
+                           hospital_id: Optional[str] = None,
+                           doctor_id: Optional[str] = None,
+                           find: Optional[str] = None,
+                           _: None = Depends(require_viewer),
+                           scope: Any = Depends(collectors.hospital_scope)):
+    """
+    26 Nov 2026: what the Recordings panel offers, for exactly what is chosen.
+
+    `doctors` - the doctors with a recording in the chosen clinic (every
+    clinic the viewer may see, when none is chosen) and dates, so the menu
+    never offers one with nothing to show. `counts` - each state's number for
+    the same clinic and dates, narrowed to the chosen doctor and the patient
+    or visit searched for, so the chips describe the list below them.
+    """
+    join = ("FROM sessions s LEFT JOIN grant_authorisations g "
+            "ON g.jti = s.grant_jti AND g.patient_id = s.patient_id")
+    where, args = _recording_filter(from_date, to_date, scope, hospital_id=hospital_id)
+    counted = ",\n".join(
+        [f"count(*) FILTER (WHERE s.confirmation = '{c}') AS {c}" for c in _CONFIRMATIONS]
+        + [f"count(*) FILTER (WHERE {clause}) AS {name}"
+           for name, clause in RECORDING_STATES.items()])
+    async with _pool().acquire() as conn:
+        doctors = await conn.fetch(f"""
+            SELECT s.doctor_id, count(*) AS n {join}
+             WHERE {' AND '.join(where)} AND s.doctor_id IS NOT NULL
+             GROUP BY s.doctor_id ORDER BY s.doctor_id
+        """, *args)
+        where, args = _recording_filter(from_date, to_date, scope, hospital_id=hospital_id,
+                                        doctor_id=doctor_id, find=find)
+        row = await conn.fetchrow(f"""
+            SELECT count(*) AS total, {counted} {join}
+             WHERE {' AND '.join(where)}
+        """, *args)
+    return {"doctors": [{"doctor_id": r["doctor_id"], "recordings": r["n"]} for r in doctors],
+            "counts": {k: int(v or 0) for k, v in dict(row).items()} if row else {}}
+
+
+@router.get("/recordings")
+async def recordings(from_date: Optional[str] = Query(None, alias="from"),
+                     to_date: Optional[str] = Query(None, alias="to"),
+                     hospital_id: Optional[str] = None,
+                     doctor_id: Optional[str] = None,
+                     patient_id: Optional[str] = None,
+                     state: Optional[str] = None,
+                     search: Optional[str] = None,
+                     find: Optional[str] = None,
+                     limit: int = 100,
+                     _: None = Depends(require_viewer),
+                     scope: Any = Depends(collectors.hospital_scope)):
+    """
+    Clinic, then doctor, then date, then patient - and a recording at any
+    level (`SRS-DSH-02`). `state` opens one of the summary's counts:
+
+        confirmed | pending | unconfirmed | refused | expired | legacy
+        quarantined | stopped_early | unarchived | uncopied | on_jabra | not_jabra
+        no_sound
+
+    `find` (26 Nov 2026): a patient ID or a visit ID, exactly.
+    """
+    limit = max(1, min(limit if isinstance(limit, int) else 100, 500))
+    where, args = _recording_filter(
+        from_date, to_date, scope, hospital_id=hospital_id, doctor_id=doctor_id,
+        patient_id=patient_id, search=search, find=find)
+    if state in RECORDING_STATES:
+        where.append(RECORDING_STATES[state])
     elif state:
-        add("s.confirmation = $N", state)
+        args.append(state)
+        where.append(f"s.confirmation = ${len(args)}")
 
     args.append(sorted(api_v2.INTERNAL_PAUSES))
     holds = f"${len(args)}"

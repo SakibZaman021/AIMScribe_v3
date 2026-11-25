@@ -240,6 +240,7 @@ const STATE_LABELS = {
   uncopied: "No cloud copy",
   on_jabra: "On the Jabra",
   not_jabra: "Not on the Jabra",
+  no_sound: "No sound",
   refused: "Refused",
   expired: "Expired",
   legacy: "Legacy",
@@ -1022,10 +1023,13 @@ $("recTable").addEventListener("click", async (e) => {
   } catch { b.textContent = "Select it"; }   // clipboard blocked: the path is on screen
 });
 
+/* 26 Nov 2026: the chips count exactly what is chosen - clinic, dates, doctor,
+   patient or visit - from /recordings/facets; the Overview's totals until it answers. */
+let FACETS = null;
 function drawStateFilters() {
   const c = (LAST && LAST.confirmation.totals) || {};
   const i = (LAST && LAST.integrity) || {};
-  const counts = {
+  const counts = FACETS ? { "": FACETS.total, ...FACETS } : {
     pending: c.pending, unconfirmed: c.unconfirmed, confirmed: c.confirmed,
     quarantined: i.quarantined_total, stopped_early: i.stopped_early_total,
     on_jabra: i.on_jabra_total, not_jabra: i.not_jabra_total, unarchived: i.unarchived_total,
@@ -1033,7 +1037,8 @@ function drawStateFilters() {
     refused: c.refused, expired: c.expired, legacy: c.legacy,
   };
   const order = ["", "pending", "unconfirmed", "confirmed", "quarantined", "stopped_early",
-                 "on_jabra", "not_jabra", "unarchived", "uncopied", "refused", "expired", "legacy"];
+                 "on_jabra", "not_jabra", "no_sound", "unarchived", "uncopied", "refused",
+                 "expired", "legacy"];
   $("stateFilters").innerHTML = order.map((s) => {
     const n = counts[s];
     if (["refused", "expired", "legacy"].includes(s) && !n && STATE !== s) return "";
@@ -1054,35 +1059,62 @@ function setState(s) {
 }
 
 let recSeq = 0;
-/* 24 Nov 2026: the chosen clinic's doctors (every clinic's, with none chosen). */
-function fillRecDoctors(clinic) {
+/* 26 Nov 2026: only the doctors with a recording in the chosen clinic and dates
+   (every clinic the viewer may see, with none chosen), with how many. */
+function fillRecDoctors(doctors) {
   const sel = $("recDoctor");
   const chosen = sel.value;
-  const ids = [...new Set(DOCTORS.filter((d) => !clinic || d.hospital_id === clinic)
-    .map((d) => d.doctor_id).filter(Boolean))].sort();
-  sel.innerHTML = `<option value="">All doctors</option>`
-    + ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  const ids = doctors.map((d) => d.doctor_id);
+  sel.innerHTML = `<option value="">All doctors (${num(doctors.length)})</option>`
+    + doctors.map((d) => `<option value="${esc(d.doctor_id)}">`
+      + `${esc(d.doctor_id)} · ${num(d.recordings)}</option>`).join("");
   sel.value = ids.includes(chosen) ? chosen : "";
+  return sel.value !== chosen;           // the chosen doctor has nothing in this range
 }
 $("recDoctor").addEventListener("change", () => loadRecordings());
 
+/* 26 Nov 2026: a patient ID or a visit ID, exactly - on Enter, or as typing pauses. */
+let findTimer = null;
+$("recFind").addEventListener("input", () => {
+  clearTimeout(findTimer);
+  findTimer = setTimeout(() => loadRecordings(), 500);
+});
+$("recFind").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { clearTimeout(findTimer); loadRecordings(); }
+});
+
 async function loadRecordings() {
   const clinic = $("clinic").value;
-  fillRecDoctors(clinic);
-  const doctor = $("recDoctor").value;
   const label = clinic ? $("clinic").selectedOptions[0].textContent : "All clinics";
+  const find = $("recFind").value.trim();
   $("recTitle").textContent = STATE ? `Recordings · ${STATE_LABELS[STATE] || human(STATE)}` : "Recordings";
   const seq = ++recSeq;
   if (!$("recTable").firstChild) $("recTable").innerHTML = empty("Loading");
   try {
-    const params = { from: $("from").value, to: $("to").value, hospital_id: clinic, limit: 200 };
+    const range = { from: $("from").value, to: $("to").value, hospital_id: clinic };
+    // The doctor menu first: a doctor with nothing in this range is let go.
+    const facets = await api("/recordings/facets",
+                             { ...range, doctor_id: $("recDoctor").value, find });
+    if (seq !== recSeq) return;
+    if (fillRecDoctors(facets.doctors || [])) {
+      FACETS = (await api("/recordings/facets", { ...range, find })).counts || null;
+      if (seq !== recSeq) return;
+    } else {
+      FACETS = facets.counts || null;
+    }
+    drawStateFilters();
+    const doctor = $("recDoctor").value;
+    const params = { ...range, limit: 200 };
     if (doctor) params.doctor_id = doctor;
+    if (find) params.find = find;
     if (STATE) params.state = STATE;
     const d = await api("/recordings", params);
     if (seq !== recSeq) return;
     const list = d.recordings || [];
     $("recTable").innerHTML = recordingsTable(list);
-    $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""} · ${num(list.length)}${list.length >= 200 ? " (first 200)" : ""} · newest first`;
+    $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""}`
+      + `${find ? ` · “${find}”` : ""} · ${num(list.length)}`
+      + `${list.length >= 200 ? " (first 200)" : ""} · newest first`;
   } catch (err) {
     if (seq !== recSeq) return;
     $("recTable").innerHTML = empty("Could not load recordings", err.message);
