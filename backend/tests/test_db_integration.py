@@ -1779,11 +1779,24 @@ async def test_trusted_origins_are_versioned_and_signed(dbs):
         assert v1 > start
         bundle = await api_v2._trusted_origins_bundle()
         payload = bundle["payload"]
-        assert "https://emr.cmed.example" in payload["origins"] and payload["version"] == v1
+        # 25 Nov 2026: the version ends with this server's digit (1, the real one).
+        assert "https://emr.cmed.example" in payload["origins"]
+        assert payload["version"] == v1 * 10 + 1
         # A PC that has not joined yet gets the same signed list with no token,
         # and nothing when it already holds this version.
         assert (await api_v2.trusted_origins_for_new_pc(have=0))["trusted_origins"] == bundle
-        assert (await api_v2.trusted_origins_for_new_pc(have=v1))["trusted_origins"] is None
+        assert (await api_v2.trusted_origins_for_new_pc(have=payload["version"])
+                )["trusted_origins"] is None
+        # A PC that holds another server's list - beta's, numbered higher - is
+        # sent this server's list, numbered above it, and then holds this one.
+        beta = (v1 + 5_000) * 10 + 2
+        taken = (await api_v2.trusted_origins_for_new_pc(have=beta))["trusted_origins"]
+        assert taken["payload"]["version"] > beta and taken["payload"]["version"] % 10 == 1
+        assert taken["payload"]["origins"] == payload["origins"]
+        assert (await api_v2.trusted_origins_for_new_pc(have=taken["payload"]["version"])
+                )["trusted_origins"] is None
+        # An older list of this server (an old PC's, before the digit) is replaced.
+        assert (await api_v2.trusted_origins_for_new_pc(have=start))["trusted_origins"] == bundle
         key.public_key().verify(bytes.fromhex(bundle["signature"]), integrity.digest(
             integrity.ORIGINS_DOMAIN, integrity.canonical_json(payload)))
         with pytest.raises(Exception):
