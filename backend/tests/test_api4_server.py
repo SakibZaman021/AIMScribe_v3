@@ -25,6 +25,36 @@ import workbook                                 # noqa: E402
 from test_v3_server import DEVICE, NOW, server  # noqa: E402,F401
 
 
+def test_cmeds_end_time_is_read_from_an_api4_close_only():
+    assert api_v2.api4_end_time("consultation_ended", "end_time=2026-11-26T10:31:05+06:00") \
+        == "2026-11-26T10:31:05+06:00"
+    assert api_v2.api4_end_time("superseded_by_new_patient",
+                                "end_time=2026-11-26T10:31:05+06:00") is None
+    assert api_v2.api4_end_time("consultation_ended", "") is None
+    assert api_v2.api4_end_time("consultation_ended", None) is None
+
+
+@pytest.mark.asyncio
+async def test_the_json_label_ends_the_visit_at_cmeds_end_time(server):
+    """The lab labels by CMED's end_time when API 4 ended the recording."""
+    sid = "01JB8XQ4M7YZ2K9V3N5P6R8T13"
+    closed = datetime(2026, 11, 26, 4, 31, 7, tzinfo=timezone.utc)
+    base = {"session_id": sid, "device_id": DEVICE["device_id"], "doctor_id": "DR0042",
+            "hospital_id": "HOSP003", "opened_at": closed, "closed_at": closed,
+            "confirmation": "confirmed"}
+    server.repo.sessions[sid] = dict(base, close_reason="consultation_ended",
+                                     close_detail="end_time=2026-11-26T10:31:05+06:00")
+    document = await api_v2.archive_clinical_document(sid)
+    assert document["visit"]["end_time"] == "2026-11-26T10:31:05+06:00"
+    assert document["visit"]["end_time_from"] == "CMED API 4"
+    # Ended any other way: when the recording stopped, as before.
+    server.repo.sessions[sid] = dict(base, close_reason="superseded_by_new_patient",
+                                     close_detail="")
+    document = await api_v2.archive_clinical_document(sid)
+    assert document["visit"]["end_time"] == closed.isoformat()
+    assert document["visit"]["end_time_from"] == "recording stopped"
+
+
 def test_an_api4_end_is_an_ordinary_end():
     assert collectors.stop_kind("consultation_ended") is None
     assert collectors.stop_label("consultation_ended") == "ended normally"

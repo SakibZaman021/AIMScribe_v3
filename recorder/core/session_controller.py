@@ -73,7 +73,16 @@ API4_END_REASON = "consultation_ended"
 # Written once a PC has received API 4. From then on the recording waits for
 # API 4 (or the next patient) and the two-minute rule after API 3 is not used:
 # CMED's page at this clinic sends the end of every visit.
-API4_FLAG_FILE = "api4_seen"
+API4_FLAG_FILE = "api4_seen"     # 3.9.8 before 25 Nov; no longer read or written
+# 25 Nov 2026: how a recording ends is set per clinic by the AIMS LAB server, in
+# every heartbeat reply ("end_rule"), never by this PC:
+#   "api3" - two minutes after CMED's API 3 (the prescription). Amader Susastho
+#            always; Aalo until CMED's API 4 is live there. API 4, if it comes,
+#            is logged and the recording still runs its two minutes.
+#   "api4" - when CMED's API 4 closes the visit; 15 minutes after API 3 if no
+#            API 4 comes.
+# Until the server has said, "api3".
+END_RULES = ("api3", "api4")
 
 # 3.9.8: what the doctor's on-screen choices are logged as. Logged only - the
 # recording carries on until API 4 or the next patient; the lab trims the audio
@@ -259,7 +268,7 @@ class SessionController:
         # the last recording belonged to, so a late or repeated API 4 for it is
         # answered without touching the recording now running.
         self._state_dir = getattr(paths, "state_dir", None)
-        self._api4_seen = self._read_api4_flag()
+        self._end_rule = "api3"
         self._last_closed: Optional[Dict[str, str]] = None
 
     # ---- startup / shutdown ----
@@ -883,6 +892,11 @@ class SessionController:
                 adopt(clinic)
             else:
                 self.hospital_id = clinic
+        rule = reply.get("end_rule") if isinstance(reply, dict) else None
+        if rule in END_RULES and rule != self._end_rule:
+            logger.info("This clinic's recordings now end by rule %r (was %r)", rule,
+                        self._end_rule)
+            self._end_rule = rule
         if isinstance(reply, dict) and reply.get("trusted_origins"):
             from core import trusted_origins
             trusted_origins.apply(reply["trusted_origins"])
@@ -968,10 +982,18 @@ class SessionController:
             if self._active is not active or self._limits_wait(active):
                 continue
             now = time.monotonic()
-            if active.armed_at is not None and not self._api4_seen:
-                limit = self._knob("counselling_limit_seconds", 120.0)
+            if active.armed_at is not None:
+                # 25 Nov: by the clinic's rule. "api3": two minutes after the
+                # prescription. "api4": CMED's API 4 ends it; if none has come
+                # 15 minutes after the prescription, it ends then.
+                if self._end_rule == "api4":
+                    limit = self._knob("api4_wait_seconds", 900.0)
+                    detail = "API 4 not received"
+                else:
+                    limit = self._knob("counselling_limit_seconds", 120.0)
+                    detail = ""
                 if limit > 0 and now - active.armed_at >= limit:
-                    if await self._end_at_a_pause(active, "counselling_limit"):
+                    if await self._end_at_a_pause(active, "counselling_limit", detail):
                         return
             elif active.pause is None:
                 limit = self._knob("no_activity_limit_seconds", 0.0)
@@ -979,7 +1001,8 @@ class SessionController:
                     if await self._close_by_limit(active, "no_activity_limit"):
                         return
 
-    async def _end_at_a_pause(self, active: ActiveSession, reason: str) -> bool:
+    async def _end_at_a_pause(self, active: ActiveSession, reason: str,
+                              detail: str = "") -> bool:
         """
         The limit is reached: close at the first quiet moment within the grace,
         so the recording does not end in the middle of the doctor's sentence.
@@ -994,9 +1017,10 @@ class SessionController:
                     getattr(active.segmenter, "live_level", 0.0) < quiet:
                 break
             await asyncio.sleep(step)
-        return await self._close_by_limit(active, reason)
+        return await self._close_by_limit(active, reason, detail)
 
-    async def _close_by_limit(self, active: ActiveSession, reason: str) -> bool:
+    async def _close_by_limit(self, active: ActiveSession, reason: str,
+                              detail: str = "") -> bool:
         async with self._lock:
             if self._active is not active:
                 return True
@@ -1005,7 +1029,10 @@ class SessionController:
             logger.info("Session %s ended by itself: %s%s", active.session_id, reason,
                         " (it was paused)" if active.pause is not None else "")
             self._forget()
-            await self._close_active(reason=reason)
+            if detail:
+                await self._close_active(reason=reason, detail=detail)
+            else:
+                await self._close_active(reason=reason)
             return True
 
     def _background_task(self, coro) -> asyncio.Task:
@@ -1334,9 +1361,15 @@ class SessionController:
 
     def _closed(self, active: ActiveSession, reason: str, *, chain_ok: bool,
                 deferred: bool = False) -> Dict[str, Any]:
+        # 25 Nov: when the microphone stopped, on this PC's clock with its
+        # time zone - what API 4's reply confirms to CMED.
+        stopped_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        if self._last_closed and self._last_closed.get("session_id") == active.session_id:
+            self._last_closed["stopped_at"] = stopped_at
         result = {
             "status": "stopped",
             "session_id": active.session_id,
+            "stopped_at": stopped_at,
             "duration_seconds": round(active.audio_seconds, 1),
             "paused_seconds": round(active.paused_seconds, 1),
             "segment_count": len(active.spool.segments),
@@ -1418,32 +1451,6 @@ class SessionController:
 
     # ---- 3.9.8: API 4, the doctor's logged choices, the consent window ----
 
-    def _read_api4_flag(self) -> bool:
-        if not self._state_dir:
-            return False
-        try:
-            from pathlib import Path
-            return (Path(self._state_dir) / API4_FLAG_FILE).exists()
-        except OSError:
-            return False
-
-    def _note_api4_seen(self) -> None:
-        if self._api4_seen:
-            return
-        self._api4_seen = True
-        logger.info("API 4 received on this PC: recordings now end on API 4 or the "
-                    "next patient, no longer two minutes after API 3")
-        if not self._state_dir:
-            return
-        try:
-            from pathlib import Path
-            folder = Path(self._state_dir)
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / API4_FLAG_FILE).write_text(
-                crypto.iso_utc(datetime.now(timezone.utc)) + "\n", encoding="utf-8")
-        except OSError as exc:
-            logger.warning("Could not keep the API 4 flag on disk: %s", exc)
-
     async def end_visit(self, end) -> Dict[str, Any]:
         """
         API 4: CMED closed the visit. Ends the recording - kept whole, an
@@ -1453,13 +1460,11 @@ class SessionController:
         for the visit that has just ended changes nothing; one for any other
         visit is refused and the recording carries on.
         """
-        self._note_api4_seen()
         async with self._lock:
             active = self._active
             if active is None or self.state == CLOSING:
                 if self._is_last_closed(end):
-                    return {"status": "already_ended",
-                            "session_id": self._last_closed["session_id"]}
+                    return self._already_ended()
                 raise SessionError("Nothing is being recorded.", code="NO_ACTIVE_SESSION")
             same_patient = end.patient_id in active.seen or \
                 end.patient_id == active.patient_ref
@@ -1469,19 +1474,40 @@ class SessionController:
             missing_visit = bool(active.visit_id) and not end.visit_id
             if not (same_patient and same_doctor and same_visit) or missing_visit:
                 if self._is_last_closed(end):
-                    return {"status": "already_ended",
-                            "session_id": self._last_closed["session_id"]}
+                    return self._already_ended()
                 active.spool.log_event("api4_mismatch", (
                     f"visit={end.visit_id or '-'} patient={self._pseudonym(end.patient_id)} "
                     f"doctor={end.doctor_id}"), audio_seconds=self._audio_position(active))
                 raise SessionError("That visit is not the one being recorded; the "
                                    "recording continues.", code="VISIT_MISMATCH")
+            if self._end_rule != "api4":
+                # 25 Nov: this clinic ends recordings two minutes after the
+                # prescription (Amader Susastho; Aalo until API 4 is live).
+                # API 4 is logged with its end_time and changes nothing.
+                active.spool.log_event("api4_not_used", f"end_time={end.end_time}",
+                                       audio_seconds=self._audio_position(active))
+                logger.info("API 4 for session %s logged; this clinic ends recordings "
+                            "two minutes after API 3", active.session_id)
+                return {"status": "continues", "session_id": active.session_id,
+                        "end_time": end.end_time}
             active.spool.log_event("api4_end", f"end_time={end.end_time}",
                                    audio_seconds=self._audio_position(active))
             self._forget()
             logger.info("Session %s ended by CMED's API 4", active.session_id)
-            return await self._close_active(reason=API4_END_REASON,
-                                            detail=f"end_time={end.end_time}")
+            result = await self._close_active(reason=API4_END_REASON,
+                                              detail=f"end_time={end.end_time}")
+            # CMED's end_time, kept with the recording for labelling, and in
+            # the reply as CMED's proof of which end was recorded.
+            result["end_time"] = end.end_time
+            if self._last_closed:
+                self._last_closed["end_time"] = end.end_time
+            return result
+
+    def _already_ended(self) -> Dict[str, Any]:
+        """The confirmation again, for a resend or a visit already ended."""
+        last = self._last_closed
+        return {"status": "already_ended", "session_id": last["session_id"],
+                "stopped_at": last.get("stopped_at"), "end_time": last.get("end_time")}
 
     def _is_last_closed(self, end) -> bool:
         last = self._last_closed
@@ -2047,7 +2073,8 @@ class SessionController:
                                                    active.sensitive["reason"]),
                     "seconds": round(time.monotonic() - active.sensitive["monotonic"], 1),
                 }
-        payload["ends_on_api4"] = self._api4_seen
+        payload["ends_on_api4"] = self._end_rule == "api4"
+        payload["end_rule"] = self._end_rule
         if active and active.pause:
             payload["pause"] = {
                 "reason": active.pause.reason,

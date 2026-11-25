@@ -13,9 +13,13 @@ the strip; one more click chooses. A tap alone does nothing. What each choice
 does, and what the menus say, is decided in overlay_model.py, which has no
 tkinter in it and is tested on its own; this file only draws.
 
-The strip is half see-through until the pointer comes near, so it does not sit
-heavily over what the doctor is reading, and it can be dragged by its dot but
-never off the screen. It stays where it was left for the next consultation.
+25 Nov 2026: the strip is a solid white card with rounded corners, fully
+opaque, and the icons are drawn smooth against the card's own white - before,
+they were see-through and their edges blended into a colour the screen behind
+did not have, so they looked blurred. It shows no words of its own: no notes,
+no "Checking with CMED", no microphone or server messages; those reach the
+AIMS LAB server, where the data collectors and researchers act on them. It can
+be dragged by the card but never off the screen, and stays where it was left.
 
 tkinter runs on its own thread, which owns every widget. Choices are handed to
 the agent's event loop, as the tray menu's are; events from the controller
@@ -57,12 +61,16 @@ KEY = "#010203"                # the strip's background: drawn see-through
 #   sidebar - Amader Susastho: at the left edge, over the EHR's dark teal
 #             sidebar, below its own icons.
 #   light   - Aalo Clinic and everything else: top right, over a white page.
+# 25 Nov: in both looks the icons sit on a solid white card (`card`, edged with
+# `card_edge`); only the screen outside the card's rounded corners (`key`) is
+# see-through. The icons blend into the card's white, which is always there.
 THEMES = {
     "sidebar": {"matte": "#00566f", "key": "#00566e", "side": "left", "height": 0.42,
-                "dot_off": "#7fb3c1"},
+                "dot_off": "#b8bec4", "card": "#ffffff", "card_edge": "#8fb8c4"},
     "light": {"matte": "#ffffff", "key": "#fefefd", "side": "right", "height": None,
-              "dot_off": "#b8bec4"},
+              "dot_off": "#b8bec4", "card": "#ffffff", "card_edge": "#c9d0d8"},
 }
+CARD_RADIUS = 16               # the card's corners
 
 
 def theme_for(hospital_id, override: str = "") -> str:
@@ -76,7 +84,7 @@ MARGIN = 20                    # from the screen's right edge, where the strip s
 TOP = 120                      # from the top: below a browser's own close button
 ICON = 44                      # each icon's diameter
 DOT = 10
-IDLE_ALPHA = 0.85              # a little see-through until the pointer comes near
+IDLE_ALPHA = 1.0               # 25 Nov: always solid (see-through looked blurred)
 NEAR_ALPHA = 1.0
 MENU_WIDTH = 300
 MENU_KEY = "#fdfdfc"           # around the menu's rounded corners: see-through
@@ -128,10 +136,11 @@ def _enable_dpi_awareness() -> float:
 
 def _apply_scale() -> None:
     """Grow the strip to match the display scale (fonts follow `tk scaling`)."""
-    global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP, MENU_RADIUS, BUTTON_RADIUS
+    global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP, MENU_RADIUS, BUTTON_RADIUS, CARD_RADIUS
     if SCALE == 1.0:
         return
     MENU_RADIUS, BUTTON_RADIUS = round(MENU_RADIUS * SCALE), round(BUTTON_RADIUS * SCALE)
+    CARD_RADIUS = round(CARD_RADIUS * SCALE)
     WIDTH, HEIGHT = round(WIDTH * SCALE), round(HEIGHT * SCALE)
     TOP = round(TOP * SCALE)
     ICON, DOT = round(ICON * SCALE), round(DOT * SCALE)
@@ -192,7 +201,7 @@ class Overlay:
         controller = self.runtime.controller
         loop = self.runtime.loop
         if controller is None or loop is None:
-            self.post("overlay_message", {"text": "The recorder is still starting."})
+            logger.warning("On-screen choice ignored: the recorder is still starting")
             return
         future = asyncio.run_coroutine_threadsafe(make_coro(controller), loop)
         future.add_done_callback(self._report)
@@ -201,7 +210,6 @@ class Overlay:
         exc = future.exception()
         if exc is not None:
             logger.warning("On-screen control action failed: %s", exc)
-            self.post("overlay_message", {"text": str(exc)[:160]})
 
     def _status(self) -> Dict[str, Any]:
         controller = self.runtime.controller
@@ -277,8 +285,8 @@ class Overlay:
         """An icon that opens its menu on hover or tap, and does nothing else."""
         import tkinter as tk
 
-        canvas = tk.Canvas(parent, bg=self._backdrop, highlightthickness=0, bd=0,
-                           takefocus=1, cursor="hand2")
+        canvas = tk.Canvas(parent, bg=THEMES[self._theme]["card"], highlightthickness=0,
+                           bd=0, takefocus=1, cursor="hand2")
         canvas.kind = kind
         canvas.hover = False
         canvas.draw = lambda: self._draw_icon(canvas)
@@ -315,8 +323,7 @@ class Overlay:
         if canvas.hover:
             inside = HOVER if inside == PAPER else inside
         theme = THEMES[self._theme]
-        art = self._icon_image(canvas.kind, size, ring, inside, matte=theme["matte"],
-                               key=self._backdrop if self._see_through else None)
+        art = self._icon_image(canvas.kind, size, ring, inside, matte=theme["card"])
         if art is not None:
             # Held on the widget: a PhotoImage only the canvas refers to is
             # collected, and the icon then draws as nothing.
@@ -405,23 +412,51 @@ class Overlay:
                 pass
         else:
             self._backdrop = THEMES[theme]["matte"]
-        for widget in (self.canvas, self.stop_button, self.mark_button):
-            widget.configure(bg=self._backdrop)
+        self.canvas.configure(bg=self._backdrop)
+        for widget in (self.stop_button, self.mark_button):
+            widget.configure(bg=THEMES[theme]["card"])
         if self._spot is None:
             self._place()
 
     def _paint(self, view) -> None:
-        """Only the dot that says a recording is on; the screen shows around it."""
+        """The solid card, and on it the dot that says a recording is on."""
         canvas = self.canvas
         canvas.delete("all")
-        canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=self._backdrop,
-                                outline=self._backdrop)
+        theme = THEMES[self._theme]
+        art = self._rounded_image(WIDTH, self._height, CARD_RADIUS, fill=theme["card"],
+                                  edge=theme["card_edge"], matte=theme["card_edge"],
+                                  key=self._backdrop if self._see_through else None)
+        if art is not None:
+            canvas.art = art
+            canvas.create_image(0, 0, anchor="nw", image=art)
+        else:
+            canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=theme["card"],
+                                    outline=theme["card_edge"])
         colour = {"recording": RED, "waiting": AMBER, "problem": RED}.get(
             view.dot, THEMES[self._theme]["dot_off"])
         centre = WIDTH / 2
         top = round(9 * SCALE)
-        canvas.create_oval(centre - DOT / 2, top, centre + DOT / 2, top + DOT,
-                           fill=colour, outline=colour)
+        dot = self._dot_image(DOT, colour, theme["card"])
+        if dot is not None:
+            canvas.dot_art = dot
+            canvas.create_image(round(centre - DOT / 2), top, anchor="nw", image=dot)
+        else:
+            canvas.create_oval(centre - DOT / 2, top, centre + DOT / 2, top + DOT,
+                               fill=colour, outline=colour)
+
+    @staticmethod
+    def _dot_image(size: int, colour: str, matte: str):
+        """The dot, smooth-edged against the card's white. None without Pillow."""
+        if size < 4:
+            return None
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            return None
+        ss = 4
+        image = Image.new("RGB", (size * ss, size * ss), matte)
+        ImageDraw.Draw(image).ellipse([0, 0, size * ss - 1, size * ss - 1], fill=colour)
+        return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
 
     @staticmethod
     def _round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
@@ -632,7 +667,7 @@ class Overlay:
         height = inner.winfo_reqheight() + 2 * pad - round(6 * SCALE)
         card.configure(width=width, height=height)
         art = self._rounded_image(width, height, MENU_RADIUS, fill=PAPER, edge=EDGE,
-                                  matte=PAPER, key=MENU_KEY)
+                                  matte=EDGE, key=MENU_KEY)
         if art is not None:
             card.art = art
             card.create_image(0, 0, anchor="nw", image=art)
@@ -754,7 +789,7 @@ class Overlay:
             result = self.actions.choose(kind, value, consent_open=consent_open,
                                          deletion_confirmed=True) if confirmed else ""
         if result:
-            self.post("overlay_message", {"text": result})
+            logger.info("On-screen choice %s/%s not sent: %s", kind, value, result)
         self._close_menu()
 
     def _close_menu_soon(self) -> None:

@@ -15,7 +15,7 @@ from core.spool import SessionSpool
 from core.uploader import AuthOutcome
 from tests.fakes import ScriptedUploader, make_controller, trigger
 from ui.overlay_model import (END_LABEL, MARK, MARK_MENU, MARK_TITLE, MARKED_OVER,
-                              MESSAGE_SECONDS, NEEDS_DELETE_CONFIRMATION, REFUSAL_CLOSED,
+                              NEEDS_DELETE_CONFIRMATION, REFUSAL_CLOSED,
                               REMINDER_SECONDS, SENSITIVE_END, STOP, STOP_MENU, STOP_TITLE,
                               OverlayActions, OverlayState, menu)
 
@@ -85,49 +85,34 @@ def test_a_marked_part_offers_to_end_it_and_asks_after_two_minutes():
     assert view.alarm and menu(MARK, view)[0] == MARKED_OVER
 
 
-def test_confirming_is_said_in_plain_words():
-    view = OverlayState().view(recording(confirmation="confirming"))
-    assert view.note == "Checking with CMED…"
+def test_the_screen_shows_no_words_whatever_happens():
+    """25 Nov: no notes for the doctor; the server keeps them for the lab."""
+    state = OverlayState()
+    state.on_event("recording_started", {"session_id": "S1"})
+    for event, data in [
+        ("session_confirming", {"session_id": "S1"}),
+        ("session_unconfirmed", {"session_id": "S1"}),
+        ("session_held", {"session_id": "S1", "message": "Recording. The AIMS LAB server "
+                          "has not accepted this recording yet, so it is kept on this PC."}),
+        ("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"}),
+        ("integrity_alert", {"session_id": "S1", "alert_type": "microphone_unavailable"}),
+        ("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
+                             "device": "Microphone Array (Realtek)"}),
+        ("doctor_marked", {"reason": "patient_left"}),
+        ("sensitive_started", {}),
+        ("overlay_message", {"text": "The recorder is still starting."}),
+    ]:
+        state.on_event(event, data)
+        for status in (recording(), recording(confirmation="confirming"),
+                       recording(authorisation="pending")):
+            view = state.view(status)
+            assert view.note == "" and view.dot == "recording", (event, status)
 
 
-def test_a_choice_is_acknowledged_briefly():
-    clock = Clock()
-    state = OverlayState(clock)
-    state.on_event("doctor_marked", {"reason": "patient_left"})
-    assert state.view(recording()).note == "Noted: Patient left the room. Recording continues."
-    clock.now += MESSAGE_SECONDS + 1
-    assert state.view(recording()).note == ""
-
-
-def test_why_a_recording_was_deleted_stays_on_screen_briefly():
-    clock = Clock()
-    state = OverlayState(clock)
+def test_nothing_stays_on_screen_after_a_refusal():
+    state = OverlayState()
     state.on_event("session_refused", {"session_id": "S1"})
-    view = state.view({})
-    assert view.visible and "did not consent" in view.note
-    clock.now += MESSAGE_SECONDS + 1
     assert state.view({}).visible is False
-
-
-def test_the_no_signal_warning_goes_when_sound_comes_back():
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "silent_session"})
-    view = state.view(recording())
-    assert "gives no signal" in view.note and view.dot == "problem"
-    state.on_event("sound_restored", {"session_id": "S1"})
-    assert "no signal" not in state.view(recording()).note
-
-
-def test_the_card_says_which_way_the_microphone_moved():
-    state = OverlayState()
-    state.on_event("recording_started", {"session_id": "S1"})
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
-                                       "device": "Microphone Array (2- Realtek(R) Audio)"})
-    assert "Jabra unplugged" in state.view(recording()).note
-    state.on_event("integrity_alert", {"session_id": "S1", "alert_type": "microphone_switched",
-                                       "device": "Echo Cancelling Speakerphone (Jabra Speak2 55 MS)"})
-    assert state.view(recording()).note == "Back on the Jabra speakerphone."
 
 
 def test_an_open_menu_keeps_the_control_visible():

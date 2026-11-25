@@ -66,122 +66,49 @@ DELETE_QUESTION = ("Delete this recording?",
 # Returned by choose() when the refusal still needs its one confirmation.
 NEEDS_DELETE_CONFIRMATION = "needs_delete_confirmation"
 
-# Plain words for the doctor (SRS-NFU-04), shown briefly beside the icons.
-NOTES = {
-    "session_confirming": "Checking with CMED…",
-    "session_confirmed": "Confirmed",
-    "session_unconfirmed": "Not confirmed by CMED yet - still recording",
-}
-MESSAGE_SECONDS = 6.0
+# 25 Nov 2026: the doctor's screen shows NO words of its own - no "Checking
+# with CMED", no microphone or server notes, no "Noted". Only the dot and the
+# two icons with their menus. Everything such a note used to say is already
+# sent to the AIMS LAB server (alerts and the health log); the data collectors
+# and researchers act on it there.
+MESSAGE_SECONDS = 0.0           # kept for older callers; nothing is shown
 
 
 @dataclass
 class OverlayView:
     visible: bool
-    note: str                       # one line to show beside the icons, or ""
+    note: str                       # always "": the screen shows no words
     consent_open: bool              # the refusal can still be chosen
     marked: Optional[str]           # the open sensitive part's reason, words
     alarm: bool                     # marked two minutes or more: blink and ask
-    dot: str                        # "recording" | "waiting" | "problem" | "off"
+    dot: str                        # "recording" | "off"
 
 
 class OverlayState:
-    """Turns the controller's status and events into what the control shows."""
+    """Turns the controller's status into what the control shows."""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
         self.session_id: Optional[str] = None
-        self.note = ""
-        self.shown: set = set()
         self.menu_open = False
-        self.message = ""
-        self.message_until = 0.0
-
-    def _say(self, text: str) -> None:
-        """A message that outlives the recording, such as why it stopped."""
-        self.message = text
-        self.message_until = self._clock() + MESSAGE_SECONDS
 
     def on_event(self, event: str, data: Dict[str, Any]) -> None:
-        session_id = data.get("session_id")
+        """Events change nothing on the screen; they reach the server, not the doctor."""
         if event == "recording_started":
-            self.session_id, self.note, self.shown = session_id, "", set()
-            self.message_until = 0.0
-            return
-        if event in NOTES and session_id in (None, self.session_id):
-            self.note = NOTES[event]
-            return
-        if event == "doctor_marked":
-            words = dict(STOP_MENU).get(data.get("reason"), "Reason")
-            self._say(f"Noted: {words}. Recording continues.")
-            return
-        if event == "sensitive_started":
-            self._say("Marked. This part will be removed before anyone listens to it.")
-            return
-        if event == "sensitive_ended":
-            self._say("Sensitive part ended.")
-            return
-        if event == "sound_restored" and session_id in (None, self.session_id):
-            self.shown.discard("silent_session")
-            if self.note.startswith("Microphone gives no signal"):
-                self.note = ""
-            return
-        if event == "session_refused":
-            self._say("Recording stopped and deleted - the patient did not consent.")
-            return
-        if event == "session_held" and session_id in (None, self.session_id):
-            self.note = data.get("message") or "Recording. Kept on this PC for now."
-            return
-        if event == "integrity_alert":
-            kind = data.get("alert_type")
-            if kind in self.shown:
-                return
-            if kind == "silent_session":
-                self.shown.add(kind)
-                self.note = "Microphone gives no signal - is it muted?"
-            elif kind in ("microphone_unavailable", "capture_failed"):
-                self.shown.add(kind)
-                self.note = "The microphone is not working. Check that it is connected."
-            elif kind == "microphone_switched":
-                device = str(data.get("device") or "")
-                self.note = ("Back on the Jabra speakerphone." if "jabra" in device.lower()
-                             else "Jabra unplugged - recording on this PC's microphone.")
-            return
-        if event == "overlay_message":
-            self._say(str(data.get("text", ""))[:200])
+            self.session_id = data.get("session_id")
 
     def view(self, status: Dict[str, Any]) -> OverlayView:
         active = bool(status.get("is_recording") or status.get("is_paused"))
         sensitive = status.get("sensitive") or None
         marked = (sensitive.get("label") or sensitive.get("reason")) if sensitive else None
         alarm = bool(sensitive) and float(sensitive.get("seconds") or 0) >= REMINDER_SECONDS
-
-        note = self.note
-        if active and not note:
-            if status.get("authorisation") == "pending":
-                note = "Recording - waiting for the AIMS LAB server"
-            elif status.get("confirmation") == "confirming":
-                note = NOTES["session_confirming"]
-        message_on = self._clock() < self.message_until
-        if message_on:
-            note = self.message
-
-        if not active:
-            dot = "off"
-        elif "no signal" in self.note or "not working" in self.note:
-            dot = "problem"
-        elif status.get("authorisation") == "pending":
-            dot = "waiting"
-        else:
-            dot = "recording"
-
         return OverlayView(
-            visible=active or self.menu_open or message_on,
-            note=note if (active or message_on) else "",
+            visible=active or self.menu_open,
+            note="",
             consent_open=active and status.get("consent_open", True) is not False,
             marked=marked if active else None,
             alarm=alarm and active,
-            dot=dot,
+            dot="recording" if active else "off",
         )
 
 
@@ -217,8 +144,8 @@ class OverlayActions:
                deletion_confirmed: bool = False) -> Optional[str]:
         """
         None when the choice was sent; NEEDS_DELETE_CONFIRMATION when the
-        refusal still needs its one confirmation; otherwise what to tell the
-        doctor.
+        refusal still needs its one confirmation; otherwise why it was not
+        sent (logged, never shown).
         """
         if kind == STOP:
             if value == REFUSAL:
