@@ -676,7 +676,7 @@ def create_app(runtime: Runtime) -> FastAPI:
             message = None
         if isinstance(message, dict):
             raw = json.dumps({**message, "command": "start"})
-        reply = await runtime.ws.handle_message(_HTTP_CLIENT, raw)
+        reply = await runtime.ws.handle_message(_HTTP_CLIENT, raw, origin=origin)
         return JSONResponse(status_code=int(reply.get("status") or 200), content=reply)
 
     @app.post("/api/v1/session/end")

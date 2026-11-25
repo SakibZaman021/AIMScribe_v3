@@ -295,8 +295,13 @@ async def _recorders(conn, clinic: Optional[str]) -> Dict[str, Any]:
                blocked_at, revoked_reason, octet_length(tpm_pubkey) AS key_bytes
           FROM devices
          WHERE ($1::text[] IS NULL OR hospital_id = ANY($1::text[]))
+           -- 26 Nov 2026: the real dashboard does not list a revoked PC that
+           -- has no recording here - the test PCs, which live on beta. Beta
+           -- lists them all.
+           AND ($2 OR revoked_at IS NULL
+                OR EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = devices.device_id))
          ORDER BY hospital_id, machine_name
-    """, clinic)
+    """, clinic, environment.is_beta())
 
     offline = await _offline_periods(conn, [row["device_id"] for row in rows])
 

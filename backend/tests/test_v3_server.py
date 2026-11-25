@@ -81,13 +81,18 @@ class FakeRepo:
 
     # grants
     async def create_authorisation(self, *, jti, device_id, hospital_id, visit, expires_at,
-                                   visit_id=None):
+                                   visit_id=None, origin=None):
         self.auths[jti] = dict(
             jti=jti, device_id=device_id, hospital_id=hospital_id,
             cmed_hospital_id=visit.cmed_hospital_id, patient_id=visit.patient_id,
             doctor_id=visit.doctor_id, start_time=visit.start_time,
             visit_date=visit.day, notice_id=None, session_id=None, issued_at=NOW(),
-            expires_at=expires_at, visit_id=visit_id)
+            expires_at=expires_at, visit_id=visit_id, origin=origin)
+
+    # 052: this server's trusted EHR pages
+    async def trusted_origins(self, *, include_removed=False):
+        return [{"origin": o} for o in getattr(self, "origins",
+                                               ["https://karail.aaloclinic.org:8443"])]
 
     # interface 4: the recording's visit_id, and when its API 3 arrived
     async def set_session_visit(self, session_id, visit_id):
@@ -618,6 +623,10 @@ class FakeRepo:
     async def raise_alert(self, **kw):
         self.alerts.append(kw)
 
+    async def alert_once(self, *, alert_type, group, window, severity="warning", detail=None):
+        self.alerts.append({"alert_type": alert_type, "group": group, "detail": detail})
+        return True
+
     async def audit(self, **kw):
         self.audits.append(kw)
 
@@ -858,6 +867,37 @@ def visit_of(fields=FIELDS) -> Visit:
 # ============================================================
 # Grants
 # ============================================================
+
+async def test_a_page_the_server_does_not_trust_gets_no_grant(server):
+    """26 Nov 2026: the real server takes recordings only from the clinics' pages."""
+    status, reply = await mint({**FIELDS, "origin": "https://dev.aaloclinic.org"})
+    assert (status, reply["code"]) == (403, "ORIGIN_NOT_TRUSTED")
+    assert not server.repo.auths
+    refused = [a for a in server.repo.alerts if a["alert_type"] == "origin_not_trusted"]
+    assert refused and refused[0]["detail"]["origin"] == "https://dev.aaloclinic.org"
+
+
+async def test_a_clinic_page_gets_its_grant_and_the_page_is_kept(server):
+    status, reply = await mint({**FIELDS, "origin": "https://KARAIL.aaloclinic.org:8443/"})
+    assert (status, reply["code"]) == (200, "GRANTED")
+    assert server.repo.auths[reply["jti"]]["origin"] == "https://KARAIL.aaloclinic.org:8443"
+
+
+async def test_an_older_recorder_naming_no_page_is_taken_unless_required(server, monkeypatch):
+    status, reply = await mint()
+    assert status == 200 and server.repo.auths[reply["jti"]]["origin"] is None
+    monkeypatch.setenv("AIMS_REQUIRE_ORIGIN", "on")
+    status, reply = await mint()
+    assert (status, reply["code"]) == (403, "ORIGIN_MISSING")
+
+
+async def test_a_page_added_on_the_dashboard_is_trusted_at_once(server):
+    server.repo.origins = ["https://karail.aaloclinic.org:8443"]
+    assert (await mint({**FIELDS, "origin": "https://10.0.40.211"}))[0] == 403
+    server.repo.origins.append("https://10.0.40.211")
+    api_v2._ORIGINS_CACHE["at"] = -1e9                 # what an add through the API does
+    assert (await mint({**FIELDS, "origin": "https://10.0.40.211"}))[0] == 200
+
 
 async def test_grant_verifies_on_the_recorder_and_names_the_pcs_clinic(server):
     from core import crypto

@@ -1853,15 +1853,17 @@ class V2Repository:
 
     async def create_authorisation(self, *, jti: str, device_id, hospital_id: str,
                                    visit, expires_at: datetime,
-                                   visit_id: Optional[str] = None) -> None:
+                                   visit_id: Optional[str] = None,
+                                   origin: Optional[str] = None) -> None:
         async with self._acquire() as conn:
             await conn.execute("""
                 INSERT INTO grant_authorisations
                     (jti, device_id, hospital_id, cmed_hospital_id, patient_id,
-                     doctor_id, start_time, visit_date, expires_at, visit_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     doctor_id, start_time, visit_date, expires_at, visit_id, origin)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             """, jti, device_id, hospital_id, visit.cmed_hospital_id, visit.patient_id,
-                 visit.doctor_id, visit.start_time, visit.day, expires_at, visit_id)
+                 visit.doctor_id, visit.start_time, visit.day, expires_at, visit_id,
+                 origin)
 
     async def set_session_visit(self, session_id: str, visit_id: str) -> None:
         async with self._acquire() as conn:

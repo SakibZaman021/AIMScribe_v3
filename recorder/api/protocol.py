@@ -99,6 +99,10 @@ class Trigger:
     start_time: str           # exactly as CMED's server wrote it (SRS-CNF-02)
     date: str
     visit_id: str = ""
+    # 3.9.9: the EHR page that sent API 1 (its Origin header), forwarded with
+    # the grant request so the server can refuse a page it does not trust -
+    # the real server takes only the clinics' own pages (26 Nov 2026).
+    origin: str = ""
 
     @property
     def start_at(self) -> datetime:
@@ -109,7 +113,9 @@ class Trigger:
                 "hospital_id": self.hospital_id, "start_time": self.start_time,
                 "date": self.date}
         # Only when sent, so a page without it sends the server what it did.
-        return {**five, "visit_id": self.visit_id} if self.visit_id else five
+        if self.visit_id:
+            five = {**five, "visit_id": self.visit_id}
+        return {**five, "origin": self.origin} if self.origin else five
 
 
 @dataclass(frozen=True)

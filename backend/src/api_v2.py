@@ -2164,8 +2164,12 @@ class TrustedOriginRequest(BaseModel):
 
 @router.get("/admin/trusted-origins")
 async def admin_trusted_origins(_: None = Depends(require_admin)):
-    """CMED's EHR addresses every recorder obeys, and the ones removed."""
-    rows = await _repo().trusted_origins(include_removed=True)
+    """
+    CMED's EHR addresses every recorder obeys. Beta also lists the removed
+    ones; the real dashboard shows only its clinics' pages (26 Nov 2026).
+    """
+    from environment import is_beta
+    rows = await _repo().trusted_origins(include_removed=is_beta())
     return {"version": await _repo().trusted_origins_version(),
             "origins": [{k: (v.isoformat() if isinstance(v, datetime) else v)
                          for k, v in r.items()} for r in rows]}
@@ -2185,6 +2189,7 @@ async def admin_add_trusted_origin(body: TrustedOriginRequest,
         raise HTTPException(status_code=422, detail="an exact address such as "
                                                     "https://emr.example.com - no path or *")
     await _repo().add_trusted_origin(origin, by=body.by, note=body.note)
+    _ORIGINS_CACHE["at"] = -1e9                     # grants see it at once
     await _repo().audit(event_type="trusted_origin.added", actor_type="admin",
                         actor_id=body.by, detail={"origin": origin, "note": body.note})
     return {"status": "trusted", "origin": origin,
@@ -2195,6 +2200,7 @@ async def admin_add_trusted_origin(body: TrustedOriginRequest,
 async def admin_remove_trusted_origin(body: TrustedOriginRequest,
                                       _: None = Depends(require_admin)):
     origin = body.origin.strip().rstrip("/").lower()
+    _ORIGINS_CACHE["at"] = -1e9                     # grants see it at once
     if not await _repo().remove_trusted_origin(origin, by=body.by):
         raise HTTPException(status_code=404, detail="not a trusted address")
     await _repo().audit(event_type="trusted_origin.removed", actor_type="admin",
@@ -3202,6 +3208,7 @@ def forget_directory() -> None:
     """Drop what this process remembers about clinics and doctors. For tests."""
     _CLINIC_CACHE.clear()
     _KNOWN_DOCTORS.clear()
+    _ORIGINS_CACHE["at"] = -1e9
 
 
 _AUDIT_QUEUE: "Optional[asyncio.Queue]" = None
@@ -3315,6 +3322,65 @@ async def _clinic_for(cmed_hospital_id: str, device: Dict[str, Any]) -> Optional
     return own if cmed_hospital_id == own else None
 
 
+_ORIGINS_CACHE: Dict[str, Any] = {"at": -1e9, "origins": frozenset()}
+_ORIGINS_CACHE_SECONDS = 30.0
+
+
+async def _trusted_origin_set() -> frozenset:
+    """This server's trusted EHR pages, remembered for half a minute."""
+    now = time.monotonic()
+    if now - _ORIGINS_CACHE["at"] >= _ORIGINS_CACHE_SECONDS:
+        rows = await _repo().trusted_origins()
+        _ORIGINS_CACHE["origins"] = frozenset(
+            str(r["origin"]).strip().rstrip("/").lower() for r in rows)
+        _ORIGINS_CACHE["at"] = now
+    return _ORIGINS_CACHE["origins"]
+
+
+def _origin_required() -> bool:
+    """AIMS_REQUIRE_ORIGIN=on: refuse a grant that names no page (pre-3.9.9)."""
+    return os.getenv("AIMS_REQUIRE_ORIGIN", "off").strip().lower() in ("1", "on", "true", "yes")
+
+
+async def _page_refusal(body: Dict[str, Any], device) -> Tuple[Optional[str], Any]:
+    """
+    26 Nov 2026, the owner's rule: the real server takes recordings only from
+    the clinics' own EHR pages - the addresses on its trusted list. Recorder
+    3.9.9 forwards the page that sent API 1; a page not on this server's list
+    is refused here, so a test page never records into the real server, even
+    on an approved PC. The recorder keeps the audio on the PC (held). Older
+    recorders send no page: taken unless AIMS_REQUIRE_ORIGIN is on.
+
+    Returns (the page, None) or (None, the refusal).
+    """
+    origin = body.get("origin")
+    if not (isinstance(origin, str) and origin.strip()):
+        if _origin_required():
+            return None, _coded(403, "ORIGIN_MISSING",
+                                "This recorder does not say which page started the "
+                                "recording; this server needs recorder 3.9.9 or later.")
+        return None, None
+    origin = origin.strip().rstrip("/")[:200]
+    if origin.lower() in await _trusted_origin_set():
+        return origin, None
+    logger.warning("Grant refused for PC %s: page %r is not trusted here",
+                   device.get("device_id"), origin)
+    try:
+        await _repo().alert_once(
+            alert_type="origin_not_trusted",
+            group=f"origin_not_trusted:{device.get('device_id')}:{origin.lower()}",
+            window=timedelta(days=1), severity="info",
+            detail={"device_id": str(device.get("device_id")),
+                    "machine_name": device.get("machine_name"),
+                    "hospital_id": device.get("hospital_id"), "origin": origin,
+                    "kept": "on the PC; nothing reached this server"})
+    except Exception as exc:                          # the refusal stands regardless
+        logger.warning("Could not log the refused page: %s", exc)
+    return None, _coded(403, "ORIGIN_NOT_TRUSTED",
+                        f"The page {origin} is not one of this server's clinic pages. "
+                        "Recordings from it are not taken here.", origin=origin)
+
+
 @router.post("/grant/mint")
 async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
     """
@@ -3337,6 +3403,9 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         visit = conf.parse_visit(body)
     except FieldError as exc:
         return _coded(400, exc.code, str(exc), field=exc.field)
+    origin, refusal = await _page_refusal(body, device)
+    if refusal is not None:
+        return refusal
 
     clinic = await _clinic_for(visit.cmed_hospital_id, device)
     mismatch = clinic is None
@@ -3381,7 +3450,8 @@ async def mint_grant(body: Dict[str, Any], device=Depends(require_device)):
         visit_id = None
     await repo.create_authorisation(
         jti=jti, device_id=device["device_id"], hospital_id=clinic, visit=visit,
-        expires_at=now + timedelta(seconds=ctx.grants.lifetime), visit_id=visit_id)
+        expires_at=now + timedelta(seconds=ctx.grants.lifetime), visit_id=visit_id,
+        origin=origin)
     confirmed = False
     if not mismatch and not await _visit_contested(visit, clinic):
         notice_id = await repo.find_unclaimed_notice(
@@ -4419,6 +4489,7 @@ async def admin_clinic_codes(_: None = Depends(require_admin)):
     Each clinic's CMED code, and the PCs refused in the last 30 days with the
     code they sent (16 Nov) - the dashboard's CMED > Clinic codes.
     """
+    from environment import is_beta
     repo = _repo()
     async with repo._acquire() as conn:
         clinics = await conn.fetch("""
@@ -4426,8 +4497,12 @@ async def admin_clinic_codes(_: None = Depends(require_admin)):
                    h.cmed_last_message_at, coalesce(h.end_rule, 'api3') AS end_rule,
                    (SELECT count(*) FROM devices d WHERE d.hospital_id = h.hospital_id
                        AND d.revoked_at IS NULL) AS pcs
-              FROM hospitals h ORDER BY h.hospital_id
-        """)
+              FROM hospitals h
+             -- 26 Nov 2026: the real dashboard lists only its working clinics;
+             -- the test clinics (switched off) are on beta.
+             WHERE $1 OR h.active
+             ORDER BY h.hospital_id
+        """, is_beta())
         # 26 Nov: whether CMED's API 4 is reaching each clinic's PCs - from the
         # recordings' own logs (api4_end, api4_not_used, api4_mismatch).
         api4 = {r["hospital_id"]: r for r in await conn.fetch("""
