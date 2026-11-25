@@ -98,3 +98,19 @@ def test_the_workbook_lists_the_doctors_choices_with_the_audio_time():
                           "CMED closed the visit (API 4)"]
     assert "at 2:05 of the audio" in rows[0][2]
     assert rows[-1][1] == "Ended" and "CMED closed the visit" in rows[-1][2]
+
+
+def test_refused_visits_are_not_counted_as_a_patient():
+    """26 Nov: 44 refusals (patient IDs wiped) showed as "1 patient"; now 0 kept, 44 refused."""
+    rows = [{"patient_id": "REDACTED", "refused": True, "refused_at": NOW(), "closed_at": NOW(),
+             "close_reason": "doctor_stopped:patient_did_not_consent", "confirmation": "refused",
+             "copied_at": None, "archived_at": None, "segment_count": 0, "pieces": 0,
+             "held": False, "cmed_matched": False, "api2_at": None, "api3_at": None,
+             "microphones": None, "switches": 0, "no_sound": False, "pauses": [], "alerts": [],
+             "close_detail": None, "opened_at": NOW()} for _ in range(44)]
+    kept = dict(rows[0], patient_id="P1", refused=False, refused_at=None,
+                close_reason="superseded_by_new_patient", confirmation="confirmed")
+    summary = workbook._summary_row(rows + [kept])
+    head = [name for name, _ in workbook.SUMMARY_COLUMNS]
+    values = dict(zip(head[1:], summary))            # the row has no "Doctor" cell
+    assert values["Patients"] == 1 and values["Audio files"] == 45 and values["Refused"] == 44
