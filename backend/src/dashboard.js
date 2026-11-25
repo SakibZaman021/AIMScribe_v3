@@ -911,6 +911,26 @@ function pauseLine(r) {
     + `Paused ${list.length}×: ${esc(parts.join(", "))}</span>`;
 }
 
+/* 26 Nov: the doctor's Stop and Pause choices on the recorder's buttons, in
+   order, each with its Dhaka time and its place in the audio. They never
+   stopped the recording; they arrive with the recording when it closes. */
+function doctorLog(r) {
+  const list = r.doctor_log || [];
+  if (!list.length) {
+    return r.status === "active"
+      ? `<span class="hint" title="The doctor's choices arrive with the recording when it closes">after it closes</span>`
+      : `<span class="hint">–</span>`;
+  }
+  const at = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "Asia/Dhaka" }) : "?";
+  const mmss = (s) => s == null ? "" : `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  return `<span class="tags">` + list.map((e) => {
+    const tone = e.button === "Stop" ? "bad" : "warn";
+    const words = e.button === "Pause ended" ? "Pause ended" : `${e.button}: ${e.reason}`;
+    const where = e.audio_seconds == null ? "" : ` · ${mmss(e.audio_seconds)}`;
+    return tag(tone, `${words}${where}`, `${at(e.at)} (Dhaka)${e.reason ? " - " + e.reason : ""}. The recording continued.`);
+  }).join("") + `</span>`;
+}
+
 function recordingsTable(list) {
   if (!list.length) {
     return STATE
@@ -920,7 +940,7 @@ function recordingsTable(list) {
   const showClinic = !$("clinic").value;
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>PC</th><th>Doctor</th>`
     + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
-    + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th>`
+    + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th><th>Doctor's log</th>`
     + `<th>Stored</th><th>Download</th><th>Pieces</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
@@ -965,6 +985,7 @@ function recordingsTable(list) {
           + td("Demographics", cmedArrival(r, r.api2_at, "demographics (API 2)"))
           + td("Prescription", cmedArrival(r, r.api3_at, "prescription (API 3)"))
           + td("Status", `<span class="tags">${status.join("")}</span>`)
+          + td("Doctor's log", doctorLog(r), "wrap")
           + td("Stored", storedTag(r))
           + td("Download", audioLinks(r))
           + td("Pieces", piecesButton(r))
