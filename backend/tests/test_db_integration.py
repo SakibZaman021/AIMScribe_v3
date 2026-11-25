@@ -3639,7 +3639,7 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         evening = (await client.get("/api/v2/dashboard/watch/report", params={
             "hospital_id": "HOSP555", "shift": "evening"})).json()
         assert evening["text"].startswith("\U0001F4CB Evening shift summary: HOSP555")
-        assert "(14:30 to 20:30)" in evening["text"].splitlines()[0]
+        assert "(14:30 to 21:00)" in evening["text"].splitlines()[0]
         assert (await client.get("/api/v2/dashboard/watch/report", params={
             "hospital_id": "HOSP555", "shift": "night"})).status_code == 400
         client.cookies.clear()
@@ -3652,7 +3652,7 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         from datetime import time as dtime
         tz = collectors.zone()
         at = {t: datetime.combine(today, dtime(*t), tzinfo=tz) for t in
-              ((14, 0), (14, 45), (20, 0), (20, 45))}
+              ((14, 0), (14, 45), (20, 0), (21, 15))}
         mine = lambda: [s[1] for s in sent if s[0] == "boss@uni.example"]   # noqa: E731
         async with dbs.rec.acquire() as conn:
             await watchers.shift_summaries(conn, now=at[(14, 0)])
@@ -3664,8 +3664,8 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
                 "Morning shift summary workbook: HOSP555",
                 "Morning shift summary workbook: HOSP556", "Morning shift summary: HOSP555",
                 "Morning shift summary: HOSP556"]
-            await watchers.shift_summaries(conn, now=at[(20, 45)])
-            await watchers.shift_summaries(conn, now=at[(20, 45)])
+            await watchers.shift_summaries(conn, now=at[(21, 15)])
+            await watchers.shift_summaries(conn, now=at[(21, 15)])
         evening = [x for x in mine() if x not in morning]
         assert sorted(x.split(",")[0] for x in evening) == [
             "Evening shift summary workbook: HOSP555", "Evening shift summary workbook: HOSP556",
@@ -4179,7 +4179,7 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
         assert (await client.get("/api/v2/dashboard/watch/summary.xlsx",
                                  params={"hospital_id": "HOSP003"})).status_code == 403
         page = (await client.get("/api/v2/dashboard/watch/me")).json()
-        assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
+        assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"  # set above
     _unserve()
 
 
