@@ -104,6 +104,9 @@ services:
       AIMS_PUBLIC_BASE_URL: https://${AIMS_BETA_PUBLIC_HOST}
       AIMS_TRUSTED_PROXIES: ${AIMS_BETA_GATEWAY_IP:-172.30.20.2}
       AIMS_PORTAL_COOKIE: aims_beta_portal
+      # 25 Nov 2026: beta's digit on its trusted-list versions (the real server's is 1),
+      # so a PC always takes the list of the server it talks to (api_v2._trusted_origins_bundle).
+      AIMS_ORIGINS_TAG: "2"
       # The same signing keys: a test PC moves here by its .env alone.
       AIMS_GRANT_PRIVATE_KEY: ${AIMS_GRANT_PRIVATE_KEY:?set in .env.beta}
       AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:?set in .env.beta}

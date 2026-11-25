@@ -2021,8 +2021,8 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
     # CMED's EHR addresses, signed, whenever this PC holds an older list.
     if body.trusted_origins_version is not None and ctx.signer is not None:
         try:
-            bundle = await _trusted_origins_bundle()
-            if bundle and bundle["payload"]["version"] > body.trusted_origins_version:
+            bundle = await _trusted_origins_bundle(body.trusted_origins_version)
+            if bundle:
                 reply["trusted_origins"] = bundle
         except Exception as exc:
             logger.warning("Could not send the trusted origins: %s", exc)
@@ -2059,20 +2059,60 @@ def _piece_reports(items: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-_ORIGINS_CACHE: Dict[str, Any] = {"version": -1, "bundle": None}
+_ORIGINS_CACHE: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 
-async def _trusted_origins_bundle() -> Optional[Dict[str, Any]]:
-    """The signed list, signed once per version rather than once per heartbeat."""
+def _origins_tag() -> int:
+    """
+    25 Nov 2026: this server's mark on the version of its list (1 the real
+    server, 2 the beta server: AIMS_ORIGINS_TAG). See _trusted_origins_bundle.
+    """
+    try:
+        tag = int(os.getenv("AIMS_ORIGINS_TAG", "").strip() or 1)
+    except ValueError:
+        tag = 1
+    return tag if 1 <= tag <= 9 else 1
+
+
+async def _trusted_origins_bundle(have: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """
+    The signed list for a PC that holds list version `have` (None: this
+    server's own, as it stands), or None when that PC already holds it.
+
+    A recorder takes a list only when its version is higher than the one it
+    holds, so an old list cannot be replayed. The version was the time of the
+    last change - shared by the real and the beta server, which sign with the
+    same key. On 25 Nov a PC that had held beta's list (changed 184 ms after
+    the real one's) went on trusting beta's test pages while it recorded to
+    the real server: the real server kept answering "you hold a newer list".
+
+    Now each server ends its versions with its own digit (_origins_tag), and
+    a PC holding a list that is not this server's current one is sent this
+    server's list numbered above what it holds. The server a PC talks to
+    always wins, both ways; versions still only grow, so replay stays refused.
+    """
     repo = _repo()
-    version = await repo.trusted_origins_version()
-    if version == 0:
+    changed = await repo.trusted_origins_version()
+    if changed == 0:
         return None
-    if _ORIGINS_CACHE["version"] != version:
+    tag = _origins_tag()
+    base = changed * 10 + tag
+    held = have if isinstance(have, int) and have > 0 else 0
+    if have is None:
+        version = base
+    elif held % 10 == tag and held >= base:
+        return None                                   # this server's list, as it stands
+    else:
+        version = base if held < base else (held // 10 + 1) * 10 + tag
+    bundle = _ORIGINS_CACHE.get((changed, version))
+    if bundle is None:
         origins = [r["origin"] for r in await repo.trusted_origins()]
-        _ORIGINS_CACHE.update(version=version, bundle=ctx.signer.sign_trusted_origins(
-            origins=origins, version=version, issued_at=datetime.now(timezone.utc)))
-    return _ORIGINS_CACHE["bundle"]
+        bundle = ctx.signer.sign_trusted_origins(
+            origins=origins, version=version, issued_at=datetime.now(timezone.utc))
+        if len(_ORIGINS_CACHE) > 200:
+            _ORIGINS_CACHE.clear()
+        _ORIGINS_CACHE[(changed, version)] = bundle
+    return bundle
 
 
 @router.get("/trusted-origins")
@@ -2086,10 +2126,7 @@ async def trusted_origins_for_new_pc(have: int = 0):
     """
     if ctx.signer is None:
         return {"trusted_origins": None}
-    bundle = await _trusted_origins_bundle()
-    if bundle is None or bundle["payload"]["version"] <= have:
-        return {"trusted_origins": None}
-    return {"trusted_origins": bundle}
+    return {"trusted_origins": await _trusted_origins_bundle(have)}
 
 
 TRUSTED_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
