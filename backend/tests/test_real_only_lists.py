@@ -11,6 +11,7 @@ dashboard lists only what is real.
 """
 from __future__ import annotations
 
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -145,3 +146,79 @@ async def test_recordings_all_on_the_jabra_have_their_own_filter(dbs):
     off_ids = {r["session_id"] for r in off["recordings"]}
     assert jabra in on_ids and laptop not in on_ids
     assert laptop in off_ids and jabra not in off_ids
+
+
+# ---- 26 Nov 2026: the Recordings panel counts what is chosen ----
+
+async def _recording(conn, device, *, clinic, doctor, patient, visit=None, days_ago=0,
+                     rms=None):
+    """One recording, and (with `rms`) its pieces' loudness, one value per piece."""
+    from datetime import datetime, timedelta, timezone
+    from core.spool import new_ulid
+    sid = new_ulid()
+    opened = datetime.now(timezone.utc) - timedelta(days=days_ago, minutes=5)
+    await conn.execute("""
+        INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                              protocol_version, status, session_date, opened_at, visit_id,
+                              confirmation)
+        VALUES ($1, $2, $3, $4, $5, 2, 'closed', $6, $7, $8, 'confirmed')
+    """, sid, patient, doctor, clinic, device["device_id"], opened.date(), opened, visit)
+    for n, level in enumerate(rms or [], start=1):
+        digest = os.urandom(32)
+        await conn.execute("""
+            INSERT INTO chain_entries (session_id, entry_no, entry_type, payload,
+                                       payload_sha256, prev_hash, entry_hash,
+                                       device_signature, occurred_at)
+            VALUES ($1, $2, 'segment', '{}', $3, $3, $3, $3, now())
+        """, sid, n, digest)
+        await conn.execute("""
+            INSERT INTO segments (session_id, seq_no, entry_no, object_key, bytes,
+                                  duration_seconds, sha256, rms_mean)
+            VALUES ($1, $2, $2, $3, 100, 30, $4, $5)
+        """, sid, n, f"audio/{sid}/piece_{n:04d}.wav", digest, level)
+    return sid
+
+
+async def test_the_recordings_panel_counts_and_offers_only_whats_chosen(dbs):
+    repo = dbs.repo
+    device = await enrolled_device(repo)
+    tag = uuid.uuid4().hex[:6].upper()
+    karail, other = f"KAR_{tag}", f"OTH_{tag}"
+    for clinic in (karail, other):
+        await repo.upsert_hospital(clinic, clinic, "Asia/Dhaka")
+    a, b, c, old = f"DRA{tag}", f"DRB{tag}", f"DRC{tag}", f"DROLD{tag}"
+    async with dbs.rec.acquire() as conn:
+        await _recording(conn, device, clinic=karail, doctor=a, patient=f"PA{tag}",
+                         visit=f"VIS-{tag}", rms=[0.0, 0.0])           # no sound
+        await _recording(conn, device, clinic=karail, doctor=a, patient=f"PA2{tag}",
+                         rms=[0.0, 812.5])                              # sound
+        await _recording(conn, device, clinic=karail, doctor=b, patient=f"PB{tag}")
+        await _recording(conn, device, clinic=other, doctor=c, patient=f"PC{tag}")
+        await _recording(conn, device, clinic=karail, doctor=old, patient=f"PO{tag}",
+                         days_ago=40)                                   # outside 7 days
+    _server(dbs)
+    try:
+        facets = dashboard.recording_facets
+        week = await facets(from_date=None, to_date=None, hospital_id=karail,
+                            doctor_id=None, find=None, _=None, scope=None)
+        assert [d["doctor_id"] for d in week["doctors"]] == [a, b]     # not C, not OLD
+        assert week["counts"]["total"] == 3 and week["counts"]["no_sound"] == 1
+        one = await facets(from_date=None, to_date=None, hospital_id=karail,
+                           doctor_id=a, find=None, _=None, scope=None)
+        assert one["counts"]["total"] == 2 and one["counts"]["confirmed"] == 2
+        assert [d["doctor_id"] for d in one["doctors"]] == [a, b]      # the menu stays whole
+        by_visit = await facets(from_date=None, to_date=None, hospital_id=None,
+                                doctor_id=None, find=f"vis-{tag.lower()}", _=None, scope=None)
+        assert by_visit["counts"]["total"] == 1
+        listed = await dashboard.recordings(
+            from_date=None, to_date=None, hospital_id=karail, doctor_id=None,
+            patient_id=None, state="no_sound", search=None, find=None, limit=500,
+            _=None, scope=None)
+        assert [r["patient_id"] for r in listed["recordings"]] == [f"PA{tag}"]
+        found = await dashboard.recordings(
+            from_date=None, to_date=None, hospital_id=None, doctor_id=None,
+            patient_id=None, state=None, search=None, find=f"PB{tag}", limit=500,
+            _=None, scope=None)
+        assert [r["doctor_id"] for r in found["recordings"]] == [b]
+    finally:
+        _unserve()
