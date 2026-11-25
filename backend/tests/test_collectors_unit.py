@@ -94,11 +94,11 @@ def test_an_urgent_telegram_message_is_marked_and_fits():
 def test_the_report_time_and_what_problems_only_keeps(monkeypatch):
     import watchers
     monkeypatch.delenv("AIMS_REPORT_AT", raising=False)
-    assert watchers.report_time() == time(20, 30)
+    assert watchers.report_time() == time(21, 0)
     monkeypatch.setenv("AIMS_REPORT_AT", "21:15")
     assert watchers.report_time() == time(21, 15)
     monkeypatch.setenv("AIMS_REPORT_AT", "late")
-    assert watchers.report_time() == time(20, 30)
+    assert watchers.report_time() == time(21, 0)
     assert "escalation" in watchers.PROBLEMS_ONLY and "daily_report" in watchers.PROBLEMS_ONLY
     assert "jabra_back" not in watchers.PROBLEMS_ONLY
     assert collectors.PROBLEMS["silent_session"].startswith("the microphone gives no sound")
@@ -193,5 +193,5 @@ def test_the_two_summaries_meet_and_cover_the_night():
     e0, e1, ew = watchers.shift_window(day, "evening")
     assert m1 == e0                                   # nothing falls between them
     assert e1 - m0 == timedelta(hours=24)             # the night is in the morning one
-    assert (m0.hour, m0.minute) == (14, 30)           # 20:30 Dhaka the day before, in UTC
-    assert mw == "20:30 the day before to 14:30" and ew == "14:30 to 20:30"
+    assert (m0.hour, m0.minute) == (15, 0)            # 21:00 Dhaka the day before, in UTC
+    assert mw == "21:00 the day before to 14:30" and ew == "14:30 to 21:00"

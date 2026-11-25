@@ -2680,11 +2680,11 @@ async function loadWatch(first) {
     again();
   }
   $("wMode").value = me.mode || "everything";
-  $("wReportAt").textContent = me.report_at || "20:30";
+  $("wReportAt").textContent = me.report_at || "21:00";
   $("wMiddayAt").textContent = me.midday_at || "14:30";
   if (first) {   // the summary most recently sent
     const hm = new Date().toLocaleTimeString("en-GB", { timeZone: "Asia/Dhaka", hour12: false }).slice(0, 5);
-    $("wRepShift").value = hm >= (me.report_at || "20:30") ? "evening" : (hm >= (me.midday_at || "14:30") ? "morning" : "evening");
+    $("wRepShift").value = hm >= (me.report_at || "21:00") ? "evening" : (hm >= (me.midday_at || "14:30") ? "morning" : "evening");
   }
   // 24 Nov 2026: an admin may take any clinic's summary and workbook; a
   // researcher, the hospitals they look after. Before, an admin who looks

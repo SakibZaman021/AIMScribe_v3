@@ -3639,7 +3639,7 @@ async def test_the_evening_report_says_what_happened_and_what_to_do_tomorrow(
         evening = (await client.get("/api/v2/dashboard/watch/report", params={
             "hospital_id": "HOSP555", "shift": "evening"})).json()
         assert evening["text"].startswith("\U0001F4CB Evening shift summary: HOSP555")
-        assert "(14:30 to 20:30)" in evening["text"].splitlines()[0]
+        assert "(14:30 to 21:00)" in evening["text"].splitlines()[0]
         assert (await client.get("/api/v2/dashboard/watch/report", params={
             "hospital_id": "HOSP555", "shift": "night"})).status_code == 400
         client.cookies.clear()
@@ -4179,7 +4179,7 @@ async def test_nothing_is_sent_at_night_and_each_shift_has_a_summary_and_a_csv(
         assert (await client.get("/api/v2/dashboard/watch/summary.xlsx",
                                  params={"hospital_id": "HOSP003"})).status_code == 403
         page = (await client.get("/api/v2/dashboard/watch/me")).json()
-        assert page["midday_at"] == "14:30" and page["report_at"] == "20:30"
+        assert page["midday_at"] == "14:30" and page["report_at"] == "21:00"
     _unserve()
 
 

@@ -17,7 +17,7 @@ each alert written for supervision, with who to call:
                    alert - also sent again to the collector on shift
     fixed / ended  once that problem is gone: how, and how long it took
     pattern        three unusual stops by one doctor within two hours
-    summaries      at 14:30 and 20:30 (AIMS_MIDDAY_SUMMARY_AT, AIMS_REPORT_AT):
+    summaries      at 14:30 and 21:00 (AIMS_MIDDAY_SUMMARY_AT, AIMS_REPORT_AT):
                    one message per hospital for that shift, and one CSV of
                    every recording and alert at their hospitals
 
@@ -98,11 +98,13 @@ PHONE = re.compile(r"^\+?[0-9][0-9 -]{5,20}[0-9]$")
 
 
 def report_time() -> dtime:
-    text = os.getenv("AIMS_REPORT_AT", "").strip() or "20:30"
+    # 26 Nov 2026 (the owner): the evening summary at 21:00, half an hour after
+    # the evening shift ends, so the last consultations are in it.
+    text = os.getenv("AIMS_REPORT_AT", "").strip() or "21:00"
     try:
         return dtime.fromisoformat(text)
     except ValueError:
-        return dtime(20, 30)
+        return dtime(21, 0)
 
 
 def _time_env(name: str, default: dtime) -> dtime:
@@ -138,7 +140,7 @@ async def _place_rows(conn, hospital_id: Optional[str] = None,
 async def quiet_for(conn, hospital_id: Optional[str] = None, place_id: Optional[int] = None,
                     now: Optional[datetime] = None) -> bool:
     """
-    Quiet hours: from the evening summary (20:30) until the place's morning shift
+    Quiet hours: from the evening summary (21:00) until the place's morning shift
     starts (08:00 unless set in Places). Nobody is messaged then; it waits for
     the next summary. AIMS_QUIET_HOURS=off turns this off.
     """
@@ -922,7 +924,7 @@ def shift_window(day: date, shift: str) -> Tuple[datetime, datetime, str]:
 
 async def shift_summaries(conn, now: Optional[datetime] = None) -> None:
     """
-    At 14:30 and 20:30, once each: to every researcher, one message per hospital
+    At 14:30 and 21:00, once each: to every researcher, one message per hospital
     they look after, for that shift, then one CSV of all of it.
     """
     local = (now or datetime.now(timezone.utc)).astimezone(collectors.zone())

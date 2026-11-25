@@ -270,6 +270,10 @@ services:
       AIMS_COLLECTOR_MAIL_FROM: ${AIMS_COLLECTOR_MAIL_FROM:-}
       AIMS_COLLECTOR_MAILER: ${AIMS_COLLECTOR_MAILER:-on}
       AIMS_TELEGRAM_BOT_TOKEN: ${AIMS_TELEGRAM_BOT_TOKEN:-}
+      # When the researchers' shift summaries go out (Dhaka time). Empty: 14:30
+      # and 21:00 (watchers.py). Quiet hours start at the evening one.
+      AIMS_MIDDAY_SUMMARY_AT: ${AIMS_MIDDAY_SUMMARY_AT:-}
+      AIMS_REPORT_AT: ${AIMS_REPORT_AT:-}
       # Downloads from the portal (downloads.py): the archive worker decrypts
       # one copy and streams it back, on the internal network. The limits are
       # per person.
