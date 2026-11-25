@@ -4,8 +4,9 @@
 API 4 is sent like API 1, from the EHR page, and ends the recording of the visit
 it names, kept whole. A resend, or one for a visit the next patient has already
 ended, changes nothing; one for another visit is refused and the recording
-carries on. Once a PC has received API 4, the two-minute rule after API 3 is no
-longer used there.
+carries on. 25 Nov 2026: whether API 4 ends recordings is the clinic's rule,
+sent by the server in each heartbeat reply - "api4" where CMED's API 4 is live,
+"api3" (two minutes after the prescription) elsewhere, Amader Susastho always.
 
 The doctor's Stop reasons and sensitive-part marks are written into the
 recording's own log, with the second of audio, and the recording carries on.
@@ -32,6 +33,13 @@ def visit(visit_id, patient="P1", start=None, doctor="DR0042"):
 def end(visit_id="VIS-A", patient="P1", doctor="DR0042", when=None):
     return VisitEnd(patient_id=patient, doctor_id=doctor, end_time=when or at(9),
                     visit_id=visit_id)
+
+
+def api4_ctl(*args, **kwargs):
+    """A PC whose clinic ends recordings on CMED's API 4 (the server said so)."""
+    ctl = ctl_with(*args, **kwargs)
+    ctl._end_rule = "api4"
+    return ctl
 
 
 def logged(ctl, session=None):
@@ -66,23 +74,26 @@ def test_an_api4_missing_what_it_needs_is_refused(body, field):
 # ---------------------------------------------------------------- ending
 
 async def test_api4_ends_the_visits_recording_and_keeps_it(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     first = await ctl.open_session(visit("VIS-A"))
     session = ctl._active.spool
     result = await ctl.end_visit(end("VIS-A"))
     assert result["status"] == "stopped" and ctl.state == "idle"
     assert closed_reason(ctl) == API4_END_REASON == "consultation_ended"
     assert session.close_reason == "consultation_ended"
+    assert session.close_detail == f"end_time={at(9)}"       # kept for labelling
     assert any(e == "api4_end" for e, _, _ in logged(ctl, session))
-    # A resend changes nothing.
+    assert result["end_time"] == at(9) and result["stopped_at"]
+    # A resend changes nothing, and confirms the same stop again.
     again = await ctl.end_visit(end("VIS-A"))
-    assert again == {"status": "already_ended", "session_id": first["session_id"]}
+    assert again == {"status": "already_ended", "session_id": first["session_id"],
+                     "stopped_at": result["stopped_at"], "end_time": at(9)}
     await ctl.close()
 
 
 async def test_api4_for_a_visit_the_next_patient_ended_leaves_the_new_one(
         monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A", "RAHIM"))
     second = await ctl.open_session(visit("VIS-B", "KARIM", at(1)))
     result = await ctl.end_visit(end("VIS-A", "RAHIM"))
@@ -97,7 +108,7 @@ async def test_api4_for_a_visit_the_next_patient_ended_leaves_the_new_one(
 ])
 async def test_api4_for_another_visit_is_refused_and_recording_continues(
         monkeypatch, spool, device_key, wrong):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A"))
     with pytest.raises(SessionError) as err:
         await ctl.end_visit(end(**{"visit_id": "VIS-A", **wrong}))
@@ -108,32 +119,51 @@ async def test_api4_for_another_visit_is_refused_and_recording_continues(
 
 
 async def test_api4_with_nothing_recording(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     with pytest.raises(SessionError) as err:
         await ctl.end_visit(end())
     assert err.value.code == "NO_ACTIVE_SESSION"
 
 
-async def test_after_the_first_api4_the_two_minute_rule_is_not_used(
+async def test_the_rule_comes_from_the_server_and_defaults_to_api3(
         monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.05,
-                   end_grace_seconds=0.0)
-    first = await ctl.open_session(visit("VIS-A"))
-    assert ctl.status()["ends_on_api4"] is False
-    await ctl.end_visit(end("VIS-A"))
-    assert ctl.status()["ends_on_api4"] is True
-    second = await ctl.open_session(visit("VIS-B", "P2", at(2)))
-    assert await ctl.prescription_received(session_id=second["session_id"], seconds_ago=0)
-    await asyncio.sleep(0.3)
-    assert ctl.state == "recording", "API 3 + two minutes must no longer end it"
-    assert first["session_id"] != second["session_id"]
+    ctl = ctl_with(monkeypatch, spool, device_key)
+    assert ctl.status()["end_rule"] == "api3" and ctl.status()["ends_on_api4"] is False
+    await ctl._on_heartbeat_reply({"status": "ok", "end_rule": "api4"})
+    assert ctl.status()["end_rule"] == "api4"
+    await ctl._on_heartbeat_reply({"status": "ok", "end_rule": "anything else"})
+    assert ctl.status()["end_rule"] == "api4", "an unknown rule changes nothing"
+    await ctl._on_heartbeat_reply({"status": "ok", "end_rule": "api3"})
+    assert ctl.status()["end_rule"] == "api3"
     await ctl.close()
 
 
-async def test_before_any_api4_the_two_minute_rule_still_ends_it(
+async def test_an_api3_clinic_logs_api4_and_still_ends_two_minutes_after_api3(
         monkeypatch, spool, device_key):
+    """Amader Susastho: API 4 never ends a recording; API 3 + two minutes does."""
+    ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.3,
+                   end_grace_seconds=0.0)
+    opened = await ctl.open_session(visit("VIS-A"))
+    session = ctl._active.spool
+    result = await ctl.end_visit(end("VIS-A"))
+    assert result == {"status": "continues", "session_id": opened["session_id"],
+                      "end_time": at(9)}
+    assert ctl.state == "recording"
+    assert any(e == "api4_not_used" and d == f"end_time={at(9)}"
+               for e, d, _ in logged(ctl, session))
+    assert await ctl.prescription_received(session_id=opened["session_id"], seconds_ago=0)
+    assert await wait_for(lambda: ctl.state == "idle")
+    assert closed_reason(ctl) == "counselling_limit"
+    await ctl.close()
+
+
+async def test_an_old_api4_flag_on_disk_changes_nothing(monkeypatch, spool, device_key,
+                                                        tmp_path):
+    """3.9.8 before 25 Nov kept a flag that turned the two-minute rule off for good."""
+    (tmp_path / "api4_seen").write_text("2026-11-25T08:56:48Z\n", encoding="utf-8")
     ctl = ctl_with(monkeypatch, spool, device_key, counselling_limit_seconds=0.05,
                    end_grace_seconds=0.0)
+    ctl._state_dir = tmp_path
     opened = await ctl.open_session(visit("VIS-A"))
     assert await ctl.prescription_received(session_id=opened["session_id"], seconds_ago=0)
     assert await wait_for(lambda: ctl.state == "idle")
@@ -141,16 +171,34 @@ async def test_before_any_api4_the_two_minute_rule_still_ends_it(
     await ctl.close()
 
 
-async def test_the_flag_is_kept_on_disk(monkeypatch, spool, device_key, tmp_path):
-    from types import SimpleNamespace
-    ctl = ctl_with(monkeypatch, spool, device_key)
-    ctl._state_dir = tmp_path
-    await ctl.open_session(visit("VIS-A"))
-    await ctl.end_visit(end("VIS-A"))
-    assert (tmp_path / "api4_seen").exists()
-    ctl.cfg.paths = SimpleNamespace(state_dir=tmp_path)
-    assert ctl._read_api4_flag() is True
+async def test_an_api4_clinic_waits_for_api4_then_ends_15_minutes_after_api3(
+        monkeypatch, spool, device_key):
+    ctl = api4_ctl(monkeypatch, spool, device_key, counselling_limit_seconds=0.05,
+                   api4_wait_seconds=0.6, end_grace_seconds=0.0)
+    opened = await ctl.open_session(visit("VIS-A"))
+    assert await ctl.prescription_received(session_id=opened["session_id"], seconds_ago=0)
+    await asyncio.sleep(0.3)
+    assert ctl.state == "recording", "two minutes after API 3 is not the rule here"
+    assert await wait_for(lambda: ctl.state == "idle")
+    assert closed_reason(ctl) == "counselling_limit"
     await ctl.close()
+
+
+async def test_a_recording_with_no_cmed_message_ends_by_itself(
+        monkeypatch, spool, device_key):
+    """No API 3, no API 4, no next patient: it no longer runs for hours."""
+    ctl = ctl_with(monkeypatch, spool, device_key, no_activity_limit_seconds=0.3,
+                   end_grace_seconds=0.0)
+    await ctl.open_session(visit("VIS-A"))
+    assert await wait_for(lambda: ctl.state == "idle")
+    assert closed_reason(ctl) == "no_activity_limit"
+    await ctl.close()
+
+
+def test_the_safety_end_is_on_by_default():
+    from config import SecurityConfig
+    assert SecurityConfig.no_activity_limit_seconds == 2700.0
+    assert SecurityConfig.api4_wait_seconds == 900.0
 
 
 # ---------------------------------------------------------------- over the socket and HTTP
@@ -164,7 +212,7 @@ def end_message(visit_id="VIS-A", patient="P1"):
 async def test_api4_over_the_socket(monkeypatch, spool, device_key, make_security):
     from types import SimpleNamespace
     from api.websocket_server import WebSocketManager
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     manager = WebSocketManager(SimpleNamespace(security=make_security(), app_version="3.9.8"))
     manager.set_controller(ctl)
     await ctl.open_session(visit("VIS-A"))
@@ -174,11 +222,34 @@ async def test_api4_over_the_socket(monkeypatch, spool, device_key, make_securit
     ended = await manager.handle_message(None, end_message())
     assert (ended["status"], ended["code"], ended["request_id"]) == \
         (200, "RECORDING_ENDED", "r4")
-    assert ended["data"]["visit_id"] == "VIS-A"
+    data = ended["data"]
+    assert data["visit_id"] == "VIS-A"
+    # 25 Nov: CMED's assurance that the recording has stopped.
+    assert data["recording_stopped"] is True and data["audio_saved"] is True
+    assert data["end_time"] == at(9) and data["stopped_at"]
+    assert data["session_id"] and data["segment_count"] is not None
     again = await manager.handle_message(None, end_message())
     assert again["code"] == "VISIT_ALREADY_ENDED"
+    assert again["data"]["recording_stopped"] is True
+    assert (again["data"]["stopped_at"], again["data"]["end_time"]) == \
+        (data["stopped_at"], at(9))
     none = await manager.handle_message(None, end_message("VIS-Q", "P7"))
     assert none["code"] == "NO_ACTIVE_SESSION"
+    await ctl.close()
+
+
+async def test_api4_at_an_api3_clinic_over_the_socket(monkeypatch, spool, device_key,
+                                                      make_security):
+    from types import SimpleNamespace
+    from api.websocket_server import WebSocketManager
+    ctl = ctl_with(monkeypatch, spool, device_key)
+    manager = WebSocketManager(SimpleNamespace(security=make_security(), app_version="3.9.8"))
+    manager.set_controller(ctl)
+    await ctl.open_session(visit("VIS-A"))
+    reply = await manager.handle_message(None, end_message())
+    assert (reply["status"], reply["code"]) == (200, "RECORDING_CONTINUES")
+    assert reply["data"]["recording_stopped"] is False and reply["data"]["end_time"] == at(9)
+    assert ctl.state == "recording"
     await ctl.close()
 
 
@@ -191,7 +262,7 @@ async def test_api4_over_http_needs_a_trusted_page(monkeypatch, spool, device_ke
     from api.websocket_server import WebSocketManager
 
     monkeypatch.setattr(websocket_server, "_same_windows_session", lambda request: True)
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     security = make_security()
     origin = sorted(security.allowed_origins)[0]
     cfg = SimpleNamespace(security=security, app_version="3.9.8")
@@ -222,7 +293,7 @@ async def test_api4_over_http_needs_a_trusted_page(monkeypatch, spool, device_ke
 # ---------------------------------------------------------------- the doctor's choices
 
 async def test_a_stop_reason_is_logged_and_recording_continues(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A"))
     for reason in ("consultation_finished", "patient_left", "urgent_interruption"):
         result = await ctl.doctor_mark(reason)
@@ -239,7 +310,7 @@ async def test_a_stop_reason_is_logged_and_recording_continues(monkeypatch, spoo
 
 
 async def test_a_sensitive_part_is_logged_from_start_to_end(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A"))
     assert (await ctl.sensitive_start("patient_request"))["status"] == "marked"
     status = ctl.status()
@@ -256,7 +327,7 @@ async def test_a_sensitive_part_is_logged_from_start_to_end(monkeypatch, spool, 
 
 async def test_a_sensitive_part_still_open_ends_with_the_recording(
         monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A"))
     session = ctl._active.spool
     await ctl.sensitive_start("sensitive_personal_matter")
@@ -267,7 +338,7 @@ async def test_a_sensitive_part_still_open_ends_with_the_recording(
 
 
 async def test_the_refusal_is_open_until_api2_arrives(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     opened = await ctl.open_session(visit("VIS-A"))
     assert ctl.status()["consent_open"] is True
     await ctl._on_heartbeat_reply({"status": "ok",
@@ -281,7 +352,7 @@ async def test_the_refusal_is_open_until_api2_arrives(monkeypatch, spool, device
 
 
 async def test_the_refusal_still_deletes_while_it_is_open(monkeypatch, spool, device_key):
-    ctl = ctl_with(monkeypatch, spool, device_key)
+    ctl = api4_ctl(monkeypatch, spool, device_key)
     await ctl.open_session(visit("VIS-A"))
     result = await ctl.refuse_session()
     assert result["status"] == "refused" and ctl.state == "idle"

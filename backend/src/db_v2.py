@@ -714,7 +714,7 @@ class V2Repository:
                        object_prefix, confirmation, grant_jti, file_stem,
                        local_start, local_end, copied_at, segments_deleted_at,
                        json_stale, parts_count, parts_stale, continues_session_id,
-                       visit_id
+                       visit_id, close_reason, manifest->>'close_detail' AS close_detail
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -1783,6 +1783,12 @@ class V2Repository:
     # v3 (SRS 3.2): clinic mapping, grants, confirmation, refusals and
     # Channel B. Tables from scripts/010_v3_confirmation_channel_b.sql.
     # ============================================================
+
+    async def clinic_end_rule(self, hospital_id: str) -> Optional[str]:
+        """How this clinic's recordings end: 'api3' or 'api4' (migration 051)."""
+        async with self._acquire() as conn:
+            return await conn.fetchval(
+                "SELECT end_rule FROM hospitals WHERE hospital_id = $1", hospital_id)
 
     async def hospital_for_cmed_id(self, cmed_hospital_id: str) -> Optional[str]:
         async with self._acquire() as conn:

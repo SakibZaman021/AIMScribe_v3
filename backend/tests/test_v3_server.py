@@ -104,6 +104,9 @@ class FakeRepo:
         if s is not None and s.get("demographics_received_at") is None:
             s["demographics_received_at"] = NOW()
 
+    async def clinic_end_rule(self, hospital_id):
+        return getattr(self, "end_rules", {}).get(hospital_id, "api3")
+
     async def demographics_notice(self, device_id, session_id):
         s = self.sessions.get(session_id)
         return bool(s and not s.get("closed_at") and s.get("demographics_received_at")

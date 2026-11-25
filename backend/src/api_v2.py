@@ -1743,6 +1743,21 @@ NORMAL_CLOSE_REASONS = frozenset({
 })
 
 
+def api4_end_time(close_reason: Optional[str], close_detail: Optional[str]) -> Optional[str]:
+    """
+    25 Nov: CMED's own end of the visit, when its API 4 ended the recording -
+    exactly as CMED wrote it. The recorder keeps it as the close detail
+    "end_time=..."; it is the visit's end time in the JSON label and is shown
+    to CMED in the visit's status.
+    """
+    if close_reason != "consultation_ended":
+        return None
+    detail = (close_detail or "").strip()
+    if not detail.startswith("end_time="):
+        return None
+    return detail[len("end_time="):].strip() or None
+
+
 @router.post("/session/close")
 async def close_session(body: CloseRequest, device=Depends(require_device)):
     """
@@ -1996,6 +2011,15 @@ async def heartbeat(body: HeartbeatRequest, device=Depends(require_device)):
     # here within 30 seconds; before 3.9.3 it kept the clinic it joined at and
     # refused every grant for the new one (17 Nov, CMED's PC at TEST/Karail).
     reply: Dict[str, Any] = {"status": "ok", "hospital_id": device["hospital_id"]}
+    # 25 Nov: how this clinic's recordings end - "api3", two minutes after
+    # CMED's API 3 (Amader Susastho always; any clinic until API 4 is live
+    # there), or "api4", on CMED's API 4. Set per clinic here, never by the PC.
+    try:
+        rule = await _repo().clinic_end_rule(device["hospital_id"])
+    except Exception as exc:
+        logger.warning("Could not read the clinic's end rule: %s", exc)
+        rule = None
+    reply["end_rule"] = rule if rule in ("api3", "api4") else "api3"
     # 3.9.8: CMED's API 2 (demographics) for the open recording has arrived;
     # the recorder then closes the doctor's "Patient did not consent" choice.
     if body.session_id:
@@ -2847,7 +2871,12 @@ async def _clinical_document(session: Dict[str, Any],
     document.setdefault("visit", {})
     document["visit"].setdefault("doctor_id", session["doctor_id"])
     document["visit"].setdefault("hospital_id", session["hospital_id"])
-    document["visit"]["end_time"] = ended.isoformat() if ended else None
+    # 25 Nov: when CMED's API 4 ended the recording, the visit ends at CMED's
+    # own end_time (the lab labels by it); otherwise when the recording stopped.
+    cmed_end = api4_end_time(session.get("close_reason"), session.get("close_detail"))
+    document["visit"]["end_time"] = cmed_end or (ended.isoformat() if ended else None)
+    document["visit"]["end_time_from"] = "CMED API 4" if cmed_end else (
+        "recording stopped" if ended else None)
     document["visit"].setdefault("start_time", started.isoformat() if started else None)
 
     archive_sha = session.get("archive_sha256")

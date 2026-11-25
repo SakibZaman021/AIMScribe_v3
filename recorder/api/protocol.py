@@ -52,6 +52,10 @@ CODES: Dict[str, Tuple[int, str]] = {
     # API 4 (3.9.8): the end of a visit.
     "RECORDING_ENDED": (200, "Recording ended. The visit is closed."),
     "VISIT_ALREADY_ENDED": (200, "That visit's recording had already ended."),
+    # 25 Nov: a clinic whose recordings end two minutes after API 3 (Amader
+    # Susastho; Aalo until API 4 is live there). API 4 is logged, nothing more.
+    "RECORDING_CONTINUES": (200, "Logged. This clinic's recording ends two minutes "
+                                 "after the prescription (API 3)."),
     "VISIT_MISMATCH": (409, "That visit is not the one being recorded; the recording "
                             "continues."),
     "DEVICE_NOT_ENROLLED": (423, "This PC is not registered with AIMS LAB."),

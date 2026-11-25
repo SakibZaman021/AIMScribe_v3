@@ -334,11 +334,29 @@ class WebSocketManager:
         """
         end = protocol.parse_end(message)
         result = await self._controller.end_visit(end)
+        # 25 Nov: the reply is CMED's assurance. It is sent only after the
+        # microphone has stopped and the last of the audio is written on this
+        # PC; it says so, with the stop time and CMED's own end_time.
+        if result.get("status") == "continues":
+            # 25 Nov: this clinic ends recordings two minutes after API 3.
+            return "RECORDING_CONTINUES", {
+                "session_id": result.get("session_id"), "visit_id": end.visit_id or None,
+                "recording_stopped": False, "end_time": result.get("end_time"),
+                "ends": "two minutes after API 3"}
         if result.get("status") == "already_ended":
-            return "VISIT_ALREADY_ENDED", {"session_id": result.get("session_id")}
-        return "RECORDING_ENDED", {"session_id": result.get("session_id"),
-                                   "duration_seconds": result.get("duration_seconds"),
-                                   "visit_id": end.visit_id or None}
+            return "VISIT_ALREADY_ENDED", {
+                "session_id": result.get("session_id"), "visit_id": end.visit_id or None,
+                "recording_stopped": True, "stopped_at": result.get("stopped_at"),
+                "end_time": result.get("end_time")}
+        return "RECORDING_ENDED", {
+            "session_id": result.get("session_id"), "visit_id": end.visit_id or None,
+            "recording_stopped": True, "stopped_at": result.get("stopped_at"),
+            "end_time": end.end_time,
+            "duration_seconds": result.get("duration_seconds"),
+            # The audio is safe on this PC (False only while a full disk holds
+            # the last seconds in memory); it uploads to AIMS LAB by itself.
+            "audio_saved": not result.get("waiting_for_disk", False),
+            "segment_count": result.get("segment_count")}
 
     # ---- commands CMED does not use ----
 

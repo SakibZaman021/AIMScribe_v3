@@ -466,7 +466,8 @@ async def _recording_of(visit, hospital_id: Optional[str]) -> Optional[Dict[str,
     async with repo._acquire() as conn:
         row = await conn.fetchrow("""
             SELECT session_id, opened_at, closed_at, close_reason, segment_count,
-                   total_duration_seconds, confirmation
+                   total_duration_seconds, confirmation,
+                   manifest->>'close_detail' AS close_detail
               FROM sessions WHERE session_id = $1
         """, found["session_id"])
     return dict(row) if row else None
@@ -634,6 +635,14 @@ async def visit_status(visit_id: str, request: Request):
                 "audio_received": bool(recording["segment_count"]),
                 "seconds": float(recording["total_duration_seconds"] or 0) or None,
                 "confirmation": recording["confirmation"]}
+    # 25 Nov: CMED's server can see, beside API 4's own reply, that its API 4
+    # reached the recorder and the recording stopped, and which end_time is kept.
+    api4 = None
+    if recording is not None:
+        cmed_end = api_v2.api4_end_time(recording["close_reason"], recording["close_detail"])
+        if cmed_end:
+            api4 = {"received": True, "end_time": cmed_end, "recording_stopped": True,
+                    "stopped_at": _iso(recording["closed_at"])}
     api2 = {"received_at": _iso(row["patient_information_at"]),
             "warnings": row["api2_warnings"] or 0} if row["patient_information_at"] else None
     api3 = {"received_at": _iso(row["prescription_at"]),
@@ -641,7 +650,7 @@ async def visit_status(visit_id: str, request: Request):
             "warnings": row["api3_warnings"] or 0} if row["prescription_at"] else None
     return clinical._reply(200, "OK", visit_id=visit_id, hospital_id=row["hospital_id"],
                            patient_id=row["hospital_patient_id"], api1_recording=api1,
-                           api2=api2, api3=api3,
+                           api2=api2, api3=api3, api4=api4,
                            complete=bool(api1 and api1["audio_received"] and api2 and api3))
 
 

@@ -222,6 +222,10 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
     # Without it the recorder is never told API 2 arrived (3.9.8 refusal window).
     ("050_v3_demographics_notice.sql", "recordings", "column sessions.demographics_received_at",
      _column("sessions", "demographics_received_at")),
+    # Without it every PC is told "api3" (the safe default) and no clinic can
+    # be switched to CMED's API 4.
+    ("051_v3_clinic_end_rule.sql", "recordings", "column hospitals.end_rule",
+     _column("hospitals", "end_rule")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

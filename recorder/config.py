@@ -348,7 +348,13 @@ class SecurityConfig:
     # A follow-up with no prescription has no limit; the next patient ends it.
     counselling_limit_seconds: float = 120.0
     end_grace_seconds: float = 10.0
-    no_activity_limit_seconds: float = 0.0
+    # 25 Nov 2026: a recording with no CMED message for 45 minutes ends by
+    # itself (the doctor can no longer stop it; before, a test visit with no
+    # API 3 ran for almost three hours). 0 turns it off.
+    no_activity_limit_seconds: float = 2700.0
+    # Where the clinic's rule is "api4": the end if API 4 has not come this
+    # long after API 3.
+    api4_wait_seconds: float = 900.0
     receipt_public_key_path: Path = field(default_factory=lambda: pinned_key_path("aimslab_receipt_pub.pem"))
     device_key_path: Path = field(default_factory=lambda: data_dir() / "keys" / "device_ed25519.dpapi")
     allow_plaintext_keystore: bool = False
@@ -488,7 +494,8 @@ class Config:
             developer_mode=(not installed) or _bool("AIMS_DEVELOPER_MODE", False),
             counselling_limit_seconds=_float("AIMS_COUNSELLING_LIMIT_SECONDS", 120.0),
             end_grace_seconds=_float("AIMS_END_GRACE_SECONDS", 10.0),
-            no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 0.0),
+            no_activity_limit_seconds=_float("AIMS_NO_ACTIVITY_LIMIT_SECONDS", 2700.0),
+            api4_wait_seconds=_float("AIMS_API4_WAIT_SECONDS", 900.0),
         )
 
         pause = PauseConfig(

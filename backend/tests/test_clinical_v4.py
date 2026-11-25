@@ -289,6 +289,20 @@ async def test_the_status_of_one_visit(cmed):
     async with cmed.dbs.rec.acquire() as conn:
         assert await conn.fetchval("SELECT prescription_received_at IS NOT NULL FROM sessions "
                                    "WHERE session_id = $1", sid)
+    assert state["api4"] is None                       # not ended by API 4 (yet)
+
+    # 25 Nov: CMED's API 4 ends it - the status confirms the stop and the end_time.
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("""
+            UPDATE sessions SET closed_at = now(), close_reason = 'consultation_ended',
+                   manifest = '{"close_detail": "end_time=2026-11-07T10:26:31+06:00"}'::jsonb
+             WHERE session_id = $1
+        """, sid)
+    code, state = await status(cmed, first["visit_id"])
+    assert state["api4"]["received"] is True and state["api4"]["recording_stopped"] is True
+    assert state["api4"]["end_time"] == "2026-11-07T10:26:31+06:00"
+    assert state["api4"]["stopped_at"] and state["api1_recording"]["ended_by"] == \
+        "consultation_ended"
 
 
 # ============================================================
@@ -343,6 +357,28 @@ async def test_a_grant_remembers_the_visit_id(cmed):
         jti=jti, device_id=cmed.device["device_id"], hospital_id="HOSP003", visit=visit,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=1), visit_id="VIS1001")
     assert (await cmed.dbs.repo.get_authorisation(jti))["visit_id"] == "VIS1001"
+
+
+@postgres
+async def test_the_heartbeat_says_how_the_clinics_recordings_end(cmed):
+    """25 Nov: "api3" (two minutes after API 3) until AIMS LAB switches a clinic."""
+    beat = api_v2.HeartbeatRequest(device_id=str(cmed.device["device_id"]))
+    reply = await api_v2.heartbeat(beat, device=cmed.device)
+    assert reply["end_rule"] == "api3"
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("UPDATE hospitals SET end_rule = 'api4' WHERE hospital_id = $1",
+                           cmed.device["hospital_id"])
+    try:
+        reply = await api_v2.heartbeat(beat, device=cmed.device)
+        assert reply["end_rule"] == "api4"
+        async with cmed.dbs.rec.acquire() as conn:
+            with pytest.raises(Exception):
+                await conn.execute("UPDATE hospitals SET end_rule = 'whenever' "
+                                   "WHERE hospital_id = $1", cmed.device["hospital_id"])
+    finally:
+        async with cmed.dbs.rec.acquire() as conn:
+            await conn.execute("UPDATE hospitals SET end_rule = 'api3' WHERE hospital_id = $1",
+                               cmed.device["hospital_id"])
 
 
 @postgres
