@@ -4423,11 +4423,27 @@ async def admin_clinic_codes(_: None = Depends(require_admin)):
     async with repo._acquire() as conn:
         clinics = await conn.fetch("""
             SELECT h.hospital_id, h.name, h.timezone, h.active, h.cmed_hospital_id,
-                   h.cmed_last_message_at,
+                   h.cmed_last_message_at, coalesce(h.end_rule, 'api3') AS end_rule,
                    (SELECT count(*) FROM devices d WHERE d.hospital_id = h.hospital_id
                        AND d.revoked_at IS NULL) AS pcs
               FROM hospitals h ORDER BY h.hospital_id
         """)
+        # 26 Nov: whether CMED's API 4 is reaching each clinic's PCs - from the
+        # recordings' own logs (api4_end, api4_not_used, api4_mismatch).
+        api4 = {r["hospital_id"]: r for r in await conn.fetch("""
+            SELECT s.hospital_id,
+                   max((e->>'at')::timestamptz) AS last_at,
+                   count(*) FILTER (WHERE (e->>'at')::timestamptz > now() - interval '7 days')
+                       AS last_7_days
+              FROM sessions s,
+                   jsonb_array_elements(CASE WHEN jsonb_typeof(s.manifest::jsonb -> 'events')
+                                                  = 'array'
+                                             THEN s.manifest::jsonb -> 'events'
+                                             ELSE '[]'::jsonb END) e
+             WHERE s.opened_at > now() - interval '60 days'
+               AND e->>'event' IN ('api4_end', 'api4_not_used', 'api4_mismatch')
+             GROUP BY s.hospital_id
+        """)}
         refused = await conn.fetch("""
             SELECT id, raised_at, detail FROM integrity_alerts
              WHERE alert_type = 'device_register_refused'
@@ -4454,8 +4470,41 @@ async def admin_clinic_codes(_: None = Depends(require_admin)):
                     "app_version": detail.get("app_version"), "address": detail.get("address"),
                     "linked_now": await repo.active_clinic_for_cmed(
                         detail.get("cmed_hospital_id") or "") is not None})
-    return {"clinics": [{k: iso(v) for k, v in dict(c).items()} for c in clinics],
-            "refused": out}
+    rows = []
+    for c in clinics:
+        row = {k: iso(v) for k, v in dict(c).items()}
+        seen = api4.get(c["hospital_id"])
+        row["api4_last_at"] = iso(seen["last_at"]) if seen else None
+        row["api4_last_7_days"] = int(seen["last_7_days"]) if seen else 0
+        rows.append(row)
+    return {"clinics": rows, "refused": out}
+
+
+class EndRuleRequest(BaseModel):
+    hospital_id: str = Field(..., max_length=64)
+    end_rule: str = Field(..., pattern=r"^(api3|api4)$")
+
+
+@router.post("/admin/clinic-end-rule")
+async def admin_clinic_end_rule(body: EndRuleRequest, _: None = Depends(require_admin)):
+    """
+    How a clinic's recordings end (migration 051): 'api3' - two minutes after
+    CMED's API 3; 'api4' - when CMED's API 4 arrives (15 minutes after API 3
+    if none comes). Every PC of the clinic takes it at its next heartbeat.
+    """
+    hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    async with _repo()._acquire() as conn:
+        before = await conn.fetchval("SELECT end_rule FROM hospitals WHERE hospital_id = $1",
+                                     hospital_id)
+        if before is None and not await conn.fetchval(
+                "SELECT 1 FROM hospitals WHERE hospital_id = $1", hospital_id):
+            raise HTTPException(status_code=404, detail="no such clinic")
+        await conn.execute("UPDATE hospitals SET end_rule = $2 WHERE hospital_id = $1",
+                           hospital_id, body.end_rule)
+    await _repo().audit(event_type="hospital.end_rule", actor_type="admin",
+                        actor_id=hospital_id,
+                        detail={"from": before, "to": body.end_rule})
+    return {"status": "ok", "hospital_id": hospital_id, "end_rule": body.end_rule}
 
 
 class DoctorRequest(BaseModel):

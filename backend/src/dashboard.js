@@ -1351,7 +1351,7 @@ async function loadCodes() {
   $("codes").innerHTML = !CLINIC_CODES.length
     ? empty("No clinic yet", "Clinics appear here once they are set up.", true)
     : `<table><thead><tr><th>Our clinic</th><th>CMED's code for it</th><th>PCs</th>`
-      + `<th>Last from CMED</th></tr></thead><tbody>`
+      + `<th>Last from CMED</th><th>How recordings end</th><th>API 4 last seen</th></tr></thead><tbody>`
       + CLINIC_CODES.map((c) => `<tr>`
         + td("Our clinic", `<b><code>${esc(c.hospital_id)}</code></b><br><span class="hint">${esc(c.name || "")}</span>`
           + (c.active ? "" : ` ${tag("quiet", "inactive")}`))
@@ -1360,6 +1360,14 @@ async function loadCodes() {
           + `<button type="button" class="chip" data-savecode="${esc(c.hospital_id)}">Save</button>`)
         + td("PCs", esc(String(c.pcs || 0)))
         + td("Last from CMED", esc(c.cmed_last_message_at ? dhaka(c.cmed_last_message_at) : "never"))
+        // 26 Nov: the end rule, and whether CMED's API 4 reaches this clinic's PCs.
+        + td("How recordings end", `<select class="small" data-endrule="${esc(c.hospital_id)}" `
+          + `aria-label="How ${esc(c.hospital_id)} recordings end">`
+          + `<option value="api3"${c.end_rule === "api4" ? "" : " selected"}>2 min after API 3</option>`
+          + `<option value="api4"${c.end_rule === "api4" ? " selected" : ""}>CMED's API 4</option></select>`)
+        + td("API 4 last seen", c.api4_last_at
+          ? `${tag("good", esc(dhaka(c.api4_last_at)))}<br><span class="hint">${esc(String(c.api4_last_7_days || 0))} in the last 7 days</span>`
+          : tag("quiet", "never"))
         + `</tr>`).join("") + `</tbody></table>`;
   const refused = data.refused || [];
   const options = CLINIC_CODES.map((c) =>
@@ -1394,6 +1402,20 @@ async function saveCode(hospitalId, code) {
   } catch (err) { window.alert(`Not saved: ${err.message}`); }
   loadCodes();
 }
+
+$("codes").addEventListener("change", async (e) => {
+  const sel = e.target.closest("[data-endrule]");
+  if (!sel) return;
+  const clinic = sel.dataset.endrule;
+  const rule = sel.value;
+  const words = rule === "api4"
+    ? `${clinic}: recordings will end when CMED's API 4 arrives (15 minutes after API 3 if it never comes). Switch only once CMED has API 4 live at this clinic. Continue?`
+    : `${clinic}: recordings will end two minutes after CMED's API 3, as before. Continue?`;
+  if (!window.confirm(words)) { loadCodes(); return; }
+  try { await adminCall("POST", "/api/v2/admin/clinic-end-rule", { hospital_id: clinic, end_rule: rule }); }
+  catch (err) { window.alert(`Not saved: ${err.message}`); }
+  loadCodes();
+});
 
 $("codes").addEventListener("click", (e) => {
   const b = e.target.closest("[data-savecode]");

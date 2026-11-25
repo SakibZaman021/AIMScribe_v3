@@ -699,3 +699,30 @@ async def test_api2_reaching_an_open_recording_closes_the_refusal_on_the_pc(cmed
     async with cmed.dbs.rec.acquire() as conn:
         await conn.execute("UPDATE sessions SET closed_at = now() WHERE session_id = $1", sid)
     assert not await cmed.dbs.repo.demographics_notice(cmed.device["device_id"], sid)
+
+
+@postgres
+async def test_the_clinic_table_shows_the_end_rule_and_where_api4_arrives(cmed):
+    """26 Nov: admins see each clinic's end rule, switch it, and see API 4 arriving."""
+    sid = uuid.uuid4().hex[:26].upper()
+    opened = datetime.now(timezone.utc) - timedelta(minutes=20)
+    at = (opened + timedelta(minutes=9)).isoformat()
+    manifest = json.dumps({"events": [{"at": at, "event": "api4_not_used",
+                                       "detail": "end_time=x", "audio_seconds": 540.0}]})
+    async with cmed.dbs.rec.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, device_id,
+                                  protocol_version, status, session_date, opened_at, manifest)
+            VALUES ($1, 'P1', 'DR0042', 'HOSP003', $2, 2, 'active', $3, $4, $5)
+        """, sid, cmed.device["device_id"], opened.date(), opened, manifest)
+    table = await api_v2.admin_clinic_codes(None)
+    row = next(c for c in table["clinics"] if c["hospital_id"] == "HOSP003")
+    assert row["end_rule"] == "api3" and row["api4_last_7_days"] == 1
+    assert row["api4_last_at"] is not None
+    reply = await api_v2.admin_clinic_end_rule(
+        api_v2.EndRuleRequest(hospital_id="HOSP003", end_rule="api4"), None)
+    assert reply["end_rule"] == "api4"
+    assert await cmed.dbs.repo.clinic_end_rule("HOSP003") == "api4"
+    with pytest.raises(api_v2.HTTPException):
+        await api_v2.admin_clinic_end_rule(
+            api_v2.EndRuleRequest(hospital_id="NO_SUCH_CLINIC", end_rule="api4"), None)
