@@ -232,6 +232,11 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _column("grant_authorisations", "origin")),
     ("052_v3_origin_lock.sql", "recordings", "table server_settings",
      _table("server_settings")),
+    # Without them the analysis pipeline (lab transcript, NER, metrics) cannot run.
+    ("053_v3_analysis_pipeline.sql", "recordings", "table pipeline_jobs",
+     _table("pipeline_jobs")),
+    ("053_v3_analysis_pipeline.sql", "recordings", "table pipeline_results",
+     _table("pipeline_results")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",
