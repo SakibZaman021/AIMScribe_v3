@@ -390,6 +390,87 @@ def _chunks(reader, name: str, aes, context: Optional[bytes],
         index += 1
 
 
+# ============================================================
+# Part of a copy - listening on the portal (26 Nov 2026)
+# ============================================================
+
+HEADER_MAX_BYTES = _HEADER.size + _BINDING_LEN.size + MAX_BINDING_BYTES
+
+
+@dataclass
+class Layout:
+    """Where everything is in one sealed object, read from its header alone."""
+    context: Optional[bytes]       # the binding as sealed (None: format 1)
+    chunk_bytes: int               # plaintext per chunk
+    header_bytes: int
+    total_bytes: int               # the sealed object
+    plain_bytes: int               # the file inside it
+    chunks: int
+
+    def span(self, first: int, last: int) -> Tuple[int, int]:
+        """The sealed bytes [start, end) that hold chunks first..last."""
+        step = self.chunk_bytes + _CHUNK_OVERHEAD
+        start = self.header_bytes + first * step
+        return start, min(self.total_bytes, self.header_bytes + (last + 1) * step)
+
+
+def layout(head: bytes, name: str, total_bytes: int,
+           expect: Optional[Dict[str, Any]] = None) -> Layout:
+    """
+    The layout of a sealed object from its first bytes (at least its header;
+    HEADER_MAX_BYTES always suffice) and its size. With `expect`, a copy bound
+    to anything else is refused here, before any chunk is read.
+    """
+    import io
+    context, chunk_bytes, header_bytes = _read_header_sized(io.BytesIO(head), name)
+    if not 0 < chunk_bytes <= MAX_CHUNK_BYTES:
+        raise CopyError(f"{name} has a malformed header")
+    if expect:
+        found = None
+        if context is not None:
+            try:
+                found = json.loads(context.decode("utf-8")) if context else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CopyError(f"{name} has a malformed binding") from exc
+        check_binding(found, expect, name)
+    body = total_bytes - header_bytes
+    plain = plain_size(body, chunk_bytes)
+    chunks = -(-body // (chunk_bytes + _CHUNK_OVERHEAD))
+    return Layout(context, chunk_bytes, header_bytes, total_bytes, plain, chunks)
+
+
+def decrypt_span(sealed: bytes, where: Layout, first: int, name: str,
+                 key: bytes) -> Iterator[bytes]:
+    """
+    The plaintext of the consecutive chunks in `sealed`, the first of them
+    chunk `first`. Each is authenticated with its own position and with
+    whether it is the object's last chunk, so a chunk moved, swapped or taken
+    from another copy does not decrypt.
+    """
+    aes = _cipher(key)
+    view, at, index = memoryview(sealed), 0, first
+    while at < len(view):
+        if index >= where.chunks:
+            raise CopyError(f"{name} has more chunks than its size allows")
+        if len(view) - at < NONCE_BYTES + _FRAME.size:
+            raise CopyError(f"{name} ends in the middle of a chunk")
+        nonce = bytes(view[at:at + NONCE_BYTES])
+        (length,) = _FRAME.unpack(view[at + NONCE_BYTES:at + NONCE_BYTES + _FRAME.size])
+        at += NONCE_BYTES + _FRAME.size
+        if length > where.chunk_bytes + 16 or len(view) - at < length:
+            raise CopyError(f"{name} has a malformed chunk ({index})")
+        last = index == where.chunks - 1
+        try:
+            plain = aes.decrypt(nonce, bytes(view[at:at + length]),
+                                _aad(index, last, where.context))
+        except Exception:
+            raise CopyError(f"{name} does not decrypt: wrong key, or the file has "
+                            f"been changed (chunk {index})")
+        yield plain
+        at += length
+        index += 1
+
+
 def decrypt_file(source: Path, target: Path, key: bytes,
                  expect: Optional[Dict[str, Any]] = None) -> Path:
     """
@@ -441,7 +522,8 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
-__all__ = ["CopyError", "Encrypted", "audio_fingerprint", "binding", "check_binding",
+__all__ = ["CopyError", "Encrypted", "Layout", "audio_fingerprint", "binding",
+           "check_binding", "decrypt_span", "layout",
            "stem_fingerprint",
            "decrypt_file", "encrypt_file", "flac_matches_wav", "load_key",
            "open_sealed", "plain_size", "read_binding", "sealed_sha256", "sha256_file"]

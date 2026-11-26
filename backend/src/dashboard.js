@@ -21,6 +21,9 @@ const AUTO_SECONDS = 30;    // auto-refresh interval
 const STALE_SECONDS = 90;   // the "updated" pill turns amber after this
 
 const $ = (id) => document.getElementById(id);
+// 26 Nov 2026: the recording player's state (the player is at the end of this file).
+let REC_LIST = [];
+const PLAYER = { sid: null, part: null, row: null, dragging: false };
 // Local date, not UTC: in Dhaka toISOString() puts everything before 6 am on
 // the previous day.
 const ymd = (d) => {
@@ -873,10 +876,10 @@ function audioLinks(r) {
   // 049: CMED staff take the clinical record only, never the audio.
   if (PORTAL.role === "cmed") return record.slice("<br>".length);
   if (files.length > 1) {
-    return files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
+    return listenButton(r) + files.map((f) => link(`${base}?part=${f.part_no}`, `Part ${f.part_no}`,
       `Download patient file ${f.part_no} (WAV)`)).join(" ") + record;
   }
-  return link(base, "Audio (WAV)", "Download the WAV") + record;
+  return listenButton(r) + link(base, "Audio (WAV)", "Download the WAV") + record;
 }
 
 function recordUrl(r) {
@@ -941,7 +944,7 @@ function recordingsTable(list) {
   return `<table><thead><tr><th>Date</th>${showClinic ? "<th>Clinic</th>" : ""}<th>PC</th><th>Doctor</th>`
     + `<th>Patient files and rule</th><th>Visit</th><th class="num">Length</th><th>Microphone</th>`
     + `<th>CMED</th><th>Demographics</th><th>Prescription</th><th>Status</th><th>Doctor's log</th>`
-    + `<th>Stored</th><th>Download</th><th>Pieces</th><th>Folder on server</th></tr></thead><tbody>`
+    + `<th>Stored</th><th>Listen · download</th><th>Pieces</th><th>Folder on server</th></tr></thead><tbody>`
     + list.map((r) => {
         const rel = r.archive_relpath || "";
         const folder = rel ? rel.replace(/\/[^/]*$/, "") : "";
@@ -972,7 +975,7 @@ function recordingsTable(list) {
         if (!status.length) status.push(`<span class="hint">${esc(human(r.status) || "–")}</span>`);
         const tone = r.quarantine_reason || r.confirmation === "unconfirmed" ? "row-bad"
           : r.confirmation === "pending" ? "row-warn" : "";
-        return `<tr class="${tone}">`
+        return `<tr class="${tone}${PLAYER.sid === r.session_id ? " playing" : ""}" data-sid="${esc(r.session_id)}">`
           + td("Date", `${esc(r.date || "")}${t ? `<span class="sub2">${esc(t)}</span>` : ""}`)
           + (showClinic ? td("Clinic", esc(clinicName(r.hospital_id))) : "")
           + td("PC", r.pc ? `<span title="${esc(r.pc_id || "")}">${esc(r.pc)}</span>` : `<span class="hint">–</span>`)
@@ -987,7 +990,7 @@ function recordingsTable(list) {
           + td("Status", `<span class="tags">${status.join("")}</span>`)
           + td("Doctor's log", doctorLog(r), "wrap")
           + td("Stored", storedTag(r))
-          + td("Download", audioLinks(r))
+          + td("Listen · download", audioLinks(r))
           + td("Pieces", piecesButton(r))
           + td("Folder", folder
             ? `<span title="${esc(folder)}">${esc(folder)}</span>`
@@ -1093,6 +1096,7 @@ function fillRecDoctors(doctors) {
   return sel.value !== chosen;           // the chosen doctor has nothing in this range
 }
 $("recDoctor").addEventListener("change", () => loadRecordings());
+$("recShift").addEventListener("change", () => loadRecordings());
 
 /* 26 Nov 2026: a patient ID or a visit ID, exactly - on Enter, or as typing pauses. */
 let findTimer = null;
@@ -1108,11 +1112,12 @@ async function loadRecordings() {
   const clinic = $("clinic").value;
   const label = clinic ? $("clinic").selectedOptions[0].textContent : "All clinics";
   const find = $("recFind").value.trim();
+  const shift = $("recShift").value;
   $("recTitle").textContent = STATE ? `Recordings · ${STATE_LABELS[STATE] || human(STATE)}` : "Recordings";
   const seq = ++recSeq;
   if (!$("recTable").firstChild) $("recTable").innerHTML = empty("Loading");
   try {
-    const range = { from: $("from").value, to: $("to").value, hospital_id: clinic };
+    const range = { from: $("from").value, to: $("to").value, hospital_id: clinic, shift };
     // The doctor menu first: a doctor with nothing in this range is let go.
     const facets = await api("/recordings/facets",
                              { ...range, doctor_id: $("recDoctor").value, find });
@@ -1132,8 +1137,11 @@ async function loadRecordings() {
     const d = await api("/recordings", params);
     if (seq !== recSeq) return;
     const list = d.recordings || [];
+    REC_LIST = list;
     $("recTable").innerHTML = recordingsTable(list);
+    drawPlayer();
     $("recHint").textContent = `${label}${doctor ? ` · ${doctor}` : ""}`
+      + `${shift ? ` · ${shift} shift` : ""}`
       + `${find ? ` · “${find}”` : ""} · ${num(list.length)}`
       + `${list.length >= 200 ? " (first 200)" : ""} · newest first`;
   } catch (err) {
@@ -2851,3 +2859,250 @@ $("wTgTest").addEventListener("click", async () => {
   }
   $("wTgTest").disabled = false;
 });
+
+
+/* ============================================================
+   26 Nov 2026: the recording player. A researcher (their own hospitals) or
+   an admin plays a recording in the page - play, pause, drag to any point -
+   without downloading it. The browser asks the server for the part it needs;
+   the server decrypts only the 4 MB pieces that hold it. The list on screen
+   is the playlist: Previous and Next move through it.
+   ============================================================ */
+
+function mayListen(r) {
+  if (!PORTAL || PORTAL.role === "collector" || PORTAL.role === "cmed") return false;
+  if (!r.copied || r.confirmation !== "confirmed") return false;
+  if (PORTAL.role === "researcher" && !(PORTAL.download_hospitals || []).includes(r.hospital_id)) return false;
+  return true;
+}
+
+function listenButton(r) {
+  if (!mayListen(r)) return "";
+  const on = PLAYER.sid === r.session_id;
+  return `<button type="button" class="copy dl listen" data-listen="${esc(r.session_id)}" aria-pressed="${on}"`
+    + ` title="Play in the page - nothing is downloaded"><span class="ico ico-listen" aria-hidden="true"></span>`
+    + `${on ? "Playing" : "Listen"}</button><br>`;
+}
+
+function clock(seconds) {
+  if (!isFinite(seconds) || seconds < 0) seconds = 0;
+  const s = Math.floor(seconds);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+function playable() { return REC_LIST.filter(mayListen); }
+
+function listenUrl(sid, part) {
+  return `/api/v2/dashboard/recordings/${encodeURIComponent(sid)}/listen` + (part ? `?part=${part}` : "");
+}
+
+function playerSay(words, bad) {
+  const sub = $("plSub");
+  sub.textContent = words;
+  sub.className = bad ? "bad" : "";
+}
+
+async function listenTo(r, part) {
+  const audio = $("plAudio");
+  const files = r.files || [];
+  part = part || (files.length > 1 ? files[0].part_no : null);
+  PLAYER.sid = r.session_id; PLAYER.part = part; PLAYER.row = r;
+  $("player").hidden = false;
+  const patient = files.length > 1
+    ? (files.find((f) => f.part_no === part) || {}).patient_id : (r.patient_id || (files[0] || {}).patient_id);
+  $("plTitle").textContent = [clinicName(r.hospital_id), r.doctor_id, patient].filter(Boolean).join(" · ");
+  const sel = $("plPart");
+  sel.hidden = files.length < 2;
+  sel.innerHTML = files.map((f) => `<option value="${f.part_no}">Part ${f.part_no}`
+    + `${f.patient_id ? " · " + esc(f.patient_id) : ""}</option>`).join("");
+  if (part) sel.value = String(part);
+  audio.pause();
+  audio.removeAttribute("src");
+  setSeek(0, 0);
+  playerSay(`${r.date || ""}${timeOf(r.local_start) ? " " + timeOf(r.local_start) : ""} · loading…`);
+  $("plPlay").classList.add("loading");
+  markPlaying();
+  try {
+    const check = await fetch(listenUrl(r.session_id, part) + (part ? "&" : "?") + "check=1",
+                              { headers: { ...portalHeaders(), Accept: "application/json" } });
+    if (!check.ok) {
+      let why = `status ${check.status}`;
+      try { why = (await check.json()).detail || why; } catch { /* not JSON */ }
+      throw new Error(why);
+    }
+  } catch (err) {
+    if (PLAYER.sid !== r.session_id) return;
+    $("plPlay").classList.remove("loading");
+    playerSay(`Cannot play: ${err.message}`, true);
+    return;
+  }
+  if (PLAYER.sid !== r.session_id || PLAYER.part !== part) return;
+  audio.src = listenUrl(r.session_id, part);
+  audio.playbackRate = Number($("plSpeed").value) || 1;
+  playerSay(`${r.date || ""}${timeOf(r.local_start) ? " " + timeOf(r.local_start) : ""}`
+    + `${r.visit_id ? " · visit " + r.visit_id : ""}`);
+  audio.play().catch(() => { /* the browser wants a click first: the Play button is there */ });
+  if ("mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: $("plTitle").textContent,
+                                                            artist: "AIMScribe recording" });
+    } catch { /* not supported */ }
+  }
+  drawPlayer();
+}
+
+function markPlaying() {
+  document.querySelectorAll("#recTable tr[data-sid]").forEach((tr) => {
+    const on = tr.dataset.sid === PLAYER.sid;
+    tr.classList.toggle("playing", on);
+    const b = tr.querySelector("[data-listen]");
+    if (b) {
+      b.setAttribute("aria-pressed", String(on));
+      b.lastChild.textContent = on ? "Playing" : "Listen";
+    }
+  });
+}
+
+function drawPlayer() {
+  const list = playable();
+  const i = list.findIndex((r) => r.session_id === PLAYER.sid);
+  $("plPrev").disabled = i <= 0;
+  $("plNext").disabled = i < 0 || i >= list.length - 1;
+  markPlaying();
+}
+
+function setSeek(at, length) {
+  const seek = $("plSeek");
+  seek.max = String(length || 0);
+  if (!PLAYER.dragging) seek.value = String(at || 0);
+  const shown = PLAYER.dragging ? Number(seek.value) : at;
+  seek.style.setProperty("--p", length ? `${(shown / length) * 100}%` : "0%");
+  $("plAt").textContent = clock(shown);
+  $("plLen").textContent = clock(length);
+}
+
+function bufferedTo(audio) {
+  const b = audio.buffered;
+  for (let k = 0; k < b.length; k++) {
+    if (b.start(k) <= audio.currentTime + 0.5 && audio.currentTime <= b.end(k)) return b.end(k);
+  }
+  return audio.currentTime;
+}
+
+(function wirePlayer() {
+  const audio = $("plAudio");
+  const play = $("plPlay");
+  const showPlaying = () => {
+    const on = !audio.paused && !audio.ended;
+    play.querySelector(".ico").className = `ico ${on ? "ico-pause" : "ico-play"}`;
+    play.setAttribute("aria-label", on ? "Pause" : "Play");
+  };
+  const tick = () => {
+    setSeek(audio.currentTime, audio.duration || 0);
+    const length = audio.duration || 0;
+    $("plSeek").style.setProperty("--b", length ? `${(bufferedTo(audio) / length) * 100}%` : "0%");
+  };
+  audio.addEventListener("timeupdate", tick);
+  audio.addEventListener("progress", tick);
+  audio.addEventListener("loadedmetadata", tick);
+  audio.addEventListener("durationchange", tick);
+  audio.addEventListener("play", showPlaying);
+  audio.addEventListener("pause", showPlaying);
+  audio.addEventListener("ended", () => { showPlaying(); playerSay("Finished. Next ▸ plays the next recording in the list."); });
+  audio.addEventListener("waiting", () => play.classList.add("loading"));
+  audio.addEventListener("seeking", () => play.classList.add("loading"));
+  for (const ev of ["playing", "canplay", "seeked", "pause"]) {
+    audio.addEventListener(ev, () => play.classList.remove("loading"));
+  }
+  audio.addEventListener("error", () => {
+    if (!audio.getAttribute("src")) return;
+    play.classList.remove("loading");
+    playerSay("The recording stopped loading. Press Play to try again, or download it.", true);
+  });
+
+  play.addEventListener("click", () => {
+    if (!audio.getAttribute("src") && PLAYER.row) { listenTo(PLAYER.row, PLAYER.part); return; }
+    if (audio.error) {                      // load again from where it stopped
+      const at = audio.currentTime;
+      audio.load();
+      audio.currentTime = at;
+    }
+    if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  });
+  const jump = (by) => {
+    if (!isFinite(audio.duration)) return;
+    audio.currentTime = Math.max(0, Math.min(audio.duration - 0.05, audio.currentTime + by));
+    tick();
+  };
+  $("plBack").addEventListener("click", () => jump(-10));
+  $("plFwd").addEventListener("click", () => jump(10));
+  $("plRestart").addEventListener("click", () => {
+    audio.currentTime = 0;
+    if (audio.paused) audio.play().catch(() => {});
+  });
+  const seek = $("plSeek");
+  seek.addEventListener("input", () => { PLAYER.dragging = true; setSeek(Number(seek.value), audio.duration || 0); });
+  seek.addEventListener("change", () => {
+    PLAYER.dragging = false;
+    if (isFinite(audio.duration)) audio.currentTime = Number(seek.value);
+    tick();
+  });
+  try {
+    const saved = localStorage.getItem("aims.playerSpeed");
+    if (saved && [...$("plSpeed").options].some((o) => o.value === saved)) $("plSpeed").value = saved;
+  } catch { /* storage blocked: 1x */ }
+  $("plSpeed").addEventListener("change", () => {
+    audio.playbackRate = Number($("plSpeed").value) || 1;
+    try { localStorage.setItem("aims.playerSpeed", $("plSpeed").value); } catch { /* fine */ }
+  });
+  $("plPart").addEventListener("change", () => {
+    if (PLAYER.row) listenTo(PLAYER.row, Number($("plPart").value));
+  });
+  const step = (by) => {
+    const list = playable();
+    const i = list.findIndex((r) => r.session_id === PLAYER.sid);
+    const r = list[i + by];
+    if (r) listenTo(r);
+  };
+  $("plPrev").addEventListener("click", () => step(-1));
+  $("plNext").addEventListener("click", () => step(1));
+  $("plClose").addEventListener("click", () => {
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    PLAYER.sid = PLAYER.part = PLAYER.row = null;
+    $("player").hidden = true;
+    markPlaying();
+  });
+  $("recTable").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-listen]");
+    if (!b) return;
+    const r = REC_LIST.find((x) => x.session_id === b.dataset.listen);
+    if (!r) return;
+    if (PLAYER.sid === r.session_id && audio.getAttribute("src")) {
+      if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+      return;
+    }
+    listenTo(r);
+  });
+  // Space plays or pauses, the arrows jump 10 seconds - while the player is
+  // open and nobody is typing in a field.
+  document.addEventListener("keydown", (e) => {
+    if ($("player").hidden || e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) && t.id !== "plSeek") return;
+    if (e.key === " " && !(t && t.tagName === "BUTTON")) { e.preventDefault(); play.click(); }
+    else if (e.key === "ArrowLeft" && t.id !== "plSeek") { e.preventDefault(); jump(-10); }
+    else if (e.key === "ArrowRight" && t.id !== "plSeek") { e.preventDefault(); jump(10); }
+  });
+  if ("mediaSession" in navigator) {
+    const on = (what, fn) => { try { navigator.mediaSession.setActionHandler(what, fn); } catch { /* fine */ } };
+    on("play", () => audio.play().catch(() => {}));
+    on("pause", () => audio.pause());
+    on("seekbackward", () => jump(-10));
+    on("seekforward", () => jump(10));
+    on("previoustrack", () => step(-1));
+    on("nexttrack", () => step(1));
+  }
+})();
