@@ -124,6 +124,8 @@ class Settings:
         # decrypt one copy and stream it back. 0 turns it off.
         self.decrypt_port = int(os.getenv("AIMS_DECRYPT_PORT", "0"))
         self.decrypt_concurrency = int(os.getenv("AIMS_DECRYPT_CONCURRENCY", "2"))
+        # 26 Nov 2026: listening on the portal - a chunk or two per answer.
+        self.listen_concurrency = int(os.getenv("AIMS_LISTEN_CONCURRENCY", "6"))
 
     def problems(self) -> List[str]:
         issues = []

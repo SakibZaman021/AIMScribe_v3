@@ -54,7 +54,7 @@
 	# own script and style - served as files, never inline - and call its own
 	# API, and nothing else. Under the policy above it loaded blank.
 	@dashboard path /api/v2/dashboard /api/v2/dashboard/*
-	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 	# Uploads never come through here - recorders upload pieces straight to
 	# the segment store - so a large body is a mistake or an attack. CMED's
@@ -182,7 +182,7 @@
 	@api not path /api/v2/dashboard /api/v2/dashboard/*
 	header @api Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
 	@dashboard path /api/v2/dashboard /api/v2/dashboard/*
-	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	header @dashboard Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 	request_body {
 		max_size 2MB

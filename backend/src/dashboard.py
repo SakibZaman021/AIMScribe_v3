@@ -576,7 +576,8 @@ _CONFIRMATIONS = ("pending", "unconfirmed", "confirmed", "refused", "expired", "
 def _recording_filter(from_date: Optional[str], to_date: Optional[str], scope: Any, *,
                       hospital_id: Optional[str] = None, doctor_id: Optional[str] = None,
                       patient_id: Optional[str] = None, search: Optional[str] = None,
-                      find: Optional[str] = None) -> Tuple[List[str], List[Any]]:
+                      find: Optional[str] = None,
+                      shift: Optional[str] = None) -> Tuple[List[str], List[Any]]:
     """The WHERE clauses and arguments every Recordings query shares."""
     today = clinic_today()
     start = _day(from_date, today - timedelta(days=7))
@@ -606,7 +607,22 @@ def _recording_filter(from_date: Optional[str], to_date: Optional[str], scope: A
         add("(lower(s.patient_id) = lower($N) OR lower(COALESCE(s.visit_id, "
             "CASE WHEN g.patient_id = s.patient_id THEN g.visit_id END)) = lower($N))",
             find.strip()[:128])
+    if shift in SHIFTS:
+        # 26 Nov 2026: morning or evening by the clinic's clock when the
+        # recording opened - before or after the midday summary (14:30), the
+        # same line the shift summaries and the workbook draw.
+        # The clinic's offset from UTC, worked out here: the database is never
+        # asked to know the zone by name (db_v2.close_session says why).
+        import watchers
+        args.append(datetime.combine(start, datetime.min.time(), tzinfo=collectors.zone())
+                    .utcoffset() or timedelta(0))
+        offset = f"${len(args)}"
+        add(f"((s.opened_at AT TIME ZONE 'UTC') + {offset}::interval)::time "
+            f"{'<' if shift == 'morning' else '>='} $N::time", watchers.midday_time())
     return where, args
+
+
+SHIFTS = ("morning", "evening")
 
 
 @router.get("/recordings/facets")
@@ -615,6 +631,7 @@ async def recording_facets(from_date: Optional[str] = Query(None, alias="from"),
                            hospital_id: Optional[str] = None,
                            doctor_id: Optional[str] = None,
                            find: Optional[str] = None,
+                           shift: Optional[str] = None,
                            _: None = Depends(require_viewer),
                            scope: Any = Depends(collectors.hospital_scope)):
     """
@@ -628,7 +645,8 @@ async def recording_facets(from_date: Optional[str] = Query(None, alias="from"),
     """
     join = ("FROM sessions s LEFT JOIN grant_authorisations g "
             "ON g.jti = s.grant_jti AND g.patient_id = s.patient_id")
-    where, args = _recording_filter(from_date, to_date, scope, hospital_id=hospital_id)
+    where, args = _recording_filter(from_date, to_date, scope, hospital_id=hospital_id,
+                                    shift=shift)
     counted = ",\n".join(
         [f"count(*) FILTER (WHERE s.confirmation = '{c}') AS {c}" for c in _CONFIRMATIONS]
         + [f"count(*) FILTER (WHERE {clause}) AS {name}"
@@ -640,7 +658,7 @@ async def recording_facets(from_date: Optional[str] = Query(None, alias="from"),
              GROUP BY s.doctor_id ORDER BY s.doctor_id
         """, *args)
         where, args = _recording_filter(from_date, to_date, scope, hospital_id=hospital_id,
-                                        doctor_id=doctor_id, find=find)
+                                        doctor_id=doctor_id, find=find, shift=shift)
         row = await conn.fetchrow(f"""
             SELECT count(*) AS total, {counted} {join}
              WHERE {' AND '.join(where)}
@@ -658,6 +676,7 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
                      state: Optional[str] = None,
                      search: Optional[str] = None,
                      find: Optional[str] = None,
+                     shift: Optional[str] = None,
                      limit: int = 100,
                      _: None = Depends(require_viewer),
                      scope: Any = Depends(collectors.hospital_scope)):
@@ -670,11 +689,12 @@ async def recordings(from_date: Optional[str] = Query(None, alias="from"),
         no_sound
 
     `find` (26 Nov 2026): a patient ID or a visit ID, exactly.
+    `shift` (26 Nov 2026): morning | evening, by when the recording opened.
     """
     limit = max(1, min(limit if isinstance(limit, int) else 100, 500))
     where, args = _recording_filter(
         from_date, to_date, scope, hospital_id=hospital_id, doctor_id=doctor_id,
-        patient_id=patient_id, search=search, find=find)
+        patient_id=patient_id, search=search, find=find, shift=shift)
     if state in RECORDING_STATES:
         where.append(RECORDING_STATES[state])
     elif state:
@@ -1516,8 +1536,9 @@ async def page() -> HTMLResponse:
 
 # The page's own policy: its script, its style and its own API, nothing else.
 # No inline script or style is allowed, which is why both are separate files.
+# media-src (26 Nov 2026): the player plays the recordings from this API only.
 PAGE_POLICY = ("default-src 'none'; script-src 'self'; style-src 'self'; "
-               "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+               "connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; "
                "form-action 'none'; frame-ancestors 'none'")
 
 _STATIC = {"dashboard.css": "text/css; charset=utf-8",
