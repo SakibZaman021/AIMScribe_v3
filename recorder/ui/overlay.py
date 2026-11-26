@@ -1,5 +1,14 @@
 """
-The on-screen control, drawn with tkinter (3.9.8).
+The on-screen control, drawn with tkinter (3.9.8; glass tiles from 3.9.11).
+
+3.9.11 (26 Nov 2026, the owner's design): no white card and no dot. Two glass
+tiles in the iOS style (ui/glass.py) float straight on CMED's or Aalo's page in
+a window with a transparency per pixel (ui/layered.py), so their rounded edges
+and shadows are crisp on any background. Once the doctor gives a Stop reason
+both tiles go for the rest of that recording (the reason is logged, and the
+menu said the recording continues until CMED closes the visit); they come back
+with the next patient. While a sensitive part is marked the Mark tile is amber
+and pulses. The notes below describe 3.9.8 and still hold for the menus.
 
 A slim, see-through strip at the top right of the screen until the doctor drags
 it elsewhere, shown only while a consultation is recording. One small dot says
@@ -35,8 +44,9 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, STOP,
-                              OverlayActions, OverlayState, menu)
+from ui import glass, layered
+from ui.overlay_model import (DELETE_QUESTION, MARK, NEEDS_DELETE_CONFIRMATION, REFUSAL,
+                              STOP, OverlayActions, OverlayState, menu)
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +88,17 @@ def theme_for(hospital_id, override: str = "") -> str:
     if override in THEMES:
         return override
     return "sidebar" if "SUSASTHO" in str(hospital_id or "").upper() else "light"
-WIDTH, HEIGHT = 56, 132        # the strip
+# 3.9.11: the strip is two glass tiles (ui/glass.py) with room for their shadows.
+_BOX = glass.layout(1.0)
+WIDTH, HEIGHT = _BOX.width, _BOX.height
 NOTE_HEIGHT = 0                # kept for older callers: notes now sit beside it
-MARGIN = 20                    # from the screen's right edge, where the strip starts
-TOP = 120                      # from the top: below a browser's own close button
-ICON = 44                      # each icon's diameter
-DOT = 10
+MARGIN = 12                    # from the screen's left edge and the taskbar
+TOP = 112                      # from the top: below a browser's own close button
+ICON = glass.TILE              # each tile's side
+DOT = 10                       # kept for older callers: 3.9.11 draws no dot
 IDLE_ALPHA = 1.0               # 25 Nov: always solid (see-through looked blurred)
 NEAR_ALPHA = 1.0
+BEAT_SECONDS = 0.6             # 3.9.11: the marked Mark tile glows on and off at this pace
 MENU_WIDTH = 300
 MENU_KEY = "#fdfdfc"           # around the menu's rounded corners: see-through
 MENU_RADIUS = 14               # the menu's corners
@@ -137,14 +150,32 @@ def _enable_dpi_awareness() -> float:
 def _apply_scale() -> None:
     """Grow the strip to match the display scale (fonts follow `tk scaling`)."""
     global WIDTH, HEIGHT, ICON, DOT, MENU_WIDTH, TOP, MENU_RADIUS, BUTTON_RADIUS, CARD_RADIUS
+    global _BOX
     if SCALE == 1.0:
         return
     MENU_RADIUS, BUTTON_RADIUS = round(MENU_RADIUS * SCALE), round(BUTTON_RADIUS * SCALE)
     CARD_RADIUS = round(CARD_RADIUS * SCALE)
-    WIDTH, HEIGHT = round(WIDTH * SCALE), round(HEIGHT * SCALE)
+    _BOX = glass.layout(SCALE)
+    WIDTH, HEIGHT = _BOX.width, _BOX.height
     TOP = round(TOP * SCALE)
-    ICON, DOT = round(ICON * SCALE), round(DOT * SCALE)
+    ICON, DOT = _BOX.stop[2] - _BOX.stop[0], round(DOT * SCALE)
     MENU_WIDTH = round(MENU_WIDTH * SCALE)
+
+
+def _work_area_bottom() -> int:
+    """The bottom of the screen above the taskbar, in pixels; 0 when unknown."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        area = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(area), 0):
+            return int(area.bottom)                     # SPI_GETWORKAREA
+    except Exception:
+        pass
+    return 0
 
 
 class Overlay:
@@ -236,25 +267,19 @@ class Overlay:
         except Exception:
             pass
 
-        key = THEMES[self._theme]["key"]
-        win = tk.Toplevel(self.root, bg=key)
+        matte = THEMES[self._theme]["matte"]
+        win = tk.Toplevel(self.root, bg=matte)
         win.overrideredirect(True)                  # no title bar: no minimise, no close
         win.attributes("-topmost", True)
         win.withdraw()
-        try:
-            win.attributes("-transparentcolor", key)
-            self._backdrop = key
-            self._see_through = True
-        except Exception:
-            self._backdrop = THEMES[self._theme]["matte"]
-            self._see_through = False
-        self._set_alpha(win, IDLE_ALPHA)
+        self._backdrop = matte
+        self._see_through = False
         self.window = win
 
         self.canvas = tk.Canvas(win, width=WIDTH, height=HEIGHT, bg=self._backdrop,
                                 highlightthickness=0, bd=0, cursor="fleur")
         self.canvas.pack()
-        # Dragged by the strip itself; the icons are their own widgets, so a
+        # Dragged by the strip itself; the tiles are their own widgets, so a
         # press on one opens its menu and never starts a drag.
         self.canvas.bind("<ButtonPress-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
@@ -262,16 +287,36 @@ class Overlay:
         win.bind("<Enter>", lambda _e: self._come_near(True))
         win.bind("<Leave>", lambda _e: self._come_near(False))
 
-        left = (WIDTH - ICON) // 2
+        # 3.9.11: each tile's face is a widget of its own, laid exactly over the
+        # tile in the picture, so the pointer and taps work as before.
         self.stop_button = self._icon(win, STOP)
-        self.stop_button.place(x=left, y=round(26 * SCALE), width=ICON, height=ICON)
         self.mark_button = self._icon(win, MARK)
-        self.mark_button.place(x=left, y=round(26 * SCALE) + ICON + round(14 * SCALE),
-                               width=ICON, height=ICON)
+        for widget, face in ((self.stop_button, _BOX.stop), (self.mark_button, _BOX.mark)):
+            widget.place(x=face[0], y=face[1], width=face[2] - face[0],
+                         height=face[3] - face[1])
         self._place()
 
-    @staticmethod
-    def _set_alpha(window, alpha: float) -> None:
+        # 3.9.11: a window with a transparency per pixel, so the glass tiles and
+        # their shadows blend into CMED's or Aalo's page with no white card and
+        # no blurred fringe. Where Windows refuses, the tiles sit on the theme's
+        # own colour instead.
+        self._hwnd = None
+        try:
+            win.update_idletasks()
+            hwnd = int(win.wm_frame(), 16)
+            if layered.make_layered(hwnd):
+                self._hwnd = hwnd
+                self._see_through = True
+        except Exception as exc:
+            logger.info("See-through control unavailable, drawn on a colour: %s", exc)
+        logger.info("On-screen control: %s", "glass, see-through" if self._hwnd else
+                    "glass on a plain colour")
+
+    def _set_alpha(self, window, alpha: float) -> None:
+        # Never on the see-through strip: a window-wide alpha would make Windows
+        # drop its per-pixel picture (they cannot be used together).
+        if window is self.window and getattr(self, "_hwnd", None):
+            return
         try:
             window.attributes("-alpha", alpha)
         except Exception:
@@ -289,7 +334,7 @@ class Overlay:
                            bd=0, takefocus=1, cursor="hand2")
         canvas.kind = kind
         canvas.hover = False
-        canvas.draw = lambda: self._draw_icon(canvas)
+        canvas.draw = self._render
 
         def opened(_event=None):
             canvas.hover = True
@@ -306,157 +351,84 @@ class Overlay:
 
     # ---- drawing ----
 
-    def _icon_colours(self, kind: str):
+    def _hovered(self) -> str:
+        for widget, kind in ((self.stop_button, "stop"), (self.mark_button, "mark")):
+            if getattr(widget, "hover", False):
+                return kind
+        return ""
+
+    def _picture(self):
+        """The strip as it should look now: an RGBA picture (ui/glass.py)."""
         view = self._view
-        if view is None or not view.visible:
-            return OFF, PAPER
-        if kind == MARK and view.marked:
-            if view.alarm and int(time.monotonic() * 2) % 2 == 0:
-                return RED, RED            # blinking: the part has run two minutes
-            return AMBER, AMBER            # a sensitive part is marked
-        return (RED if kind == STOP else BLUE), PAPER
+        marked = bool(view and view.marked)
+        beat = marked and bool(view and view.pulse) and \
+            int(time.monotonic() / BEAT_SECONDS) % 2 == 0
+        return glass.strip(SCALE, mark_tint=glass.AMBER if marked else glass.BLUE,
+                           glow=beat, hover=self._hovered())
 
-    def _draw_icon(self, canvas) -> None:
-        canvas.delete("all")
-        size = canvas.winfo_width() or ICON
-        ring, inside = self._icon_colours(canvas.kind)
-        if canvas.hover:
-            inside = HOVER if inside == PAPER else inside
-        theme = THEMES[self._theme]
-        art = self._icon_image(canvas.kind, size, ring, inside, matte=theme["card"])
-        if art is not None:
-            # Held on the widget: a PhotoImage only the canvas refers to is
-            # collected, and the icon then draws as nothing.
-            canvas.art = art
-            canvas.create_image(0, 0, anchor="nw", image=art)
+    def _render(self) -> None:
+        """Draw the two glass tiles: see-through where Windows allows, else on a colour."""
+        if self.window is None:
             return
-        thick = max(2, round(3 * SCALE))
-        pad = thick / 2 + 1
-        canvas.create_oval(pad, pad, size - pad, size - pad, fill=inside, outline=ring,
-                           width=thick)
-        glyph = PAPER if inside != PAPER and inside != HOVER else ring
-        third = size / 3
-        if canvas.kind == STOP:
-            canvas.create_rectangle(third, third, size - third, size - third,
-                                    fill=glyph, outline=glyph)
-        else:
-            bar = size / 9
-            top, bottom = third * 0.95, size - third * 0.95
-            canvas.create_rectangle(size / 2 - 2.2 * bar, top, size / 2 - 0.8 * bar,
-                                    bottom, fill=glyph, outline=glyph)
-            canvas.create_rectangle(size / 2 + 0.8 * bar, top, size / 2 + 2.2 * bar,
-                                    bottom, fill=glyph, outline=glyph)
-
-    @staticmethod
-    def _icon_image(kind: str, size: int, ring: str, inside: str, *,
-                    matte: str = PAPER, key: Optional[str] = None):
-        """
-        The icon drawn four times larger and scaled down, so the circle has a
-        smooth edge (tkinter's own circles are drawn as a staircase). Its edge
-        blends into `matte`, the colour it sits on; outside the circle the
-        pixels are `key`, which the window shows as see-through. None without
-        Pillow; the plain shapes are drawn instead.
-        """
-        if size < 8:
-            return None
         try:
-            from PIL import Image, ImageDraw, ImageTk
+            picture = self._picture()
+        except Exception as exc:                 # no Pillow: plain shapes, as before 3.9.8
+            logger.debug("Glass tiles unavailable: %s", exc)
+            self._render_plain()
+            return
+        if self._hwnd and self.window.state() != "withdrawn":
+            if layered.show(self._hwnd, picture, self.window.winfo_rootx(),
+                            self.window.winfo_rooty()):
+                return
+            logger.info("See-through drawing refused by Windows; drawn on a colour")
+            self._hwnd = None
+            self._see_through = False
+        if self._hwnd:
+            return                               # hidden: drawn when shown
+        self._render_on_colour(picture)
+
+    def _render_on_colour(self, picture) -> None:
+        """The same picture laid on the theme's colour, for a window without alpha."""
+        try:
+            from PIL import ImageTk
         except ImportError:
-            return None
+            self._render_plain()
+            return
+        hexed = THEMES[self._theme]["matte"]
+        flat = glass.flatten(picture, tuple(int(hexed[i:i + 2], 16) for i in (1, 3, 5)))
+        art = ImageTk.PhotoImage(flat)
+        # Held on the widgets: a PhotoImage only a canvas refers to is collected.
+        self.canvas.art = art
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=art)
+        for widget, face in ((self.stop_button, _BOX.stop), (self.mark_button, _BOX.mark)):
+            piece = ImageTk.PhotoImage(flat.crop(face))
+            widget.art = piece
+            widget.delete("all")
+            widget.create_image(0, 0, anchor="nw", image=piece)
 
-        def rgb(colour):
-            return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
-
-        ss = 4
-        big = size * ss
-        image = Image.new("RGB", (big, big), rgb(matte))
-        draw = ImageDraw.Draw(image)
-        thick = max(2, round(3 * SCALE)) * ss
-        pad = thick // 2 + ss
-        draw.ellipse([pad, pad, big - pad, big - pad], fill=rgb(inside), outline=rgb(ring),
-                     width=thick)
-        glyph = rgb(PAPER) if inside not in (PAPER, HOVER) else rgb(ring)
-        third = big / 3
-        if kind == STOP:
-            draw.rounded_rectangle([third, third, big - third, big - third],
-                                   radius=round(2 * SCALE) * ss, fill=glyph)
-        else:
-            bar, top, bottom = big / 9, third * 0.95, big - third * 0.95
-            for left in (big / 2 - 2.2 * bar, big / 2 + 0.8 * bar):
-                draw.rounded_rectangle([left, top, left + 1.4 * bar, bottom],
-                                       radius=round(1.5 * SCALE) * ss, fill=glyph)
-        small = image.resize((size, size), Image.LANCZOS)
-        if key is not None:
-            # Wholly outside the circle: see-through. The edge keeps its blend.
-            mask = Image.new("L", (big, big), 0)
-            ImageDraw.Draw(mask).ellipse([pad - thick // 2, pad - thick // 2,
-                                          big - pad + thick // 2, big - pad + thick // 2],
-                                         fill=255)
-            mask = mask.resize((size, size), Image.LANCZOS)
-            small.paste(Image.new("RGB", (size, size), rgb(key)), (0, 0),
-                        mask.point(lambda v: 255 if v == 0 else 0))
-        return ImageTk.PhotoImage(small)
+    def _render_plain(self) -> None:
+        """Without Pillow: a plain square in each tile's colour."""
+        marked = bool(self._view and self._view.marked)
+        for widget, colour in ((self.stop_button, RED),
+                               (self.mark_button, AMBER if marked else BLUE)):
+            widget.delete("all")
+            size = widget.winfo_width() or ICON
+            widget.create_rectangle(2, 2, size - 2, size - 2, fill=colour, outline=colour)
 
     def _set_theme(self, theme: str) -> None:
         """Change look when the PC's clinic is known (or changes)."""
         if theme == self._theme or theme not in THEMES:
             return
         self._theme = theme
-        if self._see_through:
-            key = THEMES[theme]["key"]
-            self._backdrop = key
+        self._backdrop = THEMES[theme]["matte"]
+        for widget in (self.canvas, self.stop_button, self.mark_button):
             try:
-                self.window.configure(bg=key)
-                self.window.attributes("-transparentcolor", key)
+                widget.configure(bg=self._backdrop)
             except Exception:
                 pass
-        else:
-            self._backdrop = THEMES[theme]["matte"]
-        self.canvas.configure(bg=self._backdrop)
-        for widget in (self.stop_button, self.mark_button):
-            widget.configure(bg=THEMES[theme]["card"])
         if self._spot is None:
             self._place()
-
-    def _paint(self, view) -> None:
-        """The solid card, and on it the dot that says a recording is on."""
-        canvas = self.canvas
-        canvas.delete("all")
-        theme = THEMES[self._theme]
-        art = self._rounded_image(WIDTH, self._height, CARD_RADIUS, fill=theme["card"],
-                                  edge=theme["card_edge"], matte=theme["card_edge"],
-                                  key=self._backdrop if self._see_through else None)
-        if art is not None:
-            canvas.art = art
-            canvas.create_image(0, 0, anchor="nw", image=art)
-        else:
-            canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=theme["card"],
-                                    outline=theme["card_edge"])
-        colour = {"recording": RED, "waiting": AMBER, "problem": RED}.get(
-            view.dot, THEMES[self._theme]["dot_off"])
-        centre = WIDTH / 2
-        top = round(9 * SCALE)
-        dot = self._dot_image(DOT, colour, theme["card"])
-        if dot is not None:
-            canvas.dot_art = dot
-            canvas.create_image(round(centre - DOT / 2), top, anchor="nw", image=dot)
-        else:
-            canvas.create_oval(centre - DOT / 2, top, centre + DOT / 2, top + DOT,
-                               fill=colour, outline=colour)
-
-    @staticmethod
-    def _dot_image(size: int, colour: str, matte: str):
-        """The dot, smooth-edged against the card's white. None without Pillow."""
-        if size < 4:
-            return None
-        try:
-            from PIL import Image, ImageDraw, ImageTk
-        except ImportError:
-            return None
-        ss = 4
-        image = Image.new("RGB", (size * ss, size * ss), matte)
-        ImageDraw.Draw(image).ellipse([0, 0, size * ss - 1, size * ss - 1], fill=colour)
-        return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
 
     @staticmethod
     def _round_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
@@ -477,14 +449,13 @@ class Overlay:
         self.window.geometry(f"{WIDTH}x{self._height}+{x}+{y}")
 
     def _home(self) -> tuple:
-        """Where the strip starts for this look, before the doctor moves it."""
-        theme = THEMES[self._theme]
-        if theme["side"] == "left":
-            # Centred on the EHR's sidebar, below its own icons.
-            sidebar = round(86 * SCALE)
-            return (max(0, (sidebar - WIDTH) // 2),
-                    round(self.window.winfo_screenheight() * theme["height"]))
-        return self.window.winfo_screenwidth() - WIDTH - MARGIN, TOP
+        """
+        Where the strip starts, before the doctor moves it. 26 Nov 2026 (the
+        owner): the lower left of the screen, on every clinic's page, just above
+        the taskbar.
+        """
+        bottom = _work_area_bottom() or self.window.winfo_screenheight()
+        return MARGIN, max(0, bottom - self._height - MARGIN)
 
     def _on_screen(self, x: int, y: int) -> tuple:
         right = self.window.winfo_screenwidth() - WIDTH
@@ -501,6 +472,7 @@ class Overlay:
         x, y = self._on_screen(event.x_root - self._grab[0], event.y_root - self._grab[1])
         self._spot = (x, y)
         self.window.geometry(f"+{x}+{y}")
+        self._render()                     # the see-through picture moves with it
         self._close_menu()
 
     def _drag_end(self, _event=None) -> None:
@@ -530,9 +502,6 @@ class Overlay:
             self._set_theme(theme_for(status.get("hospital_id"), self._theme_override))
         previous = self._view
         self._view = view
-        self.stop_button.draw()
-        self.mark_button.draw()
-        self._paint(view)
         self._show_note(view.note)
 
         # A marked part that has run two minutes: its menu opens by itself, once.
@@ -554,6 +523,7 @@ class Overlay:
                 self.window.deiconify()
             self._keep_on_top(active=bool(status.get("is_recording")
                                           or status.get("is_paused")))
+            self._render()
         elif self.window.state() != "withdrawn":
             logger.info("On-screen control hidden: recording=%s session=%s menu_open=%s",
                         status.get("is_recording"), status.get("session_id"),
@@ -790,7 +760,14 @@ class Overlay:
                                          deletion_confirmed=True) if confirmed else ""
         if result:
             logger.info("On-screen choice %s/%s not sent: %s", kind, value, result)
+        elif kind == STOP and value != REFUSAL:
+            # 3.9.11: the reason is logged; both buttons go for this recording.
+            self.state.stop_chosen(self._status().get("session_id"))
+            logger.info("On-screen Stop (%s) logged: buttons hidden for this recording", value)
         self._close_menu()
+        if self.state.stopped_session is not None:
+            status = self._status()
+            self.apply(self.state.view(status), status)
 
     def _close_menu_soon(self) -> None:
         self._cancel_close()

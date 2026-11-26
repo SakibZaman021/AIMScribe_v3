@@ -81,7 +81,9 @@ class OverlayView:
     consent_open: bool              # the refusal can still be chosen
     marked: Optional[str]           # the open sensitive part's reason, words
     alarm: bool                     # marked two minutes or more: blink and ask
-    dot: str                        # "recording" | "off"
+    dot: str                        # "recording" | "off" (3.9.11: not drawn)
+    pulse: bool = False             # 3.9.11: a part is marked, the Mark button pulses
+    stopped: bool = False           # 3.9.11: a Stop reason was logged this recording
 
 
 class OverlayState:
@@ -91,24 +93,39 @@ class OverlayState:
         self._clock = clock
         self.session_id: Optional[str] = None
         self.menu_open = False
+        # 3.9.11 (26 Nov 2026, the owner's design): once the doctor has given a
+        # Stop reason, both buttons go for the rest of that recording - the
+        # reason is logged and the menu said the recording continues until CMED
+        # closes the visit. They come back with the next patient's recording.
+        self.stopped_session: Optional[str] = None
 
     def on_event(self, event: str, data: Dict[str, Any]) -> None:
         """Events change nothing on the screen; they reach the server, not the doctor."""
         if event == "recording_started":
             self.session_id = data.get("session_id")
 
+    def stop_chosen(self, session_id: Optional[str]) -> None:
+        """A Stop reason was logged for this recording: hide both buttons for it."""
+        self.stopped_session = session_id or "?"
+
     def view(self, status: Dict[str, Any]) -> OverlayView:
         active = bool(status.get("is_recording") or status.get("is_paused"))
+        session = status.get("session_id")
+        if self.stopped_session is not None and session and session != self.stopped_session:
+            self.stopped_session = None             # the next patient: buttons back
+        stopped = active and self.stopped_session is not None
         sensitive = status.get("sensitive") or None
         marked = (sensitive.get("label") or sensitive.get("reason")) if sensitive else None
         alarm = bool(sensitive) and float(sensitive.get("seconds") or 0) >= REMINDER_SECONDS
         return OverlayView(
-            visible=active or self.menu_open,
+            visible=(active and not stopped) or self.menu_open,
             note="",
             consent_open=active and status.get("consent_open", True) is not False,
             marked=marked if active else None,
             alarm=alarm and active,
             dot="recording" if active else "off",
+            pulse=bool(marked) and active,
+            stopped=stopped,
         )
 
 

@@ -49,19 +49,21 @@ def where(o):
     return o.window.winfo_rootx(), o.window.winfo_rooty()
 
 
-def test_it_starts_at_the_top_right(card):
+def test_it_starts_at_the_lower_left(card):
+    # 26 Nov 2026 (the owner): lower left, just above the taskbar.
     x, y = where(card)
-    assert x == card.window.winfo_screenwidth() - ov.WIDTH - ov.MARGIN and y == ov.TOP
+    bottom = ov._work_area_bottom() or card.window.winfo_screenheight()
+    assert x == ov.MARGIN and y == bottom - card._height - ov.MARGIN
 
 
 def test_dragging_moves_it_and_it_stays_there(card):
     start = where(card)
     card._drag_start(press(card, 30, 40))
     grabbed = press(card, 30, 40)
-    card._drag_move(SimpleNamespace(x_root=grabbed.x_root - 300, y_root=grabbed.y_root + 200))
+    card._drag_move(SimpleNamespace(x_root=grabbed.x_root + 300, y_root=grabbed.y_root - 200))
     card._drag_end()
     moved = where(card)
-    assert moved == (start[0] - 300, start[1] + 200)
+    assert moved == (start[0] + 300, start[1] - 200)
 
     # Hidden after the consultation and shown for the next: still there.
     card.window.withdraw()
