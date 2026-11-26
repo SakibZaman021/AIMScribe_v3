@@ -312,6 +312,10 @@ app.include_router(collectors.admin_router)
 import watchers  # noqa: E402
 app.include_router(watchers.router)
 app.include_router(watchers.admin_router)
+# The analysis pipeline (053): the lab's transcript and NER, the quality
+# service's metrics, through signed jobs; off unless AIMS_PIPELINE=on.
+import pipeline  # noqa: E402
+app.include_router(pipeline.router)
 
 
 # ============================================================================

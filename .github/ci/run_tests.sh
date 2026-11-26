@@ -61,6 +61,7 @@ for f in backend/tests/test_*.py; do
     suite "server: $(basename "$f")" backend "tests/$(basename "$f")"
 done
 suite "archive worker" backend/archive_worker
+suite "pipeline agent" pipeline_agent
 suite "deployment, backups, monitor, deployer" deploy/uiu
 suite "tools" tools test_channel_b_test.py test_load_test.py
 

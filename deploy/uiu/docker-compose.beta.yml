@@ -130,6 +130,7 @@ services:
       AIMS_MIN_RECORDER_VERSION: ${AIMS_MIN_RECORDER_VERSION:-3.4.0}
       AIMS_LIMITS: "off"
       AIMS_SELF_REGISTRATION: "on"
+      AIMS_PIPELINE: ${AIMS_PIPELINE:-off}
       # Beta's own upload bucket (beta/set-r2-beta.sh).
       MINIO_ENDPOINT: ${AIMS_BETA_MINIO_ENDPOINT:?set in .env.beta}
       MINIO_EXTERNAL_ENDPOINT: ""
@@ -185,6 +186,7 @@ services:
       AIMS_ARCHIVE_ROOT: /archive
       AIMS_COPY_KEY: ${AIMS_COPY_KEY:-}
       AIMS_COPY_BATCH: 1
+      AIMS_PIPELINE: ${AIMS_PIPELINE:-off}
       AIMS_DECRYPT_PORT: 7070
       AIMS_DECRYPT_CONCURRENCY: 2
       AIMS_POLL_SECONDS: 60

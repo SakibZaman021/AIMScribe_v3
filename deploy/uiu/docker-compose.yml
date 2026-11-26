@@ -351,6 +351,8 @@ services:
       # is pending, and uploads up to its allowance, until CMED confirms two
       # of its recordings; never confirmed in this many days, it is rejected.
       AIMS_SELF_REGISTRATION: ${AIMS_SELF_REGISTRATION:-on}
+      # 053: the analysis pipeline (lab transcript + NER, quality metrics); off until switched on.
+      AIMS_PIPELINE: ${AIMS_PIPELINE:-off}
       AIMS_PENDING_UPLOAD_MB: ${AIMS_PENDING_UPLOAD_MB:-500}
       AIMS_PENDING_DEVICES_PER_CLINIC: ${AIMS_PENDING_DEVICES_PER_CLINIC:-5}
       AIMS_PENDING_DEVICE_DAYS: ${AIMS_PENDING_DEVICE_DAYS:-7}
@@ -453,6 +455,7 @@ services:
       # else - not on the API, not at either storage provider (SRS-DAT-08).
       AIMS_COPY_KEY: ${AIMS_COPY_KEY:-}
       AIMS_COPY_BATCH: ${AIMS_COPY_BATCH:-2}
+      AIMS_PIPELINE: ${AIMS_PIPELINE:-off}
       # Decrypts one copy for a portal download (serve.py), for the API only:
       # the worker key is required and the port is not published.
       AIMS_DECRYPT_PORT: 7070

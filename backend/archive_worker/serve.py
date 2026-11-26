@@ -33,6 +33,16 @@ short, and the browser shows it failed.
     and the recording's binding; the whole-file fingerprint is a download's
     check, not a listen's.
 
+    POST /seal             X-Worker-Key: <AIMS_WORKER_KEY>       (27 Nov 2026)
+        {"url": ..., "expect": {...}, "plain_sha256": ..., "job_id": "<job>",
+         "recipient": "<the claiming machine's X25519 public key, 64 hex>"}
+    -> 200, Content-Length: the sealed size, then the WAV sealed to that key
+       (pipeline_seal): the analysis pipeline's audio for the lab machine.
+       Decrypted with the copy key and sealed again as it streams; nothing
+       plain is written to disk. As with /decrypt, the last chunk is held back
+       until the whole WAV's SHA-256 is the archived one, so a sealed file
+       that completes is the archived recording, byte for byte.
+
 Listens on the internal network only; the port is not published.
 """
 from __future__ import annotations
@@ -50,6 +60,7 @@ from typing import Any, Dict, Optional
 import requests
 
 import cloudcopy
+import pipeline_seal
 from cloudcopy import CopyError
 
 logger = logging.getLogger("archive_worker.serve")
@@ -57,6 +68,7 @@ logger = logging.getLogger("archive_worker.serve")
 MAX_REQUEST_BYTES = 16 * 1024
 WINDOW_CHUNKS = 2                   # at most this many chunks per /range answer
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_JOB = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 class _Exact:
@@ -99,7 +111,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._answer(404, "not found")
 
     def do_POST(self) -> None:
-        if self.path not in ("/decrypt", "/range"):
+        if self.path not in ("/decrypt", "/range", "/seal"):
             self._answer(404, "not found")
             return
         given = (self.headers.get("X-Worker-Key") or "").encode("utf-8")
@@ -129,6 +141,13 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             self._answer(400, "url, expect and plain_sha256 are required")
             return
+        recipient, job_id = None, None
+        if self.path == "/seal":
+            recipient, job_id = ask.get("recipient"), ask.get("job_id")
+            if not isinstance(recipient, str) or not _HEX64.match(recipient) \
+                    or not isinstance(job_id, str) or not _JOB.match(job_id):
+                self._answer(400, "recipient (64 hex) and job_id are required")
+                return
         if not isinstance(url, str) or not url.startswith(self.server.schemes) \
                 or not isinstance(expect, dict) or not expect.get("session_id") \
                 or not isinstance(want, str) or not _HEX64.match(want):
@@ -138,7 +157,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._answer(429, "already decrypting as many downloads as allowed; try again")
             return
         try:
-            self._stream(url, expect, want)
+            if self.path == "/seal":
+                self._stream(url, expect, want, recipient=bytes.fromhex(recipient),
+                             job_id=job_id)
+            else:
+                self._stream(url, expect, want)
         finally:
             self.server.slots.release()
 
@@ -231,7 +254,8 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
 
-    def _stream(self, url: str, expect: Dict[str, Any], want: str) -> None:
+    def _stream(self, url: str, expect: Dict[str, Any], want: str, *,
+                recipient: Optional[bytes] = None, job_id: Optional[str] = None) -> None:
         name = f"the copy of {expect.get('session_id')}"
         try:
             upstream = self.server.http.get(url, stream=True, timeout=(10, 120),
@@ -257,6 +281,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._answer(409, str(exc))
                 return
 
+            if recipient is not None:
+                self._send_sealed(expect, want, size, held, chunks, recipient, job_id)
+                return
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Content-Length", str(size))
@@ -285,6 +312,44 @@ class _Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
         finally:
             upstream.close()
+
+
+    def _send_sealed(self, expect: Dict[str, Any], want: str, size: int, first: bytes,
+                     chunks, recipient: bytes, job_id: str) -> None:
+        """The pipeline's audio: the WAV sealed to the claiming machine, last chunk held."""
+        digest = hashlib.sha256()
+
+        def plain():
+            digest.update(first)
+            yield first
+            for chunk in chunks:
+                digest.update(chunk)
+                yield chunk
+
+        sealed = pipeline_seal.seal(plain(), size, recipient, job_id)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(pipeline_seal.sealed_size(size, job_id)))
+        self.end_headers()
+        try:
+            held = next(sealed)                    # the header
+            for block in sealed:
+                self.wfile.write(held)
+                held = block
+            if digest.hexdigest() != want:
+                logger.error("Sealed audio for job %s cut short: it decrypts, but not to "
+                             "the archived file", job_id)
+                self.close_connection = True
+                return
+            self.wfile.write(held)
+            logger.info("Sealed %s for pipeline job %s (%.1f MB)", expect.get("session_id"),
+                        job_id, (size or 0) / 1024 ** 2)
+        except (CopyError, pipeline_seal.SealError) as exc:
+            logger.error("Sealed audio for job %s cut short: %s", job_id, exc)
+            self.close_connection = True
+        except OSError as exc:
+            logger.warning("Sealed audio for job %s stopped: %s", job_id, exc)
+            self.close_connection = True
 
 
 class DecryptServer(ThreadingHTTPServer):

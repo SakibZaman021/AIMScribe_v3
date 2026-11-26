@@ -56,6 +56,7 @@ existing parts, proves they are still that audio, and cuts again.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import signal
@@ -126,6 +127,9 @@ class Settings:
         self.decrypt_concurrency = int(os.getenv("AIMS_DECRYPT_CONCURRENCY", "2"))
         # 26 Nov 2026: listening on the portal - a chunk or two per answer.
         self.listen_concurrency = int(os.getenv("AIMS_LISTEN_CONCURRENCY", "6"))
+        # 053: seal the analysis pipeline's results into the copies (off by default).
+        self.pipeline = os.getenv("AIMS_PIPELINE", "off").strip().lower() in (
+            "1", "on", "true", "yes")
 
     def problems(self) -> List[str]:
         issues = []
@@ -929,6 +933,59 @@ class ArchiveWorker:
                 logger.error("Rewriting the JSON for %s failed: %s",
                              session["session_id"], exc)
                 self.report_copy_failure(session["session_id"], "json", str(exc))
+        return done + self.pipeline_results_pass()
+
+    def pipeline_results_pass(self) -> int:
+        """
+        053 (27 Nov 2026): the analysis pipeline's transcripts, NER and metrics,
+        sealed with the copy key into the recording's own folder, beside its
+        audio. Nothing to do while the pipeline is off on the server (404).
+        """
+        if not getattr(self.settings, "pipeline", False):
+            return 0
+        try:
+            pending = self.fetch("pipeline/results/pending", 10)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return 0
+            raise
+        done = 0
+        for item in pending:
+            if not self.running:
+                break
+            try:
+                body = item["body"].encode("utf-8")
+                if hashlib.sha256(body).hexdigest() != item["body_sha256"]:
+                    raise CopyError("the result is not the one the server accepted")
+                with tempfile.TemporaryDirectory() as tmp:
+                    source = Path(tmp) / "result.json"
+                    source.write_bytes(body)
+                    sealed = cloudcopy.encrypt_file(
+                        source, Path(tmp) / "result.json.enc", self.settings.copy_key,
+                        cloudcopy.binding(item["session_id"], item["kind"],
+                                          part_no=item.get("part_no"), stem=item.get("stem")))
+                    place = self.post("pipeline/results/authorize",
+                                      {"job_id": item["job_id"], "kind": item["kind"]})
+                    with open(sealed.path, "rb") as handle:
+                        response = self.session.put(
+                            place["upload_url"], data=handle,
+                            headers={"X-Worker-Key": None,
+                                     "Content-Type": "application/octet-stream"},
+                            timeout=self.settings.download_timeout,
+                            verify=self.settings.verify_tls)
+                    response.raise_for_status()
+                    self.post("pipeline/results/complete", {
+                        "job_id": item["job_id"], "kind": item["kind"],
+                        "object_key": place["object_key"], "bytes": sealed.bytes,
+                        "sha256": sealed.sha256, "plain_sha256": sealed.plain_sha256,
+                        "md5": sealed.md5})
+                done += 1
+                logger.info("Pipeline %s for %s sealed into %s", item["kind"],
+                            item["session_id"], place["object_key"])
+            except Exception as exc:
+                self.failed += 1
+                logger.error("Pipeline %s for %s not copied: %s", item.get("kind"),
+                             item.get("session_id"), exc)
         return done
 
     def parts_of(self, session: Dict[str, Any]) -> List[Dict[str, Any]]:

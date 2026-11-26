@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # restore.py is not run by the worker, but it is the only way to read a
 # cloud copy back, so it ships in the image that made them.
-COPY worker.py archive.py catalogue.py cloudcopy.py restore.py serve.py ./
+COPY worker.py archive.py catalogue.py cloudcopy.py restore.py serve.py pipeline_seal.py ./
 
 # Copies are raw WAV now; the codec is kept only so restore.py can still read
 # a FLAC copy made before that. Fail the build if it is not usable.
