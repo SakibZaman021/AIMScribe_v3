@@ -521,7 +521,9 @@ async def listen(session_id: str, request: Request, part: Optional[int] = None,
     end = size - 1 if end is None else min(end, size - 1)
 
     heard = (person.email, sid, copy["part_no"])
-    if _listen_heard.get(heard, 0.0) < _now() - LISTEN_AUDIT_SECONDS:
+    # Never heard yet is checked apart: the clock counts from the machine's
+    # start, so 'long ago' as 0.0 would skip every listen in its first half hour.
+    if heard not in _listen_heard or _listen_heard[heard] < _now() - LISTEN_AUDIT_SECONDS:
         _listen_heard[heard] = _now()
         try:
             await api_v2._repo().audit(

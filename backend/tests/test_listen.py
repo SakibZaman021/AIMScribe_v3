@@ -56,6 +56,10 @@ def _range_worker(calls):
 
 async def test_the_player_gets_exactly_the_bytes_it_asks_for(dbs, monkeypatch):
     sid, _ = await _copied_recording(dbs, "PLISTEN1")
+    import downloads
+    # A machine started minutes ago (the clock counts from its start): the
+    # first listen is still logged.
+    monkeypatch.setattr(downloads, "_now", lambda: 100.0)
     calls: list = []
     who = {"value": "owner@uiu.example"}
     size = len(_DL_WAV)
