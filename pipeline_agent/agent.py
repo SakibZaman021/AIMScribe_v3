@@ -13,6 +13,17 @@ so the model side is one plain command that reads files and writes files:
 
     model.json  {"model": "...", "model_version": "...", "weights_sha256": "<64 hex>"}
 
+Or, for a model that already runs as an HTTP service on this machine
+(--model-url instead of --command; loopback only, so audio never leaves it):
+
+    lab       POST <url>/v1/transcribe   multipart field "audio" (the WAV)  -> transcript JSON
+              POST <url>/v1/ner          {"language", "text", "segments"}   -> NER JSON
+    metrics   POST <url>/v1/compare      the inputs JSON                    -> metrics JSON
+    both      GET  <url>/v1/model                                           -> model.json
+    (the paths can be changed with --transcribe-path, --ner-path, --compare-path,
+    --model-path; a bearer token for the service, if it wants one, is read from
+    the environment variable named by --model-token-env)
+
 What it does for every job:
   * claims jobs with requests signed by this machine's Ed25519 key;
   * lab: downloads the audio sealed to this machine's X25519 key, opens it,
@@ -48,6 +59,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
+import ipaddress
 
 import requests
 from cryptography.hazmat.primitives import serialization
@@ -137,9 +149,69 @@ def _split(command: str):
 
 # ---------------------------------------------------------------- one job
 
+class ModelService:
+    """A model already running as an HTTP service on this machine (loopback only)."""
+
+    def __init__(self, url: str, *, transcribe_path: str = "/v1/transcribe",
+                 ner_path: str = "/v1/ner", compare_path: str = "/v1/compare",
+                 model_path: str = "/v1/model", token: Optional[str] = None,
+                 allow_remote: bool = False) -> None:
+        host = urlsplit(url).hostname or ""
+        if not allow_remote and not _loopback(host):
+            raise SystemExit(f"--model-url must be on this machine (127.0.0.1, localhost, ::1), "
+                             f"not {host!r}: the audio must not leave it")
+        self.url = url.rstrip("/")
+        self.paths = {"transcribe": transcribe_path, "ner": ner_path,
+                      "compare": compare_path, "model": model_path}
+        self.http = requests.Session()
+        self.http.trust_env = False                      # never through a proxy
+        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    def _answer(self, response: requests.Response, what: str) -> Dict[str, Any]:
+        if response.status_code >= 400:
+            raise RuntimeError(f"the model service refused {what}: "
+                               f"{response.status_code} {response.text[:300]}")
+        try:
+            return response.json()
+        except ValueError:
+            raise RuntimeError(f"the model service's {what} answer is not JSON") from None
+
+    def model(self) -> Dict[str, Any]:
+        return self._answer(self.http.get(self.url + self.paths["model"], headers=self.headers,
+                                          timeout=30), "model")
+
+    def transcribe(self, wav: Path) -> Dict[str, Any]:
+        with open(wav, "rb") as handle:
+            return self._answer(self.http.post(
+                self.url + self.paths["transcribe"], headers=self.headers,
+                files={"audio": ("audio.wav", handle, "audio/wav")},
+                data={"language": "bn"}, timeout=COMMAND_TIMEOUT), "transcribe")
+
+    def ner(self, transcript: Dict[str, Any]) -> Dict[str, Any]:
+        return self._answer(self.http.post(
+            self.url + self.paths["ner"], headers=self.headers, timeout=COMMAND_TIMEOUT,
+            json={"language": transcript.get("language", "bn"), "text": transcript.get("text", ""),
+                  "segments": transcript.get("segments", [])}), "ner")
+
+    def compare(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return self._answer(self.http.post(
+            self.url + self.paths["compare"], headers=self.headers, json=inputs,
+            timeout=COMMAND_TIMEOUT), "compare")
+
+
+def _loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class Job:
-    def __init__(self, server: Server, job: Dict[str, Any], role: str, command: str,
+    def __init__(self, server: Server, job: Dict[str, Any], role: str, command,
                  work: Path, box: Optional[X25519PrivateKey]) -> None:
+        # `command`: a command line (str), or a ModelService for --model-url.
         self.server, self.job, self.role, self.command, self.box = server, job, role, command, box
         self.id, self.ticket = job["job_id"], job["ticket"]
         self.dir = Path(tempfile.mkdtemp(prefix=f"{self.id}_", dir=work))
@@ -208,6 +280,14 @@ class Job:
             response.close()
         if digest.hexdigest() != self.job["audio_sha256"]:
             raise RuntimeError("the audio is not the archived recording (hash mismatch)")
+        if isinstance(self.command, ModelService):
+            service = self.command
+            model = service.model()
+            transcript = service.transcribe(wav)
+            wav.unlink()
+            self._post("transcript", transcript, model, audio_sha256=digest.hexdigest())
+            self._post("ner", service.ner(transcript), model, audio_sha256=digest.hexdigest())
+            return
         ran = self._run_command("--audio", str(wav))
         wav.unlink()                                       # not needed past this point
         for kind in ("transcript", "ner"):
@@ -217,6 +297,10 @@ class Job:
     def _metrics(self) -> None:
         inputs = self.server.call("GET", f"/jobs/{self.id}/inputs",
                                   headers={"X-Pipeline-Ticket": self.ticket}).json()
+        if isinstance(self.command, ModelService):
+            service = self.command
+            self._post("metrics", service.compare(inputs), service.model())
+            return
         path = self.dir / "inputs.json"
         path.write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
         ran = self._run_command("--inputs", str(path))
@@ -233,6 +317,13 @@ def run(args: argparse.Namespace) -> None:
     box = _load(keys / "box.key") if args.role == "lab" else None
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
+    target = args.command
+    if args.model_url:
+        token = os.getenv(args.model_token_env) if args.model_token_env else None
+        target = ModelService(args.model_url, transcribe_path=args.transcribe_path,
+                              ner_path=args.ner_path, compare_path=args.compare_path,
+                              model_path=args.model_path, token=token,
+                              allow_remote=args.allow_remote_model)
     busy: Dict[str, threading.Thread] = {}
     pause = 2.0
     log.info("Agent started: role %s, up to %s job(s) at once", args.role, args.parallel)
@@ -252,7 +343,7 @@ def run(args: argparse.Namespace) -> None:
             pause = min(pause * 2, 60.0)
             continue
         for job in jobs:
-            worker = Job(server, job, args.role, args.command, work, box)
+            worker = Job(server, job, args.role, target, work, box)
             thread = threading.Thread(target=worker.run, name=job["job_id"], daemon=True)
             busy[job["job_id"]] = thread
             thread.start()
@@ -268,7 +359,16 @@ def main(argv=None) -> None:
     r.add_argument("--machine", required=True)
     r.add_argument("--keys", required=True)
     r.add_argument("--role", choices=("lab", "metrics"), required=True)
-    r.add_argument("--command", required=True)
+    how = r.add_mutually_exclusive_group(required=True)
+    how.add_argument("--command", help="the model as a command that reads and writes files")
+    how.add_argument("--model-url", help="the model as an HTTP service on this machine")
+    r.add_argument("--transcribe-path", default="/v1/transcribe")
+    r.add_argument("--ner-path", default="/v1/ner")
+    r.add_argument("--compare-path", default="/v1/compare")
+    r.add_argument("--model-path", default="/v1/model")
+    r.add_argument("--model-token-env", help="environment variable holding the service's token")
+    r.add_argument("--allow-remote-model", action="store_true",
+                   help="allow a model URL off this machine (not recommended)")
     r.add_argument("--parallel", type=int, default=2)
     r.add_argument("--work", default=str(Path(tempfile.gettempdir()) / "aimscribe-agent"))
     r.add_argument("--insecure", action="store_true", help="tests only: skip TLS checks")

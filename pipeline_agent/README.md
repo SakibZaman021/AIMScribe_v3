@@ -31,7 +31,31 @@ python agent.py run --server https://aimscribe.iriic.uiu.ac.bd \
 Run it as a service (systemd) so it restarts with the machine. It only makes outbound
 HTTPS calls, so no port has to be opened.
 
-## 3. What your command receives and must write
+## 3a. If your model already runs as an HTTP API (recommended when it does)
+
+Keep it, on this machine only. Bind it to `127.0.0.1`, take it off any public
+gateway, close the inbound port, and remove any watchdog or R2 code. The agent
+calls it:
+
+| Call | Sends | Answer (JSON) |
+|---|---|---|
+| `GET /v1/model` | nothing | `{"model": "...", "model_version": "..."}` (+ optional `weights_sha256`) |
+| `POST /v1/transcribe` | multipart: file `audio` (the WAV), field `language=bn` | transcript.json (below) |
+| `POST /v1/ner` | `{"language", "text", "segments"}` | ner.json (below) |
+| `POST /v1/compare` (metrics role) | the inputs JSON (below) | metrics.json (below) |
+
+```bash
+python agent.py run --server https://aimscribe.iriic.uiu.ac.bd:9443 --machine <id> \
+    --keys /etc/aimscribe-agent --role lab --model-url http://127.0.0.1:8000 --parallel 2
+```
+
+Other endpoint names: `--transcribe-path`, `--ner-path`, `--compare-path`, `--model-path`.
+A token for your API: put it in an environment variable and pass its name with
+`--model-token-env` (sent as `Authorization: Bearer ...`). Answer errors with 4xx/5xx and
+`{"detail": "..."}`. Answer synchronously, however long it takes, and delete the uploaded
+WAV when you answer. The agent refuses a model URL that is not on this machine.
+
+## 3b. Or: what your command receives and must write
 
 The agent calls your command with these arguments added at the end:
 

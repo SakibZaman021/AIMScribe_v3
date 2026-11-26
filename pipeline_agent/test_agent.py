@@ -108,3 +108,117 @@ def test_keygen_never_overwrites_keys(tmp_path, capsys):
     assert "sign_pubkey:" in shown and "box_pubkey:" in shown
     with pytest.raises(SystemExit):
         agent.keygen(tmp_path / "keys")
+
+
+# ---- a model that already runs as an HTTP service on this machine (--model-url) ----
+
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+
+class ModelAPI:
+    """A stand-in for Rahat's own service, on 127.0.0.1."""
+
+    def __init__(self, fail_ner=False, token=None):
+        self.seen, api = [], self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, status, body):
+                raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _authorised(self):
+                if token and self.headers.get("Authorization") != f"Bearer {token}":
+                    self._send(401, {"detail": "token"})
+                    return False
+                return True
+
+            def do_GET(self):
+                if self._authorised():
+                    api.seen.append(("GET", self.path, b""))
+                    self._send(200, {"model": "rahat-bn-asr", "model_version": "2026.11.1"})
+
+            def do_POST(self):
+                if not self._authorised():
+                    return
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                api.seen.append(("POST", self.path, body))
+                if self.path == "/v1/transcribe":
+                    self._send(200, {"language": "bn", "text": "জ্বর আছে"})
+                elif self.path == "/v1/ner":
+                    if fail_ner:
+                        self._send(500, {"detail": "GPU out of memory"})
+                    else:
+                        self._send(200, {"entities": [{"type": "symptom", "text": "জ্বর"}]})
+                elif self.path == "/v1/compare":
+                    self._send(200, {"scores": {"recall": 0.5}})
+                else:
+                    self._send(404, {"detail": "no"})
+
+        self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.http.server_address[1]}"
+
+
+def test_a_lab_job_through_the_models_own_api(tmp_path, monkeypatch):
+    api = ModelAPI(token="local-secret")
+    try:
+        private, public = pipeline_seal.new_box_key()
+        job = a_job()
+        sealed = b"".join(pipeline_seal.seal([AUDIO], len(AUDIO), public, job["job_id"]))
+        server = FakeServer(sealed)
+        service = agent.ModelService(api.url, token="local-secret")
+        agent.Job(server, job, "lab", service, tmp_path, private).run()
+        posted = {p.rsplit("/", 1)[-1]: b for m, p, b, h in server.calls if "/results/" in p}
+        assert posted["transcript"]["data"] == {"language": "bn", "text": "জ্বর আছে"}
+        assert posted["ner"]["model"] == "rahat-bn-asr"
+        assert posted["ner"]["audio_sha256"] == job["audio_sha256"]
+        upload = next(b for m, p, b in api.seen if p == "/v1/transcribe")
+        assert AUDIO in upload                                  # the WAV went to the model
+        ner_call = json.loads(next(b for m, p, b in api.seen if p == "/v1/ner"))
+        assert ner_call["text"] == "জ্বর আছে"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        api.http.shutdown()
+
+
+def test_an_error_from_the_model_api_is_reported_not_posted(tmp_path):
+    api = ModelAPI(fail_ner=True)
+    try:
+        private, public = pipeline_seal.new_box_key()
+        job = a_job()
+        sealed = b"".join(pipeline_seal.seal([AUDIO], len(AUDIO), public, job["job_id"]))
+        server = FakeServer(sealed)
+        agent.Job(server, job, "lab", agent.ModelService(api.url), tmp_path, private).run()
+        assert not any(p.endswith("/results/ner") for m, p, b, h in server.calls)
+        failed = [b for m, p, b, h in server.calls if p.endswith("/fail")]
+        assert failed and "GPU out of memory" in failed[0]["reason"]
+    finally:
+        api.http.shutdown()
+
+
+def test_a_metrics_job_through_the_models_own_api(tmp_path):
+    api = ModelAPI()
+    try:
+        server = FakeServer(inputs={"job_id": "cmp_x", "prescription": {}, "ner": {}})
+        agent.Job(server, a_job(job_id="cmp_" + "c" * 32), "metrics",
+                  agent.ModelService(api.url), tmp_path, None).run()
+        posted = [b for m, p, b, h in server.calls if p.endswith("/results/metrics")]
+        assert posted and posted[0]["data"] == {"scores": {"recall": 0.5}}
+    finally:
+        api.http.shutdown()
+
+
+def test_the_model_url_must_be_on_this_machine():
+    for bad in ("http://10.0.0.5:8000", "http://gpu.example.org:8000", "https://1.2.3.4"):
+        with pytest.raises(SystemExit):
+            agent.ModelService(bad)
+    for good in ("http://127.0.0.1:8000", "http://localhost:9000", "http://[::1]:8000"):
+        agent.ModelService(good)
