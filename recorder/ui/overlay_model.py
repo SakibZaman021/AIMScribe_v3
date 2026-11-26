@@ -43,7 +43,7 @@ STOP_MENU: List[Tuple[str, str]] = [
     ("urgent_interruption", "Emergency"),
 ]
 # Shown under the refusal once it is closed, so a doctor knows why it is grey.
-REFUSAL_CLOSED = "Patient did not consent (closed once CMED sent the patient's details)"
+REFUSAL_CLOSED = "Patient did not consent (only in the first minute)"
 
 MARK_TITLE = ("Mark sensitive part. Recording continues. This part will be removed "
               "before anyone listens to it.")
@@ -166,11 +166,10 @@ class OverlayActions:
         """
         if kind == STOP:
             if value == REFUSAL:
+                # 3.9.12: logged like the other reasons; the recording continues.
                 if not consent_open:
-                    return "Closed once CMED sent the patient's details."
-                if not deletion_confirmed:
-                    return NEEDS_DELETE_CONFIRMATION
-                self._submit(lambda c: c.refuse_session())
+                    return "Offered in the first minute of the recording only."
+                self._submit(lambda c: c.doctor_mark(REFUSAL))
                 return None
             if value not in dict(STOP_MENU):
                 return "Choose a reason from the list."

@@ -760,8 +760,9 @@ class Overlay:
                                          deletion_confirmed=True) if confirmed else ""
         if result:
             logger.info("On-screen choice %s/%s not sent: %s", kind, value, result)
-        elif kind == STOP and value != REFUSAL:
+        elif kind == STOP:
             # 3.9.11: the reason is logged; both buttons go for this recording.
+            # 3.9.12: the refusal report too - it is logged like the others.
             self.state.stop_chosen(self._status().get("session_id"))
             logger.info("On-screen Stop (%s) logged: buttons hidden for this recording", value)
         self._close_menu()

@@ -337,17 +337,33 @@ async def test_a_sensitive_part_still_open_ends_with_the_recording(
     await ctl.close()
 
 
-async def test_the_refusal_is_open_until_api2_arrives(monkeypatch, spool, device_key):
+async def test_the_refusal_report_is_offered_in_the_first_minute(monkeypatch, spool,
+                                                                  device_key):
+    """3.9.12: offered for the first minute of the recording, whatever API 2 does."""
     ctl = api4_ctl(monkeypatch, spool, device_key)
     opened = await ctl.open_session(visit("VIS-A"))
     assert ctl.status()["consent_open"] is True
-    await ctl._on_heartbeat_reply({"status": "ok",
-                                   "demographics_received": {"session_id": "OTHER"}})
-    assert ctl.status()["consent_open"] is True
     await ctl._on_heartbeat_reply({"status": "ok", "demographics_received":
                                    {"session_id": opened["session_id"]}})
-    assert ctl.status()["consent_open"] is False
+    assert ctl.status()["consent_open"] is True                  # API 2 no longer closes it
     assert any(e == "api2_received" for e, _, _ in logged(ctl))
+    monkeypatch.setattr(type(ctl), "_audio_position", lambda self, active: 61.0)
+    assert ctl.status()["consent_open"] is False                 # after the first minute
+    await ctl.close()
+
+
+async def test_the_refusal_report_is_logged_and_the_recording_continues(
+        monkeypatch, spool, device_key):
+    """3.9.12, the owner's decision: nothing stops and nothing is deleted."""
+    from core.session_controller import REFUSAL_REASON
+    ctl = api4_ctl(monkeypatch, spool, device_key)
+    await ctl.open_session(visit("VIS-A"))
+    session = ctl._active.spool
+    result = await ctl.doctor_mark(REFUSAL_REASON)
+    assert result["status"] == "logged" and ctl.state == "recording"
+    assert [d for e, d, _ in logged(ctl, session) if e == "doctor_mark"] == [
+        "Patient did not consent (reported by the doctor)"]
+    assert not session.refused
     await ctl.close()
 
 
