@@ -88,6 +88,12 @@ END_RULES = ("api3", "api4")
 # recording carries on until API 4 or the next patient; the lab trims the audio
 # afterwards from this log and the data collectors' records.
 DOCTOR_MARKS = {
+    # 3.9.12 (26 Nov 2026, the owner's decision): the doctor's report that the
+    # patient did not consent is logged like the other reasons and the
+    # recording continues. AIMS LAB matches it against the data collector's
+    # notes, and its medical board decides whether the recording is kept or
+    # deleted. Offered in the first minute of a recording only.
+    REFUSAL_REASON: "Patient did not consent (reported by the doctor)",
     "consultation_finished": "Consultation finished",
     "patient_left": "Patient left the room",
     "urgent_interruption": "Emergency",
@@ -2065,8 +2071,11 @@ class SessionController:
             "level": self._live_level(active),
         }
         if active is not None:
-            # 3.9.8: the refusal is offered until CMED's API 2 arrives.
-            payload["consent_open"] = active.demographics_at is None
+            # 3.9.12: the doctor's refusal report is offered in the first
+            # minute of the recording (it was: until CMED's API 2, which at Aalo
+            # arrives about a second after the start).
+            payload["consent_open"] = self._audio_position(active) < self._knob(
+                "refusal_window_seconds", 60.0)
             if active.sensitive is not None:
                 payload["sensitive"] = {
                     "reason": active.sensitive["reason"],

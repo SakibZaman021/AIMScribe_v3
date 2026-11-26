@@ -153,12 +153,12 @@ def test_stop_reasons_are_logged_not_obeyed():
     assert all(c[0] not in ("stop_session", "pause_session") for c in calls.made)
 
 
-def test_the_refusal_asks_once_then_deletes():
+def test_the_refusal_is_only_logged_and_nothing_is_deleted():
+    """3.9.12, the owner's decision: logged like the other reasons; recording goes on."""
     act, calls = actions()
-    assert act.choose(STOP, REFUSAL_REASON) == NEEDS_DELETE_CONFIRMATION
-    assert calls.made == []
-    assert act.choose(STOP, REFUSAL_REASON, deletion_confirmed=True) is None
-    assert calls.made == [("refuse_session", (), {})]
+    assert act.choose(STOP, REFUSAL_REASON) is None
+    assert calls.made == [("doctor_mark", (REFUSAL_REASON,), {})]
+    assert not any(c[0] == "refuse_session" for c in calls.made)
 
 
 def test_the_refusal_cannot_be_chosen_once_closed():
