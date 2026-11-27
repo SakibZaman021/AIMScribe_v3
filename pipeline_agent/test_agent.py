@@ -102,7 +102,8 @@ def test_a_metrics_job_posts_its_metrics(tmp_path):
     assert posted and posted[0][2]["data"] == {"scores": {"recall": 1.0}}
 
 
-def test_keygen_never_overwrites_keys(tmp_path, capsys):
+def test_keygen_never_overwrites_keys(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv(agent.PASSPHRASE_ENV, "correct horse battery staple")
     agent.keygen(tmp_path / "keys")
     shown = capsys.readouterr().out
     assert "sign_pubkey:" in shown and "box_pubkey:" in shown
@@ -222,3 +223,71 @@ def test_the_model_url_must_be_on_this_machine():
             agent.ModelService(bad)
     for good in ("http://127.0.0.1:8000", "http://localhost:9000", "http://[::1]:8000"):
         agent.ModelService(good)
+
+
+
+# ---- keys encrypted at rest, and changing them ----
+
+def test_keys_are_encrypted_and_need_their_passphrase(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(agent.PASSPHRASE_ENV, "s3cret phrase")
+    agent.keygen(tmp_path)
+    for name in ("sign.key", "box.key"):
+        assert b"ENCRYPTED" in (tmp_path / name).read_bytes()
+    assert agent.Keys(tmp_path, b"s3cret phrase").box is not None
+    with pytest.raises(SystemExit):
+        agent.Keys(tmp_path, b"wrong")
+    with pytest.raises(SystemExit):
+        agent.Keys(tmp_path, None)
+
+
+def test_unencrypted_keys_are_refused_unless_asked_for(tmp_path, capsys):
+    agent.keygen(tmp_path, plain=True)
+    with pytest.raises(SystemExit):
+        agent.Keys(tmp_path, None)
+    assert agent.Keys(tmp_path, None, allow_plain=True).signing is not None
+
+
+def test_the_systemd_credential_is_the_first_place_the_passphrase_comes_from(tmp_path,
+                                                                             monkeypatch):
+    (tmp_path / "agent-passphrase").write_text("from-credential" + chr(10))
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
+    monkeypatch.setenv(agent.PASSPHRASE_ENV, "from-env")
+    assert agent.passphrase() == b"from-credential"
+
+
+def test_approved_new_keys_take_over_and_the_old_are_set_aside(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(agent.PASSPHRASE_ENV, "pp")
+    agent.keygen(tmp_path)
+    keys = agent.Keys(tmp_path, b"pp")
+    old_public = keys.signing.public_key().public_bytes(*agent.RAW)
+    agent._new_pair(tmp_path, ".next", b"pp")
+    server = agent.Server("http://test", "m", keys)
+    calls = []
+
+    def fake_call(method, path, payload=None, **kw):
+        calls.append(keys.signing.public_key().public_bytes(*agent.RAW))
+        if len(calls) == 1:
+            raise RuntimeError(f"{method} {path}: 401 request signature does not verify")
+        return "ok"
+
+    server._call = fake_call
+    assert server.call("POST", "/claim", {}) == "ok"
+    assert calls[0] == old_public and calls[1] != old_public
+    assert not (tmp_path / "sign.next.key").exists()
+    assert list(tmp_path.glob("sign.retired-*.key"))
+
+
+def test_other_refusals_never_switch_keys(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(agent.PASSPHRASE_ENV, "pp")
+    agent.keygen(tmp_path)
+    keys = agent.Keys(tmp_path, b"pp")
+    agent._new_pair(tmp_path, ".next", b"pp")
+    server = agent.Server("http://test", "m", keys)
+
+    def refused(method, path, payload=None, **kw):
+        raise RuntimeError(f"{method} {path}: 403 not from this machine's address")
+
+    server._call = refused
+    with pytest.raises(RuntimeError):
+        server.call("POST", "/claim", {})
+    assert (tmp_path / "sign.next.key").exists()

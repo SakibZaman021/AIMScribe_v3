@@ -1,0 +1,33 @@
+# /etc/systemd/system/aimscribe-agent.service  (Linux, systemd 250 or newer)
+#
+# The keys' passphrase is a systemd credential, encrypted with this machine's
+# TPM (or its host key) - copied to another machine it opens nothing. Once:
+#   sudo mkdir -p /etc/credstore.encrypted
+#   sudo systemd-creds encrypt --name=agent-passphrase - /etc/credstore.encrypted/agent-passphrase
+#   (type the passphrase you gave `agent.py keygen`, then Ctrl+D)
+# Then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aimscribe-agent
+[Unit]
+Description=AIMScribe pipeline agent (lab)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=aimscribe
+WorkingDirectory=/opt/aimscribe-agent
+LoadCredentialEncrypted=agent-passphrase:/etc/credstore.encrypted/agent-passphrase
+ExecStart=/usr/bin/python3 /opt/aimscribe-agent/agent.py run \
+    --server https://aimscribe.iriic.uiu.ac.bd:9443 \
+    --machine REPLACE_WITH_MACHINE_ID \
+    --keys /etc/aimscribe-agent --role lab \
+    --model-url http://127.0.0.1:8000 --parallel 2 \
+    --work /var/lib/aimscribe-agent
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/aimscribe-agent /var/lib/aimscribe-agent
+
+[Install]
+WantedBy=multi-user.target

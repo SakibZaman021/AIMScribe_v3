@@ -15,8 +15,13 @@ pip install cryptography requests
 python agent.py keygen --keys /etc/aimscribe-agent
 ```
 
+It asks for a passphrase (twice): the private keys are stored encrypted with it, so a
+copied key file alone is useless. Keep the passphrase somewhere safe; the service reads it
+from an encrypted systemd credential (see `aimscribe-agent.service`).
+
 This prints `sign_pubkey` and `box_pubkey`. Send both to the AIMScribe administrator,
-together with the machine's fixed public IP address. The private keys stay in
+together with the machine's fixed public IP address (a lab machine is only ever accepted
+from that address). The private keys stay in
 `/etc/aimscribe-agent` (readable by the agent's user only) and never leave the machine.
 The administrator enrols the machine and sends back its **machine id**.
 
@@ -123,3 +128,23 @@ Signed with the same keys (see `Server.call` in `agent.py`):
   `rec`, clinic, doctor and date. It never includes patient IDs.
 - `GET /api/v2/pipeline/recordings/<rec>/transcript` returns one recording's transcript when
   someone opens it. Each read is logged.
+
+## 5. Changing keys (every 90 days, or at once after any doubt)
+
+```bash
+sudo -u aimscribe python3 agent.py rotate --server https://aimscribe.iriic.uiu.ac.bd:9443 \
+    --machine <machine id> --keys /etc/aimscribe-agent
+```
+
+It makes new keys, proves to the server that this machine holds them, and waits. The
+current keys keep working until the AIMScribe administrator approves; then the agent
+switches to the new keys by itself at its next request, and renames the old ones
+`*.retired-<date>.key` - delete those. The server reminds the administrators when a
+machine's keys are older than 90 days.
+
+## 6. What the server watches
+
+Every refused request is logged. One that uses an enrolled machine's name from another
+address, with a wrong signature, a replayed request or a revoked machine pages the
+AIMScribe administrators at once, as does a machine fetching far more audio than usual.
+They can revoke the machine in one step; its jobs go back to the queue.
