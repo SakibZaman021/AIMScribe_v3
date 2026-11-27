@@ -91,7 +91,8 @@ async def world(dbs, monkeypatch):
         answer = await pipeline.enrol_machine(pipeline.EnrolRequest(
             name=f"{role}-{uuid.uuid4().hex[:8]}", role=role,
             sign_pubkey=key.public_key().public_bytes(*RAW).hex(), box_pubkey=box,
-            allowed_ips=ips, by="tests"), _=None)
+            allowed_ips=ips if ips is not None else (["127.0.0.1"] if role == "lab" else None),
+            by="tests"), _=None)
         return Machine(client, answer["machine_id"], key)
 
     async def recording(confirmed=True):
@@ -302,7 +303,7 @@ async def test_the_lab_receives_the_archived_wav_sealed_to_itself(world, tmp_pat
         enrolled = await pipeline.enrol_machine(pipeline.EnrolRequest(
             name=f"gpu-{uuid.uuid4().hex[:6]}", role="lab",
             sign_pubkey=key.public_key().public_bytes(*RAW).hex(),
-            box_pubkey=box_public.hex(), by="tests"), _=None)
+            box_pubkey=box_public.hex(), allowed_ips=["127.0.0.1"], by="tests"), _=None)
         lab = Machine(world.client, enrolled["machine_id"], key)
         sid, object_key = await world.recording()
         stem = pipeline._stem(object_key)
@@ -337,3 +338,102 @@ async def test_the_lab_receives_the_archived_wav_sealed_to_itself(world, tmp_pat
     finally:
         worker.shutdown()
         store.http.shutdown()
+
+
+
+# ---- hardening (054): the IP lock, alarms, and changing keys ----
+
+async def _alerts(world, alert_type):
+    async with world.dbs.rec.acquire() as conn:
+        return [dict(r) for r in await conn.fetch(
+            "SELECT severity, detail FROM integrity_alerts WHERE alert_type = $1", alert_type)]
+
+
+async def test_a_lab_machine_cannot_be_enrolled_without_its_address(world):
+    key = Ed25519PrivateKey.generate().public_key().public_bytes(*RAW).hex()
+    for ips in (None, [], ["not-an-ip"]):
+        with pytest.raises(Exception) as refused:
+            await pipeline.enrol_machine(pipeline.EnrolRequest(
+                name=f"lab-{uuid.uuid4().hex[:6]}", role="lab", sign_pubkey=key,
+                box_pubkey=os.urandom(32).hex(), allowed_ips=ips, by="tests"), _=None)
+        assert getattr(refused.value, "status_code", None) == 422
+
+
+async def test_someone_using_an_enrolled_machines_name_pages_the_administrators(world):
+    lab = await world.enrol("lab")
+    walled = await world.enrol("lab", ips=["10.9.9.9"])
+    forger = Machine(world.client, lab.id, Ed25519PrivateKey.generate())
+    assert (await forger.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 401
+    assert (await walled.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 403
+    stranger = Machine(world.client, str(uuid.uuid4()), Ed25519PrivateKey.generate())
+    assert (await stranger.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 401
+    alerts = await _alerts(world, "pipeline_access_refused")
+    reasons = {(a["severity"], json.loads(a["detail"])["reason"] if isinstance(a["detail"], str)
+                else a["detail"]["reason"]) for a in alerts}
+    assert ("critical", "signature") in reasons
+    assert ("critical", "address") in reasons
+    assert ("warning", "unknown machine") in reasons      # internet noise is not a page
+
+
+async def test_fetching_far_more_audio_than_usual_pages_the_administrators(world, monkeypatch):
+    lab = await world.enrol("lab")
+    monkeypatch.setenv("AIMS_PIPELINE_AUDIO_PER_HOUR", "2")
+    machine = {"machine_id": uuid.UUID(lab.id), "name": "gpu-volume-test"}
+    for _ in range(3):
+        await world.dbs.repo.audit(event_type="pipeline.audio_sent", actor_type="device",
+                                   actor_id="gpu-volume-test", detail={})
+    await pipeline._check_volume(machine)
+    assert any(a["severity"] == "critical"
+               for a in await _alerts(world, "pipeline_unusual_volume"))
+
+
+def _proof(new_key, machine_id, sign_hex, box_hex):
+    import base64
+    message = pipeline.rotation_message(machine_id, sign_hex, box_hex)
+    return base64.urlsafe_b64encode(new_key.sign(message)).rstrip(b"=").decode()
+
+
+async def test_keys_change_only_when_an_administrator_approves(world):
+    lab = await world.enrol("lab")
+    new = Ed25519PrivateKey.generate()
+    sign_hex = new.public_key().public_bytes(*RAW).hex()
+    box_hex = os.urandom(32).hex()
+    bad = await lab.call("POST", "/rotate", {"sign_pubkey": sign_hex, "box_pubkey": box_hex,
+                                             "proof": _proof(Ed25519PrivateKey.generate(),
+                                                             lab.id, sign_hex, box_hex)})
+    assert bad.status_code == 403                        # must prove it holds the new key
+    asked = await lab.call("POST", "/rotate", {"sign_pubkey": sign_hex, "box_pubkey": box_hex,
+                                               "proof": _proof(new, lab.id, sign_hex, box_hex)})
+    assert asked.status_code == 200, asked.text
+    newcomer = Machine(world.client, lab.id, new)
+    assert (await newcomer.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 401
+    assert (await lab.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 200
+    await pipeline.decide_rotation(lab.id, "approve", pipeline.RevokeRequest(by="tests"), _=None)
+    assert (await newcomer.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 200
+    assert (await lab.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 401
+    async with world.dbs.rec.acquire() as conn:
+        box = await conn.fetchval("SELECT box_pubkey FROM pipeline_machines WHERE "
+                                  "machine_id = $1", uuid.UUID(lab.id))
+    assert bytes(box).hex() == box_hex
+
+
+async def test_a_rejected_key_change_leaves_the_old_keys(world):
+    lab = await world.enrol("lab")
+    new = Ed25519PrivateKey.generate()
+    sign_hex = new.public_key().public_bytes(*RAW).hex()
+    box_hex = os.urandom(32).hex()
+    await lab.call("POST", "/rotate", {"sign_pubkey": sign_hex, "box_pubkey": box_hex,
+                                       "proof": _proof(new, lab.id, sign_hex, box_hex)})
+    await pipeline.decide_rotation(lab.id, "reject", pipeline.RevokeRequest(by="tests"), _=None)
+    assert (await lab.call("POST", "/claim", {"max": 1, "wait": 0})).status_code == 200
+    with pytest.raises(Exception):
+        await pipeline.decide_rotation(lab.id, "approve", pipeline.RevokeRequest(by="tests"),
+                                       _=None)
+
+
+def test_the_agent_and_the_server_agree_on_the_key_change_proof():
+    m, sign_hex, box_hex = str(uuid.uuid4()), "ab" * 32, "cd" * 32
+    assert agent.rotation_message(m, sign_hex, box_hex) == \
+        pipeline.rotation_message(m, sign_hex, box_hex)
+    assert agent.ROTATE_DOMAIN == pipeline.ROTATE_DOMAIN
+    assert agent.SIGNATURE_DOMAIN == pipeline.SIGNATURE_DOMAIN

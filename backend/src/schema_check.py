@@ -237,6 +237,9 @@ REQUIRED: List[Tuple[str, str, str, str]] = [
      _table("pipeline_jobs")),
     ("053_v3_analysis_pipeline.sql", "recordings", "table pipeline_results",
      _table("pipeline_results")),
+    # Without it a pipeline machine cannot change its keys.
+    ("054_v3_pipeline_key_rotation.sql", "recordings", "column pipeline_machines.keys_since",
+     _column("pipeline_machines", "keys_since")),
     ("clinical/001_aims_clinical.sql", "clinical", "table encounters", _table("encounters")),
     # Without it a visit's files are not registered and v_visit_folder is missing.
     ("clinical/006_visit_folder.sql", "clinical", "table visit_objects",

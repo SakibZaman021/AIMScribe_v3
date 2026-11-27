@@ -17,8 +17,11 @@ a bucket key or a database login. They work through this narrow interface:
     worker    GET  /api/v2/pipeline/results/pending       results to seal into the copies
               POST /api/v2/pipeline/results/authorize     where to put one
               POST /api/v2/pipeline/results/complete      it is there; checked here
-    admin     POST /api/v2/pipeline/admin/machines        enrol a machine
+    machine   POST /api/v2/pipeline/rotate                 ask for new keys (054)
+    admin     POST /api/v2/pipeline/admin/machines        enrol a machine (a lab machine
+                                                          must name its fixed IP address)
               POST /api/v2/pipeline/admin/machines/{id}/revoke
+              POST /api/v2/pipeline/admin/machines/{id}/rotation/{approve|reject}
               GET  /api/v2/pipeline/admin/machines | /admin/status
               POST /api/v2/pipeline/admin/sweep
 
@@ -31,12 +34,20 @@ that machine and job, the audio hash the machine computed matching the
 ticket, a step not already accepted, and a body of the agreed format. The
 machine never names a path: the folder is worked out here from the job.
 
+Every refused request is logged as an integrity alert; one that names an
+enrolled machine (a bad signature, another address, a replayed nonce, a
+revoked machine) is critical, which the server monitor pages to the
+administrators at once. So is a machine fetching far more audio than usual
+(AIMS_PIPELINE_AUDIO_PER_HOUR, default 300).
+
 Switched on with AIMS_PIPELINE=on; off, every route answers 404.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -69,6 +80,11 @@ STEPS = {"lab": ("transcript", "ner"), "compare": ("metrics",)}
 ROLE_KIND = {"lab": "lab", "metrics": "compare"}
 LIMITS = {"transcript": 2_000_000, "ner": 1_000_000, "metrics": 256_000}
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+ROTATE_DOMAIN = b"AIMS-PIPELINE-ROTATE-V1\n"
+KEY_AGE_DAYS = 90
+REFUSAL_WINDOW = timedelta(hours=1)
+# Refusals that mean someone holds, or is trying, an enrolled machine's identity.
+ALARMING = {"signature", "address", "replay", "revoked"}
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _JOB = re.compile(r"^(lab|cmp)_[0-9a-f]{32}$")
 _REC = re.compile(r"^rec_[0-9a-f]{32}$")
@@ -103,6 +119,27 @@ def request_message(*, method: str, path: bytes, timestamp: str, nonce: str,
         hashlib.sha256(body or b"").hexdigest().encode("ascii")])
 
 
+async def _refused(reason: str, *, status: int, detail: str, address: str,
+                   machine: Optional[Dict[str, Any]] = None,
+                   machine_id: Optional[str] = None) -> None:
+    """Log a refused request; one naming an enrolled machine pages the administrators."""
+    known = machine is not None
+    severity = "critical" if known and reason in ALARMING else "warning"
+    try:
+        await _repo().alert_once(
+            alert_type="pipeline_access_refused",
+            group=f"pipeline_refused:{machine['machine_id'] if known else address}:{reason}",
+            window=REFUSAL_WINDOW, severity=severity,
+            detail={"reason": reason, "detail": detail, "address": address,
+                    "machine": machine["name"] if known else None,
+                    "machine_id": str(machine["machine_id"]) if known else machine_id})
+    except Exception as exc:                        # the refusal stands regardless
+        logger.warning("Could not log a refused pipeline request: %s", exc)
+    logger.warning("Pipeline request refused (%s) from %s%s", reason, address,
+                   f" as {machine['name']}" if known else "")
+    raise HTTPException(status_code=status, detail=detail)
+
+
 async def require_machine(request: Request,
                           x_pipeline_machine: Optional[str] = Header(None),
                           x_pipeline_timestamp: Optional[str] = Header(None),
@@ -110,36 +147,42 @@ async def require_machine(request: Request,
                           x_pipeline_signature: Optional[str] = Header(None)) -> Dict[str, Any]:
     """An enrolled, unrevoked machine, from its allowed address, signing this request."""
     _on()
+    import security
+    address = security.client_ip(request)
     try:
         machine_id = uuid.UUID(str(x_pipeline_machine))
     except ValueError:
-        raise HTTPException(status_code=401, detail="X-Pipeline-Machine is required")
+        await _refused("no machine", status=401, detail="X-Pipeline-Machine is required",
+                       address=address)
+    async with _repo()._acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM pipeline_machines WHERE machine_id = $1",
+                                  machine_id)
+    if row is None:
+        await _refused("unknown machine", status=401, detail="unknown machine",
+                       address=address, machine_id=str(machine_id))
+    machine = dict(row)
+    if machine["revoked_at"] is not None:
+        await _refused("revoked", status=403, detail="this machine was revoked",
+                       address=address, machine=machine)
+    if machine["allowed_ips"] and address not in machine["allowed_ips"]:
+        await _refused("address", status=403, detail="not from this machine's address",
+                       address=address, machine=machine)
     if not (x_pipeline_timestamp and x_pipeline_nonce and x_pipeline_signature):
-        raise HTTPException(status_code=401, detail="this request must be signed")
+        await _refused("unsigned", status=401, detail="this request must be signed",
+                       address=address, machine=machine)
     if not (x_pipeline_timestamp.isascii() and x_pipeline_timestamp.isdigit()) \
             or abs(time.time() - int(x_pipeline_timestamp)) > SIGNATURE_WINDOW:
-        raise HTTPException(status_code=401, detail="request time is outside 5 minutes; "
-                                                    "check the machine's clock")
+        await _refused("clock", status=401, detail="request time is outside 5 minutes; "
+                                                   "check the machine's clock",
+                       address=address, machine=machine)
     if not _NONCE.match(x_pipeline_nonce):
-        raise HTTPException(status_code=401, detail="X-Pipeline-Nonce is not valid")
+        await _refused("nonce", status=401, detail="X-Pipeline-Nonce is not valid",
+                       address=address, machine=machine)
     try:
         signature = api_v2._b64url_decode(x_pipeline_signature)
     except ValueError:
-        raise HTTPException(status_code=401, detail="X-Pipeline-Signature is not base64url")
-
-    async with _repo()._acquire() as conn:
-        machine = await conn.fetchrow("SELECT * FROM pipeline_machines WHERE machine_id = $1",
-                                      machine_id)
-    if machine is None:
-        raise HTTPException(status_code=401, detail="unknown machine")
-    if machine["revoked_at"] is not None:
-        raise HTTPException(status_code=403, detail="this machine was revoked")
-    import security
-    address = security.client_ip(request)
-    if machine["allowed_ips"] and address not in machine["allowed_ips"]:
-        logger.warning("Pipeline machine %s refused from %s", machine["name"], address)
-        raise HTTPException(status_code=403, detail="not from this machine's address")
-
+        await _refused("signature", status=401, detail="X-Pipeline-Signature is not base64url",
+                       address=address, machine=machine)
     body = await request.body()
     message = request_message(method=request.method, path=api_v2._signed_path(request),
                               timestamp=x_pipeline_timestamp, nonce=x_pipeline_nonce,
@@ -147,17 +190,20 @@ async def require_machine(request: Request,
     import integrity
     if not integrity.verify_device_signature(bytes(machine["sign_pubkey"]), message,
                                              signature):
-        raise HTTPException(status_code=401, detail="request signature does not verify")
+        await _refused("signature", status=401, detail="request signature does not verify",
+                       address=address, machine=machine)
     async with _repo()._acquire() as conn:
         used = await conn.fetchval("""
             INSERT INTO pipeline_nonces (machine_id, nonce) VALUES ($1, $2)
             ON CONFLICT DO NOTHING RETURNING 1
         """, machine_id, x_pipeline_nonce)
-        if not used:
-            raise HTTPException(status_code=401, detail="request nonce was already used")
-        await conn.execute("UPDATE pipeline_machines SET last_seen_at = now(), "
-                           "last_address = $2 WHERE machine_id = $1", machine_id, address)
-    return dict(machine)
+        if used:
+            await conn.execute("UPDATE pipeline_machines SET last_seen_at = now(), "
+                               "last_address = $2 WHERE machine_id = $1", machine_id, address)
+    if not used:
+        await _refused("replay", status=401, detail="request nonce was already used",
+                       address=address, machine=machine)
+    return machine
 
 
 def _role(machine: Dict[str, Any], role: str) -> None:
@@ -248,6 +294,16 @@ async def sweep(force: bool = False) -> Dict[str, int]:
             """)
             await conn.execute("DELETE FROM pipeline_nonces "
                                "WHERE used_at < now() - interval '1 day'")
+            stale = await conn.fetch("SELECT machine_id, name, keys_since FROM "
+                                     "pipeline_machines WHERE revoked_at IS NULL AND "
+                                     "keys_since < now() - make_interval(days => $1)",
+                                     KEY_AGE_DAYS)
+        for old in stale:
+            await repo.alert_once(
+                alert_type="pipeline_keys_old", group=f"pipeline_keys:{old['machine_id']}",
+                window=timedelta(days=7), severity="warning",
+                detail={"machine": old["name"], "keys_since": old["keys_since"].isoformat(),
+                        "fix": "run agent.py rotate on the machine, then approve it"})
         per_session: Dict[str, List[Dict[str, Any]]] = {}
         for row in candidates:
             per_session.setdefault(row["session_id"], []).append(dict(row))
@@ -435,6 +491,7 @@ async def job_audio(job_id: str, machine=Depends(require_machine),
     await _repo().audit(event_type="pipeline.audio_sent", actor_type="device",
                         actor_id=machine["name"], session_id=job["session_id"],
                         detail={"job": job_id, "bytes": answer.headers.get("content-length")})
+    await _check_volume(machine)
 
     async def stream():
         try:
@@ -590,6 +647,29 @@ def _canonical(body: Any) -> str:
     """The exact text a result was fingerprinted as (Postgres re-formats JSONB)."""
     value = json.loads(body) if isinstance(body, str) else body
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _check_volume(machine: Dict[str, Any]) -> None:
+    """Page the administrators when a machine fetches far more audio than usual."""
+    try:
+        limit = int(os.getenv("AIMS_PIPELINE_AUDIO_PER_HOUR", "300"))
+    except ValueError:
+        limit = 300
+    try:
+        async with _repo()._acquire() as conn:
+            fetched = await conn.fetchval("""
+                SELECT count(*) FROM audit_log WHERE event_type = 'pipeline.audio_sent'
+                   AND actor_id = $1 AND occurred_at > now() - interval '1 hour'
+            """, machine["name"])
+        if int(fetched) > limit:
+            await _repo().alert_once(
+                alert_type="pipeline_unusual_volume",
+                group=f"pipeline_volume:{machine['machine_id']}", window=REFUSAL_WINDOW,
+                severity="critical",
+                detail={"machine": machine["name"], "audio_last_hour": int(fetched),
+                        "limit": limit, "fix": "revoke the machine if this is not expected"})
+    except Exception as exc:
+        logger.warning("Could not check %s's audio volume: %s", machine["name"], exc)
 
 
 def _without_personal(value: Any) -> Any:
@@ -776,6 +856,99 @@ async def results_complete(body: ResultCopied, _: None = Depends(require_worker)
 
 
 # ============================================================
+# Changing a machine's keys (054)
+# ============================================================
+
+class RevokeRequest(BaseModel):
+    by: str = Field(..., min_length=2, max_length=128)
+
+
+def rotation_message(machine_id: str, sign_hex: str, box_hex: str) -> bytes:
+    """What the new signing key signs, to show the machine holds it."""
+    return ROTATE_DOMAIN + f"{machine_id}\n{sign_hex}\n{box_hex}".encode("ascii")
+
+
+class RotateRequest(BaseModel):
+    sign_pubkey: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    box_pubkey: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+    proof: str = Field(..., max_length=200)
+
+
+@router.post("/rotate")
+async def request_rotation(body: RotateRequest, machine=Depends(require_machine)):
+    """
+    New keys, asked for with the current key and proven with the new one.
+    Nothing changes until an administrator approves; the current keys keep
+    working until then.
+    """
+    if machine["role"] == "lab" and not body.box_pubkey:
+        raise HTTPException(status_code=422, detail="a lab machine needs a new box_pubkey")
+    box_hex = body.box_pubkey or ""
+    if body.sign_pubkey == bytes(machine["sign_pubkey"]).hex():
+        raise HTTPException(status_code=422, detail="that is the key already in use")
+    import integrity
+    try:
+        proof = api_v2._b64url_decode(body.proof)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="proof is not base64url")
+    if not integrity.verify_device_signature(
+            bytes.fromhex(body.sign_pubkey),
+            rotation_message(str(machine["machine_id"]), body.sign_pubkey, box_hex), proof):
+        raise HTTPException(status_code=403, detail="the proof does not verify with the "
+                                                    "new key")
+    async with _repo()._acquire() as conn:
+        await conn.execute("""
+            UPDATE pipeline_machines SET pending_sign_pubkey = $2, pending_box_pubkey = $3,
+                   rotation_requested_at = now() WHERE machine_id = $1
+        """, machine["machine_id"], bytes.fromhex(body.sign_pubkey),
+            bytes.fromhex(box_hex) if box_hex else None)
+    await _repo().audit(event_type="pipeline.rotation_requested", actor_type="device",
+                        actor_id=machine["name"], detail={"machine": str(machine["machine_id"])})
+    await _repo().alert_once(
+        alert_type="pipeline_rotation_waiting",
+        group=f"pipeline_rotation:{machine['machine_id']}", window=timedelta(days=1),
+        severity="warning",
+        detail={"machine": machine["name"], "fix": "approve or reject it"})
+    return {"status": "waiting for an administrator", "machine_id": str(machine["machine_id"])}
+
+
+@router.post("/admin/machines/{machine_id}/rotation/{decision}")
+async def decide_rotation(machine_id: str, decision: Literal["approve", "reject"],
+                          body: RevokeRequest, _: None = Depends(require_admin)):
+    """Approve: the new keys replace the old at once. Reject: the request is dropped."""
+    _on()
+    try:
+        mid = uuid.UUID(machine_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="no such machine")
+    async with _repo()._acquire() as conn:
+        if decision == "approve":
+            done = await conn.fetchval("""
+                UPDATE pipeline_machines
+                   SET sign_pubkey = pending_sign_pubkey,
+                       box_pubkey = COALESCE(pending_box_pubkey, box_pubkey),
+                       pending_sign_pubkey = NULL, pending_box_pubkey = NULL,
+                       rotation_requested_at = NULL, keys_since = now()
+                 WHERE machine_id = $1 AND pending_sign_pubkey IS NOT NULL
+                   AND revoked_at IS NULL
+                RETURNING 1
+            """, mid)
+        else:
+            done = await conn.fetchval("""
+                UPDATE pipeline_machines SET pending_sign_pubkey = NULL,
+                       pending_box_pubkey = NULL, rotation_requested_at = NULL
+                 WHERE machine_id = $1 AND pending_sign_pubkey IS NOT NULL
+                RETURNING 1
+            """, mid)
+    if not done:
+        raise HTTPException(status_code=404, detail="no key change is waiting for this "
+                                                    "machine")
+    await _repo().audit(event_type=f"pipeline.rotation_{decision}d", actor_type="admin",
+                        actor_id=body.by, detail={"machine": machine_id})
+    return {"machine_id": machine_id, "status": f"{decision}d"}
+
+
+# ============================================================
 # Administration
 # ============================================================
 
@@ -794,6 +967,16 @@ async def enrol_machine(body: EnrolRequest, _: None = Depends(require_admin)):
     _on()
     if body.role == "lab" and not body.box_pubkey:
         raise HTTPException(status_code=422, detail="a lab machine needs its box_pubkey")
+    if body.role == "lab" and not body.allowed_ips:
+        raise HTTPException(status_code=422, detail="a lab machine must name its fixed IP "
+                                                    "address (allowed_ips)")
+    ips = []
+    for ip in body.allowed_ips or []:
+        try:
+            ips.append(str(ipaddress.ip_address(ip.strip())))
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"not an IP address: {ip!r}")
+    body.allowed_ips = ips or None
     async with _repo()._acquire() as conn:
         try:
             machine_id = await conn.fetchval("""
@@ -813,10 +996,6 @@ async def enrol_machine(body: EnrolRequest, _: None = Depends(require_admin)):
     return {"machine_id": str(machine_id), "name": body.name, "role": body.role}
 
 
-class RevokeRequest(BaseModel):
-    by: str = Field(..., min_length=2, max_length=128)
-
-
 @router.post("/admin/machines/{machine_id}/revoke")
 async def revoke_machine(machine_id: str, body: RevokeRequest,
                          _: None = Depends(require_admin)):
@@ -827,8 +1006,9 @@ async def revoke_machine(machine_id: str, body: RevokeRequest,
         raise HTTPException(status_code=404, detail="no such machine")
     async with _repo()._acquire() as conn:
         done = await conn.execute("UPDATE pipeline_machines SET revoked_at = now(), "
-                                  "revoked_by = $2 WHERE machine_id = $1 AND revoked_at "
-                                  "IS NULL", mid, body.by)
+                                  "revoked_by = $2, pending_sign_pubkey = NULL, "
+                                  "pending_box_pubkey = NULL WHERE machine_id = $1 AND "
+                                  "revoked_at IS NULL", mid, body.by)
         await conn.execute("UPDATE pipeline_jobs SET state = 'ready', machine_id = NULL, "
                            "lease_until = NULL, updated_at = now() WHERE state = 'leased' "
                            "AND machine_id = $1", mid)
@@ -845,7 +1025,8 @@ async def list_machines(_: None = Depends(require_admin)):
     async with _repo()._acquire() as conn:
         rows = await conn.fetch("SELECT machine_id, name, role, allowed_ips, max_inflight, "
                                 "enrolled_by, enrolled_at, revoked_at, last_seen_at, "
-                                "last_address FROM pipeline_machines ORDER BY enrolled_at")
+                                "last_address, keys_since, rotation_requested_at "
+                                "FROM pipeline_machines ORDER BY enrolled_at")
     return {"machines": [{k: (str(v) if isinstance(v, uuid.UUID) else
                               v.isoformat() if isinstance(v, datetime) else v)
                           for k, v in dict(r).items()} for r in rows]}
@@ -867,7 +1048,8 @@ async def pipeline_status(_: None = Depends(require_viewer)):
         parked = await conn.fetch("SELECT job_id, kind, session_id, last_error, updated_at "
                                   "FROM pipeline_jobs WHERE state = 'parked' "
                                   "ORDER BY updated_at DESC LIMIT 50")
-        seen = await conn.fetch("SELECT name, role, last_seen_at FROM pipeline_machines "
+        seen = await conn.fetch("SELECT name, role, last_seen_at, keys_since, "
+                                "rotation_requested_at FROM pipeline_machines "
                                 "WHERE revoked_at IS NULL")
     by_kind: Dict[str, Dict[str, int]] = {}
     for r in states:
@@ -880,7 +1062,10 @@ async def pipeline_status(_: None = Depends(require_viewer)):
                         "at": r["updated_at"].isoformat()} for r in parked],
             "machines": [{"name": r["name"], "role": r["role"],
                           "last_seen_at": r["last_seen_at"].isoformat()
-                          if r["last_seen_at"] else None} for r in seen]}
+                          if r["last_seen_at"] else None,
+                          "keys_age_days": (datetime.now(timezone.utc) - r["keys_since"]).days,
+                          "rotation_waiting": r["rotation_requested_at"] is not None}
+                         for r in seen]}
 
 
 @router.post("/admin/sweep")
